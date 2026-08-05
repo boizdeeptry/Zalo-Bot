@@ -24,27 +24,26 @@ export function element(tag, options = {}, ...children) {
   return node;
 }
 
-export function pageHeader(title, description, eyebrow = "Portal vận hành") {
+export function pageHeader(title, description) {
   return element(
     "header",
-    { className: "page-header" },
-    element("p", { className: "eyebrow", text: eyebrow }),
+    { className: "pagehead" },
     element("h1", { text: title }),
-    element("p", { className: "page-description", text: description }),
+    element("p", { className: "sub", text: description }),
   );
 }
 
 export function statusPanel({ tone = "neutral", title, body }) {
+  const className = tone === "success"
+    ? "banner ok"
+    : tone === "danger"
+      ? "banner bad"
+      : "hint";
   return element(
     "section",
-    { className: `status-panel status-panel--${tone}`, attributes: { role: "status" } },
-    element("span", { className: "status-dot", attributes: { "aria-hidden": "true" } }),
-    element(
-      "div",
-      {},
-      element("h2", { text: title }),
-      element("p", { text: body }),
-    ),
+    { className, attributes: { role: tone === "danger" ? "alert" : "status" } },
+    element("div", { className: "bt", text: title }),
+    element("div", { className: "bd", text: body }),
   );
 }
 

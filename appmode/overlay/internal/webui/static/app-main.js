@@ -1,85 +1,112 @@
-import { ROUTES, createRouteHost, routeFromHash } from "./core/router.js";
-import { element, errorPanel } from "./core/ui.js";
+import { NAVIGATION, ROUTES, createRouteHost, routeFromHash } from "./core/router.js";
+import { renderNavigation } from "./core/shell.js";
+import { errorPanel } from "./core/ui.js";
 
-const nav = document.querySelector("[data-portal-nav]");
-const content = document.querySelector("[data-portal-content]");
-const routeHost = createRouteHost(content);
-
-const pageDefinitions = Object.freeze({
-  overview: {
-    load: async () => {
-      const page = await import("./pages/overview.js");
-      return { mount: page.mount };
-    },
+const implementedPages = Object.freeze({
+  agents: async () => {
+    const page = await import("./pages/agents.js");
+    return { mount: page.mount };
   },
-  agents: {
-    load: async () => {
-      const page = await import("./pages/agents.js");
-      return { mount: page.mount };
-    },
+  knowledge: async () => {
+    const page = await import("./pages/knowledge.js");
+    return { mount: page.mount };
   },
-  knowledge: {
-    load: async () => {
-      const page = await import("./pages/knowledge.js");
-      return { mount: page.mount };
-    },
-  },
-  models: {
-    load: async () => {
-      const page = await import("./pages/models.js");
-      return { mount: page.mount };
-    },
+  models: async () => {
+    const page = await import("./pages/models.js");
+    return { mount: page.mount };
   },
 });
 
-function buildNavigation() {
-  const fragment = document.createDocumentFragment();
-  for (const route of Object.values(ROUTES)) {
-    fragment.append(element(
-      "a",
-      {
-        className: "nav-link",
-        attributes: { href: `#${route.id}`, "data-route": route.id },
-      },
-      element("span", { className: "nav-marker", attributes: { "aria-hidden": "true" } }),
-      element("span", { text: route.label }),
-    ));
+async function loadRoutePage(route) {
+  if (route.todo) {
+    const page = await import("./pages/roadmap.js");
+    return page.createRoadmapPage(route);
   }
-  nav.replaceChildren(fragment);
+  return implementedPages[route.id]();
 }
 
-function markActiveRoute(routeId) {
-  for (const link of nav.querySelectorAll("[data-route]")) {
-    const active = link.dataset.route === routeId;
-    link.classList.toggle("is-active", active);
-    if (active) link.setAttribute("aria-current", "page");
-    else link.removeAttribute("aria-current");
+export function createPortalController({
+  nav,
+  content,
+  getHash,
+  loadPage = loadRoutePage,
+  routeHost = createRouteHost(content),
+  renderNavigation: drawNavigation = renderNavigation,
+  renderError = errorPanel,
+  setTitle = (title) => { globalThis.document.title = title; },
+  focusContent = () => content.focus({ preventScroll: true }),
+  reportError = (...args) => globalThis.console.error(...args),
+} = {}) {
+  let navigationRevision = 0;
+  let disposed = false;
+
+  async function navigate() {
+    if (disposed) return;
+    const revision = ++navigationRevision;
+    const routeId = routeFromHash(getHash());
+    const route = ROUTES[routeId];
+    drawNavigation({ container: nav, groups: NAVIGATION, activeId: routeId });
+    setTitle(`${route.label} · Trợ lý Zalo`);
+
+    try {
+      const page = await loadPage(route);
+      if (disposed || revision !== navigationRevision) return;
+      routeHost.mount(page, { routeId });
+      if (!disposed && revision === navigationRevision) focusContent();
+    } catch (error) {
+      if (disposed || revision !== navigationRevision) return;
+      reportError("portal route failed", error);
+      try {
+        routeHost.dispose();
+      } catch (cleanupError) {
+        reportError("portal cleanup failed", cleanupError);
+      }
+      content.replaceChildren(renderError(error));
+    }
   }
-}
 
-let navigationRevision = 0;
-
-async function renderRoute() {
-  const revision = ++navigationRevision;
-  const routeId = routeFromHash(window.location.hash);
-  const definition = pageDefinitions[routeId];
-  markActiveRoute(routeId);
-  document.title = `${ROUTES[routeId].label} · Portal Zalo`;
-
-  try {
-    const page = await definition.load();
-    if (revision !== navigationRevision) return;
-    await routeHost.mount(page, { routeId });
-    if (revision === navigationRevision) content.focus({ preventScroll: true });
-  } catch (error) {
-    if (revision !== navigationRevision) return;
-    console.error("portal route failed", error);
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    navigationRevision += 1;
     routeHost.dispose();
-    content.replaceChildren(errorPanel(error));
   }
+
+  return Object.freeze({ dispose, navigate });
 }
 
-buildNavigation();
-window.addEventListener("hashchange", renderRoute);
-window.addEventListener("beforeunload", () => routeHost.dispose(), { once: true });
-renderRoute();
+export function startPortal({
+  document: documentRef = globalThis.document,
+  window: windowRef = globalThis.window,
+} = {}) {
+  const nav = documentRef.querySelector("[data-portal-nav]");
+  const content = documentRef.querySelector("[data-portal-content]");
+  const controller = createPortalController({
+    nav,
+    content,
+    getHash: () => windowRef.location.hash,
+    setTitle: (title) => { documentRef.title = title; },
+  });
+  let stopped = false;
+
+  const onHashChange = () => { void controller.navigate(); };
+  const onBeforeUnload = () => dispose();
+
+  function dispose() {
+    if (stopped) return;
+    stopped = true;
+    windowRef.removeEventListener("hashchange", onHashChange);
+    windowRef.removeEventListener("beforeunload", onBeforeUnload);
+    controller.dispose();
+  }
+
+  windowRef.addEventListener("hashchange", onHashChange);
+  windowRef.addEventListener("beforeunload", onBeforeUnload, { once: true });
+  void controller.navigate();
+
+  return Object.freeze({ dispose, navigate: controller.navigate });
+}
+
+if (typeof globalThis.document !== "undefined" && typeof globalThis.window !== "undefined") {
+  startPortal({ document: globalThis.document, window: globalThis.window });
+}

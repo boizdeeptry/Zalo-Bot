@@ -46,6 +46,30 @@ test("mounting a route disposes the old page before clearing its DOM", async () 
   ]);
 });
 
+test("a throwing page disposer is consumed before the next mount", () => {
+  let disposeCalls = 0;
+  const host = createRouteHost({ replaceChildren() {} });
+
+  host.mount({
+    mount() {
+      return {
+        dispose() {
+          disposeCalls += 1;
+          throw new Error("cleanup failed");
+        },
+      };
+    },
+  });
+
+  assert.throws(
+    () => host.mount({ mount: () => ({ dispose() {} }) }),
+    /cleanup failed/,
+  );
+  assert.equal(disposeCalls, 1);
+  assert.doesNotThrow(() => host.dispose());
+  assert.equal(disposeCalls, 1);
+});
+
 test("page mount must return its disposer synchronously", () => {
   const host = createRouteHost({ replaceChildren() {} });
 

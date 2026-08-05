@@ -124,8 +124,9 @@ export function createRouteHost(container) {
         throw new TypeError("Route page must expose mount(container, context)");
       }
 
-      disposeCurrent();
+      const dispose = disposeCurrent;
       disposeCurrent = () => {};
+      dispose();
       container.replaceChildren();
       const result = page.mount(container, context);
       if (result && typeof result.then === "function") {
@@ -135,8 +136,9 @@ export function createRouteHost(container) {
     },
 
     dispose() {
-      disposeCurrent();
+      const dispose = disposeCurrent;
       disposeCurrent = () => {};
+      dispose();
     },
   });
 }

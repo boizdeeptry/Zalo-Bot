@@ -243,8 +243,28 @@ func incoming() {
 '@
   Write-TestFile (Join-Path $repo 'README.md') "tracked`n"
   Write-TestFile (Join-Path $repo 'untracked.txt') "must not be staged`n"
+  $upstreamStyles = @{
+    'app.css' = "upstream app sentinel`n"
+    'zalo.css' = "upstream zalo sentinel`n"
+    'modal.css' = "upstream modal sentinel`n"
+  }
+  foreach ($style in $upstreamStyles.GetEnumerator()) {
+    Write-TestFile (Join-Path $repo "internal\webui\static\$($style.Key)") $style.Value
+  }
   Write-TestFile (Join-Path $overlay 'internal\daemon\app_routes.go') "package daemon`n"
   Write-TestFile (Join-Path $overlay 'internal\webui\static\core\router.js') "export {};`n"
+  Write-TestFile (Join-Path $overlay 'internal\webui\static\portal.css') "portal overlay sentinel`n"
+  $productionStatic = Join-Path $PSScriptRoot '..\appmode\overlay\internal\webui\static'
+  if (-not (Test-Path -LiteralPath $productionStatic -PathType Container)) {
+    throw "Production Portal static directory missing: $productionStatic"
+  }
+  foreach ($stylesheet in @('app.css', 'zalo.css', 'modal.css')) {
+    $productionStylesheet = Join-Path $productionStatic $stylesheet
+    if (Test-Path -LiteralPath $productionStylesheet) {
+      Copy-Item -LiteralPath $productionStylesheet `
+        -Destination (Join-Path $overlay "internal\webui\static\$stylesheet") -Force
+    }
+  }
 
   & git -C $repo add -- 'internal' 'README.md'
   if ($LASTEXITCODE -ne 0) { throw 'Could not stage fixture files' }
@@ -252,6 +272,10 @@ func incoming() {
 
   $gotStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot $stage
   Assert-Equal $gotStage ([IO.Path]::GetFullPath($stage)) 'Stage path was not normalized'
+  foreach ($style in $upstreamStyles.GetEnumerator()) {
+    $stagedStyle = [IO.File]::ReadAllText((Join-Path $gotStage "internal\webui\static\$($style.Key)"))
+    Assert-Equal $stagedStyle $style.Value "Upstream $($style.Key) was replaced by the Portal overlay"
+  }
   Apply-AppSeams -Stage $gotStage
 
   if (-not (Test-Path -LiteralPath (Join-Path $gotStage 'internal\daemon\app_routes.go'))) {
