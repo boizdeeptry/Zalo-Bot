@@ -1,11 +1,11 @@
 import { requestJSON } from "../core/api.js";
 import { waitForServerRestart } from "../core/state.js";
-import { element, errorPanel, pageHeader, statusPanel } from "../core/ui.js";
+import { element, pageHeader } from "../core/ui.js";
 
 const MODEL_INFO = Object.freeze({
-  haiku: Object.freeze({ name: "Haiku", tag: "Nhanh nhất, tiết kiệm nhất", description: "Phù hợp hỏi đáp thường ngày dựa trên wiki." }),
-  sonnet: Object.freeze({ name: "Sonnet", tag: "Cân bằng", description: "Suy luận tốt hơn khi cần nối nhiều nguồn." }),
-  opus: Object.freeze({ name: "Opus", tag: "Sâu nhất, chi phí cao nhất", description: "Dành cho câu hỏi khó cần suy luận sâu." }),
+  haiku: Object.freeze({ name: "Haiku", tag: "nhanh nhất, rẻ nhất", description: "Trả lời nhanh, chi phí thấp nhất. Đủ cho hỏi đáp thường ngày dựa trên wiki. Mặc định." }),
+  sonnet: Object.freeze({ name: "Sonnet", tag: "cân bằng", description: "Suy luận tốt hơn Haiku, vẫn nhanh. Chọn khi khách hỏi những câu cần nối nhiều nguồn." }),
+  opus: Object.freeze({ name: "Opus", tag: "sâu nhất, đắt nhất", description: "Suy luận sâu nhất, chậm hơn và tốn hơn nhiều. Cân nhắc kỹ nếu lượng tin lớn." }),
 });
 
 export function createModelService(request = requestJSON) {
@@ -45,19 +45,19 @@ export function createModelsPage({
       let disposed = false;
       container.append(root);
 
+      const header = () => pageHeader("Models", "Mô hình mà bot dùng để viết câu trả lời.");
       const renderError = (error) => {
         if (!disposed && error?.name !== "AbortError") {
           root.replaceChildren(
-            pageHeader("Mô hình", "Chọn mức cân bằng giữa tốc độ, chi phí và độ sâu suy luận."),
-            errorPanel(error),
+            header(),
+            element("p", { className: "note", text: `không đọc được cấu hình: ${error.message || error}` }),
           );
         }
       };
 
       async function load() {
         root.replaceChildren(
-          pageHeader("Mô hình", "Chọn mức cân bằng giữa tốc độ, chi phí và độ sâu suy luận."),
-          statusPanel({ tone: "neutral", title: "Đang đọc cấu hình", body: "Kiểm tra mô hình đang chạy và lựa chọn đã lưu…" }),
+          header(),
         );
         try {
           const data = await service.load();
@@ -72,9 +72,9 @@ export function createModelsPage({
         const choices = Array.isArray(data.choices) ? data.choices.filter((model) => Object.hasOwn(MODEL_INFO, model)) : [];
         let chosen = choices.includes(data.saved) ? data.saved : data.active;
         if (!choices.includes(chosen)) chosen = choices[0] || "haiku";
-        const choiceBox = element("div", { className: "model-grid" });
-        const notice = element("div", { className: "action-status", attributes: { "aria-live": "polite" } });
-        const save = element("button", { className: "button button--primary", attributes: { type: "button" }, text: "Lưu và khởi động lại" });
+        const choiceBox = element("div", { className: "picks" });
+        const notice = element("span", { className: "note", attributes: { "aria-live": "polite" } });
+        const save = element("button", { className: "btn go", attributes: { type: "button" }, text: "Lưu" });
 
         const draw = () => {
           choiceBox.replaceChildren(...choices.map((model) => {
@@ -82,16 +82,26 @@ export function createModelsPage({
             return element(
               "button",
               {
-                className: `model-card${model === chosen ? " is-selected" : ""}`,
-                attributes: { type: "button", "aria-pressed": model === chosen },
+                className: `pick${model === chosen ? " on" : ""}`,
+                attributes: { type: "button", "aria-pressed": String(model === chosen) },
                 on: { click: () => { chosen = model; draw(); } },
               },
-              element("span", { className: "model-card__top" },
-                element("strong", { text: info.name }),
-                model === data.active ? element("span", { className: "active-badge", text: "Đang chạy" }) : null,
-              ),
-              element("span", { className: "model-card__description", text: info.description }),
-              element("span", { className: "model-card__tag", text: info.tag }),
+              element("span", { className: "dot", attributes: { "aria-hidden": "true" } }),
+              (() => {
+                const body = element("span");
+                body.style.minWidth = "0";
+                const name = element("span", { className: "nm", text: info.name });
+                if (model === data.active) {
+                  const running = element("span", { className: "running", text: "  · đang chạy" });
+                  running.style.fontWeight = "400";
+                  running.style.fontSize = "11.5px";
+                  running.style.color = "var(--live)";
+                  name.append(running);
+                }
+                body.append(name, element("div", { className: "ds", text: info.description }));
+                return body;
+              })(),
+              element("span", { className: "tag", text: info.tag }),
             );
           }));
         };
@@ -120,30 +130,17 @@ export function createModelsPage({
             if (!restarted && !disposed) save.disabled = false;
           } catch (error) {
             if (!disposed && error?.name !== "AbortError") {
-              notice.replaceChildren(errorPanel(error));
+              notice.textContent = `không lưu được: ${error.message || error}`;
               save.disabled = false;
             }
           }
         });
 
         root.replaceChildren(
-          pageHeader("Mô hình", "Chọn mức cân bằng giữa tốc độ, chi phí và độ sâu suy luận."),
-          statusPanel({
-            tone: "neutral",
-            title: data.active ? `Đang chạy ${MODEL_INFO[data.active]?.name || data.active}` : "Chưa xác định mô hình đang chạy",
-            body: data.saved && data.saved !== data.active
-              ? `Đã lưu ${MODEL_INFO[data.saved]?.name || data.saved}; cần khởi động lại để áp dụng.`
-              : "Lưu lựa chọn sẽ tự khởi động lại daemon; hội thoại và phiên Zalo vẫn được giữ.",
-          }),
-          element("section", { className: "section-block", attributes: { "aria-labelledby": "model-choice-title" } },
-            element("div", { className: "section-heading" },
-              element("h2", { attributes: { id: "model-choice-title" }, text: "Chọn mô hình trả lời" }),
-              element("p", { text: "Chỉ ba bí danh an toàn được chấp nhận." }),
-            ),
-            choiceBox,
-            element("div", { className: "form-actions" }, save),
-            notice,
-          ),
+          header(),
+          choiceBox,
+          element("div", { className: "row" }, save, notice),
+          element("div", { className: "hint", text: "Bấm Lưu là phần mềm tự khởi động lại để áp dụng, mất khoảng 10 giây. Trang này tự tải lại khi xong. Hội thoại, danh bạ và tri thức không mất gì, phiên Zalo cũng không phải quét lại." }),
         );
       }
 
