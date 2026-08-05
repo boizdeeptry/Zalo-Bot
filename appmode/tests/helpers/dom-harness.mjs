@@ -241,6 +241,10 @@ class TestElement extends TestNode {
     return !defaultPrevented;
   }
 
+  click() {
+    if (!this.disabled) this.dispatchEvent({ type: "click" });
+  }
+
   focus() {
     if (this.ownerDocument) this.ownerDocument.activeElement = this;
   }

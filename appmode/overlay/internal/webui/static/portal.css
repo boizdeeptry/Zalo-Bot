@@ -34,3 +34,54 @@
 .hint .bd { margin-top:3px; }
 .note { font-size:12.5px; color:var(--dim); }
 #rail-toggle { display:none; }
+
+.btn {
+  font:inherit; font-size:13px; padding:7px 15px; border-radius:7px; cursor:pointer;
+  background:var(--sunk); color:var(--ink); border:1px solid var(--line);
+  transition:background .12s, border-color .12s;
+}
+.btn:hover:not(:disabled) { background:var(--panel); border-color:var(--dim); }
+.btn:disabled { opacity:.45; cursor:default; }
+.btn.go {
+  background:var(--live); border-color:var(--live); color:#0b0d11; font-weight:600;
+}
+.btn.go:hover:not(:disabled) { filter:brightness(1.09); background:var(--live); }
+
+.cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
+.card {
+  border:1px solid var(--line); border-radius:9px; padding:13px 17px; min-width:132px;
+  background:var(--panel);
+}
+.card .n { font-size:26px; font-weight:600; line-height:1.15; }
+.card .l { font-size:11.5px; color:var(--dim); }
+
+#drop {
+  border:2px dashed var(--line); border-radius:11px; padding:30px 20px; text-align:center;
+  cursor:pointer; transition:border-color .12s, background .12s;
+}
+#drop:hover,
+#drop.hot { border-color:var(--live); background:rgba(63,199,127,.07); }
+#drop .big { font-size:14px; margin-bottom:5px; }
+#drop .small { font-size:11.5px; color:var(--dim); }
+
+.row { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin:16px 0; }
+.cols { display:flex; gap:16px; flex-wrap:wrap; }
+.cols > div { flex:1 1 264px; min-width:0; }
+.cols h3 {
+  font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim);
+  margin:0 0 7px;
+}
+.flist {
+  border:1px solid var(--line); border-radius:8px; max-height:232px; overflow-y:auto;
+  font-size:12.5px; background:var(--panel);
+}
+.flist > div { padding:5px 11px; border-bottom:1px solid var(--line); }
+.flist > div:last-child { border-bottom:0; }
+.flist .none { color:var(--dim); font-style:italic; }
+
+#steps {
+  font-family:ui-monospace, Consolas, monospace; font-size:11.5px; line-height:1.65;
+  border:1px solid var(--line); border-radius:8px; padding:9px 12px;
+  max-height:268px; overflow-y:auto; white-space:pre-wrap; word-break:break-word;
+  background:var(--sunk); color:var(--dim);
+}
