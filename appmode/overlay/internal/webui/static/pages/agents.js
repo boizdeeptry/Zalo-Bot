@@ -66,6 +66,13 @@ export function fillHoles(text, values) {
   return filled;
 }
 
+export function handleQuickFillEnter(event, apply) {
+  if (event?.key !== "Enter") return false;
+  event.preventDefault();
+  apply();
+  return true;
+}
+
 function detailRow(label, value) {
   return element(
     "div",
@@ -253,40 +260,48 @@ function documentEditor(document, data, { onCancel, onSave }) {
     const inputs = new Map();
     const note = element("div", { className: "action-status", attributes: { "aria-live": "polite" } });
     const fields = holes.map((hole) => {
+      const inputId = `agent-editor-${document}-hole-${hole.key}`;
       const input = element("input", {
         className: "text-input",
-        attributes: { type: "text", maxlength: MAX_PLACEHOLDER_VALUE, autocomplete: "off" },
+        attributes: {
+          id: inputId,
+          type: "text",
+          maxlength: MAX_PLACEHOLDER_VALUE,
+          autocomplete: "off",
+        },
+        on: { keydown: (event) => handleQuickFillEnter(event, applyQuickFill) },
       });
       inputs.set(hole.key, input);
       return element("div", { className: "form-field" },
-        element("label", {},
+        element("label", { attributes: { for: inputId } },
           element("code", { text: `{{${hole.key}}}` }),
           element("span", { text: `${hole.count} chỗ` }),
         ),
         input,
       );
     });
+
+    function applyQuickFill() {
+      note.replaceChildren();
+      try {
+        const values = {};
+        for (const [key, input] of inputs) {
+          if (input.value.trim()) values[key] = input.value;
+        }
+        if (Object.keys(values).length === 0) throw new Error("Chưa điền ô nào.");
+        textarea.value = fillHoles(textarea.value, values);
+        drawQuickFill();
+        textarea.focus();
+      } catch (error) {
+        note.replaceChildren(errorPanel(error));
+      }
+    }
+
     const apply = element("button", {
       className: "button button--secondary",
       attributes: { type: "button" },
       text: "Điền vào nội dung",
-      on: {
-        click: () => {
-          note.replaceChildren();
-          try {
-            const values = {};
-            for (const [key, input] of inputs) {
-              if (input.value.trim()) values[key] = input.value;
-            }
-            if (Object.keys(values).length === 0) throw new Error("Chưa điền ô nào.");
-            textarea.value = fillHoles(textarea.value, values);
-            drawQuickFill();
-            textarea.focus();
-          } catch (error) {
-            note.replaceChildren(errorPanel(error));
-          }
-        },
-      },
+      on: { click: applyQuickFill },
     });
     quickFill.replaceChildren(
       element("p", { className: "form-feedback", text: `Điền nhanh ${holes.length} chỗ trống vào bản nháp trước khi lưu:` }),

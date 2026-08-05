@@ -60,7 +60,7 @@ func (a *api) handlePersonaGet(w http.ResponseWriter, r *http.Request) {
 	b, err := os.ReadFile(p)
 	if err != nil {
 		// Sổ tay được phép KHÔNG tồn tại: nó là tuỳ chọn, và một ô sửa rỗng đúng hơn một lỗi.
-		if os.IsNotExist(err) {
+		if r.PathValue("name") == "roster" && os.IsNotExist(err) {
 			a.writeJSON(w, http.StatusOK, map[string]any{"text": "", "path": p, "label": label})
 			return
 		}

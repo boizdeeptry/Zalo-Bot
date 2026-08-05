@@ -259,3 +259,24 @@ func TestAppPersonaDoesNotCreateMissingPersonaWithoutBackup(t *testing.T) {
 		t.Fatalf("missing persona was created without a backup: %v", err)
 	}
 }
+
+func TestAppPersonaGetRejectsMissingPersonaButAllowsMissingRoster(t *testing.T) {
+	dir := t.TempDir()
+	a := newAppAgentTestAPI(filepath.Join(dir, "persona.md"), filepath.Join(dir, "roster.md"))
+
+	personaReq := httptest.NewRequest(http.MethodGet, "/agent/persona/persona", nil)
+	personaReq.SetPathValue("name", "persona")
+	personaResponse := httptest.NewRecorder()
+	a.handlePersonaGet(personaResponse, personaReq)
+	if personaResponse.Code != http.StatusInternalServerError {
+		t.Fatalf("missing persona GET status = %d, want 500; body = %s", personaResponse.Code, personaResponse.Body.String())
+	}
+
+	rosterReq := httptest.NewRequest(http.MethodGet, "/agent/persona/roster", nil)
+	rosterReq.SetPathValue("name", "roster")
+	rosterResponse := httptest.NewRecorder()
+	a.handlePersonaGet(rosterResponse, rosterReq)
+	if rosterResponse.Code != http.StatusOK {
+		t.Fatalf("missing roster GET status = %d, want 200; body = %s", rosterResponse.Code, rosterResponse.Body.String())
+	}
+}

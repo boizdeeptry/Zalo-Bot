@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   createAgentService,
   fillHoles,
+  handleQuickFillEnter,
   scanHoles,
 } from "../overlay/internal/webui/static/pages/agents.js";
 
@@ -12,6 +13,19 @@ test("scanHoles counts uppercase placeholders only", () => {
     scanHoles("{{TEN_BOT}} {{TEN_BOT}} {{ten}}"),
     [{ key: "TEN_BOT", count: 2 }],
   );
+});
+
+test("editor quick fill intercepts Enter instead of saving the outer form", () => {
+  let prevented = 0;
+  let applied = 0;
+  const handled = handleQuickFillEnter({
+    key: "Enter",
+    preventDefault: () => { prevented++ },
+  }, () => { applied++ });
+
+  assert.equal(handled, true);
+  assert.equal(prevented, 1);
+  assert.equal(applied, 1);
 });
 
 test("editor quick fill replaces repeated roster placeholders locally", () => {
