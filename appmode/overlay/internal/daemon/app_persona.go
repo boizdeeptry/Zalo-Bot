@@ -11,6 +11,7 @@ package daemon
 // chỉ tiện hơn Notepad, nó ĐÚNG hơn Notepad.
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -112,6 +113,11 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 	// git, nên .goc là đường lùi duy nhất.
 	old, readErr := os.ReadFile(p)
 	backup := p + ".goc"
+	if readErr != nil && !(r.PathValue("name") == "roster" && errors.Is(readErr, os.ErrNotExist)) {
+		a.logger.Error("persona: đọc tệp trước khi lưu", "path", p, "err", readErr)
+		a.writeErr(w, http.StatusInternalServerError, "không đọc được tệp "+label+", chưa ghi gì")
+		return
+	}
 	if readErr == nil {
 		if err := writeAppBackupOnce(backup, old, 0o600); err != nil {
 			a.logger.Error("persona: ghi bản gốc", "path", backup, "err", err)

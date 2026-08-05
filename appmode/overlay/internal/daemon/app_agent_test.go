@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -128,6 +129,71 @@ func TestAppAgentAtomicReplacementLeavesNoTemporaryFile(t *testing.T) {
 	}
 }
 
+func TestAppAgentFailedReplacementPreservesOriginal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "persona.md")
+	if err := os.WriteFile(path, []byte("bản đang dùng"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("replace failed")
+	err := writeAppFileAtomicWith(path, []byte("bản chưa hoàn tất"), 0o600, func(_, _ string) error {
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("atomic replacement error = %v, want %v", err, wantErr)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "bản đang dùng" {
+		t.Fatalf("failed replacement changed original to %q", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "persona.md" {
+		t.Fatalf("failed replacement left files: %#v", entries)
+	}
+}
+
+func TestAppAgentBackupIsPublishedOnlyAfterCompleteWrite(t *testing.T) {
+	dir := t.TempDir()
+	backup := filepath.Join(dir, "persona.md.goc")
+	wantErr := errors.New("publish failed")
+	err := writeAppBackupOnceWith(backup, []byte("bản gốc đầy đủ"), 0o600, func(_, _ string) error {
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("backup publication error = %v, want %v", err, wantErr)
+	}
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Fatalf("failed publication exposed final backup: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed backup publication left files: %#v", entries)
+	}
+
+	if err := writeAppBackupOnce(backup, []byte("bản gốc đầy đủ"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAppBackupOnce(backup, []byte("không được ghi đè"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "bản gốc đầy đủ" {
+		t.Fatalf("existing backup was replaced with %q", got)
+	}
+}
+
 func TestAppPersonaWritesUTF8WithoutBOMAndRefreshesReadiness(t *testing.T) {
 	dir := t.TempDir()
 	persona := filepath.Join(dir, "persona.md")
@@ -172,5 +238,24 @@ func TestAppPersonaWritesUTF8WithoutBOMAndRefreshesReadiness(t *testing.T) {
 	}
 	if string(backup) != original {
 		t.Fatalf("persona backup = %q; want original %q", backup, original)
+	}
+}
+
+func TestAppPersonaDoesNotCreateMissingPersonaWithoutBackup(t *testing.T) {
+	dir := t.TempDir()
+	persona := filepath.Join(dir, "missing-persona.md")
+	a := newAppAgentTestAPI(persona, filepath.Join(dir, "roster.md"))
+	req := httptest.NewRequest(http.MethodPut, "/agent/persona/persona", strings.NewReader(`{"text":"Giọng mới"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("name", "persona")
+	recorder := httptest.NewRecorder()
+
+	a.handlePersonaPut(recorder, req)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("missing persona PUT status = %d, want 500; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := os.Stat(persona); !os.IsNotExist(err) {
+		t.Fatalf("missing persona was created without a backup: %v", err)
 	}
 }

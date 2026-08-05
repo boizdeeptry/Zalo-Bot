@@ -38,62 +38,80 @@ var placeholderRe = regexp.MustCompile(`\{\{([A-Z][A-Z_]*)\}\}`)
 // nên một chuỗi dài là một cách bơm chỉ dẫn vào prompt của chính mình mà không ai thấy.
 const maxPlaceholderValue = 60
 
-// writeAppFileAtomic writes beside the destination, flushes the complete file,
-// then swaps it into place. A crash can therefore leave the old or new persona,
-// never a half-written one.
-func writeAppFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
+func writeAppTemp(path string, data []byte, mode os.FileMode) (tempPath string, err error) {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return err
+		return "", err
 	}
-	tmpPath := tmp.Name()
+	tempPath = tmp.Name()
+	complete := false
 	defer func() {
 		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
+		if !complete {
+			_ = os.Remove(tempPath)
+		}
 	}()
 
 	if err = tmp.Chmod(mode); err != nil {
-		return err
+		return tempPath, err
 	}
 	if _, err = tmp.Write(data); err != nil {
-		return err
+		return tempPath, err
 	}
 	if err = tmp.Sync(); err != nil {
-		return err
+		return tempPath, err
 	}
 	if err = tmp.Close(); err != nil {
-		return err
+		return tempPath, err
 	}
-	return os.Rename(tmpPath, path)
+	complete = true
+	return tempPath, nil
 }
 
-// writeAppBackupOnce creates the recovery copy before the first edit and never
-// overwrites it. O_EXCL also closes the race between checking and creating.
-func writeAppBackupOnce(path string, data []byte, mode os.FileMode) (err error) {
-	backup, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if errors.Is(err, os.ErrExist) {
-		return nil
-	}
+// writeAppFileAtomic writes beside the destination, flushes the complete file,
+// then swaps it into place with the platform replacement primitive.
+func writeAppFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeAppFileAtomicWith(path, data, mode, replaceAppFile)
+}
+
+func writeAppFileAtomicWith(path string, data []byte, mode os.FileMode, replace func(string, string) error) error {
+	tempPath, err := writeAppTemp(path, data, mode)
 	if err != nil {
 		return err
 	}
-	complete := false
-	defer func() {
-		_ = backup.Close()
-		if !complete {
-			_ = os.Remove(path)
+	defer func() { _ = os.Remove(tempPath) }()
+	return replace(tempPath, path)
+}
+
+// writeAppBackupOnce flushes a private temporary copy, then atomically publishes
+// it with a hard link. The final .goc name is never visible with partial bytes,
+// and link creation cannot overwrite a backup from an earlier edit.
+func writeAppBackupOnce(path string, data []byte, mode os.FileMode) error {
+	return writeAppBackupOnceWith(path, data, mode, os.Link)
+}
+
+func writeAppBackupOnceWith(path string, data []byte, mode os.FileMode, publish func(string, string) error) error {
+	tempPath, err := writeAppTemp(path, data, mode)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tempPath) }()
+	if err := publish(tempPath, path); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return err
 		}
-	}()
-	if _, err = backup.Write(data); err != nil {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return statErr
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("bản lưu gốc không phải tệp thường: %s", path)
+		}
+		return nil
+	}
+	if err := os.Chmod(path, mode); err != nil {
 		return err
 	}
-	if err = backup.Sync(); err != nil {
-		return err
-	}
-	if err = backup.Close(); err != nil {
-		return err
-	}
-	complete = true
 	return nil
 }
 

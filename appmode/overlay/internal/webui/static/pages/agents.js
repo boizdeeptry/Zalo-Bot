@@ -55,6 +55,17 @@ function validateQuickValue(key, rawValue) {
   return value;
 }
 
+export function fillHoles(text, values) {
+  let filled = String(text ?? "");
+  const known = new Set(scanHoles(filled).map((hole) => hole.key));
+  for (const [key, rawValue] of Object.entries(values || {})) {
+    if (!known.has(key)) continue;
+    const value = validateQuickValue(key, rawValue);
+    filled = filled.replaceAll(`{{${key}}}`, value);
+  }
+  return filled;
+}
+
 function detailRow(label, value) {
   return element(
     "div",
@@ -172,22 +183,41 @@ function quickFillSection(agent, onSubmit) {
 function editorSection(onOpen) {
   const editorRegion = element("div", {
     className: "editor-region",
-    attributes: { "aria-live": "polite" },
+    attributes: { id: "agent-editor-region", "aria-live": "polite" },
   });
-  const cards = Object.entries(EDITABLE_DOCUMENTS).map(([name, document]) => element(
-    "article",
-    { className: "document-card" },
-    element("div", {},
-      element("h3", { text: document.label }),
-      element("p", { text: document.description }),
-    ),
-    element("button", {
+  const buttons = [];
+  const cards = Object.entries(EDITABLE_DOCUMENTS).map(([name, document]) => {
+    const open = element("button", {
       className: "button button--secondary",
-      attributes: { type: "button" },
-      text: "Mở trình sửa",
-      on: { click: () => onOpen(name, editorRegion) },
-    }),
-  ));
+      attributes: {
+        type: "button",
+        "aria-controls": editorRegion.id,
+        "aria-expanded": "false",
+      },
+      text: `Mở ${document.label}`,
+    });
+    buttons.push(open);
+    open.addEventListener("click", () => {
+      for (const button of buttons) button.setAttribute("aria-expanded", "false");
+      open.setAttribute("aria-expanded", "true");
+      onOpen(name, editorRegion, {
+        opener: open,
+        close() {
+          open.setAttribute("aria-expanded", "false");
+          open.focus();
+        },
+      });
+    });
+    return element(
+      "article",
+      { className: "document-card" },
+      element("div", {},
+        element("h3", { text: document.label }),
+        element("p", { text: document.description }),
+      ),
+      open,
+    );
+  });
   return element(
     "section",
     { className: "section-block", attributes: { "aria-labelledby": "agent-documents-title" } },
@@ -211,8 +241,61 @@ function documentEditor(document, data, { onCancel, onSave }) {
     },
   });
   textarea.value = data.text || "";
+  const quickFill = element("div", { className: "quick-fill-form editor-quick-fill" });
   const feedback = element("div", { className: "form-feedback", attributes: { "aria-live": "polite" } });
   const save = element("button", { className: "button button--primary", attributes: { type: "submit" }, text: "Lưu tệp" });
+  function drawQuickFill() {
+    const holes = scanHoles(textarea.value);
+    if (holes.length === 0) {
+      quickFill.replaceChildren(element("p", { className: "empty-note", text: "Không còn chỗ trống nào trong nội dung này." }));
+      return;
+    }
+    const inputs = new Map();
+    const note = element("div", { className: "action-status", attributes: { "aria-live": "polite" } });
+    const fields = holes.map((hole) => {
+      const input = element("input", {
+        className: "text-input",
+        attributes: { type: "text", maxlength: MAX_PLACEHOLDER_VALUE, autocomplete: "off" },
+      });
+      inputs.set(hole.key, input);
+      return element("div", { className: "form-field" },
+        element("label", {},
+          element("code", { text: `{{${hole.key}}}` }),
+          element("span", { text: `${hole.count} chỗ` }),
+        ),
+        input,
+      );
+    });
+    const apply = element("button", {
+      className: "button button--secondary",
+      attributes: { type: "button" },
+      text: "Điền vào nội dung",
+      on: {
+        click: () => {
+          note.replaceChildren();
+          try {
+            const values = {};
+            for (const [key, input] of inputs) {
+              if (input.value.trim()) values[key] = input.value;
+            }
+            if (Object.keys(values).length === 0) throw new Error("Chưa điền ô nào.");
+            textarea.value = fillHoles(textarea.value, values);
+            drawQuickFill();
+            textarea.focus();
+          } catch (error) {
+            note.replaceChildren(errorPanel(error));
+          }
+        },
+      },
+    });
+    quickFill.replaceChildren(
+      element("p", { className: "form-feedback", text: `Điền nhanh ${holes.length} chỗ trống vào bản nháp trước khi lưu:` }),
+      fields,
+      element("div", { className: "form-actions" }, apply),
+      note,
+    );
+  }
+
   const form = element(
     "form",
     {
@@ -240,6 +323,7 @@ function documentEditor(document, data, { onCancel, onSave }) {
       ),
       element("code", { text: data.path || "" }),
     ),
+    quickFill,
     element("label", { className: "visually-hidden", attributes: { for: textarea.id }, text: data.label || EDITABLE_DOCUMENTS[document].label }),
     textarea,
     element("div", { className: "form-actions" },
@@ -248,6 +332,7 @@ function documentEditor(document, data, { onCancel, onSave }) {
     ),
     feedback,
   );
+  drawQuickFill();
   queueMicrotask(() => textarea.focus());
   return form;
 }
@@ -294,7 +379,7 @@ export function createAgentsPage({ request = requestJSON } = {}) {
               await service.fill(values);
               await refresh();
             }),
-            editorSection(async (name, region) => {
+            editorSection(async (name, region, editorControls) => {
               const currentEditor = ++editorRevision;
               region.replaceChildren(statusPanel({ tone: "neutral", title: "Đang mở tệp", body: "Đọc nội dung UTF-8…" }));
               try {
@@ -304,6 +389,7 @@ export function createAgentsPage({ request = requestJSON } = {}) {
                   onCancel: () => {
                     editorRevision++;
                     region.replaceChildren();
+                    editorControls.close();
                   },
                   onSave: async (text) => {
                     await service.saveDocument(name, text);
@@ -313,6 +399,7 @@ export function createAgentsPage({ request = requestJSON } = {}) {
               } catch (error) {
                 if (!disposed && currentEditor === editorRevision && error?.name !== "AbortError") {
                   region.replaceChildren(errorPanel(error));
+                  editorControls.close();
                 }
               }
             }),

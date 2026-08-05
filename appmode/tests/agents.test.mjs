@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   createAgentService,
+  fillHoles,
   scanHoles,
 } from "../overlay/internal/webui/static/pages/agents.js";
 
@@ -10,6 +11,13 @@ test("scanHoles counts uppercase placeholders only", () => {
   assert.deepEqual(
     scanHoles("{{TEN_BOT}} {{TEN_BOT}} {{ten}}"),
     [{ key: "TEN_BOT", count: 2 }],
+  );
+});
+
+test("editor quick fill replaces repeated roster placeholders locally", () => {
+  assert.equal(
+    fillHoles("Gọi {{TEN_THANH_VIEN}}; chào {{TEN_THANH_VIEN}}.", { TEN_THANH_VIEN: "Mai" }),
+    "Gọi Mai; chào Mai.",
   );
 });
 
