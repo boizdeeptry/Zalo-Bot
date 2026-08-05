@@ -25,16 +25,23 @@
 # Do la ly do mac dinh la XOA: hong theo huong "phai quet lai QR" thi mat mot phut,
 # hong theo huong kia thi mat tai khoan. Cua chan o buoc 6 tu choi ket thuc neu tep
 # do con.
-param([switch]$KeepData)
+param(
+  [Parameter(Mandatory)][string]$Repo,
+  [Parameter(Mandatory)][string]$Out,
+  [switch]$KeepData,
+  [switch]$KeepStage
+)
 
 $ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot 'scripts\BuildApp.psm1') -Force
+$paths = Resolve-BuildPaths -Repo $Repo -Out $Out
+$Repo = $paths.Repo
+$Out = $paths.Out
 
 # Repo chi de DOC. Script nay khong nam trong no nua, co chu dich: nguon dong goi
 # la thu rieng cua ban ban, va de no trong repo lam `git status` cua ban dang chay
 # luon ban mot thu muc khong lien quan gi den bot dang tra loi khach.
-$Repo = 'C:\Users\Admin\Desktop\AgentDC'
-if (-not (Test-Path (Join-Path $Repo '.git'))) { throw "khong thay repo o $Repo" }
-$Out  = 'F:\dist\TuvanZalo'
 $Tmp  = Join-Path $env:TEMP ('agentdc-app-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 
 Write-Host "repo : $Repo"
