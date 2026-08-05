@@ -113,19 +113,17 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 	old, readErr := os.ReadFile(p)
 	backup := p + ".goc"
 	if readErr == nil {
-		if _, err := os.Stat(backup); os.IsNotExist(err) {
-			if err := os.WriteFile(backup, old, 0o600); err != nil {
-				a.logger.Error("persona: ghi bản gốc", "path", backup, "err", err)
-				a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
-				return
-			}
+		if err := writeAppBackupOnce(backup, old, 0o600); err != nil {
+			a.logger.Error("persona: ghi bản gốc", "path", backup, "err", err)
+			a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
+			return
 		}
 	}
 
 	// \r\n -> \n. Ô textarea của trình duyệt trả về \r\n theo chuẩn HTML, và một tệp lẫn hai kiểu
 	// xuống dòng làm mọi lần so sánh về sau nhiễu.
 	text := strings.ReplaceAll(req.Text, "\r\n", "\n")
-	if err := os.WriteFile(p, []byte(text), 0o600); err != nil {
+	if err := writeAppFileAtomic(p, []byte(text), 0o600); err != nil {
 		a.logger.Error("persona: ghi tệp", "path", p, "err", err)
 		a.writeErr(w, http.StatusInternalServerError, "không ghi được tệp "+label)
 		return

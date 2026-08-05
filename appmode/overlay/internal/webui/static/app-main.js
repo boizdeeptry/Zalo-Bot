@@ -14,11 +14,8 @@ const pageDefinitions = Object.freeze({
   },
   agents: {
     load: async () => {
-      const { createFoundationPage } = await import("./pages/overview.js");
-      return createFoundationPage({
-        title: "Trợ lý AI",
-        description: "Kiểm tra danh tính, văn phong và các chỗ cần hoàn thiện trước khi trợ lý làm việc.",
-      });
+      const page = await import("./pages/agents.js");
+      return { mount: page.mount };
     },
   },
   knowledge: {

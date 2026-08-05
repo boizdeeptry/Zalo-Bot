@@ -120,9 +120,7 @@ $subs = @(
 # khong them mot route /manage: them route thi ton mot route, mot nut, va van con
 # mot trang khong ai can o `/`. Nut trong zalo.html tro `/` vi the tu nhien dung.
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\kb.go') -Destination (Join-Path $Tmp 'internal\daemon\kb.go') -Force
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\agentcfg.go') -Destination (Join-Path $Tmp 'internal\daemon\agentcfg.go') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\restart.go') -Destination (Join-Path $Tmp 'internal\daemon\restart.go') -Force
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\personaedit.go') -Destination (Join-Path $Tmp 'internal\daemon\personaedit.go') -Force
 
 # app.js cua portal cu khong con duoc nap, nhung no van nam trong assets. Bo di:
 # mot tep 60 KB khong ai goi la mot tep nguoi doc code sau nay phai doan xem con

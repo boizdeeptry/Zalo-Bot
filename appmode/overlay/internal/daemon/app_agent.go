@@ -2,7 +2,7 @@ package daemon
 
 // AI Agents: cấu hình con agent trả lời Zalo.
 //
-// TỆP NÀY CHỈ CÓ TRONG BẢN ĐÓNG GÓI. Xem F:\dist\_build\appmode\.
+// Tệp này chỉ được chèn vào bản đóng gói qua appmode/overlay.
 //
 // Việc chính của trang này không phải "hiện cấu hình" mà là TRẢ LỜI MỘT CÂU: bot đã sẵn sàng nói
 // chuyện với khách chưa. Với bản giao đi thì câu trả lời là CHƯA, vì persona.md còn chỗ trống —
@@ -13,6 +13,7 @@ package daemon
 // điền thì phải có một chỗ không thể bỏ qua.
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -36,6 +37,65 @@ var placeholderRe = regexp.MustCompile(`\{\{([A-Z][A-Z_]*)\}\}`)
 // Đây là TÊN, không phải một đoạn văn. Giá trị này được nhân bản vào 7 tới 19 chỗ trong prompt,
 // nên một chuỗi dài là một cách bơm chỉ dẫn vào prompt của chính mình mà không ai thấy.
 const maxPlaceholderValue = 60
+
+// writeAppFileAtomic writes beside the destination, flushes the complete file,
+// then swaps it into place. A crash can therefore leave the old or new persona,
+// never a half-written one.
+func writeAppFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err = tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+// writeAppBackupOnce creates the recovery copy before the first edit and never
+// overwrites it. O_EXCL also closes the race between checking and creating.
+func writeAppBackupOnce(path string, data []byte, mode os.FileMode) (err error) {
+	backup, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		_ = backup.Close()
+		if !complete {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err = backup.Write(data); err != nil {
+		return err
+	}
+	if err = backup.Sync(); err != nil {
+		return err
+	}
+	if err = backup.Close(); err != nil {
+		return err
+	}
+	complete = true
+	return nil
+}
 
 // personaPath lấy đường persona đang được nạp.
 func (a *api) personaPath() (string, error) {
@@ -190,14 +250,12 @@ func (a *api) handleAgentPut(w http.ResponseWriter, r *http.Request) {
 	// có git ở đây, và chỗ trống đã bị thay mất nên không tìm lại được. Một tệp .goc cạnh nó là
 	// đường lùi duy nhất, và nó phải được tạo TRƯỚC lần ghi đầu.
 	backup := p + ".goc"
-	if _, err := os.Stat(backup); os.IsNotExist(err) {
-		if err := os.WriteFile(backup, b, 0o600); err != nil {
-			a.logger.Error("agent: ghi bản gốc persona", "path", backup, "err", err)
-			a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
-			return
-		}
+	if err := writeAppBackupOnce(backup, b, 0o600); err != nil {
+		a.logger.Error("agent: ghi bản gốc persona", "path", backup, "err", err)
+		a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
+		return
 	}
-	if err := os.WriteFile(p, []byte(text), 0o600); err != nil {
+	if err := writeAppFileAtomic(p, []byte(text), 0o600); err != nil {
 		a.logger.Error("agent: ghi persona", "path", p, "err", err)
 		a.writeErr(w, http.StatusInternalServerError, "không ghi được văn phong")
 		return

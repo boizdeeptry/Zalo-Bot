@@ -279,6 +279,11 @@ select {
   background: rgba(255, 123, 129, 0.07);
 }
 
+.status-panel--success {
+  border-color: rgba(85, 214, 139, 0.36);
+  background: var(--accent-soft);
+}
+
 .status-dot {
   width: 8px;
   height: 8px;
@@ -295,6 +300,11 @@ select {
 
 .status-panel--danger .status-dot {
   background: var(--danger);
+}
+
+.status-panel--success .status-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 5px rgba(85, 214, 139, 0.09);
 }
 
 .status-panel h2 {
@@ -376,6 +386,221 @@ select {
   font-size: 18px;
 }
 
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--border);
+}
+
+.detail-row {
+  min-width: 0;
+  padding: 15px 17px;
+  background: var(--surface);
+}
+
+.detail-row dt {
+  margin-bottom: 3px;
+  color: var(--quiet);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.detail-row dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.quick-fill-form,
+.document-editor-form {
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.quick-fill-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 17px;
+}
+
+.form-field {
+  min-width: 0;
+}
+
+.form-field label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 7px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+code {
+  color: var(--accent);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+}
+
+.text-input,
+.document-editor {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: #0d1118;
+  color: var(--text);
+}
+
+.text-input {
+  min-height: 42px;
+  padding: 9px 11px;
+}
+
+.document-editor {
+  display: block;
+  min-height: 320px;
+  margin-top: 15px;
+  padding: 14px;
+  resize: vertical;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 2;
+}
+
+.field-help,
+.editor-heading p,
+.document-card p,
+.empty-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.field-help {
+  margin: 6px 0 0;
+}
+
+.form-actions,
+.form-feedback {
+  grid-column: 1 / -1;
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  margin-top: 3px;
+}
+
+.form-feedback:empty {
+  display: none;
+}
+
+.form-feedback .status-panel {
+  max-width: none;
+}
+
+.button {
+  min-height: 38px;
+  padding: 8px 13px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.button--primary {
+  background: var(--accent);
+  color: #07120c;
+}
+
+.button--secondary {
+  border-color: var(--border-strong);
+  background: var(--surface-soft);
+}
+
+.button--ghost {
+  border-color: var(--border);
+  background: transparent;
+  color: var(--muted);
+}
+
+.document-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 11px;
+}
+
+.document-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 17px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.document-card h3,
+.editor-heading h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.document-card p,
+.editor-heading p,
+.empty-note {
+  margin: 4px 0 0;
+}
+
+.editor-region:not(:empty) {
+  margin-top: 14px;
+}
+
+.editor-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.editor-heading code {
+  max-width: 50%;
+  overflow-wrap: anywhere;
+  color: var(--quiet);
+  text-align: right;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 @media (max-width: 760px) {
   .portal-shell {
     grid-template-columns: 1fr;
@@ -410,6 +635,11 @@ select {
   .portal-content {
     padding: 36px 20px 60px;
   }
+
+  .quick-fill-form,
+  .document-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 520px) {
@@ -424,6 +654,21 @@ select {
 
   .section-heading p {
     margin-top: 4px;
+  }
+
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .document-card,
+  .editor-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .editor-heading code {
+    max-width: none;
+    text-align: left;
   }
 }
 
