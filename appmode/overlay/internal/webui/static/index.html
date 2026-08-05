@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Tổng quan · Portal Zalo</title>
+    <link rel="stylesheet" href="/assets/app.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#portal-content">Bỏ qua điều hướng</a>
+    <div class="portal-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#overview" aria-label="Portal Zalo — Tổng quan">
+          <span class="brand-mark" aria-hidden="true">Z</span>
+          <span>
+            <strong>Portal Zalo</strong>
+            <small>Trung tâm vận hành</small>
+          </span>
+        </a>
+
+        <p class="nav-label">Cấu hình</p>
+        <nav class="primary-nav" data-portal-nav aria-label="Điều hướng Portal"></nav>
+
+        <div class="sidebar-spacer"></div>
+        <p class="nav-label">Làm việc</p>
+        <a class="conversation-link" href="/zalo">
+          <span class="conversation-icon" aria-hidden="true">↗</span>
+          <span>
+            <strong>Hội thoại</strong>
+            <small>Mở không gian trực</small>
+          </span>
+        </a>
+        <p class="sidebar-note">Chạy cục bộ trên máy này</p>
+      </aside>
+
+      <main id="portal-content" class="portal-content" data-portal-content tabindex="-1" aria-live="polite">
+        <p class="route-loading">Đang mở Portal…</p>
+      </main>
+    </div>
+    <script type="module" src="/assets/app-main.js"></script>
+  </body>
+</html>

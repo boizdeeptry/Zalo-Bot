@@ -1,0 +1,8 @@
+{
+  "name": "agentdc-zalo-portal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests"
+  }
+}

@@ -119,8 +119,6 @@ $subs = @(
 # Nguoi mua khong mua phan dieu phoi agent lap trinh, nen thay ca index.html chu
 # khong them mot route /manage: them route thi ton mot route, mot nut, va van con
 # mot trang khong ai can o `/`. Nut trong zalo.html tro `/` vi the tu nhien dung.
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\index.html') -Destination (Join-Path $Tmp 'internal\webui\static\index.html') -Force
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\manage.js') -Destination (Join-Path $Tmp 'internal\webui\static\manage.js') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\kb.go') -Destination (Join-Path $Tmp 'internal\daemon\kb.go') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\agentcfg.go') -Destination (Join-Path $Tmp 'internal\daemon\agentcfg.go') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\restart.go') -Destination (Join-Path $Tmp 'internal\daemon\restart.go') -Force
