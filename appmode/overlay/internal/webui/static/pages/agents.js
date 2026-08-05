@@ -1,11 +1,15 @@
 import { requestJSON } from "../core/api.js";
-import { element, errorPanel, pageHeader, statusPanel } from "../core/ui.js";
+import { element, errorPanel, pageHeader } from "../core/ui.js";
 
 const PLACEHOLDER_PATTERN = /\{\{([A-Z][A-Z_]*)\}\}/g;
 const MAX_PLACEHOLDER_VALUE = 60;
 const EDITABLE_DOCUMENTS = Object.freeze({
-  persona: Object.freeze({ label: "Văn phong", description: "Giọng nói và nguyên tắc trả lời của trợ lý." }),
-  roster: Object.freeze({ label: "Sổ tay thành viên", description: "Tên gọi và ngữ cảnh riêng của những người trợ lý cần nhận diện." }),
+  persona: Object.freeze({ label: "Văn phong" }),
+  roster: Object.freeze({ label: "Sổ tay thành viên" }),
+});
+const HINTS = Object.freeze({
+  TEN_BOT: "ví dụ: trợ lý An — tên bot tự gọi mình",
+  TEN_CHUYEN_GIA: "ví dụ: Anh Nam — người mà tri thức thuộc về",
 });
 
 export function scanHoles(text) {
@@ -13,22 +17,16 @@ export function scanHoles(text) {
   for (const match of String(text ?? "").matchAll(PLACEHOLDER_PATTERN)) {
     counts.set(match[1], (counts.get(match[1]) || 0) + 1);
   }
-  return [...counts]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, count]) => ({ key, count }));
+  return [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([key, count]) => ({ key, count }));
 }
 
 function documentPath(name) {
-  if (!Object.hasOwn(EDITABLE_DOCUMENTS, name)) {
-    throw new RangeError(`Unsupported agent document: ${name}`);
-  }
+  if (!Object.hasOwn(EDITABLE_DOCUMENTS, name)) throw new RangeError(`Unsupported agent document: ${name}`);
   return `/agent/persona/${name}`;
 }
 
 export function createAgentService(request = requestJSON) {
-  if (typeof request !== "function") {
-    throw new TypeError("Agent service requires an API request function");
-  }
+  if (typeof request !== "function") throw new TypeError("Agent service requires an API request function");
   return Object.freeze({
     load: () => request("/agent"),
     fill: (values) => request("/agent", { method: "PUT", body: { values } }),
@@ -37,21 +35,11 @@ export function createAgentService(request = requestJSON) {
   });
 }
 
-function fieldLabel(key) {
-  return key.toLowerCase().split("_").map((part) => (
-    part ? part[0].toUpperCase() + part.slice(1) : ""
-  )).join(" ");
-}
-
 function validateQuickValue(key, rawValue) {
   const value = String(rawValue ?? "").trim();
   if (!value) throw new Error(`{{${key}}} chưa được điền.`);
-  if ([...value].length > MAX_PLACEHOLDER_VALUE) {
-    throw new Error(`{{${key}}} không được dài quá ${MAX_PLACEHOLDER_VALUE} ký tự.`);
-  }
-  if (/[\r\n]/.test(value) || value.includes("{{") || value.includes("}}")) {
-    throw new Error(`{{${key}}} không được chứa xuống dòng hay dấu {{ }}.`);
-  }
+  if ([...value].length > MAX_PLACEHOLDER_VALUE) throw new Error(`{{${key}}} không được dài quá ${MAX_PLACEHOLDER_VALUE} ký tự.`);
+  if (/[\r\n]/.test(value) || value.includes("{{") || value.includes("}}")) throw new Error(`{{${key}}} không được chứa xuống dòng hay dấu {{ }}.`);
   return value;
 }
 
@@ -59,9 +47,7 @@ export function fillHoles(text, values) {
   let filled = String(text ?? "");
   const known = new Set(scanHoles(filled).map((hole) => hole.key));
   for (const [key, rawValue] of Object.entries(values || {})) {
-    if (!known.has(key)) continue;
-    const value = validateQuickValue(key, rawValue);
-    filled = filled.replaceAll(`{{${key}}}`, value);
+    if (known.has(key)) filled = filled.replaceAll(`{{${key}}}`, validateQuickValue(key, rawValue));
   }
   return filled;
 }
@@ -73,372 +59,223 @@ export function handleQuickFillEnter(event, apply) {
   return true;
 }
 
-function detailRow(label, value) {
-  return element(
-    "div",
-    { className: "detail-row" },
-    element("dt", { text: label }),
-    element("dd", { text: value || "—" }),
+function shortPath(path) {
+  if (!path) return "(chưa đặt)";
+  const marker = String(path).toLowerCase().indexOf("\\brain\\");
+  return marker >= 0 ? `brain\\${String(path).slice(marker + 7)}` : String(path);
+}
+
+function fact(label, value, note, edit) {
+  const row = element("div", { className: "fact" },
+    element("div", { className: "fkk", text: label }),
+    element("div", { className: "fvv" }, element("span", { text: value || "—" }), note && element("span", { className: "fn", text: note })),
+  );
+  if (edit) row.append(edit);
+  return row;
+}
+
+function agentFacts(agent, openDocument) {
+  const pencil = (name) => element("button", {
+    className: "pen",
+    attributes: { type: "button", title: "Sửa nội dung tệp", "aria-label": `Sửa ${EDITABLE_DOCUMENTS[name].label}` },
+    text: "✎",
+    on: { click(event) { openDocument(name, event.currentTarget); } },
+  });
+  return element("div", { className: "facts" },
+    fact("Mô hình", agent.model || "(mặc định)", "đổi ở mục Models"),
+    fact("Phạm vi quyền", Array.isArray(agent.tools) ? agent.tools.join(", ") : "", "CHỈ ĐỌC, không đổi được từ đây"),
+    fact("Tệp văn phong", agent.persona_name, `${Math.round((agent.persona_size || 0) / 1024)} KB`, pencil("persona")),
+    fact("Sổ tay thành viên", shortPath(agent.roster_path), null, pencil("roster")),
+    fact("Luật riêng từng nhóm", shortPath(agent.overlay_dir)),
+    fact("Thư mục tri thức", (Array.isArray(agent.kb_roots) ? agent.kb_roots : []).map(shortPath).join("  ·  ")),
   );
 }
 
-function agentDetails(agent) {
-  const roots = Array.isArray(agent.kb_roots) && agent.kb_roots.length
-    ? agent.kb_roots.join(" · ")
-    : "Chưa cấu hình";
-  const tools = Array.isArray(agent.tools) ? agent.tools.join(", ") : "—";
-  return element(
-    "section",
-    { className: "section-block", attributes: { "aria-labelledby": "agent-config-title" } },
-    element(
-      "div",
-      { className: "section-heading" },
-      element("h2", { attributes: { id: "agent-config-title" }, text: "Cấu hình đang dùng" }),
-      element("p", { text: "Quyền công cụ là chỉ đọc và không đổi từ Portal." }),
-    ),
-    element(
-      "dl",
-      { className: "detail-grid" },
-      detailRow("Mô hình", agent.model),
-      detailRow("Tệp văn phong", agent.persona_name),
-      detailRow("Kho tri thức", roots),
-      detailRow("Công cụ", tools),
-    ),
-  );
-}
-
-function quickFillSection(agent, onSubmit) {
+function quickFill(agent, onSave) {
   const holes = Array.isArray(agent.placeholders) ? agent.placeholders : [];
-  if (holes.length === 0) {
-    return element(
-      "section",
-      { className: "section-block", attributes: { "aria-labelledby": "quick-fill-title" } },
-      element("div", { className: "section-heading" },
-        element("h2", { attributes: { id: "quick-fill-title" }, text: "Danh tính bắt buộc" }),
-        element("p", { text: "Đã điền đủ." }),
-      ),
-      element("p", { className: "empty-note", text: "Không còn chỗ trống dạng {{TEN_HOA}} trong văn phong." }),
-    );
-  }
-
+  if (!holes.length) return null;
   const inputs = new Map();
-  const feedback = element("div", { className: "form-feedback", attributes: { "aria-live": "polite" } });
+  const usedInputIds = new Set();
+  const note = element("span", { className: "note", attributes: { "aria-live": "polite" } });
+  const save = element("button", { className: "btn go", attributes: { type: "submit" }, text: "Lưu văn phong" });
   const fields = holes.map((hole) => {
-    const input = element("input", {
-      className: "text-input",
-      attributes: {
-        id: `agent-hole-${hole.key}`,
-        name: hole.key,
-        maxlength: MAX_PLACEHOLDER_VALUE,
-        autocomplete: "off",
-        required: true,
-      },
-    });
+    const stem = String(hole.key ?? "value").replace(/[^A-Za-z0-9_-]/g, "-") || "value";
+    const baseId = `agent-hole-${stem}`;
+    let inputId = baseId;
+    let duplicate = 2;
+    while (usedInputIds.has(inputId)) inputId = `${baseId}-${duplicate++}`;
+    usedInputIds.add(inputId);
+    const input = element("input", { attributes: { id: inputId, type: "text", maxlength: MAX_PLACEHOLDER_VALUE, placeholder: HINTS[hole.key] || "điền giá trị", required: true } });
     inputs.set(hole.key, input);
-    return element(
-      "div",
-      { className: "form-field" },
-      element("label", { attributes: { for: input.id } },
-        element("span", { text: fieldLabel(hole.key) }),
-        element("code", { text: `{{${hole.key}}}` }),
-      ),
+    return element("div", { className: "field" },
+      element("label", { attributes: { for: inputId } }, element("span", { className: "fk", text: `{{${hole.key}}}` }), element("span", { className: "fc", text: `${hole.count} chỗ trong tệp` })),
       input,
-      element("p", {
-        className: "field-help",
-        text: hole.sample || `Xuất hiện ${hole.count} lần trong văn phong.`,
-      }),
+      hole.sample && element("div", { className: "fs", text: hole.sample }),
     );
   });
-  const submit = element("button", { className: "button button--primary", attributes: { type: "submit" }, text: "Lưu các tên" });
-  const form = element(
-    "form",
-    {
-      className: "quick-fill-form",
-      on: {
-        submit: async (event) => {
-          event.preventDefault();
-          feedback.replaceChildren();
-          try {
-            const values = Object.fromEntries([...inputs].map(([key, input]) => [key, validateQuickValue(key, input.value)]));
-            submit.disabled = true;
-            submit.textContent = "Đang lưu…";
-            await onSubmit(values);
-          } catch (error) {
-            feedback.replaceChildren(errorPanel(error));
-            submit.disabled = false;
-            submit.textContent = "Lưu các tên";
-          }
-        },
-      },
-    },
-    fields,
-    element("div", { className: "form-actions" }, submit),
-    feedback,
-  );
-
-  return element(
-    "section",
-    { className: "section-block", attributes: { "aria-labelledby": "quick-fill-title" } },
-    element("div", { className: "section-heading" },
-      element("h2", { attributes: { id: "quick-fill-title" }, text: "Điền nhanh danh tính" }),
-      element("p", { text: `${holes.length} mục cần hoàn thiện` }),
-    ),
-    form,
-  );
+  return element("form", {
+    on: { submit: async (event) => {
+      event.preventDefault();
+      note.textContent = "";
+      try {
+        const values = Object.fromEntries([...inputs].map(([key, input]) => [key, validateQuickValue(key, input.value)]));
+        save.disabled = true;
+        note.textContent = "đang lưu…";
+        await onSave(values);
+      } catch (error) {
+        note.textContent = `không lưu được: ${error instanceof Error ? error.message : String(error)}`;
+        save.disabled = false;
+      }
+    } },
+  }, element("div", { attributes: { style: "max-width:660px" } }, fields), element("div", { className: "row" }, save, note));
 }
 
-function editorSection(onOpen) {
-  const editorRegion = element("div", {
-    className: "editor-region",
-    attributes: { id: "agent-editor-region", "aria-live": "polite" },
-  });
-  const buttons = [];
-  const cards = Object.entries(EDITABLE_DOCUMENTS).map(([name, document]) => {
-    const open = element("button", {
-      className: "button button--secondary",
-      attributes: {
-        type: "button",
-        "aria-controls": editorRegion.id,
-        "aria-expanded": "false",
-      },
-      text: `Mở ${document.label}`,
-    });
-    buttons.push(open);
-    open.addEventListener("click", () => {
-      for (const button of buttons) button.setAttribute("aria-expanded", "false");
-      open.setAttribute("aria-expanded", "true");
-      onOpen(name, editorRegion, {
-        opener: open,
-        close() {
-          open.setAttribute("aria-expanded", "false");
-          open.focus();
-        },
-      });
-    });
-    return element(
-      "article",
-      { className: "document-card" },
-      element("div", {},
-        element("h3", { text: document.label }),
-        element("p", { text: document.description }),
-      ),
-      open,
-    );
-  });
-  return element(
-    "section",
-    { className: "section-block", attributes: { "aria-labelledby": "agent-documents-title" } },
-    element("div", { className: "section-heading" },
-      element("h2", { attributes: { id: "agent-documents-title" }, text: "Tệp hướng dẫn" }),
-      element("p", { text: "Lưu UTF-8, không BOM, giữ bản gốc .goc." }),
-    ),
-    element("div", { className: "document-grid" }, cards),
-    editorRegion,
-  );
-}
+function documentEditor(name, data, { onCancel, onSave }, editorId) {
+  const textareaId = `agent-editor-${editorId}-text`;
+  const headingId = `agent-editor-${editorId}-title`;
+  const descriptionId = `agent-editor-${editorId}-description`;
+  const textarea = element("textarea", { attributes: { id: textareaId, rows: 18, spellcheck: false } });
+  textarea.value = String(data?.text ?? "");
+  const quick = element("div", { className: "quick" });
+  const quickNote = element("span", { className: "note", attributes: { "aria-live": "polite" } });
+  const footerNote = element("span", { className: "note", attributes: { "aria-live": "polite" } });
+  const save = element("button", { className: "btn go", attributes: { type: "submit" }, text: "Lưu" });
 
-function documentEditor(document, data, { onCancel, onSave }) {
-  const textarea = element("textarea", {
-    className: "document-editor",
-    attributes: {
-      id: `agent-document-${document}`,
-      rows: 18,
-      spellcheck: true,
-      "aria-describedby": `agent-document-${document}-help`,
-    },
-  });
-  textarea.value = data.text || "";
-  const quickFill = element("div", { className: "quick-fill-form editor-quick-fill" });
-  const feedback = element("div", { className: "form-feedback", attributes: { "aria-live": "polite" } });
-  const save = element("button", { className: "button button--primary", attributes: { type: "submit" }, text: "Lưu tệp" });
-  function drawQuickFill() {
+  function drawQuick() {
     const holes = scanHoles(textarea.value);
-    if (holes.length === 0) {
-      quickFill.replaceChildren(element("p", { className: "empty-note", text: "Không còn chỗ trống nào trong nội dung này." }));
+    if (!holes.length) {
+      quick.className = "quick done";
+      quick.replaceChildren(element("span", { className: "qok", text: "✓ Không còn chỗ trống nào trong nội dung này" }));
       return;
     }
     const inputs = new Map();
-    const note = element("div", { className: "action-status", attributes: { "aria-live": "polite" } });
-    const fields = holes.map((hole) => {
-      const inputId = `agent-editor-${document}-hole-${hole.key}`;
-      const input = element("input", {
-        className: "text-input",
-        attributes: {
-          id: inputId,
-          type: "text",
-          maxlength: MAX_PLACEHOLDER_VALUE,
-          autocomplete: "off",
-        },
-        on: { keydown: (event) => handleQuickFillEnter(event, applyQuickFill) },
-      });
-      inputs.set(hole.key, input);
-      return element("div", { className: "form-field" },
-        element("label", { attributes: { for: inputId } },
-          element("code", { text: `{{${hole.key}}}` }),
-          element("span", { text: `${hole.count} chỗ` }),
-        ),
-        input,
-      );
-    });
-
-    function applyQuickFill() {
-      note.replaceChildren();
+    const apply = () => {
       try {
         const values = {};
-        for (const [key, input] of inputs) {
-          if (input.value.trim()) values[key] = input.value;
-        }
-        if (Object.keys(values).length === 0) throw new Error("Chưa điền ô nào.");
+        for (const [key, input] of inputs) if (input.value.trim()) values[key] = input.value;
+        if (!Object.keys(values).length) throw new Error("chưa điền ô nào");
         textarea.value = fillHoles(textarea.value, values);
-        drawQuickFill();
+        drawQuick();
         textarea.focus();
-      } catch (error) {
-        note.replaceChildren(errorPanel(error));
-      }
-    }
-
-    const apply = element("button", {
-      className: "button button--secondary",
-      attributes: { type: "button" },
-      text: "Điền vào nội dung",
-      on: { click: applyQuickFill },
+      } catch (error) { quickNote.textContent = error instanceof Error ? error.message : String(error); }
+    };
+    const fields = holes.map((hole) => {
+      const inputId = `agent-editor-${editorId}-hole-${hole.key}`;
+      const input = element("input", { attributes: { id: inputId, type: "text", maxlength: MAX_PLACEHOLDER_VALUE, placeholder: HINTS[hole.key] || "điền giá trị" }, on: { keydown: (event) => handleQuickFillEnter(event, apply) } });
+      inputs.set(hole.key, input);
+      return element("div", { className: "qf" }, element("label", { attributes: { for: inputId } }, element("span", { className: "fk", text: `{{${hole.key}}}` }), element("span", { className: "fc", text: `${hole.count} chỗ` })), input);
     });
-    quickFill.replaceChildren(
-      element("p", { className: "form-feedback", text: `Điền nhanh ${holes.length} chỗ trống vào bản nháp trước khi lưu:` }),
-      fields,
-      element("div", { className: "form-actions" }, apply),
-      note,
+    quick.className = "quick";
+    quick.replaceChildren(
+      element("div", { className: "qh", text: `Điền nhanh ${holes.length} chỗ trống, nếu không muốn sửa nội dung:` }),
+      element("div", { className: "qg" }, fields),
+      element("div", { className: "qr" }, element("button", { className: "btn", attributes: { type: "button" }, text: "Điền vào nội dung", on: { click: apply } }), quickNote),
     );
   }
 
-  const form = element(
-    "form",
-    {
-      className: "document-editor-form",
-      on: {
-        submit: async (event) => {
-          event.preventDefault();
-          feedback.replaceChildren();
-          save.disabled = true;
-          save.textContent = "Đang lưu…";
-          try {
-            await onSave(textarea.value);
-          } catch (error) {
-            feedback.replaceChildren(errorPanel(error));
-            save.disabled = false;
-            save.textContent = "Lưu tệp";
-          }
-        },
-      },
-    },
-    element("div", { className: "editor-heading" },
-      element("div", {},
-        element("h3", { text: data.label || EDITABLE_DOCUMENTS[document].label }),
-        element("p", { attributes: { id: `agent-document-${document}-help` }, text: "Nội dung được chuẩn hóa xuống dòng và ghi an toàn dưới dạng UTF-8." }),
-      ),
-      element("code", { text: data.path || "" }),
-    ),
-    quickFill,
-    element("label", { className: "visually-hidden", attributes: { for: textarea.id }, text: data.label || EDITABLE_DOCUMENTS[document].label }),
-    textarea,
-    element("div", { className: "form-actions" },
-      save,
-      element("button", { className: "button button--ghost", attributes: { type: "button" }, text: "Đóng", on: { click: onCancel } }),
-    ),
-    feedback,
+  const closeButton = element("button", { className: "btn", attributes: { type: "button" }, text: "Đóng", on: { click: onCancel } });
+  const form = element("form", { on: { submit: async (event) => {
+    event.preventDefault();
+    footerNote.textContent = "đang lưu…";
+    save.disabled = true;
+    try { await onSave(textarea.value); } catch (error) {
+      footerNote.textContent = `không lưu được: ${error instanceof Error ? error.message : String(error)}`;
+      save.disabled = false;
+      textarea.focus();
+    }
+  } } },
+  element("div", { className: "sheethead" }, element("div", { className: "st", attributes: { id: headingId }, text: `Sửa ${data?.label || EDITABLE_DOCUMENTS[name].label}` }), element("div", { className: "sp", text: data?.path || "" })),
+  quick, element("label", { className: "visually-hidden", attributes: { for: textareaId }, text: data?.label || EDITABLE_DOCUMENTS[name].label }), textarea,
+  element("div", { className: "sheetfoot" }, element("span", { className: "note", attributes: { id: descriptionId }, text: "Có hiệu lực ngay ở lượt trả lời sau, không cần mở lại phần mềm." }), footerNote, closeButton, save),
   );
-  drawQuickFill();
+  drawQuick();
   queueMicrotask(() => textarea.focus());
-  return form;
+  return { form, textarea, closeButton, save, headingId, descriptionId };
 }
 
 export function createAgentsPage({ request = requestJSON } = {}) {
-  return Object.freeze({
-    mount(container) {
-      const controller = new AbortController();
-      const service = createAgentService((path, options = {}) => request(path, { ...options, signal: controller.signal }));
-      const root = element("div", { className: "agents-page" });
-      let disposed = false;
-      let refreshRevision = 0;
-      let editorRevision = 0;
-      container.append(root);
-
-      const header = () => pageHeader(
-        "Trợ lý AI",
-        "Hoàn thiện danh tính, văn phong và sổ tay trước khi trợ lý trò chuyện với khách hàng.",
-      );
-
-      const refresh = async () => {
-        const revision = ++refreshRevision;
-        root.replaceChildren(
-          header(),
-          statusPanel({ tone: "neutral", title: "Đang kiểm tra trợ lý", body: "Đọc văn phong và các chỗ cần hoàn thiện…" }),
+  return Object.freeze({ mount(container) {
+    const controller = new AbortController();
+    const service = createAgentService((path, options = {}) => request(path, { ...options, signal: controller.signal }));
+    const root = element("div", { className: "agents-page" });
+    let disposed = false;
+    let refreshRevision = 0;
+    let editorRevision = 0;
+    let dismissEditor = () => {};
+    container.append(root);
+    const header = () => pageHeader("AI Agents", "Một agent: con trả lời tin nhắn Zalo. Giọng nói của nó nằm trong tệp văn phong.");
+    const refresh = async () => {
+      const revision = ++refreshRevision;
+      root.replaceChildren(header(), element("div", { className: "hint", text: "Đang đọc văn phong và các chỗ cần hoàn thiện…" }));
+      try {
+        const agent = await service.load();
+        if (disposed || revision !== refreshRevision) return;
+        const holes = Array.isArray(agent?.placeholders) ? agent.placeholders : [];
+        const banner = element("section", { className: `banner ${agent?.ready ? "ok" : "bad"}`, attributes: { role: "status" } },
+          element("div", { className: "bt", text: agent?.ready ? "Sẵn sàng nói chuyện với khách" : `CHƯA sẵn sàng: văn phong còn ${holes.length} chỗ trống` }),
+          element("div", { className: "bd", text: agent?.ready ? "Không còn chỗ trống nào trong tệp văn phong." : "Điền hết bên dưới rồi bấm Lưu. Chưa điền thì bot sẽ gửi cho khách nguyên chữ trong ngoặc." }),
         );
-        try {
-          const agent = await service.load();
-          if (disposed || revision !== refreshRevision) return;
-          const holes = Array.isArray(agent.placeholders) ? agent.placeholders : [];
-          root.replaceChildren(
-            header(),
-            statusPanel(agent.ready ? {
-              tone: "success",
-              title: "Trợ lý đã sẵn sàng",
-              body: "Văn phong không còn chỗ trống bắt buộc. Bạn có thể tiếp tục kiểm tra hội thoại.",
-            } : {
-              tone: "progress",
-              title: "Trợ lý chưa sẵn sàng",
-              body: `Còn ${holes.length} mục danh tính cần điền trước khi mở cho khách thật.`,
-            }),
-            agentDetails(agent),
-            quickFillSection(agent, async (values) => {
-              await service.fill(values);
+        const openDocument = async (name, opener) => {
+          dismissEditor();
+          const current = ++editorRevision;
+          try {
+            const data = await service.loadDocument(name);
+            if (disposed || current !== editorRevision) return;
+            const back = element("div", { className: "sheetback", attributes: { "data-agents-overlay": "" } });
+            let closed = false;
+            const onKey = (event) => { if (event.key === "Escape") close(); };
+            const dismiss = (restoreFocus) => {
+              if (closed) return;
+              closed = true;
+              editorRevision++;
+              document.removeEventListener?.("keydown", onKey);
+              back.remove();
+              if (dismissEditor === disposeEditor) dismissEditor = () => {};
+              if (restoreFocus) opener?.focus();
+            };
+            const close = () => dismiss(true);
+            const disposeEditor = () => dismiss(false);
+            dismissEditor = disposeEditor;
+            document.addEventListener?.("keydown", onKey);
+            back.addEventListener("click", (event) => { if (event.target === back) close(); });
+            const editor = documentEditor(name, data, { onCancel: close, onSave: async (value) => {
+              await service.saveDocument(name, value);
+              if (disposed || closed || current !== editorRevision) return;
+              dismiss(false);
               await refresh();
-            }),
-            editorSection(async (name, region, editorControls) => {
-              const currentEditor = ++editorRevision;
-              region.replaceChildren(statusPanel({ tone: "neutral", title: "Đang mở tệp", body: "Đọc nội dung UTF-8…" }));
-              try {
-                const data = await service.loadDocument(name);
-                if (disposed || currentEditor !== editorRevision) return;
-                region.replaceChildren(documentEditor(name, data, {
-                  onCancel: () => {
-                    editorRevision++;
-                    region.replaceChildren();
-                    editorControls.close();
-                  },
-                  onSave: async (text) => {
-                    await service.saveDocument(name, text);
-                    await refresh();
-                  },
-                }));
-              } catch (error) {
-                if (!disposed && currentEditor === editorRevision && error?.name !== "AbortError") {
-                  region.replaceChildren(errorPanel(error));
-                  editorControls.close();
-                }
+            } }, current);
+            const sheet = element("div", {
+              className: "sheet",
+              attributes: { role: "dialog", "aria-modal": "true", "aria-labelledby": editor.headingId, "aria-describedby": editor.descriptionId },
+            }, editor.form);
+            back.addEventListener("keydown", (event) => {
+              if (event.key !== "Tab") return;
+              const focusable = back.querySelectorAll
+                ? [...back.querySelectorAll("button:not([disabled]), input:not([disabled]), textarea:not([disabled])")]
+                : [editor.textarea, editor.closeButton, editor.save];
+              const position = focusable.indexOf(document.activeElement);
+              if (event.shiftKey && position <= 0) {
+                event.preventDefault();
+                focusable.at(-1)?.focus();
+              } else if (!event.shiftKey && (position === -1 || position === focusable.length - 1)) {
+                event.preventDefault();
+                focusable[0]?.focus();
               }
-            }),
-          );
-        } catch (error) {
-          if (!disposed && revision === refreshRevision && error?.name !== "AbortError") {
-            root.replaceChildren(header(), errorPanel(error));
+            });
+            back.append(sheet);
+            document.body.append(back);
+          } catch (error) {
+            if (!disposed && current === editorRevision && error?.name !== "AbortError") root.append(errorPanel(error));
           }
-        }
-      };
-
-      void refresh();
-      return {
-        dispose() {
-          disposed = true;
-          refreshRevision++;
-          editorRevision++;
-          controller.abort();
-        },
-      };
-    },
-  });
+        };
+        root.replaceChildren(header(), banner, quickFill(agent, async (values) => { await service.fill(values); await refresh(); }), agentFacts(agent, openDocument), element("div", { className: "hint", text: "Phạm vi quyền cố định là chỉ-đọc, và đó là chủ đích: agent này tự động trả lời khách, nên nó không có quyền ghi hay xoá bất cứ gì. Con agent biên soạn wiki ở mục Knowledge mới có quyền ghi." }));
+      } catch (error) {
+        if (!disposed && revision === refreshRevision && error?.name !== "AbortError") root.replaceChildren(header(), errorPanel(error));
+      }
+    };
+    void refresh();
+    return { dispose() { disposed = true; refreshRevision++; editorRevision++; dismissEditor(); controller.abort(); } };
+  } });
 }
 
-export function mount(container) {
-  return createAgentsPage().mount(container);
-}
+export function mount(container) { return createAgentsPage().mount(container); }
