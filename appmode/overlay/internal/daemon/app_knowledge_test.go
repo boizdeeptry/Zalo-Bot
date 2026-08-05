@@ -92,11 +92,41 @@ func TestAppKnowledgeUploadIsExclusiveAndAllowlisted(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(brain, "raw", "installer.exe")); !os.IsNotExist(err) {
 		t.Fatalf("rejected executable exists in raw: %v", err)
 	}
+
+	for _, unsafeName := range []string{"installer.exe:payload.md", "CON.md", "trailing.md."} {
+		rejected = httptest.NewRecorder()
+		a.handleKBUpload(rejected, appUploadRequest(t, unsafeName, "hidden"))
+		if rejected.Code != http.StatusBadRequest {
+			t.Errorf("unsafe Windows filename %q status = %d, want 400; body = %s", unsafeName, rejected.Code, rejected.Body.String())
+		}
+	}
 }
 
 func TestAppKnowledgeUploadRequestCapIs64MiB(t *testing.T) {
 	if maxUploadTotal != 64<<20 {
 		t.Fatalf("maxUploadTotal = %d, want 64 MiB", maxUploadTotal)
+	}
+}
+
+func TestAppKnowledgeRejectsOversizedRequestWith413(t *testing.T) {
+	brain := appKnowledgeBrain(t)
+	a := newAppKnowledgeTestAPI(t)
+	req := httptest.NewRequest(http.MethodPost, "/kb/upload", strings.NewReader("--boundary--"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=boundary")
+	req.ContentLength = maxUploadTotal + 1
+	recorder := httptest.NewRecorder()
+
+	a.handleKBUpload(recorder, req)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized upload status = %d, want 413; body = %s", recorder.Code, recorder.Body.String())
+	}
+	entries, err := os.ReadDir(filepath.Join(brain, "raw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("oversized upload wrote files: %#v", entries)
 	}
 }
 
@@ -114,6 +144,25 @@ func TestAppKnowledgeRejectsConcurrentIngest(t *testing.T) {
 	a.handleKBIngest(recorder, httptest.NewRequest(http.MethodPost, "/kb/ingest", nil))
 	if recorder.Code != http.StatusConflict {
 		t.Fatalf("concurrent ingest status = %d, want 409; body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestAppKnowledgeStopCancelsAndFinishCleansState(t *testing.T) {
+	cancelled := false
+	previous := ingest
+	ingest = &ingestState{running: true, cancel: func() { cancelled = true }}
+	t.Cleanup(func() { ingest = previous })
+	a := newAppKnowledgeTestAPI(t)
+	recorder := httptest.NewRecorder()
+
+	a.handleKBIngestStop(recorder, httptest.NewRequest(http.MethodDelete, "/kb/ingest", nil))
+
+	if recorder.Code != http.StatusNoContent || !cancelled {
+		t.Fatalf("stop status = %d, cancelled = %v", recorder.Code, cancelled)
+	}
+	ingest.finish("agent failed")
+	if ingest.running || !ingest.done || ingest.cancel != nil || ingest.err != "agent failed" {
+		t.Fatalf("finished ingest state = %#v", ingest)
 	}
 }
 

@@ -74,6 +74,7 @@ export async function waitForServerRestart({
     } catch (error) {
       if (signal?.aborted || error?.name === "AbortError") return false;
     }
+    if (signal?.aborted) return false;
 
     if (!sawDown) {
       if (up) {

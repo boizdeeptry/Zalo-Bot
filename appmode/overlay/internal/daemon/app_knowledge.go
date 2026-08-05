@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -97,6 +98,13 @@ func (s *ingestState) step(line string) {
 	if len(s.steps) > 200 {
 		s.steps = s.steps[len(s.steps)-200:]
 	}
+}
+
+func (s *ingestState) finish(errMsg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running, s.done, s.err = false, true, errMsg
+	s.cancel = nil
 }
 
 // brainDir đọc và kiểm thư mục brain.
@@ -251,10 +259,19 @@ func (a *api) handleKBUpload(w http.ResponseWriter, r *http.Request) {
 		a.writeErr(w, http.StatusInternalServerError, "không tạo được thư mục raw")
 		return
 	}
+	if r.ContentLength > maxUploadTotal {
+		a.writeErr(w, http.StatusRequestEntityTooLarge, "dữ liệu tải lên vượt quá giới hạn 64 MiB")
+		return
+	}
 	// Chặn ở tầng body TRƯỚC khi phân tích: ParseMultipartForm với một body khổng lồ sẽ đọc hết
 	// vào đĩa tạm rồi mới báo lỗi.
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadTotal)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			a.writeErr(w, http.StatusRequestEntityTooLarge, "dữ liệu tải lên vượt quá giới hạn 64 MiB")
+			return
+		}
 		a.writeErr(w, http.StatusBadRequest, "không đọc được dữ liệu tải lên: "+err.Error())
 		return
 	}
@@ -272,8 +289,8 @@ func (a *api) handleKBUpload(w http.ResponseWriter, r *http.Request) {
 	var saved, skipped []string
 	duplicateCount := 0
 	for _, fh := range files {
-		name := filepath.Base(strings.TrimSpace(fh.Filename))
-		if !safeSendName(name) {
+		name := filepath.Base(fh.Filename)
+		if !safeKBUploadName(name) {
 			skipped = append(skipped, fh.Filename+" (tên tệp không hợp lệ)")
 			continue
 		}
@@ -307,6 +324,28 @@ func (a *api) handleKBUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.writeJSON(w, code, map[string]any{"saved": saved, "skipped": skipped})
+}
+
+func safeKBUploadName(name string) bool {
+	if name == "" || name != strings.TrimSpace(name) || !safeSendName(name) {
+		return false
+	}
+	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") || strings.ContainsAny(name, `<>:"/\|?*`) {
+		return false
+	}
+	for _, char := range name {
+		if char < 0x20 {
+			return false
+		}
+	}
+	base := strings.ToUpper(strings.SplitN(name, ".", 2)[0])
+	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" {
+		return false
+	}
+	if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '1' && base[3] <= '9' {
+		return false
+	}
+	return true
 }
 
 // saveMultipart ghi một tệp tải lên.
@@ -400,23 +439,17 @@ Xong thì nói ngắn gọn: đã viết những trang nào, bỏ qua tệp nào
 
 func (a *api) runIngest(ctx context.Context, cancel func(), dir string) {
 	defer cancel()
-	finish := func(errMsg string) {
-		ingest.mu.Lock()
-		ingest.running, ingest.done, ingest.err = false, true, errMsg
-		ingest.cancel = nil
-		ingest.mu.Unlock()
-	}
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		ingest.step("không thấy claude trên PATH")
-		finish("chưa cài Claude Code, hoặc chưa đăng nhập. Xem DOC TRUOC.txt")
+		ingest.finish("chưa cài Claude Code, hoặc chưa đăng nhập. Xem DOC TRUOC.txt")
 		return
 	}
 	// Quyền GHI, và chỉ trong brain\. Khác hẳn profile của bot trả lời khách, thứ chỉ-đọc.
 	prof := agent.ConsultReadOnly()
 	args, err := prof.HeadlessArgv(uuid.NewString())
 	if err != nil {
-		finish(err.Error())
+		ingest.finish(err.Error())
 		return
 	}
 	// Thay allowed-tools: HeadlessArgv trả về bộ chỉ-đọc, còn biên soạn thì phải ghi được.
@@ -429,13 +462,13 @@ func (a *api) runIngest(ctx context.Context, cancel func(), dir string) {
 	cmd.Stdin = strings.NewReader(ingestPrompt)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		finish("không mở được stdout của claude")
+		ingest.finish("không mở được stdout của claude")
 		return
 	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		finish("không chạy được claude: " + err.Error())
+		ingest.finish("không chạy được claude: " + err.Error())
 		return
 	}
 	ingest.step("agent bắt đầu đọc raw/")
@@ -462,11 +495,11 @@ func (a *api) runIngest(ctx context.Context, cancel func(), dir string) {
 			ingest.step("stdout: " + l)
 		}
 		ingest.step("kết thúc với lỗi: " + msg)
-		finish(msg)
+		ingest.finish(msg)
 		return
 	}
 	ingest.step("xong")
-	finish("")
+	ingest.finish("")
 }
 
 // replaceAllowedTools đổi giá trị của --allowed-tools tại chỗ.

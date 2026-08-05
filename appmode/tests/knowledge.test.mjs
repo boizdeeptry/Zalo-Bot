@@ -89,3 +89,32 @@ test("restart polling never reloads while only the old daemon is visible", async
   assert.equal(restarted, false);
   assert.equal(reloads, 0);
 });
+
+test("restart polling ignores a probe that resolves after disposal", async () => {
+  const controller = new AbortController();
+  let resolveProbe;
+  let probeCount = 0;
+  let reloads = 0;
+  let markSecondProbe;
+  const secondProbeStarted = new Promise((resolve) => { markSecondProbe = resolve });
+  const polling = waitForServerRestart({
+    probe: () => {
+      probeCount++;
+      if (probeCount === 1) return false;
+      markSecondProbe();
+      return new Promise((resolve) => { resolveProbe = resolve });
+    },
+    wait: async () => {},
+    reload: () => { reloads++ },
+    signal: controller.signal,
+    maxAttempts: 2,
+  });
+  await secondProbeStarted;
+
+  controller.abort();
+  resolveProbe(true);
+  const restarted = await polling;
+
+  assert.equal(restarted, false);
+  assert.equal(reloads, 0);
+});

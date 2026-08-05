@@ -28,7 +28,7 @@ function metric(value, label) {
 function renderFileList(container, files) {
   const names = Array.isArray(files) ? files : [];
   if (names.length === 0) {
-    container.replaceChildren(element("li", { className: "file-list__empty", text: "Chưa có tệp nào" }));
+    container.replaceChildren(element("li", { className: "file-list__empty", text: "Kho này đang trống" }));
     return;
   }
   container.replaceChildren(...names.map((name) => element("li", { text: name })));
@@ -101,6 +101,8 @@ export function createKnowledgePage({
           type: "file",
           multiple: true,
           accept: ACCEPTED_EXTENSIONS,
+          tabindex: "-1",
+          "aria-hidden": "true",
         },
       });
       const choose = element("button", { className: "button button--secondary", attributes: { type: "button" }, text: "Chọn tệp" });
