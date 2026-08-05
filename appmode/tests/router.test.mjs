@@ -7,10 +7,10 @@ import {
 } from "../overlay/internal/webui/static/core/router.js";
 
 test("known and unknown hashes resolve predictably", () => {
-  assert.equal(routeFromHash("#knowledge"), "knowledge");
   assert.equal(routeFromHash("#models"), "models");
-  assert.equal(routeFromHash("#not-a-page"), "overview");
-  assert.equal(routeFromHash(""), "overview");
+  assert.equal(routeFromHash("#workflows"), "workflows");
+  assert.equal(routeFromHash("#not-a-page"), "knowledge");
+  assert.equal(routeFromHash(""), "knowledge");
 });
 
 test("mounting a route disposes the old page before clearing its DOM", async () => {
