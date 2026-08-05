@@ -31,6 +31,39 @@ function Resolve-BuildPaths {
   }
 }
 
+function Assert-CleanGitSource {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Repo)
+
+  $repoPath = [IO.Path]::GetFullPath($Repo)
+  $status = (& git -C $repoPath --no-optional-locks status --porcelain=v1 --untracked-files=all) -join "`n"
+  if ($LASTEXITCODE -ne 0) {
+    throw "không đọc được Git status của '$repoPath'"
+  }
+  if (-not [string]::IsNullOrWhiteSpace($status)) {
+    throw "repo nguồn không sạch; commit hoặc cất thay đổi trước khi build: '$repoPath'`n$status"
+  }
+
+  return $repoPath
+}
+
+function Get-AppGoTestSkipPattern {
+  [CmdletBinding()]
+  param()
+
+  $names = @(
+    'TestAppJSKnowsTheSessionEndedCloseReason'
+    'TestAppJSSendsThePortalMutationHeader'
+    'TestPortalReloadedKeyWithLiveSessionReachesTheShell'
+    'TestPortalRootServesTheShellWithACookie'
+    'TestPortalUsesModalNotBrowserDialogs'
+    'TestAgentPortalNoLongerCarriesZalo'
+    'TestModalCallsPassAnObject'
+  )
+  $escaped = $names | ForEach-Object { [regex]::Escape($_) }
+  return '^(?:' + ($escaped -join '|') + ')$'
+}
+
 function Clear-AppOutput {
   [CmdletBinding()]
   param(
@@ -247,4 +280,4 @@ function Assert-AppPackage {
   return $outPath
 }
 
-Export-ModuleMember -Function Resolve-BuildPaths, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams, Assert-AppPackage
+Export-ModuleMember -Function Resolve-BuildPaths, Assert-CleanGitSource, Get-AppGoTestSkipPattern, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams, Assert-AppPackage

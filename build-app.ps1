@@ -100,16 +100,11 @@ try {
 # .git, bo moi thu khong commit -- ban ban phai dung tu nguon da biet.
 Write-Host '[1/7] copy repo sang thu muc tam'
 $phase = 'stage source và overlay'
-$sourceStatusBefore = (& git -C $Repo --no-optional-locks status --short) -join "`n"
-if ($LASTEXITCODE -ne 0) { throw "không đọc được Git status của '$Repo'" }
+Assert-CleanGitSource -Repo $Repo | Out-Null
 $overlay = Join-Path $PSScriptRoot 'appmode\overlay'
 $Tmp = New-AppStage -Repo $Repo -Overlay $overlay -StageRoot $Tmp
 Apply-AppSeams -Stage $Tmp
-$sourceStatusAfter = (& git -C $Repo --no-optional-locks status --short) -join "`n"
-if ($LASTEXITCODE -ne 0) { throw "không đọc được Git status của '$Repo' sau staging" }
-if ($sourceStatusAfter -cne $sourceStatusBefore) {
-  throw "repo nguồn đã thay đổi trong lúc staging: '$Repo'"
-}
+Assert-CleanGitSource -Repo $Repo | Out-Null
 $fileCount = (Get-ChildItem -LiteralPath $Tmp -Recurse -File).Count
 Write-Host ("      {0} tep" -f $fileCount)
 
@@ -206,15 +201,7 @@ if (-not (Test-Path -LiteralPath $sourceNodeModules -PathType Container)) {
 New-Item -ItemType Junction -Path (Join-Path $transportStage 'node_modules') `
   -Target $sourceNodeModules -ErrorAction Stop | Out-Null
 
-$skipTests = @(
-  'TestAppJSKnowsTheSessionEndedCloseReason'
-  'TestAppJSSendsThePortalMutationHeader'
-  'TestPortalReloadedKeyWithLiveSessionReachesTheShell'
-  'TestPortalRootServesTheShellWithACookie'
-  'TestPortalUsesModalNotBrowserDialogs'
-  'TestAgentPortalNoLongerCarriesZalo'
-  'TestModalCallsPassAnObject'
-) -join '|'
+$skipTests = Get-AppGoTestSkipPattern
 
 Invoke-AppCommand -Label 'go test' -FilePath $goExe `
   -Arguments @('test', '-skip', $skipTests, './...') -WorkingDirectory $Tmp
@@ -361,11 +348,7 @@ if ($hits -or $binHits -gt 0) {
 Write-Host 'sach: khong con dau khach hang nao' -ForegroundColor Green
 
 Assert-AppPackage -Out $Out -AllowZaloCredentials:$KeepData | Out-Null
-$sourceStatusFinal = (& git -C $Repo --no-optional-locks status --short) -join "`n"
-if ($LASTEXITCODE -ne 0) { throw "không đọc được Git status cuối của '$Repo'" }
-if ($sourceStatusFinal -cne $sourceStatusBefore) {
-  throw "repo nguồn đã thay đổi trong lúc checkpoint: '$Repo'"
-}
+Assert-CleanGitSource -Repo $Repo | Out-Null
 
 $f = Get-ChildItem -LiteralPath $Out -Recurse -File
 Write-Host ('goi: {0} tep, {1:N1} MB  ->  {2}' -f $f.Count, (($f | Measure-Object Length -Sum).Sum / 1MB), $Out)

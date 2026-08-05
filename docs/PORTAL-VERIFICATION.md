@@ -25,7 +25,7 @@ Lệnh build thứ hai tự chạy checkpoint trước khi tạo binary: bộ Go
 
 | Cổng xác minh | Kết quả |
 |---|---|
-| PowerShell build fixtures | PASS — path có dấu/khoảng trắng, output an toàn, persona, package và overlay seams |
+| PowerShell build fixtures | PASS — path có dấu/khoảng trắng, upstream sạch, đúng bảy test được skip, output an toàn, persona, package và overlay seams |
 | Go `test -skip <7 assertion cũ> ./...` | PASS — toàn bộ package có test |
 | Portal `npm test` | PASS — 18/18 |
 | Zalo TypeScript compile | PASS |

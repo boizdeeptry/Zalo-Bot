@@ -133,6 +133,52 @@ try {
   }
 }
 
+$cleanRepoRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-clean-source-' + [guid]::NewGuid().ToString('N'))
+
+try {
+  New-Item -ItemType Directory -Force -Path $cleanRepoRoot | Out-Null
+  & git -C $cleanRepoRoot init --quiet
+  & git -C $cleanRepoRoot config user.name 'Portal Test'
+  & git -C $cleanRepoRoot config user.email 'portal-test@example.invalid'
+  Write-TestFile (Join-Path $cleanRepoRoot 'tracked.txt') "committed`n"
+  & git -C $cleanRepoRoot add -- 'tracked.txt'
+  & git -C $cleanRepoRoot commit --quiet -m 'fixture'
+  if ($LASTEXITCODE -ne 0) { throw 'Could not commit the clean-source fixture' }
+
+  Assert-CleanGitSource -Repo $cleanRepoRoot | Out-Null
+  Write-TestFile (Join-Path $cleanRepoRoot 'tracked.txt') "working-tree edit`n"
+  Assert-ThrowsLike -Action { Assert-CleanGitSource -Repo $cleanRepoRoot } `
+    -Pattern 'không sạch|not clean' -Message 'A dirty source repository was accepted'
+
+  Write-Host 'PASS: Assert-CleanGitSource rejects uncommitted source content.'
+} finally {
+  if (Test-Path -LiteralPath $cleanRepoRoot) {
+    Remove-Item -LiteralPath $cleanRepoRoot -Recurse -Force
+  }
+}
+
+$skipPattern = Get-AppGoTestSkipPattern
+$supersededTests = @(
+  'TestAppJSKnowsTheSessionEndedCloseReason'
+  'TestAppJSSendsThePortalMutationHeader'
+  'TestPortalReloadedKeyWithLiveSessionReachesTheShell'
+  'TestPortalRootServesTheShellWithACookie'
+  'TestPortalUsesModalNotBrowserDialogs'
+  'TestAgentPortalNoLongerCarriesZalo'
+  'TestModalCallsPassAnObject'
+)
+foreach ($testName in $supersededTests) {
+  if ($testName -notmatch $skipPattern) {
+    throw "Exact superseded test is not skipped: $testName"
+  }
+  foreach ($nearMatch in @("Prefix$testName", "${testName}Regression")) {
+    if ($nearMatch -match $skipPattern) {
+      throw "A future near-match test would be skipped: $nearMatch"
+    }
+  }
+}
+Write-Host 'PASS: Go checkpoint skips exactly seven superseded tests.'
+
 $packageRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-package-' + [guid]::NewGuid().ToString('N'))
 
 try {
