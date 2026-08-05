@@ -1,0 +1,27 @@
+.stage/
+out/
+*.zip
+
+# Generated dependencies and transient build output
+node_modules/
+*.tmp
+*.partial
+*.log
+
+# Runtime data and local credentials must never enter source control
+data/
+app/data/
+**/credentials.json
+**/token
+**/.env
+**/.env.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.pem
+*.key
+*.pfx
+*.p12

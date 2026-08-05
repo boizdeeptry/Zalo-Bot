@@ -1,0 +1,25 @@
+{
+  "_README": "Rename file này thành 'settings.local.json' (bỏ '.example') để bật. File này whitelist các thao tác Claude Code có thể làm trong vault mà KHÔNG cần hỏi xin phép — giúp workflow ingest/query/lint chạy mượt. CLAUDE.md không có trong allowlist (intentional — bạn phải duyệt mỗi lần thay schema).",
+
+  "permissions": {
+    "allow": [
+      "Read(./**)",
+      "Write(./wiki/**)",
+      "Write(./index.md)",
+      "Write(./log.md)",
+      "Write(./Home.md)",
+      "Edit(./wiki/**)",
+      "Edit(./index.md)",
+      "Edit(./log.md)",
+      "Edit(./Home.md)",
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(cat:*)",
+      "Bash(mkdir:*)"
+    ]
+  }
+}

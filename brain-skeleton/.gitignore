@@ -1,0 +1,50 @@
+# ============================================================
+# .gitignore cho vault Obsidian + Claude Code
+# Áp dụng nếu anh dùng Git (vd. GitHub) để version vault
+# ============================================================
+
+# Obsidian — workspace state thay đổi liên tục, không nên commit
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/cache
+.trash/
+
+# Obsidian — giữ các config quan trọng (uncomment nếu KHÔNG muốn commit):
+# .obsidian/
+
+# Claude Code — settings cá nhân (allowlist permissions) không nên share
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+*.tmp
+*.temp
+
+# ============================================================
+# CHÚ Ý: KHÔNG ignore raw/ và wiki/ — đó là content chính
+# Trừ khi anh muốn raw/ chứa file rất lớn (>100MB) → dùng Git LFS
+# ============================================================
