@@ -132,3 +132,124 @@ try {
     Remove-Item -LiteralPath $personaRoot -Recurse -Force
   }
 }
+
+$stageTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-stage-' + [guid]::NewGuid().ToString('N'))
+
+try {
+  $repo = Join-Path $stageTestRoot 'Mã nguồn AgentDC'
+  $overlay = Join-Path $stageTestRoot 'Portal overlay'
+  $stage = Join-Path $stageTestRoot 'Bản dựng'
+
+  New-Item -ItemType Directory -Force -Path $repo | Out-Null
+  & git -C $repo init --quiet
+  if ($LASTEXITCODE -ne 0) { throw 'Could not initialize the fixture Git repository' }
+
+  Write-TestFile (Join-Path $repo 'internal\daemon\server.go') @'
+package daemon
+
+func server() {
+	mux.Handle("POST /shutdown", a.auth(a.handleShutdown))
+}
+'@
+  Write-TestFile (Join-Path $repo 'internal\store\store.go') @'
+package store
+
+func migrate(db *sql.DB) error {
+	return nil
+}
+
+// hasColumn asks SQLite rather than tracking a version number.
+'@
+  Write-TestFile (Join-Path $repo 'internal\daemon\zalo.go') @'
+package daemon
+
+func incoming() {
+	default:
+		delay := time.Second
+		a.batch.add(req.ThreadID, kind, msg.Body, delay, ipc.ZaloOutboxDraft{})
+}
+'@
+  Write-TestFile (Join-Path $repo 'README.md') "tracked`n"
+  Write-TestFile (Join-Path $repo 'untracked.txt') "must not be staged`n"
+  Write-TestFile (Join-Path $overlay 'internal\daemon\app_routes.go') "package daemon`n"
+  Write-TestFile (Join-Path $overlay 'internal\webui\static\core\router.js') "export {};`n"
+
+  & git -C $repo add -- 'internal' 'README.md'
+  if ($LASTEXITCODE -ne 0) { throw 'Could not stage fixture files' }
+  $statusBefore = (& git -C $repo status --short) -join "`n"
+
+  $gotStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot $stage
+  Assert-Equal $gotStage ([IO.Path]::GetFullPath($stage)) 'Stage path was not normalized'
+  Apply-AppSeams -Stage $gotStage
+
+  if (-not (Test-Path -LiteralPath (Join-Path $gotStage 'internal\daemon\app_routes.go'))) {
+    throw 'Recursive overlay file was not copied'
+  }
+  if (-not (Test-Path -LiteralPath (Join-Path $gotStage 'internal\webui\static\core\router.js'))) {
+    throw 'Nested overlay asset was not copied'
+  }
+  if (Test-Path -LiteralPath (Join-Path $gotStage 'untracked.txt')) {
+    throw 'An untracked source file was copied into the stage'
+  }
+
+  $stagedServer = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\server.go'))
+  $stagedStore = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\store\store.go'))
+  $stagedZalo = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\zalo.go'))
+  if ([regex]::Matches($stagedServer, 'a\.registerAppRoutes\(mux\)').Count -ne 1) { throw 'Route seam was not applied exactly once' }
+  if ([regex]::Matches($stagedStore, 'migrateApp\(db\)').Count -ne 1) { throw 'Migration seam was not applied exactly once' }
+  if ([regex]::Matches($stagedZalo, 'evaluateAppWorkflow\(req, msg\)').Count -ne 1) { throw 'Workflow seam was not applied exactly once' }
+
+  $sourceServer = [IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\server.go'))
+  if ($sourceServer -match 'registerAppRoutes') { throw 'Source repo was changed by staging' }
+  $statusAfter = (& git -C $repo status --short) -join "`n"
+  Assert-Equal $statusAfter $statusBefore 'Source Git status changed during staging'
+
+  $missingStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Thiếu marker')
+  $missingServerPath = Join-Path $missingStage 'internal\daemon\server.go'
+  $missingServer = [IO.File]::ReadAllText($missingServerPath).Replace(
+    "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))", '')
+  [IO.File]::WriteAllText($missingServerPath, $missingServer, [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingStage } `
+    -Pattern 'route seam: expected exactly 1 match' -Message 'A missing route marker was accepted'
+
+  $duplicateStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Trùng marker')
+  $duplicateServerPath = Join-Path $duplicateStage 'internal\daemon\server.go'
+  $duplicateServer = [IO.File]::ReadAllText($duplicateServerPath)
+  $duplicateServer += "`n`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))`n"
+  [IO.File]::WriteAllText($duplicateServerPath, $duplicateServer, [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $duplicateStage } `
+    -Pattern 'route seam: expected exactly 1 match' -Message 'A duplicate route marker was accepted'
+
+  $missingMigrationStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Thiếu migration')
+  $missingStorePath = Join-Path $missingMigrationStage 'internal\store\store.go'
+  $missingStore = [IO.File]::ReadAllText($missingStorePath).Replace(
+    '// hasColumn asks SQLite rather than tracking a version number.', '// marker removed')
+  [IO.File]::WriteAllText($missingStorePath, $missingStore, [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingMigrationStage } `
+    -Pattern 'migration seam: expected exactly 1 match' -Message 'A missing migration marker was accepted'
+  if ([IO.File]::ReadAllText((Join-Path $missingMigrationStage 'internal\daemon\server.go')) -match 'registerAppRoutes') {
+    throw 'A failed seam validation partially modified the stage'
+  }
+
+  $duplicateWorkflowStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Trùng workflow')
+  $duplicateZaloPath = Join-Path $duplicateWorkflowStage 'internal\daemon\zalo.go'
+  $duplicateZalo = [IO.File]::ReadAllText($duplicateZaloPath)
+  $duplicateZalo += "`n`t`ta.batch.add(req.ThreadID, kind, msg.Body, delay, ipc.ZaloOutboxDraft{}`n"
+  [IO.File]::WriteAllText($duplicateZaloPath, $duplicateZalo, [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $duplicateWorkflowStage } `
+    -Pattern 'workflow seam: expected exactly 1 match' -Message 'A duplicate workflow marker was accepted'
+
+  $orchestrator = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\build-app.ps1'))
+  if ($orchestrator -notmatch 'New-AppStage' -or $orchestrator -notmatch 'Apply-AppSeams') {
+    throw 'Build orchestration does not use the guarded staging functions'
+  }
+  if ($orchestrator -match 'mux\.Handle\(`"GET /kb') {
+    throw 'Legacy direct route substitution remains in build orchestration'
+  }
+
+  Write-Host 'PASS: staging copies tracked files and applies three guarded seams.'
+} finally {
+  if (Test-Path -LiteralPath $stageTestRoot) {
+    Remove-Item -LiteralPath $stageTestRoot -Recurse -Force
+  }
+}

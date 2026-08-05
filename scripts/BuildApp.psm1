@@ -72,4 +72,132 @@ function Resolve-PersonaSource {
   return $sourcePath
 }
 
-Export-ModuleMember -Function Resolve-BuildPaths, Clear-AppOutput, Resolve-PersonaSource
+function New-AppStage {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Repo,
+    [Parameter(Mandatory)][string]$Overlay,
+    [Parameter(Mandatory)][string]$StageRoot
+  )
+
+  $paths = Resolve-BuildPaths -Repo $Repo -Out $StageRoot
+  $repoPath = $paths.Repo
+  $stagePath = $paths.Out
+  $overlayPath = [IO.Path]::GetFullPath($Overlay)
+
+  if (-not (Test-Path -LiteralPath $overlayPath -PathType Container)) {
+    throw "không thấy Portal overlay ở '$overlayPath'"
+  }
+  if (Test-Path -LiteralPath $stagePath) {
+    throw "thư mục stage đã tồn tại: '$stagePath'"
+  }
+
+  $repoPrefix = $repoPath.TrimEnd(
+    [IO.Path]::DirectorySeparatorChar,
+    [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+  if ($stagePath.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "stage không được nằm trong repo nguồn '$repoPath'"
+  }
+
+  [IO.Directory]::CreateDirectory($stagePath) | Out-Null
+
+  $trackedOutput = & git -C $repoPath --no-optional-locks ls-files -z
+  if ($LASTEXITCODE -ne 0) {
+    throw "git ls-files thất bại cho '$repoPath'"
+  }
+  $tracked = (($trackedOutput -join "`n") -split [char]0) |
+    Where-Object { $_.Length -gt 0 }
+
+  foreach ($entry in $tracked) {
+    $relative = $entry.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    $source = Join-Path $repoPath $relative
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+      throw "Git theo dõi một file không đọc được: '$entry'"
+    }
+    $destination = Join-Path $stagePath $relative
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
+    Copy-Item -LiteralPath $source -Destination $destination -Force
+  }
+
+  foreach ($item in Get-ChildItem -LiteralPath $overlayPath -File -Recurse -Force) {
+    $relative = [IO.Path]::GetRelativePath($overlayPath, $item.FullName)
+    $destination = Join-Path $stagePath $relative
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
+    Copy-Item -LiteralPath $item.FullName -Destination $destination -Force
+  }
+
+  return $stagePath
+}
+
+function Replace-ExactlyOnce {
+  param(
+    [Parameter(Mandatory)][string]$Text,
+    [Parameter(Mandatory)][string]$Needle,
+    [Parameter(Mandatory)][string]$Replacement,
+    [Parameter(Mandatory)][string]$Label
+  )
+
+  $count = 0
+  $offset = 0
+  while ($offset -le $Text.Length - $Needle.Length) {
+    $match = $Text.IndexOf($Needle, $offset, [StringComparison]::Ordinal)
+    if ($match -lt 0) { break }
+    $count++
+    $offset = $match + $Needle.Length
+  }
+  if ($count -ne 1) {
+    throw "$Label`: expected exactly 1 match, found $count"
+  }
+
+  return $Text.Replace($Needle, $Replacement)
+}
+
+function Apply-AppSeams {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Stage)
+
+  $stagePath = [IO.Path]::GetFullPath($Stage)
+  $serverPath = Join-Path $stagePath 'internal\daemon\server.go'
+  $storePath = Join-Path $stagePath 'internal\store\store.go'
+  $zaloPath = Join-Path $stagePath 'internal\daemon\zalo.go'
+
+  $server = [IO.File]::ReadAllText($serverPath)
+  $store = [IO.File]::ReadAllText($storePath)
+  $zalo = [IO.File]::ReadAllText($zaloPath)
+  $serverNewline = if ($server.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $storeNewline = if ($store.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $zaloNewline = if ($zalo.Contains("`r`n")) { "`r`n" } else { "`n" }
+
+  $routeNeedle = "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))"
+  $serverUpdated = Replace-ExactlyOnce -Text $server -Needle $routeNeedle `
+    -Replacement ("`ta.registerAppRoutes(mux)" + $serverNewline + $routeNeedle) `
+    -Label 'route seam'
+
+  $migrationNeedle = "`treturn nil" + $storeNewline + '}' + $storeNewline + $storeNewline +
+    '// hasColumn asks SQLite rather than tracking a version number'
+  $storeUpdated = Replace-ExactlyOnce -Text $store -Needle $migrationNeedle `
+    -Replacement ("`tif err := migrateApp(db); err != nil { return err }" + $storeNewline + $migrationNeedle) `
+    -Label 'migration seam'
+
+  $workflowNeedle = "`t`ta.batch.add(req.ThreadID, kind, msg.Body, delay, ipc.ZaloOutboxDraft{"
+  $workflowPrefix = @(
+    "`t`tdecision, workflowErr := a.evaluateAppWorkflow(req, msg)"
+    "`t`tif workflowErr != nil {"
+    "`t`t`ta.logger.Error(`"portal workflow failed`", `"error`", workflowErr)"
+    "`t`t`tbreak"
+    "`t`t}"
+    "`t`tif decision != appWorkflowContinue {"
+    "`t`t`tbreak"
+    "`t`t}"
+  ) -join $zaloNewline
+  $zaloUpdated = Replace-ExactlyOnce -Text $zalo -Needle $workflowNeedle `
+    -Replacement ($workflowPrefix + $zaloNewline + $workflowNeedle) `
+    -Label 'workflow seam'
+
+  $utf8NoBom = [Text.UTF8Encoding]::new($false)
+  [IO.File]::WriteAllText($serverPath, $serverUpdated, $utf8NoBom)
+  [IO.File]::WriteAllText($storePath, $storeUpdated, $utf8NoBom)
+  [IO.File]::WriteAllText($zaloPath, $zaloUpdated, $utf8NoBom)
+}
+
+Export-ModuleMember -Function Resolve-BuildPaths, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams

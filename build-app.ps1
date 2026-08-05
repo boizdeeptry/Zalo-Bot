@@ -55,18 +55,18 @@ Write-Host ''
 # Chi copy tep git theo doi. Bo node_modules (32 MB, dung lai ban co san), bo
 # .git, bo moi thu khong commit -- ban ban phai dung tu nguon da biet.
 Write-Host '[1/6] copy repo sang thu muc tam'
-[IO.Directory]::CreateDirectory($Tmp) | Out-Null
-Push-Location -LiteralPath $Repo
-$files = & git ls-files
-foreach ($f in $files) {
-  $src = Join-Path $Repo $f
-  if (-not (Test-Path -LiteralPath $src)) { continue }
-  $dst = Join-Path $Tmp $f
-  [IO.Directory]::CreateDirectory((Split-Path -Parent $dst)) | Out-Null
-  Copy-Item -LiteralPath $src -Destination $dst -Force
+$sourceStatusBefore = (& git -C $Repo --no-optional-locks status --short) -join "`n"
+if ($LASTEXITCODE -ne 0) { throw "không đọc được Git status của '$Repo'" }
+$overlay = Join-Path $PSScriptRoot 'appmode\overlay'
+$Tmp = New-AppStage -Repo $Repo -Overlay $overlay -StageRoot $Tmp
+Apply-AppSeams -Stage $Tmp
+$sourceStatusAfter = (& git -C $Repo --no-optional-locks status --short) -join "`n"
+if ($LASTEXITCODE -ne 0) { throw "không đọc được Git status của '$Repo' sau staging" }
+if ($sourceStatusAfter -cne $sourceStatusBefore) {
+  throw "repo nguồn đã thay đổi trong lúc staging: '$Repo'"
 }
-Pop-Location
-Write-Host ("      {0} tep" -f $files.Count)
+$fileCount = (Get-ChildItem -LiteralPath $Tmp -Recurse -File).Count
+Write-Host ("      {0} tep" -f $fileCount)
 
 # ---------------------------------------------------------- 2. lam sach clone
 # Nhung chuoi mang danh tinh mot doanh nghiep cu the, va chung o trong PROMPT
@@ -132,38 +132,6 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'appmode\personaedit.go') -Desti
 Remove-Item -LiteralPath (Join-Path $Tmp 'internal\webui\static\app.js') -Force -EA SilentlyContinue
 
 $subs += @(
-  # Route cua Knowledge. Chen truoc POST /shutdown -- dong cuoi bang route, on
-  # dinh nhat, va neu no doi thi script DUNG LAI thay vi build ra mot goi thieu
-  # endpoint upload.
-  @{ f = 'internal\daemon\server.go'
-     a = "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))"
-     b = "`tmux.Handle(`"GET /kb`", a.auth(a.handleKBList))`n" +
-         "`tmux.Handle(`"POST /kb/upload`", a.auth(a.handleKBUpload))`n" +
-         "`tmux.Handle(`"POST /kb/ingest`", a.auth(a.handleKBIngest))`n" +
-         "`tmux.Handle(`"DELETE /kb/ingest`", a.auth(a.handleKBIngestStop))`n" +
-         "`tmux.Handle(`"GET /kb/model`", a.auth(a.handleKBModelGet))`n" +
-         "`tmux.Handle(`"GET /agent`", a.auth(a.handleAgentGet))`n" +
-         "`tmux.Handle(`"PUT /agent`", a.auth(a.handleAgentPut))`n" +
-         "`tmux.Handle(`"GET /agent/persona/{name}`", a.auth(a.handlePersonaGet))`n" +
-         "`tmux.Handle(`"PUT /agent/persona/{name}`", a.auth(a.handlePersonaPut))`n" +
-         "`tmux.Handle(`"PUT /kb/model`", a.auth(a.handleKBModelPut))`n" +
-         "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))" },
-  # Cookie phai voi tuoi duoc bon route do. Chen vao cuoi cookieAllowedPaths.
-  @{ f = 'internal\daemon\portal.go'
-     a = "`t`"DELETE /zalo/threads/{tid}`": true,"
-     b = "`t`"DELETE /zalo/threads/{tid}`": true,`n" +
-         "`t// Knowledge cua goi ban. POST /kb/ingest CHAY MO HINH, tuc ton phi that -- cung`n" +
-         "`t// hang voi POST /sessions o cho no chi ton khi mot nguoi bam, khong tu chay.`n" +
-         "`t`"GET /kb`": true,`n" +
-         "`t`"POST /kb/upload`": true,`n" +
-         "`t`"POST /kb/ingest`": true,`n" +
-         "`t`"DELETE /kb/ingest`": true,`n" +
-         "`t`"GET /kb/model`": true,`n" +
-         "`t`"GET /agent`": true,`n" +
-         "`t`"PUT /agent`": true,`n" +
-         "`t`"GET /agent/persona/{name}`": true,`n" +
-         "`t`"PUT /agent/persona/{name}`": true,`n" +
-         "`t`"PUT /kb/model`": true," },
   # Nut ve trang chu trong rail Zalo: goi ban khong co portal dieu phoi agent.
   @{ f = 'internal\webui\static\zalo.html'
      a = 'title="Về portal điều phối agent"'
