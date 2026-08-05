@@ -216,4 +216,35 @@ function Apply-AppSeams {
   [IO.File]::WriteAllText($zaloPath, $zaloUpdated, $utf8NoBom)
 }
 
-Export-ModuleMember -Function Resolve-BuildPaths, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams
+function Assert-AppPackage {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Out,
+    [switch]$AllowZaloCredentials
+  )
+
+  $outPath = [IO.Path]::GetFullPath($Out)
+  $required = @(
+    'app\agentdc.exe'
+    'app\transport\dist\index.js'
+    'app\node\node.exe'
+    'Start.vbs'
+    'Stop.bat'
+    'README.txt'
+    'brain\wiki\index.md'
+  )
+  foreach ($relative in $required) {
+    if (-not (Test-Path -LiteralPath (Join-Path $outPath $relative) -PathType Leaf)) {
+      throw "package missing $relative"
+    }
+  }
+
+  $credentials = Join-Path $outPath 'data\zalo\credentials.json'
+  if (-not $AllowZaloCredentials -and (Test-Path -LiteralPath $credentials -PathType Leaf)) {
+    throw 'package contains Zalo credentials'
+  }
+
+  return $outPath
+}
+
+Export-ModuleMember -Function Resolve-BuildPaths, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams, Assert-AppPackage

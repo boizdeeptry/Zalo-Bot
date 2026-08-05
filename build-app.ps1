@@ -36,6 +36,45 @@ param(
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'scripts\BuildApp.psm1') -Force
+
+function Resolve-BuildTool {
+  param(
+    [Parameter(Mandatory)][string]$Name,
+    [string[]]$Candidates = @()
+  )
+
+  $command = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if ($command) { return $command.Source }
+  foreach ($candidate in $Candidates) {
+    if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+      return [IO.Path]::GetFullPath($candidate)
+    }
+  }
+  throw "không tìm thấy công cụ build '$Name'"
+}
+
+function Invoke-AppCommand {
+  param(
+    [Parameter(Mandatory)][string]$Label,
+    [Parameter(Mandatory)][string]$FilePath,
+    [Parameter(Mandatory)][string[]]$Arguments,
+    [Parameter(Mandatory)][string]$WorkingDirectory
+  )
+
+  Write-Host ("      > {0} {1}" -f $Label, ($Arguments -join ' '))
+  Push-Location -LiteralPath $WorkingDirectory
+  try {
+    & $FilePath @Arguments
+    $commandExitCode = $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
+  if ($commandExitCode -ne 0) {
+    throw "$Label thất bại (exit $commandExitCode)"
+  }
+}
+
 $paths = Resolve-BuildPaths -Repo $Repo -Out $Out
 $Repo = $paths.Repo
 $Out = $paths.Out
@@ -51,10 +90,16 @@ Write-Host "goi  : $Out"
 Write-Host "tam  : $Tmp"
 Write-Host ''
 
+$phase = 'khởi tạo stage'
+$buildComplete = $false
+
+try {
+
 # ---------------------------------------------------------------- 1. ban tam
 # Chi copy tep git theo doi. Bo node_modules (32 MB, dung lai ban co san), bo
 # .git, bo moi thu khong commit -- ban ban phai dung tu nguon da biet.
-Write-Host '[1/6] copy repo sang thu muc tam'
+Write-Host '[1/7] copy repo sang thu muc tam'
+$phase = 'stage source và overlay'
 $sourceStatusBefore = (& git -C $Repo --no-optional-locks status --short) -join "`n"
 if ($LASTEXITCODE -ne 0) { throw "không đọc được Git status của '$Repo'" }
 $overlay = Join-Path $PSScriptRoot 'appmode\overlay'
@@ -76,7 +121,7 @@ Write-Host ("      {0} tep" -f $fileCount)
 # van la mot so luong cong mot thong so doc duoc tren vo -- do la thu vi du do
 # day (cu the du de khach biet bot da mo anh ra). Bo nhan hang khong lam no bot
 # cu the.
-Write-Host '[2/6] lam sach ban tam'
+Write-Host '[2/7] lam sach ban tam'
 $subs = @(
   @{ f = 'internal\daemon\duty.go'
      a = 'hoá đơn 2 hộp MenaQ7 180mcg'
@@ -143,22 +188,56 @@ foreach ($s in $subs) {
 }
 Write-Host ("      {0} chuoi da thay" -f $subs.Count)
 
-# ------------------------------------------------------------------ 3. build
-Write-Host '[3/6] build binary va transport tu ban tam'
-Push-Location -LiteralPath $Tmp
-& go build -o (Join-Path $Tmp 'agentdc.exe') ./cmd/agentdc
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw 'go build that bai' }
-Pop-Location
+# ------------------------------------------------------------- 3. checkpoint
+Write-Host '[3/7] kiem thu checkpoint truoc khi build'
+$phase = 'checkpoint tests'
+$programFiles = [Environment]::GetFolderPath('ProgramFiles')
+$goCandidates = if ($programFiles) { @(Join-Path $programFiles 'Go\bin\go.exe') } else { @() }
+$goExe = Resolve-BuildTool -Name 'go' -Candidates $goCandidates
+$npmExe = Resolve-BuildTool -Name 'npm'
 
-# node_modules dung lai ban trong repo: `npm ci` can mang, va tsc chi can kieu.
-Push-Location -LiteralPath (Join-Path $Tmp 'tuvan-zalo')
-New-Item -ItemType Junction -Path 'node_modules' -Target (Join-Path $Repo 'tuvan-zalo\node_modules') -EA SilentlyContinue | Out-Null
-& npx tsc
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw 'tsc that bai' }
-Pop-Location
+# node_modules dùng lại bản đã khoá dependency trong repo nguồn. Chỉ tạo junction trong stage;
+# repo nguồn vẫn chỉ đọc và status được kiểm lại ngay sau staging ở trên.
+$transportStage = Join-Path $Tmp 'tuvan-zalo'
+$sourceNodeModules = Join-Path $Repo 'tuvan-zalo\node_modules'
+if (-not (Test-Path -LiteralPath $sourceNodeModules -PathType Container)) {
+  throw "thiếu dependencies Zalo ở '$sourceNodeModules'; chạy yarn install trong repo nguồn"
+}
+New-Item -ItemType Junction -Path (Join-Path $transportStage 'node_modules') `
+  -Target $sourceNodeModules -ErrorAction Stop | Out-Null
 
-# ----------------------------------------------------------- 4. lap thu muc
-Write-Host '[4/6] lap thu muc goi'
+$skipTests = @(
+  'TestAppJSKnowsTheSessionEndedCloseReason'
+  'TestAppJSSendsThePortalMutationHeader'
+  'TestPortalReloadedKeyWithLiveSessionReachesTheShell'
+  'TestPortalRootServesTheShellWithACookie'
+  'TestPortalUsesModalNotBrowserDialogs'
+  'TestAgentPortalNoLongerCarriesZalo'
+  'TestModalCallsPassAnObject'
+) -join '|'
+
+Invoke-AppCommand -Label 'go test' -FilePath $goExe `
+  -Arguments @('test', '-skip', $skipTests, './...') -WorkingDirectory $Tmp
+Invoke-AppCommand -Label 'Portal test' -FilePath $npmExe `
+  -Arguments @('--prefix', (Join-Path $PSScriptRoot 'appmode'), 'test') -WorkingDirectory $PSScriptRoot
+Invoke-AppCommand -Label 'Zalo test compile' -FilePath $npmExe `
+  -Arguments @('--prefix', $transportStage, 'run', 'build') -WorkingDirectory $Tmp
+Invoke-AppCommand -Label 'Zalo test' -FilePath $npmExe `
+  -Arguments @('--prefix', $transportStage, 'test') -WorkingDirectory $Tmp
+Invoke-AppCommand -Label 'Zalo typecheck' -FilePath $npmExe `
+  -Arguments @('--prefix', $transportStage, 'run', 'typecheck') -WorkingDirectory $Tmp
+
+# ------------------------------------------------------------------ 4. build
+Write-Host '[4/7] build binary va transport tu ban tam'
+$phase = 'build binary và transport'
+Invoke-AppCommand -Label 'go build' -FilePath $goExe `
+  -Arguments @('build', '-o', (Join-Path $Tmp 'agentdc.exe'), './cmd/agentdc') -WorkingDirectory $Tmp
+Invoke-AppCommand -Label 'Zalo build' -FilePath $npmExe `
+  -Arguments @('--prefix', $transportStage, 'run', 'build') -WorkingDirectory $Tmp
+
+# ----------------------------------------------------------- 5. lap thu muc
+Write-Host '[5/7] lap thu muc goi'
+$phase = 'lắp thư mục gói'
 if (Test-Path -LiteralPath $Out) {
   if ($KeepData) {
     Write-Host '      -KeepData: giu data\ (CHI de thu, khong de ban)' -ForegroundColor Yellow
@@ -206,16 +285,17 @@ Copy-Item -LiteralPath (Join-Path $Tmp 'tuvan-zalo\dist') -Destination (Join-Pat
 Copy-Item -LiteralPath (Join-Path $Tmp 'tuvan-zalo\package.json') -Destination (Join-Path $Out 'app\transport') -Force
 Copy-Item -LiteralPath (Join-Path $Repo 'tuvan-zalo\node_modules') -Destination (Join-Path $Out 'app\transport') -Recurse -Force
 # Tia dev deps TRONG GOI, khong trong repo: repo con can typescript de build.
-Push-Location -LiteralPath (Join-Path $Out 'app\transport')
-& npm prune --omit=dev --silent 2>&1 | Out-Null
-Pop-Location
+Invoke-AppCommand -Label 'npm prune' -FilePath $npmExe `
+  -Arguments @('--prefix', (Join-Path $Out 'app\transport'), 'prune', '--omit=dev', '--silent') `
+  -WorkingDirectory $Out
 
 # node.exe di kem: mot tep, chay don le duoc, khong can trinh cai dat Node.
 $node = (Get-Command node).Source
 Copy-Item -LiteralPath $node -Destination (Join-Path $Out 'app\node') -Force
 
-# ------------------------------------------------------- 5. persona chung hoa
-Write-Host '[5/6] persona: thay danh tinh bang cho trong'
+# ------------------------------------------------------- 6. persona chung hoa
+Write-Host '[6/7] persona: thay danh tinh bang cho trong'
+$phase = 'chuẩn hoá persona và launcher'
 $pSrc = $PersonaSource
 # Ten tep ASCII co chu dich: .bat doc theo codepage OEM chu khong UTF-8, nen mot
 # duong dan tieng Viet trong Chay.bat se bien dang va daemon khong doc duoc.
@@ -234,13 +314,9 @@ Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'launcher') -Force | ForEach
   Copy-Item -LiteralPath $_.FullName -Destination $Out -Recurse -Force
 }
 
-# --------------------------------------------------------------- 6. don + do
-Write-Host '[6/6] don thu muc tam va kiem'
-if ($KeepStage) {
-  Write-Host ("      giữ stage để kiểm tra: {0}" -f $Tmp)
-} else {
-  Remove-Item -LiteralPath $Tmp -Recurse -Force -EA SilentlyContinue
-}
+# --------------------------------------------------------------- 7. do goi
+Write-Host '[7/7] kiem tra goi va nguon'
+$phase = 'package gates'
 
 # Quet lai. Day la cua chan cuoi: mot chuoi sot lai o day la mot chuoi da ban ra.
 $pat = 'MIDU|MenaQ7|boizdeeptry|Anh Trường|Bé Mi'
@@ -260,7 +336,7 @@ if (Test-Path -LiteralPath $cred) {
   if ($KeepData) {
     # CANH BAO, khong chan. -KeepData ton tai de giu phien qua nhieu lan build khi dang thu, va
     # neu cua chan chan ca truong hop nay thi co do vo dung -- do la loi cua BAN DAU: no bao
-    # exit 1 ngay sau khi vua khuyen dung -KeepData.
+    # chặn ngay sau khi vừa khuyên dùng -KeepData.
     Write-Host 'CANH BAO: goi dang chua PHIEN ZALO cua may nay (vi -KeepData).' -ForegroundColor Yellow
     Write-Host ('  ' + $cred) -ForegroundColor Yellow
     Write-Host '  Ban nay CHI de thu. Build lai KHONG kem -KeepData truoc khi nen de ban.'
@@ -270,7 +346,7 @@ if (Test-Path -LiteralPath $cred) {
     Write-Host 'DUNG LAI: goi con chua PHIEN ZALO cua may nay.' -ForegroundColor Red
     Write-Host ('  ' + $cred) -ForegroundColor Red
     Write-Host '  Ai doc duoc tep do thi vao duoc tai khoan Zalo do. KHONG duoc nen thu muc nay de ban.'
-    exit 1
+    throw 'package contains Zalo credentials'
   }
 }
 if ($hits) {
@@ -280,9 +356,30 @@ if ($hits) {
 if ($binHits -gt 0) { Write-Host ("CON {0} CHUOI TRONG agentdc.exe" -f $binHits) -ForegroundColor Red }
 if ($hits -or $binHits -gt 0) {
   Write-Host '  KHONG duoc nen thu muc nay de ban.' -ForegroundColor Red
-  exit 1
+  throw 'package contains customer identity strings'
 }
 Write-Host 'sach: khong con dau khach hang nao' -ForegroundColor Green
 
+Assert-AppPackage -Out $Out -AllowZaloCredentials:$KeepData | Out-Null
+$sourceStatusFinal = (& git -C $Repo --no-optional-locks status --short) -join "`n"
+if ($LASTEXITCODE -ne 0) { throw "không đọc được Git status cuối của '$Repo'" }
+if ($sourceStatusFinal -cne $sourceStatusBefore) {
+  throw "repo nguồn đã thay đổi trong lúc checkpoint: '$Repo'"
+}
+
 $f = Get-ChildItem -LiteralPath $Out -Recurse -File
 Write-Host ('goi: {0} tep, {1:N1} MB  ->  {2}' -f $f.Count, (($f | Measure-Object Length -Sum).Sum / 1MB), $Out)
+$buildComplete = $true
+} catch {
+  Write-Host ("THẤT BẠI ở phase '{0}': {1}" -f $phase, $_.Exception.Message) -ForegroundColor Red
+  if (Test-Path -LiteralPath $Tmp) {
+    Write-Host ("stage được giữ để kiểm tra: {0}" -f $Tmp) -ForegroundColor Yellow
+  }
+  throw
+} finally {
+  if ($buildComplete -and -not $KeepStage -and (Test-Path -LiteralPath $Tmp)) {
+    Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction Stop
+  } elseif ($buildComplete -and $KeepStage -and (Test-Path -LiteralPath $Tmp)) {
+    Write-Host ("giữ stage theo -KeepStage: {0}" -f $Tmp)
+  }
+}

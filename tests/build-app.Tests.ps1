@@ -133,6 +133,32 @@ try {
   }
 }
 
+$packageRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-package-' + [guid]::NewGuid().ToString('N'))
+
+try {
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'package missing' -Message 'An incomplete package was accepted'
+
+  $required = @(
+    'app\agentdc.exe', 'app\transport\dist\index.js', 'app\node\node.exe',
+    'Start.vbs', 'Stop.bat', 'README.txt', 'brain\wiki\index.md'
+  )
+  foreach ($relative in $required) {
+    Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
+  }
+  Assert-AppPackage -Out $packageRoot | Out-Null
+
+  Write-TestFile (Join-Path $packageRoot 'data\zalo\credentials.json') "secret`n"
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'Zalo credentials' -Message 'A package containing Zalo credentials was accepted'
+
+  Write-Host 'PASS: Assert-AppPackage requires runtime files and rejects credentials.'
+} finally {
+  if (Test-Path -LiteralPath $packageRoot) {
+    Remove-Item -LiteralPath $packageRoot -Recurse -Force
+  }
+}
+
 $stageTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-stage-' + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -250,6 +276,11 @@ func incoming() {
   }
   if ($orchestrator -match 'mux\.Handle\(`"GET /kb') {
     throw 'Legacy direct route substitution remains in build orchestration'
+  }
+
+  $launcher = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\launcher\app\run.bat'))
+  if ($launcher -notmatch 'http://127\.0\.0\.1:8770/"' -or $launcher -match '8770/zalo') {
+    throw 'Launcher does not open the management Portal at /'
   }
 
   Write-Host 'PASS: staging copies tracked files and applies three guarded seams.'
