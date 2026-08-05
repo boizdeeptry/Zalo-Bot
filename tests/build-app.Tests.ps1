@@ -33,6 +33,16 @@ function Assert-ThrowsLike {
   throw "$Message. Expected an error matching '$Pattern'."
 }
 
+function Write-TestFile {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Content
+  )
+
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
+  [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('portal-path-' + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -56,9 +66,69 @@ try {
   Assert-ThrowsLike -Action { Resolve-BuildPaths -Repo $nestedRepo -Out $nestedRepo } `
     -Pattern 'output' -Message 'Using the repo itself as output was accepted'
 
+  $outInsideRepo = Join-Path $nestedRepo 'dist'
+  Assert-ThrowsLike -Action { Resolve-BuildPaths -Repo $nestedRepo -Out $outInsideRepo } `
+    -Pattern 'output' -Message 'An output directory inside the source repo was accepted'
+
   Write-Host 'PASS: Resolve-BuildPaths normalizes and protects build paths.'
 } finally {
   if (Test-Path -LiteralPath $root) {
     Remove-Item -LiteralPath $root -Recurse -Force
+  }
+}
+
+$clearRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-clear-' + [guid]::NewGuid().ToString('N'))
+
+try {
+  $outWithWildcard = Join-Path $clearRoot 'Gói [ab]'
+  $matchingSibling = Join-Path $clearRoot 'Gói a'
+  Write-TestFile (Join-Path $outWithWildcard 'remove.txt') "remove`n"
+  Write-TestFile (Join-Path $matchingSibling 'keep.txt') "keep`n"
+
+  Clear-AppOutput -Out $outWithWildcard
+  if (Test-Path -LiteralPath (Join-Path $outWithWildcard 'remove.txt')) {
+    throw 'Exact output contents were not removed'
+  }
+  if (-not (Test-Path -LiteralPath (Join-Path $matchingSibling 'keep.txt'))) {
+    throw 'Wildcard output path removed a matching sibling directory'
+  }
+
+  Write-TestFile (Join-Path $outWithWildcard 'data\keep.txt') "keep data`n"
+  Write-TestFile (Join-Path $outWithWildcard 'app\remove.txt') "remove app`n"
+  Clear-AppOutput -Out $outWithWildcard -KeepData
+  if (-not (Test-Path -LiteralPath (Join-Path $outWithWildcard 'data\keep.txt'))) {
+    throw 'KeepData removed the output data directory'
+  }
+  if (Test-Path -LiteralPath (Join-Path $outWithWildcard 'app')) {
+    throw 'KeepData preserved a non-data output directory'
+  }
+
+  Write-Host 'PASS: Clear-AppOutput treats wildcard characters literally.'
+} finally {
+  if (Test-Path -LiteralPath $clearRoot) {
+    Remove-Item -LiteralPath $clearRoot -Recurse -Force
+  }
+}
+
+$personaRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-persona-' + [guid]::NewGuid().ToString('N'))
+
+try {
+  $personaSource = Join-Path $personaRoot 'Nguồn persona'
+  $personaFile = Join-Path $personaSource 'Cẩm nang boizdeeptry v2.md'
+  $rosterFile = Join-Path $personaSource 'Sổ tay nhận diện thành viên.md'
+  Write-TestFile $personaFile "persona`n"
+  Write-TestFile $rosterFile "roster`n"
+
+  $resolvedPersona = Resolve-PersonaSource -PersonaSource $personaSource
+  Assert-Equal $resolvedPersona ([IO.Path]::GetFullPath($personaSource)) 'Persona source was not normalized'
+
+  Remove-Item -LiteralPath $rosterFile -Force
+  Assert-ThrowsLike -Action { Resolve-PersonaSource -PersonaSource $personaSource } `
+    -Pattern 'persona' -Message 'An incomplete persona source was accepted'
+
+  Write-Host 'PASS: Resolve-PersonaSource validates explicit persona input.'
+} finally {
+  if (Test-Path -LiteralPath $personaRoot) {
+    Remove-Item -LiteralPath $personaRoot -Recurse -Force
   }
 }
