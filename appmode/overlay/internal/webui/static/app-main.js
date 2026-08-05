@@ -1,5 +1,5 @@
 import { NAVIGATION, ROUTES, createRouteHost, routeFromHash } from "./core/router.js";
-import { renderNavigation } from "./core/shell.js";
+import { createRailNavigation, renderNavigation } from "./core/shell.js";
 import { errorPanel } from "./core/ui.js";
 
 const implementedPages = Object.freeze({
@@ -81,6 +81,9 @@ export function startPortal({
 } = {}) {
   const nav = documentRef.querySelector("[data-portal-nav]");
   const content = documentRef.querySelector("[data-portal-content]");
+  const toggle = documentRef.querySelector("#rail-toggle");
+  const rail = documentRef.querySelector("#rail");
+  const railController = createRailNavigation({ toggle, rail, navigation: nav });
   const controller = createPortalController({
     nav,
     content,
@@ -97,6 +100,7 @@ export function startPortal({
     stopped = true;
     windowRef.removeEventListener("hashchange", onHashChange);
     windowRef.removeEventListener("beforeunload", onBeforeUnload);
+    railController.dispose();
     controller.dispose();
   }
 

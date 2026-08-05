@@ -1,4 +1,4 @@
-import { element } from "./ui.js";
+import { createRailDisclosure, element } from "./ui.js";
 
 function navigationItem(item, activeId) {
   const selected = item.id === activeId;
@@ -36,4 +36,34 @@ export function renderNavigation({ container, groups, activeId }) {
     for (const item of group.items) fragment.append(navigationItem(item, activeId));
   }
   container.replaceChildren(fragment);
+}
+
+export function createRailNavigation({ toggle, rail, navigation } = {}) {
+  if (!navigation || typeof navigation.addEventListener !== "function") {
+    throw new TypeError("Rail navigation requires a navigation element");
+  }
+
+  const disclosure = createRailDisclosure({ toggle, rail });
+  const onNavigationClick = (event) => {
+    let node = event.target;
+    while (node) {
+      const routeId = node.getAttribute?.("data-route");
+      const href = node.getAttribute?.("href");
+      if (routeId && (!href || href.startsWith("#"))) {
+        disclosure.close();
+        return;
+      }
+      if (node === navigation) return;
+      node = node.parentElement ?? node.parentNode;
+    }
+  };
+
+  navigation.addEventListener("click", onNavigationClick);
+
+  function dispose() {
+    navigation.removeEventListener("click", onNavigationClick);
+    disclosure.dispose();
+  }
+
+  return Object.freeze({ dispose });
 }

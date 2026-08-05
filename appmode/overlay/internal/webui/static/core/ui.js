@@ -55,3 +55,31 @@ export function errorPanel(error) {
     body: message,
   });
 }
+
+export function createRailDisclosure({ toggle, rail } = {}) {
+  if (!toggle || !rail) {
+    throw new TypeError("Rail disclosure requires toggle and rail elements");
+  }
+
+  let open = false;
+  const setOpen = (nextOpen) => {
+    open = Boolean(nextOpen);
+    toggle.setAttribute("aria-expanded", String(open));
+    rail.classList.toggle("is-open", open);
+  };
+  const onToggle = () => setOpen(!open);
+
+  setOpen(false);
+  toggle.addEventListener("click", onToggle);
+
+  function close() {
+    setOpen(false);
+  }
+
+  function dispose() {
+    toggle.removeEventListener("click", onToggle);
+    close();
+  }
+
+  return Object.freeze({ close, dispose });
+}

@@ -1,4 +1,12 @@
-.portal-body { margin:0; display:flex; min-height:100vh; }
+.portal-body {
+  --panel: var(--surface);
+  --sunk: var(--surface-soft);
+  --line: var(--border);
+  --ink: var(--text);
+  --dim: var(--muted);
+  --live: var(--accent);
+  margin:0; display:flex; min-height:100vh;
+}
 
 .portal-body a { color:inherit; }
 .portal-body button,
@@ -148,4 +156,25 @@
   border:1px solid var(--line); border-radius:8px; padding:9px 12px;
   max-height:268px; overflow-y:auto; white-space:pre-wrap; word-break:break-word;
   background:var(--sunk); color:var(--dim);
+}
+
+@media (max-width: 720px) {
+  .portal-body { display:block; }
+  #rail-toggle {
+    display:block; position:sticky; top:0; z-index:40; width:100%; padding:10px 14px;
+    border:0; border-bottom:1px solid var(--line); background:var(--panel); color:var(--ink);
+    text-align:left; font:inherit;
+  }
+  #rail {
+    display:none; width:100%; height:auto; max-height:70vh; border-right:0;
+    border-bottom:1px solid var(--line);
+  }
+  #rail.is-open { display:flex; }
+  #main { padding:18px 16px 40px; overflow:visible; }
+  .cards,
+  .cols { display:grid; grid-template-columns:1fr; }
+  [data-agents-overlay].sheetback { padding:12px; }
+  [data-agents-overlay] .sheet {
+    width:100%; height:auto; max-height:calc(100vh - 24px); border-radius:8px;
+  }
 }

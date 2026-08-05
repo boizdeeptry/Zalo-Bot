@@ -62,6 +62,15 @@ test("desktop shell loads isolated Portal CSS with the legacy rail dimensions", 
   assert.match(index, /href="\/assets\/portal\.css"/);
   assert.match(index, /id="rail"/);
   assert.match(index, /id="main"/);
+  assert.match(css, /\.portal-body\s*\{[^}]*--panel:\s*var\(--surface\)/s);
+  assert.match(css, /\.portal-body\s*\{[^}]*--sunk:\s*var\(--surface-soft\)/s);
+  assert.match(css, /\.portal-body\s*\{[^}]*--line:\s*var\(--border\)/s);
+  assert.match(css, /\.portal-body\s*\{[^}]*--ink:\s*var\(--text\)/s);
+  assert.match(css, /\.portal-body\s*\{[^}]*--dim:\s*var\(--muted\)/s);
+  assert.match(css, /\.portal-body\s*\{[^}]*--live:\s*var\(--accent\)/s);
   assert.match(css, /#rail\s*\{[^}]*width:\s*208px/s);
   assert.match(css, /#main\s*\{[^}]*padding:\s*22px 26px/s);
+  assert.match(css, /@media\s*\(max-width:\s*720px\)/);
+  assert.match(css, /#rail\.is-open\s*\{/);
+  assert.match(css, /#rail-toggle\s*\{/);
 });
