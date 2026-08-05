@@ -60,8 +60,8 @@ function Resolve-PersonaSource {
 
   $sourcePath = [IO.Path]::GetFullPath($PersonaSource)
   $required = @(
-    'Cẩm nang boizdeeptry v2.md'
-    'Sổ tay nhận diện thành viên.md'
+    'persona.md'
+    'roster.md'
   )
   foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $sourcePath $name) -PathType Leaf)) {
@@ -152,6 +152,18 @@ function Replace-ExactlyOnce {
   return $Text.Replace($Needle, $Replacement)
 }
 
+function Assert-SignatureAbsent {
+  param(
+    [Parameter(Mandatory)][string]$Text,
+    [Parameter(Mandatory)][string]$Signature,
+    [Parameter(Mandatory)][string]$Label
+  )
+
+  if ($Text.IndexOf($Signature, [StringComparison]::Ordinal) -ge 0) {
+    throw "$Label`: inserted signature already present"
+  }
+}
+
 function Apply-AppSeams {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$Stage)
@@ -167,6 +179,10 @@ function Apply-AppSeams {
   $serverNewline = if ($server.Contains("`r`n")) { "`r`n" } else { "`n" }
   $storeNewline = if ($store.Contains("`r`n")) { "`r`n" } else { "`n" }
   $zaloNewline = if ($zalo.Contains("`r`n")) { "`r`n" } else { "`n" }
+
+  Assert-SignatureAbsent -Text $server -Signature 'a.registerAppRoutes(mux)' -Label 'route seam'
+  Assert-SignatureAbsent -Text $store -Signature 'migrateApp(db)' -Label 'migration seam'
+  Assert-SignatureAbsent -Text $zalo -Signature 'evaluateAppWorkflow(req, msg)' -Label 'workflow seam'
 
   $routeNeedle = "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))"
   $serverUpdated = Replace-ExactlyOnce -Text $server -Needle $routeNeedle `

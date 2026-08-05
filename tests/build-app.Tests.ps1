@@ -114,8 +114,8 @@ $personaRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-persona-' + [guid]:
 
 try {
   $personaSource = Join-Path $personaRoot 'Nguồn persona'
-  $personaFile = Join-Path $personaSource 'Cẩm nang boizdeeptry v2.md'
-  $rosterFile = Join-Path $personaSource 'Sổ tay nhận diện thành viên.md'
+  $personaFile = Join-Path $personaSource 'persona.md'
+  $rosterFile = Join-Path $personaSource 'roster.md'
   Write-TestFile $personaFile "persona`n"
   Write-TestFile $rosterFile "roster`n"
 
@@ -198,6 +198,11 @@ func incoming() {
   if ([regex]::Matches($stagedServer, 'a\.registerAppRoutes\(mux\)').Count -ne 1) { throw 'Route seam was not applied exactly once' }
   if ([regex]::Matches($stagedStore, 'migrateApp\(db\)').Count -ne 1) { throw 'Migration seam was not applied exactly once' }
   if ([regex]::Matches($stagedZalo, 'evaluateAppWorkflow\(req, msg\)').Count -ne 1) { throw 'Workflow seam was not applied exactly once' }
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $gotStage } `
+    -Pattern 'route seam: inserted signature already present' -Message 'Applying seams twice was accepted'
+  if ([regex]::Matches([IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\server.go')), 'a\.registerAppRoutes\(mux\)').Count -ne 1) {
+    throw 'A repeated seam application duplicated the route call'
+  }
 
   $sourceServer = [IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\server.go'))
   if ($sourceServer -match 'registerAppRoutes') { throw 'Source repo was changed by staging' }

@@ -230,8 +230,8 @@ $pSrc = $PersonaSource
 # reference\ la thu muc bo xuong danh cho thu NGUOI doc chu khong phai bot trich
 # dan. Persona phai o ngoai moi goc KB (wiki, raw) -- mot tep trong goc KB thi
 # bot trich dan duoc no, va van phong khong phai can cu.
-Copy-Item -LiteralPath (Join-Path $pSrc 'Cẩm nang boizdeeptry v2.md') -Destination (Join-Path $Out 'brain\reference\persona\persona.md') -Force
-Copy-Item -LiteralPath (Join-Path $pSrc 'Sổ tay nhận diện thành viên.md') -Destination (Join-Path $Out 'brain\reference\persona\roster.md') -Force
+Copy-Item -LiteralPath (Join-Path $pSrc 'persona.md') -Destination (Join-Path $Out 'brain\reference\persona\persona.md') -Force
+Copy-Item -LiteralPath (Join-Path $pSrc 'roster.md') -Destination (Join-Path $Out 'brain\reference\persona\roster.md') -Force
 Copy-Item -LiteralPath (Join-Path $pSrc 'overlay\README.md') -Destination (Join-Path $Out 'brain\reference\persona\overlay') -Force -EA SilentlyContinue
 & python (Join-Path $PSScriptRoot 'genpersona.py') $Out
 if ($LASTEXITCODE -ne 0) { throw 'genpersona that bai' }
@@ -243,7 +243,11 @@ Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'launcher') -Force | ForEach
 
 # --------------------------------------------------------------- 6. don + do
 Write-Host '[6/6] don thu muc tam va kiem'
-Remove-Item -LiteralPath $Tmp -Recurse -Force -EA SilentlyContinue
+if ($KeepStage) {
+  Write-Host ("      giữ stage để kiểm tra: {0}" -f $Tmp)
+} else {
+  Remove-Item -LiteralPath $Tmp -Recurse -Force -EA SilentlyContinue
+}
 
 # Quet lai. Day la cua chan cuoi: mot chuoi sot lai o day la mot chuoi da ban ra.
 $pat = 'MIDU|MenaQ7|boizdeeptry|Anh Trường|Bé Mi'
