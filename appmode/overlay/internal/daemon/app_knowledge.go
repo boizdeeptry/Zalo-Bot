@@ -2,9 +2,8 @@ package daemon
 
 // Knowledge: upload tệp nguồn rồi để agent biên soạn thành trang wiki.
 //
-// TỆP NÀY CHỈ CÓ TRONG BẢN ĐÓNG GÓI. Nó không nằm trong repo — build-app.ps1 copy nó vào bản
-// tạm rồi build ở đó. Lý do: bản dev đang chạy thật, và một endpoint nhận tệp cộng một endpoint
-// chạy agent có quyền GHI là hai thứ không nên xuất hiện ở đó mà không ai yêu cầu.
+// Tệp này chỉ được chèn vào bản đóng gói qua appmode/overlay. Bản upstream không nhận endpoint
+// tải tệp hay agent có quyền ghi khi người vận hành chưa chủ động chọn App mode.
 //
 // Hai tầng của brain, và cả tính năng này chỉ để đi từ tầng một sang tầng hai:
 //
@@ -56,7 +55,7 @@ var uploadExt = map[string]bool{
 // maxUploadBytes chặn kích cỡ một tệp. Cả request bị chặn ở maxUploadTotal.
 const (
 	maxUploadBytes = 50 << 20
-	maxUploadTotal = 200 << 20
+	maxUploadTotal = 64 << 20
 )
 
 // ingestTimeout: biên soạn nhiều tệp là việc dài. 20 phút là trần, không phải kỳ vọng.
@@ -271,6 +270,7 @@ func (a *api) handleKBUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var saved, skipped []string
+	duplicateCount := 0
 	for _, fh := range files {
 		name := filepath.Base(strings.TrimSpace(fh.Filename))
 		if !safeSendName(name) {
@@ -287,6 +287,7 @@ func (a *api) handleKBUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := saveMultipart(fh, filepath.Join(rawDir, name)); err != nil {
 			if os.IsExist(err) {
+				duplicateCount++
 				skipped = append(skipped, name+" (đã có trong raw\\)")
 				continue
 			}
@@ -299,7 +300,11 @@ func (a *api) handleKBUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	code := http.StatusOK
 	if len(saved) == 0 {
-		code = http.StatusBadRequest
+		if duplicateCount == len(files) {
+			code = http.StatusConflict
+		} else {
+			code = http.StatusBadRequest
+		}
 	}
 	a.writeJSON(w, code, map[string]any{"saved": saved, "skipped": skipped})
 }

@@ -601,6 +601,198 @@ code {
   border: 0;
 }
 
+.metric-grid,
+.source-columns,
+.model-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 11px;
+}
+
+.metric-card {
+  display: grid;
+  gap: 3px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.metric-card strong {
+  font-size: 26px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.metric-card span,
+.action-status,
+.upload-zone p,
+.model-card__description,
+.model-card__tag {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.upload-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 116px;
+  padding: 20px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  transition: 120ms ease;
+  transition-property: border-color, background-color;
+}
+
+.upload-zone.is-dragging {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.upload-zone h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.upload-zone p {
+  margin: 4px 0 0;
+}
+
+.knowledge-actions {
+  margin-top: 13px;
+}
+
+.action-status {
+  margin-top: 12px;
+}
+
+.action-status:empty {
+  display: none;
+}
+
+.action-status .status-panel {
+  max-width: none;
+}
+
+.ingest-steps {
+  max-height: 270px;
+  margin: 14px 0 0;
+  padding: 14px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #080b10;
+  color: #c8d3df;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.source-column {
+  min-width: 0;
+  padding: 17px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.source-column h2 {
+  margin: 0 0 12px;
+  font-size: 13px;
+}
+
+.file-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.file-list li {
+  min-width: 0;
+  padding: 7px 9px;
+  overflow-wrap: anywhere;
+  border-radius: 7px;
+  background: var(--surface-raised);
+  color: var(--muted);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.file-list .file-list__empty {
+  background: transparent;
+  color: var(--quiet);
+  font-family: inherit;
+}
+
+.model-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.model-card {
+  display: grid;
+  min-height: 168px;
+  padding: 17px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: 120ms ease;
+  transition-property: border-color, background-color, transform;
+}
+
+.model-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+  background: var(--surface-raised);
+}
+
+.model-card.is-selected {
+  border-color: rgba(85, 214, 139, 0.55);
+  background: var(--accent-soft);
+}
+
+.model-card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.model-card__top strong {
+  font-size: 15px;
+}
+
+.active-badge {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(85, 214, 139, 0.16);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.model-card__description {
+  align-self: center;
+  line-height: 1.55;
+}
+
+.model-card__tag {
+  align-self: end;
+  color: var(--quiet);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
 @media (max-width: 760px) {
   .portal-shell {
     grid-template-columns: 1fr;
@@ -637,7 +829,8 @@ code {
   }
 
   .quick-fill-form,
-  .document-grid {
+  .document-grid,
+  .model-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -658,6 +851,16 @@ code {
 
   .detail-grid {
     grid-template-columns: 1fr;
+  }
+
+  .metric-grid,
+  .source-columns {
+    grid-template-columns: 1fr;
+  }
+
+  .upload-zone {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .document-card,

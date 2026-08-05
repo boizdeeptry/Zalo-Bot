@@ -20,20 +20,14 @@ const pageDefinitions = Object.freeze({
   },
   knowledge: {
     load: async () => {
-      const { createFoundationPage } = await import("./pages/overview.js");
-      return createFoundationPage({
-        title: "Tri thức",
-        description: "Quản lý tài liệu nguồn và theo dõi quá trình đưa chúng vào kho tri thức.",
-      });
+      const page = await import("./pages/knowledge.js");
+      return { mount: page.mount };
     },
   },
   models: {
     load: async () => {
-      const { createFoundationPage } = await import("./pages/overview.js");
-      return createFoundationPage({
-        title: "Mô hình",
-        description: "Chọn mô hình phù hợp với tốc độ, chi phí và độ sâu của công việc.",
-      });
+      const page = await import("./pages/models.js");
+      return { mount: page.mount };
     },
   },
 });
