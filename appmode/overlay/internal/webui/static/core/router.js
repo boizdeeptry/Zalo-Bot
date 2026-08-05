@@ -33,7 +33,7 @@ export function createRouteHost(container) {
   let disposeCurrent = () => {};
 
   return Object.freeze({
-    async mount(page, context = {}) {
+    mount(page, context = {}) {
       if (!page || typeof page.mount !== "function") {
         throw new TypeError("Route page must expose mount(container, context)");
       }
@@ -41,7 +41,11 @@ export function createRouteHost(container) {
       disposeCurrent();
       disposeCurrent = () => {};
       container.replaceChildren();
-      disposeCurrent = disposerFrom(await page.mount(container, context));
+      const result = page.mount(container, context);
+      if (result && typeof result.then === "function") {
+        throw new TypeError("Route page mount must return its disposer synchronously");
+      }
+      disposeCurrent = disposerFrom(result);
     },
 
     dispose() {

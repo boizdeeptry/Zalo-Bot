@@ -48,3 +48,38 @@ test("structured API failures become AppAPIError values", async () => {
     },
   );
 });
+
+test("malformed JSON failures still become AppAPIError values", async () => {
+  const fetchImpl = async () => new Response("{broken", {
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  await assert.rejects(
+    requestJSON("/agent", { fetchImpl }),
+    (error) => {
+      assert.equal(error instanceof AppAPIError, true);
+      assert.equal(error.code, "HTTP_502");
+      assert.equal(error.status, 502);
+      return true;
+    },
+  );
+});
+
+test("malformed JSON success is rejected as an invalid response", async () => {
+  const fetchImpl = async () => new Response("{broken", {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  await assert.rejects(
+    requestJSON("/agent", { fetchImpl }),
+    (error) => {
+      assert.equal(error instanceof AppAPIError, true);
+      assert.equal(error.code, "INVALID_RESPONSE");
+      assert.equal(error.status, 200);
+      return true;
+    },
+  );
+});

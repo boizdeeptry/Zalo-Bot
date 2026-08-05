@@ -45,3 +45,12 @@ test("mounting a route disposes the old page before clearing its DOM", async () 
     "dispose:second",
   ]);
 });
+
+test("page mount must return its disposer synchronously", () => {
+  const host = createRouteHost({ replaceChildren() {} });
+
+  assert.throws(
+    () => host.mount({ mount: async () => ({ dispose() {} }) }),
+    /synchronously/,
+  );
+});

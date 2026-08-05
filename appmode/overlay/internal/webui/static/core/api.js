@@ -90,7 +90,23 @@ export async function requestJSON(path, options = {}) {
   }
 
   const response = await fetchImpl(path, requestInit(method, body, { headers, signal }));
-  const payload = await responsePayload(response);
+  let payload;
+  try {
+    payload = await responsePayload(response);
+  } catch {
+    if (!response.ok) {
+      throw new AppAPIError({
+        code: `HTTP_${response.status}`,
+        message: response.statusText || "Yêu cầu thất bại",
+        status: response.status,
+      });
+    }
+    throw new AppAPIError({
+      code: "INVALID_RESPONSE",
+      message: "Máy chủ trả về dữ liệu JSON không hợp lệ",
+      status: response.status,
+    });
+  }
   if (!response.ok) {
     throw apiErrorFrom(response, payload);
   }
