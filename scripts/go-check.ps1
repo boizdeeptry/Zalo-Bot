@@ -30,6 +30,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# gofmt xuất UTF-8. PowerShell giải mã stdout tiến trình con bằng [Console]::OutputEncoding, mà cái
+# đó tuỳ theo console của caller — khi không phải UTF-8, comment tiếng Việt trong output gofmt thành
+# mojibake, và phép so ở Get-UnformattedOverlayFiles coi MỌI tệp overlay là lệch định dạng. Một cổng
+# nói dối theo trạng thái console của người gọi là vô dụng; ép UTF-8 ngay đây để nó ổn định.
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+
 if (-not $Repo) {
   throw "thiếu repo nguồn: đặt `$env:ZALOBOT_REPO trỏ tới checkout AgentDC, hoặc truyền -Repo. Xem README.md."
 }
