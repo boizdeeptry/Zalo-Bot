@@ -40,12 +40,20 @@ transport: {
 Nghĩa là 150 Provider **không** ứng với 150 adapter. Chúng ứng với một nhúm **format** (`claude`,
 `openai`, `gemini`), và mỗi Provider chỉ khai nó nói format nào cộng vài header riêng.
 
-**Áp dụng cho Task 3:** plan liệt kê bốn adapter cho bốn Provider. Nhưng OpenAI và OpenRouter đều
-nói giao thức OpenAI, nên phần dịch request/parse response của chúng là một. Giữ bốn descriptor
-(endpoint + header + tên) nhưng đừng viết bốn bộ codec — đó là hai bản sao của cùng một logic
-parse, và bản thứ hai sẽ là chỗ bug nằm im. Bước 5 của Task 3 vốn đã dặn "centralize bounded
-decoding and status classification without merging Provider-specific payload structs"; đây là lý do
-cụ thể tại sao.
+**Áp dụng cho Task 3:** đừng để "bốn Provider" tự động thành "bốn bản sao mọi thứ". Tách phần khai
+báo (endpoint, header, tên) khỏi phần dùng chung (transport có timeout, decode giới hạn 2 MiB,
+phân loại status) và viết phần chung một lần.
+
+**Nhưng đừng gộp quá tay — ghi lại sau khi Task 3 chạy thật.** Bản đầu của ghi chú này nói OpenAI
+và OpenRouter "cùng giao thức OpenAI" nên gộp được codec generate. Sai. 9Router cho OpenAI dùng
+`chat/completions`, còn plan của ta pin OpenAI vào **Responses API** (`{model, input}` →
+`output[].content[].output_text`), khác hẳn OpenRouter (`{model, messages}` →
+`choices[].message.content`). Gộp hai cái đó là gửi một payload mà một trong hai Provider từ chối.
+
+Cái thực sự chung giữa chúng: envelope `GET models`, header bearer, và toàn bộ transport/decode/
+status. Chừng đó gộp được và đã gộp. **Độ chính xác endpoint đứng trên việc gộp codec** — một bộ
+parse dùng chung mà sai payload sẽ pass với fake server của chính mình rồi hỏng với Provider thật,
+đúng cái hạng lỗi tệ nhất.
 
 ## 2. Chi tiết transport kiểm chứng được
 
