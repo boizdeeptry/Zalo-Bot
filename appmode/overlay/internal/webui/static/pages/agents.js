@@ -78,7 +78,9 @@ function agentFacts(agent, openDocument) {
   const pencil = (name) => element("button", {
     className: "pen",
     attributes: { type: "button", title: "Sửa nội dung tệp", "aria-label": `Sửa ${EDITABLE_DOCUMENTS[name].label}` },
-    text: "✎",
+    // U+1F589 LOWER LEFT PENCIL, không phải U+270E: U+270E để mũi bút ở dưới-PHẢI, ngược với
+    // mọi icon sửa mà người dùng đã quen, nên nó đọc ra như một cái bút bị lật.
+    text: "🖉",
     on: { click(event) { openDocument(name, event.currentTarget); } },
   });
   return element("div", { className: "facts" },
