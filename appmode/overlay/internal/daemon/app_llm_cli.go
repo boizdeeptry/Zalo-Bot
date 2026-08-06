@@ -10,6 +10,7 @@ type cliDescriptor struct {
 	nativeBin      string   // tên exe khi là native (claude); rỗng nếu chạy qua node
 	subArgs        []string // lệnh con không tương tác: {"exec"} codex, nil cho -p
 	promptViaStdin bool     // true: prompt qua stdin; false: positional arg
+	promptFlag     string   // cờ đứng trước prompt trong argv: "-p" gemini; rỗng = positional (codex)
 	modelFlag      string
 	readOnlyArgs   []string   // cờ giới hạn chỉ-đọc — BẮT BUỘC có
 	bannedArgs     []string   // cờ bỏ sandbox — test chặn adapter dựng chúng
@@ -34,7 +35,7 @@ var cliDescriptors = map[string]cliDescriptor{
 	"gemini-cli": {
 		kind: "gemini-cli", display: "Gemini CLI (Google AI)",
 		npmPackage: "@google/gemini-cli", binJS: `@google\gemini-cli\bundle\gemini.js`,
-		subArgs: nil, promptViaStdin: false, modelFlag: "-m",
+		subArgs: nil, promptViaStdin: false, promptFlag: "-p", modelFlag: "-m",
 		readOnlyArgs: []string{"--approval-mode", "plan", "--skip-trust", "-o", "json"},
 		bannedArgs:   []string{"-y", "--yolo", "yolo", "auto_edit", "--raw-output"},
 		authMethod:   "gemini-file",
@@ -49,4 +50,27 @@ var cliDescriptors = map[string]cliDescriptor{
 		authMethod:   "claude-json", claudeBudget: true,
 		modelSeeds: []cliModel{{"sonnet", "Claude Sonnet"}, {"opus", "Claude Opus"}, {"fable", "Claude Fable"}},
 	},
+}
+
+// buildCLIArgv dựng argv cho phần SAU tên chương trình. CỐ Ý chỉ nối những gì descriptor mang:
+// một tin nhắn khách (input không tin được) không có đường nào thành một cờ bỏ sandbox.
+func buildCLIArgv(d cliDescriptor, req llmRequest) []string {
+	argv := make([]string, 0, 16)
+	argv = append(argv, d.subArgs...)      // codex: "exec"; khác: rỗng
+	argv = append(argv, d.readOnlyArgs...) // luôn có, luôn trước
+	if d.modelFlag != "" && req.Model != "" {
+		argv = append(argv, d.modelFlag, req.Model)
+	}
+	// claude đọc prompt qua stdin (Task 3) nên không nằm trong argv. Với vendor truyền qua argv:
+	if !d.promptViaStdin {
+		if d.promptFlag != "" {
+			argv = append(argv, d.promptFlag, req.Prompt) // gemini: -p <prompt>, prompt là VALUE của cờ — an toàn
+		} else {
+			// `--` chặn clap/codex đọc một prompt bắt đầu bằng "--" thành cờ. Tin nhắn khách là ĐẦU VÀO
+			// KHÔNG TIN CẬY, và "--dangerously-bypass-approvals-and-sandbox" là cờ thật của codex exec:
+			// không có `--`, một positional trần "--..." bị hiểu thành chính cái cờ bỏ sandbox đó.
+			argv = append(argv, "--", req.Prompt)
+		}
+	}
+	return argv
 }
