@@ -262,6 +262,10 @@ func (s *Store) AddLLMModel(m LLMModel) error {
 	if m.ProviderID == "" || m.ModelID == "" {
 		return fmt.Errorf("add llm model: cần provider và model id")
 	}
+	if !validLLMModelSource(m.Source) {
+		return fmt.Errorf("add llm model %s/%s: nguồn phải là %q hoặc %q, không phải %q",
+			m.ProviderID, m.ModelID, LLMModelManual, LLMModelDiscovered, m.Source)
+	}
 	if _, err := s.db.Exec(llmModelUpsert,
 		m.ProviderID, m.ModelID, m.Name, m.Source, boolInt(m.Available)); err != nil {
 		return fmt.Errorf("add llm model %s/%s: %w", m.ProviderID, m.ModelID, err)
@@ -278,8 +282,12 @@ func (s *Store) AddLLMModel(m LLMModel) error {
 // source vừa là phạm vi xoá vừa là nguồn ghi cho mọi hàng trong models, nên Source trên từng
 // phần tử không được đọc tới.
 func (s *Store) ReplaceLLMModels(providerID, source string, models []LLMModel) error {
-	if providerID == "" || source == "" {
-		return fmt.Errorf("replace llm models: cần provider id và nguồn")
+	if providerID == "" {
+		return fmt.Errorf("replace llm models: cần provider id")
+	}
+	if !validLLMModelSource(source) {
+		return fmt.Errorf("replace llm models of %s: nguồn phải là %q hoặc %q, không phải %q",
+			providerID, LLMModelManual, LLMModelDiscovered, source)
 	}
 	return s.inLLMTx(fmt.Sprintf("replace llm models of %s", providerID), func(tx *sql.Tx) error {
 		if _, err := tx.Exec(
@@ -480,8 +488,15 @@ func (s *Store) llmRouteEntries() ([]LLMRouteEntry, error) {
 // --- telemetry ---
 
 func (s *Store) RecordLLMAttempt(a LLMAttempt) error {
-	if a.ProviderID == "" || a.Outcome == "" {
-		return fmt.Errorf("record llm attempt: cần provider và kết quả")
+	if a.ProviderID == "" {
+		return fmt.Errorf("record llm attempt: cần provider")
+	}
+	// Đối chiếu với CHECK của schema TẠI ĐÂY, vì nếu để database từ chối thì người gọi nhận
+	// một lỗi driver không nói giá trị nào sai — và outcome là cột LLMStatus dùng để tìm
+	// Provider đang phục vụ, nên một giá trị lệch làm lượt thành công lặng lẽ biến mất.
+	if a.Outcome != LLMAttemptOK && a.Outcome != LLMAttemptError {
+		return fmt.Errorf("record llm attempt %s: kết quả phải là %q hoặc %q, không phải %q",
+			a.ProviderID, LLMAttemptOK, LLMAttemptError, a.Outcome)
 	}
 	if _, err := s.db.Exec(`
 INSERT INTO llm_attempts(provider_id, model_id, started_at, duration_ms, outcome,
@@ -560,6 +575,15 @@ func assertOneRow(res sql.Result, op string) error {
 		return fmt.Errorf("%s: %w", op, ErrNotFound)
 	}
 	return nil
+}
+
+// validLLMModelSource đối chiếu với CHECK của cột source.
+//
+// Ở cả hai đường ghi model chứ không chỉ một: ReplaceLLMModels khoanh vùng XOÁ theo đúng cột
+// này, nên một nguồn lệch tạo ra model mà không lần đồng bộ nào dọn được — và chúng trông y hệt
+// model thật trong danh sách.
+func validLLMModelSource(source string) bool {
+	return source == LLMModelManual || source == LLMModelDiscovered
 }
 
 func boolInt(v bool) int {

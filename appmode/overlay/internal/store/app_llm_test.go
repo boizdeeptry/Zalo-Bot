@@ -417,6 +417,64 @@ func TestLLMAttemptsAggregateWithoutContent(t *testing.T) {
 	}
 }
 
+// Hai cột dưới đây có CHECK trong schema, nên một giá trị lệch VẪN bị chặn nếu thiếu guard —
+// chỉ là nó nổi lên dưới dạng lỗi driver không nói được trường nào sai. Test này chốt rằng người
+// gọi nhận một câu đọc được, và rằng hàng lệch không bao giờ vào bảng.
+func TestLLMRejectsValuesTheSchemaWouldRefuse(t *testing.T) {
+	st := newLLMStore(t)
+	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
+
+	t.Run("model source", func(t *testing.T) {
+		for _, source := range []string{"", "Discovered", "auto"} {
+			err := st.AddLLMModel(LLMModel{ProviderID: "openai-1", ModelID: "gpt-5", Source: source})
+			if err == nil {
+				t.Fatalf("AddLLMModel(source=%q) = nil; want lỗi hợp lệ hoá", source)
+			}
+			if !strings.Contains(err.Error(), source) {
+				t.Errorf("AddLLMModel(source=%q) = %v; want thông báo nêu giá trị sai", source, err)
+			}
+			if err := st.ReplaceLLMModels("openai-1", source, nil); err == nil {
+				t.Errorf("ReplaceLLMModels(source=%q) = nil; want lỗi hợp lệ hoá", source)
+			}
+		}
+		// Provider rỗng phải nói về PROVIDER. Gộp chung một câu với nguồn thì lời than là "nguồn
+		// phải là manual hoặc discovered, không phải manual" — nêu đúng giá trị hợp lệ làm thủ phạm.
+		err := st.ReplaceLLMModels("", LLMModelManual, nil)
+		if err == nil {
+			t.Fatalf(`ReplaceLLMModels("", "manual", nil) = nil; want lỗi thiếu provider id`)
+		}
+		if strings.Contains(err.Error(), "nguồn") {
+			t.Errorf(`ReplaceLLMModels("", "manual", nil) = %v; want thông báo về provider id, không phải về nguồn`, err)
+		}
+		models, err := st.LLMModels("openai-1")
+		if err != nil {
+			t.Fatalf("LLMModels() = %v; want nil", err)
+		}
+		if len(models) != 1 {
+			t.Errorf("LLMModels() có %d model sau các lần ghi bị từ chối; want 1", len(models))
+		}
+	})
+
+	t.Run("attempt outcome", func(t *testing.T) {
+		for _, outcome := range []string{"", "OK", "failed"} {
+			err := st.RecordLLMAttempt(LLMAttempt{ProviderID: "openai-1", Outcome: outcome})
+			if err == nil {
+				t.Fatalf("RecordLLMAttempt(outcome=%q) = nil; want lỗi hợp lệ hoá", outcome)
+			}
+			if !strings.Contains(err.Error(), "openai-1") {
+				t.Errorf("RecordLLMAttempt(outcome=%q) = %v; want thông báo nêu Provider", outcome, err)
+			}
+		}
+		status, err := st.LLMStatus()
+		if err != nil {
+			t.Fatalf("LLMStatus() = %v; want nil", err)
+		}
+		if status.Attempts != 0 {
+			t.Errorf("LLMStatus().Attempts = %d sau các lần ghi bị từ chối; want 0", status.Attempts)
+		}
+	})
+}
+
 // Cắt phải giữ lượt MỚI, và chiều đó không có gì trong SQL tự bảo vệ: đổi DESC thành ASC vẫn
 // chạy, vẫn giữ đúng 500 hàng, và xoá sạch đúng phần telemetry mà tính năng này sinh ra để xem.
 func TestLLMAttemptsCapKeepsNewestRows(t *testing.T) {
