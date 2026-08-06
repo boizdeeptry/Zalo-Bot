@@ -308,12 +308,22 @@ function Assert-NoProviderCredential {
     throw "không thấy gói ở '$packagePath'"
   }
 
-  # KHÔNG -ErrorAction SilentlyContinue ở đâu trong chuỗi này, dù cửa quét dấu khách hàng ở
-  # build-app.ps1 có: một tệp không liệt kê hay không đọc được mà bị nuốt lặng thì phép quét trả
-  # về 0 lần khớp y hệt một gói sạch. Set-StrictMode + $ErrorActionPreference của người gọi lo
-  # phần còn lại, nên cửa này hỏng theo hướng đóng.
-  $files = Get-ChildItem -LiteralPath $packagePath -Recurse -File |
-    Where-Object { $_.FullName -notlike '*node_modules*' }
+  # -Force là BẮT BUỘC: không có nó, Get-ChildItem lặng lẽ bỏ qua tệp ẩn và mọi thứ nằm dưới một
+  # thư mục ẩn. Đó không phải chuyện lý thuyết — cả ba chỗ chép vào gói đều dùng Copy-Item -Force
+  # và Copy-Item giữ nguyên thuộc tính Hidden, còn đúng lớp tệp hay mang khoá thật (.env, .npmrc,
+  # .claude\settings.local.json) lại là lớp mà công cụ Windows thỉnh thoảng đánh dấu ẩn. Một bit
+  # thuộc tính là đủ để cửa chặn báo sạch trên một gói đang mang khoá.
+  #
+  # -ErrorAction Stop tại CHỖ GỌI chứ không dựa vào $ErrorActionPreference của người gọi: một tệp
+  # không liệt kê hay không đọc được mà bị nuốt lặng thì phép quét trả về 0 lần khớp y hệt một gói
+  # sạch, và tính chất đó quá quan trọng để nằm trong một biến ở ngoài hàm này. Đường .exe bên dưới
+  # đã hỏng-đóng sẵn: ngoại lệ của một phương thức .NET luôn là lỗi kết thúc.
+  #
+  # '*\node_modules\*' chứ không '*node_modules*': mẫu sau là so chuỗi con, nên nó bỏ qua luôn
+  # brain\node_modules-notes\. Lệch với cửa quét dấu khách hàng ở build-app.ps1 là cố ý — cửa này
+  # canh credential, và một thư mục đặt tên gần giống không được là chỗ trốn.
+  $files = Get-ChildItem -LiteralPath $packagePath -Recurse -File -Force -ErrorAction Stop |
+    Where-Object { $_.FullName -notlike '*\node_modules\*' }
 
   # .exe đi đường byte chứ không qua Select-String: đó là hai tệp cỡ chục MB gần như không có dấu
   # xuống dòng, và đọc chúng theo dòng là dựng một chuỗi khổng lồ để tìm đúng một chuỗi con. Cùng
@@ -322,7 +332,7 @@ function Assert-NoProviderCredential {
   $binaries, $texts = ($files | Where-Object { $_.Extension -eq '.exe' }),
                       ($files | Where-Object { $_.Extension -ne '.exe' })
 
-  $hits = $texts | Select-String -SimpleMatch -Pattern $Canary -Encoding UTF8
+  $hits = $texts | Select-String -SimpleMatch -Pattern $Canary -Encoding UTF8 -ErrorAction Stop
   $binaryHits = @($binaries | Where-Object {
     [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($_.FullName)).
       IndexOf($Canary, [StringComparison]::Ordinal) -ge 0

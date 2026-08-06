@@ -226,6 +226,45 @@ try {
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'plaintext provider credential' -Message 'A package config file carrying the canary was accepted'
   Remove-Item -LiteralPath $config -Force
+
+  # Tệp ẩn và tệp dưới thư mục ẩn: Get-ChildItem thiếu -Force bỏ qua cả hai KHÔNG một tiếng động.
+  # Đường vào có thật chứ không phải giả định — cả ba chỗ chép vào gói đều dùng Copy-Item -Force và
+  # nó giữ nguyên thuộc tính Hidden, còn đúng lớp tệp hay mang khoá (.env, .npmrc, settings.local)
+  # là lớp mà công cụ Windows thỉnh thoảng đánh dấu ẩn.
+  $hidden = Join-Path $gotPackage 'app\.env'
+  Write-TestFile $hidden ('KEY=' + $providerCanary + "`n")
+  (Get-Item -LiteralPath $hidden -Force).Attributes = [IO.FileAttributes]::Hidden
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'plaintext provider credential' -Message 'A hidden package file carrying the canary was accepted'
+  Remove-Item -LiteralPath $hidden -Force
+
+  $hiddenDir = Join-Path $gotPackage 'app\.config'
+  Write-TestFile (Join-Path $hiddenDir 'keys.json') ('{"k":"' + $providerCanary + '"}' + "`n")
+  (Get-Item -LiteralPath $hiddenDir -Force).Attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::Hidden
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'plaintext provider credential' -Message 'A file under a hidden directory carrying the canary was accepted'
+  Remove-Item -LiteralPath $hiddenDir -Recurse -Force
+
+  # Hỏng-đóng phải là tính chất của CHÍNH hàm quét, không phải của $ErrorActionPreference mà người
+  # gọi tình cờ đang đặt. Hạ nó xuống 'Continue' quanh lời gọi là cách duy nhất phân biệt hai điều
+  # đó: đo được là thiếu -ErrorAction Stop tại chỗ gọi thì một tệp không đọc được chỉ sinh lỗi
+  # không kết thúc, phép quét bỏ qua tệp ấy và gói báo SẠCH.
+  #
+  # Đặt ở scope của tệp test chứ không bên trong scriptblock của Assert-ThrowsLike: đặt bên trong
+  # thì hàm trong module không thấy, và phép kiểm này xanh cả khi cửa chặn đã hỏng.
+  $locked = Join-Path $gotPackage 'app\locked.txt'
+  Write-TestFile $locked "khong doc duoc`n"
+  $handle = [IO.File]::Open($locked, 'Open', 'Read', 'None')
+  $savedPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+      -Pattern 'locked\.txt' -Message 'An unreadable package file was skipped instead of failing the scan'
+  } finally {
+    $ErrorActionPreference = $savedPreference
+    $handle.Close()
+  }
+  Remove-Item -LiteralPath $locked -Force
   Assert-AppPackage -Out $packageRoot | Out-Null
 
   Write-TestFile (Join-Path $packageRoot 'data\zalo\credentials.json') "secret`n"
@@ -233,7 +272,7 @@ try {
     -Pattern 'Zalo credentials' -Message 'A package containing Zalo credentials was accepted'
 
   Write-Host 'PASS: Assert-AppPackage requires runtime files and rejects credentials.'
-  Write-Host 'PASS: Assert-AppPackage rejects a provider credential in text assets and in the binary.'
+  Write-Host 'PASS: Assert-AppPackage finds a provider credential in text, config, binary, hidden files, and fails closed on an unreadable one.'
 } finally {
   if (Test-Path -LiteralPath $packageRoot) {
     Remove-Item -LiteralPath $packageRoot -Recurse -Force

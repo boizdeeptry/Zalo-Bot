@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import { AppAPIError } from "../overlay/internal/webui/static/core/api.js";
 import {
@@ -821,8 +822,13 @@ test("a failed provider list renders the shared error panel", async (t) => {
 // Không in ra chuỗi khớp: thông báo hỏng của test đi vào log, và chuỗi đó chính là thứ đang bị tố
 // cáo. Tên tệp và số lượng đủ để biết phải đi tìm ở đâu.
 test("no embedded Portal asset carries an API-key literal", async () => {
-  const names = (await readdir(staticRoot, { recursive: true })).filter((name) => name.endsWith(".js"));
-  assert.ok(names.length >= 10, `expected the embedded Portal scripts, got ${names.length}`);
+  // .html và .css chứ không riêng .js: `//go:embed static` lấy CẢ thư mục, nên index.html và
+  // portal.css cũng nằm trong agentdc.exe — và một thẻ <script> nội tuyến trong index.html là chỗ
+  // dán khoá không kém phần thực tế.
+  const names = (await readdir(staticRoot, { recursive: true })).filter((n) => /\.(js|html|css)$/.test(n));
+  // Ghim ĐỆ QUY bằng một mục lồng có tên, không bằng số lượng: một ngưỡng đếm đặt đúng bằng con số
+  // hôm nay sẽ đỏ khi ai đó xoá một trang, với thông báo nói rằng phép duyệt hỏng.
+  assert.ok(names.includes(join("pages", "providers.js")), `walk missed pages/providers.js: ${names}`);
 
   for (const name of names) {
     const source = await readFile(new URL(name, staticRoot), "utf8");
