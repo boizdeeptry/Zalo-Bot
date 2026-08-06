@@ -217,6 +217,15 @@ try {
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'plaintext provider credential' -Message 'A binary carrying the canary was accepted'
   Write-TestFile $binary "fixture`n"
+
+  # Đuôi tệp mà một danh sách trắng sẽ bỏ sót, và đây là tệp CÓ THẬT: bản đầu của cửa chặn liệt
+  # kê mười đuôi văn bản và để lọt brain\.claude\settings.local.json.example, tệp cấu hình duy
+  # nhất của gói nằm ngoài node_modules.
+  $config = Join-Path $gotPackage 'brain\.claude\settings.local.json.example'
+  Write-TestFile $config ('{"canary":"' + $providerCanary + '"}' + "`n")
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'plaintext provider credential' -Message 'A package config file carrying the canary was accepted'
+  Remove-Item -LiteralPath $config -Force
   Assert-AppPackage -Out $packageRoot | Out-Null
 
   Write-TestFile (Join-Path $packageRoot 'data\zalo\credentials.json') "secret`n"

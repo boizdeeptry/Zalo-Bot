@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 
 import { AppAPIError } from "../overlay/internal/webui/static/core/api.js";
 import {
@@ -807,19 +807,26 @@ test("a failed provider list renders the shared error panel", async (t) => {
   assert.match(text(find(main, (node) => hasClass(node, "banner"))), /không đọc được danh sách Provider/);
 });
 
-// Cửa chặn nguồn của tầng Portal: đây là trang người dùng gõ API key, nên cũng là trang một khoá
-// dễ bị dán vào nhất lúc ai đó đang gỡ lỗi. Assets nhúng thẳng vào agentdc.exe, nên một khoá còn
-// sót ở đây đi ra bản bán mà không nằm trong tệp văn bản nào của gói để mà quét.
+// Cửa chặn nguồn của tầng Portal. Assets nhúng thẳng vào agentdc.exe, nên một khoá còn sót trong
+// bất kỳ tệp nào dưới static/ đều đi ra bản bán mà không nằm trong tệp văn bản nào của gói để quét.
+//
+// Duyệt CẢ CÂY chứ không riêng trang Providers: trang này là chỗ dễ bị dán khoá nhất, nhưng một
+// khoá trong core/api.js rời khỏi máy y hệt, và một phép kiểm chỉ đọc những tệp mà người viết nó
+// tình cờ đang sửa thì chỉ canh được đúng ngày nó ra đời.
 //
 // Bắt theo HÌNH DẠNG chứ không theo canary: cửa chặn gói tìm đúng chuỗi canary, nên nó bỏ lọt khoá
 // THẬT của người đang gỡ lỗi — đúng thứ tệ nhất được để lại. Bốn tiền tố là bốn nhà cung cấp đang
 // hỗ trợ, cùng bộ với mẫu che cuối cùng trong sanitizeProviderError.
 //
 // Không in ra chuỗi khớp: thông báo hỏng của test đi vào log, và chuỗi đó chính là thứ đang bị tố
-// cáo. Số lượng đủ để biết phải đi tìm cái gì.
-test("the Providers page source carries no API-key literal", async () => {
-  const source = await readFile(new URL("pages/providers.js", staticRoot), "utf8");
+// cáo. Tên tệp và số lượng đủ để biết phải đi tìm ở đâu.
+test("no embedded Portal asset carries an API-key literal", async () => {
+  const names = (await readdir(staticRoot, { recursive: true })).filter((name) => name.endsWith(".js"));
+  assert.ok(names.length >= 10, `expected the embedded Portal scripts, got ${names.length}`);
 
-  const found = source.match(/\b(?:sk-|xai-|gsk_|AIza)[A-Za-z0-9_-]{8,}/g) ?? [];
-  assert.equal(found.length, 0, `pages/providers.js carries ${found.length} key-shaped literal(s)`);
+  for (const name of names) {
+    const source = await readFile(new URL(name, staticRoot), "utf8");
+    const found = source.match(/\b(?:sk-|xai-|gsk_|AIza)[A-Za-z0-9_-]{8,}/g) ?? [];
+    assert.equal(found.length, 0, `${name} carries ${found.length} key-shaped literal(s)`);
+  }
 });

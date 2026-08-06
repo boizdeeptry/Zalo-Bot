@@ -284,15 +284,18 @@ function Apply-AppSeams {
 # chuỗi ở đây không tự làm cửa chặn đỏ.
 $script:ProviderCredentialCanary = 'sk-package-must-never-contain-7f36d2'
 
-# Đuôi tệp văn bản có mặt trong gói. Danh sách trắng, và bỏ node_modules: gói thật có ~1200 tệp và
-# 94 MB mà gần hết là dependency của transport, nên quét tất cả biến một cửa chặn thành một lượt chờ.
-$script:PackageTextExtensions = @('.md', '.txt', '.js', '.mjs', '.cjs', '.json', '.html', '.css', '.bat', '.vbs')
-
 # Assert-NoProviderCredential từ chối một gói còn mang khoá Provider thử nghiệm.
 #
-# Tách khỏi Assert-AppPackage để test dựng được đúng tình huống này mà không phải dựng cả bảy tệp
-# bắt buộc, nhưng nó chạy MỖI lần Assert-AppPackage chạy — một cửa chặn phải nhớ bật thì không
-# phải cửa chặn.
+# MỌI tệp ngoài node_modules đều bị quét — không có danh sách trắng đuôi tệp. Bản đầu có một danh
+# sách như thế và nó bỏ sót brain\.claude\settings.local.json.example, tệp cấu hình DUY NHẤT của
+# gói: gieo canary vào đó thì cửa chặn báo sạch. Một danh sách trắng phải đoán trước mọi đuôi tệp
+# tương lai, và mỗi lần đoán thiếu là một lần cửa xanh nhầm. node_modules mới là thứ gánh phần
+# giới hạn: 1209 tệp của gói chỉ có 52 tệp nằm ngoài nó.
+#
+# Tách khỏi Assert-AppPackage để hàm kia đọc được trong một màn hình, nhưng nó chạy MỖI lần
+# Assert-AppPackage chạy và không nhận công tắc bỏ qua — một cửa chặn phải nhớ bật thì không phải
+# cửa chặn. Không xuất khẩu: build-app.ps1 và test đều đi qua Assert-AppPackage, vì "mỗi lần build
+# có quét không" mới là câu hỏi, và chỉ lời gọi ngoài đó trả lời được.
 function Assert-NoProviderCredential {
   [CmdletBinding()]
   param(
@@ -309,25 +312,27 @@ function Assert-NoProviderCredential {
   # build-app.ps1 có: một tệp không liệt kê hay không đọc được mà bị nuốt lặng thì phép quét trả
   # về 0 lần khớp y hệt một gói sạch. Set-StrictMode + $ErrorActionPreference của người gọi lo
   # phần còn lại, nên cửa này hỏng theo hướng đóng.
-  $hits = Get-ChildItem -LiteralPath $packagePath -Recurse -File |
-    Where-Object { $script:PackageTextExtensions -contains $_.Extension } |
-    Where-Object { $_.FullName -notlike '*node_modules*' } |
-    Select-String -SimpleMatch -Pattern $Canary -Encoding UTF8
+  $files = Get-ChildItem -LiteralPath $packagePath -Recurse -File |
+    Where-Object { $_.FullName -notlike '*node_modules*' }
 
-  # Binary đọc riêng, và đó không phải phần thừa: assets Portal được go:embed vào agentdc.exe, nên
-  # một khoá dán vào pages/providers.js KHÔNG nằm trong tệp văn bản nào của gói — chỉ ở trong đây.
-  $binary = Join-Path $packagePath 'app\agentdc.exe'
-  $binaryHit = $false
-  if (Test-Path -LiteralPath $binary -PathType Leaf) {
-    $bytes = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($binary))
-    $binaryHit = $bytes.IndexOf($Canary, [StringComparison]::Ordinal) -ge 0
-  }
+  # .exe đi đường byte chứ không qua Select-String: đó là hai tệp cỡ chục MB gần như không có dấu
+  # xuống dòng, và đọc chúng theo dòng là dựng một chuỗi khổng lồ để tìm đúng một chuỗi con. Cùng
+  # lý do khiến đường này phải tồn tại: assets Portal được go:embed vào agentdc.exe, nên một khoá
+  # dán vào pages/providers.js không nằm trong tệp văn bản nào của gói — chỉ ở trong binary.
+  $binaries, $texts = ($files | Where-Object { $_.Extension -eq '.exe' }),
+                      ($files | Where-Object { $_.Extension -ne '.exe' })
 
-  if ($hits -or $binaryHit) {
+  $hits = $texts | Select-String -SimpleMatch -Pattern $Canary -Encoding UTF8
+  $binaryHits = @($binaries | Where-Object {
+    [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($_.FullName)).
+      IndexOf($Canary, [StringComparison]::Ordinal) -ge 0
+  })
+
+  if ($hits -or $binaryHits) {
     # Chỉ đường dẫn và số dòng, KHÔNG in dòng khớp: dòng đó chính là bí mật đang bị tố cáo, và
     # thông báo hỏng này đi vào log build, tức đi xa hơn cái gói.
-    $where = @($hits | ForEach-Object { '{0}:{1}' -f $_.Path, $_.LineNumber })
-    if ($binaryHit) { $where += $binary }
+    $where = @($hits | ForEach-Object { '{0}:{1}' -f $_.Path, $_.LineNumber }) +
+             @($binaryHits | ForEach-Object { $_.FullName })
     throw ('package contains plaintext provider credential: ' + ($where -join '; '))
   }
 
@@ -369,4 +374,4 @@ function Assert-AppPackage {
   return $outPath
 }
 
-Export-ModuleMember -Function Resolve-BuildPaths, Assert-CleanGitSource, Get-AppGoTestSkipPattern, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams, Assert-AppPackage, Assert-NoProviderCredential
+Export-ModuleMember -Function Resolve-BuildPaths, Assert-CleanGitSource, Get-AppGoTestSkipPattern, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams, Assert-AppPackage
