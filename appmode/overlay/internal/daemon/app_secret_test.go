@@ -25,21 +25,17 @@ func TestProviderSecretRoundTripAndRedaction(t *testing.T) {
 	key := []byte("sk-provider-test-secret")
 	encrypted, err := protectProviderSecret(key)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("protectProviderSecret(%q) error = %v; want nil", key, err)
 	}
 	if bytes.Contains(encrypted, key) {
-		t.Fatal("ciphertext contains plaintext")
+		t.Fatalf("protectProviderSecret(%q) trả ciphertext chứa nguyên bản rõ", key)
 	}
 	plain, err := unprotectProviderSecret(encrypted)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("unprotectProviderSecret(ciphertext của %q) error = %v; want nil", key, err)
 	}
 	if !bytes.Equal(plain, key) {
-		t.Fatal("DPAPI round trip changed key")
-	}
-	got := sanitizeProviderError("Authorization: Bearer sk-provider-test-secret; x-api-key=sk-provider-test-secret")
-	if strings.Contains(got, "sk-provider-test-secret") {
-		t.Fatalf("secret leaked: %q", got)
+		t.Fatalf("round trip %q = %q; want %q", key, plain, key)
 	}
 }
 
@@ -105,37 +101,57 @@ func TestSanitizeProviderErrorRedactsCredentialShapes(t *testing.T) {
 		plainCanary  = "Ab3xQ9zK7mP2wR5t"
 		prefixCanary = "sk-canary-Ab3xQ9zK7mP2wR5t"
 	)
+	// So khớp ĐÚNG BẰNG chứ không chỉ "không còn canary": một hàm trả thẳng "REDACTED" cũng qua
+	// được phép thử vắng mặt, và nhóm 1 — phần giữ lại cái nhãn — sẽ không có ai canh. Cụ thể,
+	// lỗi "[redacted]" tự ăn lại đầu ra của chính mình đã lọt qua đúng vì kiểu assert đó.
 	tests := []struct {
-		name   string
-		in     string
-		canary string
+		name, in, want string
 	}{
-		{"header Authorization Bearer", "Authorization: Bearer " + plainCanary, plainCanary},
-		{"header viết thường", "authorization: bearer " + plainCanary, plainCanary},
-		{"Bearer rụng mất tên header", "401 unauthorized (Bearer " + plainCanary + ")", plainCanary},
-		{"header x-api-key", "x-api-key: " + plainCanary, plainCanary},
-		{"header api-key", "api-key: " + plainCanary, plainCanary},
-		{"nhiều dòng header", "POST /v1/messages\r\nx-api-key: " + plainCanary + "\r\nContent-Type: application/json", plainCanary},
-		{"json api_key", `{"api_key":"` + plainCanary + `"}`, plainCanary},
-		{"json access_token", `{"access_token":"` + plainCanary + `"}`, plainCanary},
-		{"json client_secret", `{"client_secret":"` + plainCanary + `"}`, plainCanary},
-		{"json key", `{"key":"` + plainCanary + `"}`, plainCanary},
+		{"header Authorization Bearer", "Authorization: Bearer " + plainCanary, "Authorization: REDACTED"},
+		{"header viết thường", "authorization: bearer " + plainCanary, "authorization: REDACTED"},
+		{"Bearer rụng mất tên header", "401 unauthorized (Bearer " + plainCanary + ")", "401 unauthorized (Bearer REDACTED)"},
+		{"header x-api-key", "x-api-key: " + plainCanary, "x-api-key: REDACTED"},
+		{"header api-key", "api-key: " + plainCanary, "api-key: REDACTED"},
+		{
+			"giữ lại phần chẩn đoán sau giá trị",
+			"x-api-key: " + plainCanary + " (request-id req_011CabcXYZ) status=401",
+			"x-api-key: REDACTED (request-id req_011CabcXYZ) status=401",
+		},
+		{
+			"nhiều dòng header",
+			"POST /v1/messages\r\nx-api-key: " + plainCanary + "\r\nContent-Type: application/json",
+			"POST /v1/messages\r\nx-api-key: REDACTED\r\nContent-Type: application/json",
+		},
+		{"json api_key", `{"api_key":"` + plainCanary + `"}`, `{"api_key":REDACTED}`},
+		{"json access_token", `{"access_token":"` + plainCanary + `"}`, `{"access_token":REDACTED}`},
+		{"json client_secret", `{"client_secret":"` + plainCanary + `"}`, `{"client_secret":REDACTED}`},
+		{"json key", `{"key":"` + plainCanary + `"}`, `{"key":REDACTED}`},
 		{
 			"query string kiểu Gemini",
 			`Post "https://generativelanguage.googleapis.com/v1beta/models:generateContent?key=` + plainCanary + `": 400`,
-			plainCanary,
+			`Post "https://generativelanguage.googleapis.com/v1beta/models:generateContent?key=REDACTED": 400`,
 		},
 		{
 			"khoá lọt vào câu văn lỗi của Provider",
 			`{"error":{"message":"Incorrect API key provided: ` + prefixCanary + `. Check your key.","code":"invalid_api_key"}}`,
-			prefixCanary,
+			`{"error":{"message":"Incorrect API key provided: sk-REDACTED. Check your key.","code":"invalid_api_key"}}`,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := sanitizeProviderError(tt.in)
-			if strings.Contains(got, tt.canary) {
-				t.Fatalf("sanitizeProviderError(%q) = %q; credential vẫn còn", tt.in, got)
+			if got != tt.want {
+				t.Fatalf("sanitizeProviderError(%q) = %q; want %q", tt.in, got, tt.want)
+			}
+			for _, canary := range []string{plainCanary, prefixCanary} {
+				if strings.Contains(got, canary) {
+					t.Fatalf("sanitizeProviderError(%q) = %q; credential %q vẫn còn", tt.in, got, canary)
+				}
+			}
+			// Che hai lần phải ra đúng chuỗi cũ: router bọc lỗi rồi tầng HTTP che lần nữa là
+			// đường đi bình thường, không phải trường hợp hiếm.
+			if again := sanitizeProviderError(got); again != got {
+				t.Fatalf("sanitizeProviderError(sanitizeProviderError(%q)) = %q; want %q", tt.in, again, got)
 			}
 		})
 	}

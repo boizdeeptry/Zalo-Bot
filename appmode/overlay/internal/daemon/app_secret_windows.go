@@ -4,7 +4,9 @@ package daemon
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"math"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -25,8 +27,8 @@ var providerSecretEntropy = []byte("agentdc/provider-credential/v1")
 // CRYPTPROTECT_UI_FORBIDDEN vì daemon là dịch vụ nền: nếu DPAPI cần hỏi người dùng thì nó phải
 // hỏng ngay tại đây, chứ không phải treo một hộp thoại không ai nhìn thấy giữa một lượt trả lời.
 func protectProviderSecret(plain []byte) ([]byte, error) {
-	if len(plain) == 0 {
-		return nil, fmt.Errorf("protect provider credential: khoá rỗng")
+	if len(plain) == 0 || uint64(len(plain)) > math.MaxUint32 {
+		return nil, errors.New("protect provider credential: khoá rỗng hoặc dài quá mức")
 	}
 	in := newDataBlob(plain)
 	entropy := newDataBlob(providerSecretEntropy)
@@ -41,10 +43,14 @@ func protectProviderSecret(plain []byte) ([]byte, error) {
 // unprotectProviderSecret mở khoá API ra bản rõ, chỉ thành công dưới đúng tài khoản đã mã hoá.
 //
 // MỌI thất bại đều thành ErrCredentialUnreadable và errno của Windows bị bỏ hẳn: "data invalid",
-// "key not found" và "sai người dùng" là ba cách nói cùng một chuyện với người dùng cuối, còn
-// giữ lại chuỗi lỗi hệ thống thì tạo thêm một đường nữa phải soi xem có dính khoá không.
+// "key not found" và "sai người dùng" dẫn tới cùng một việc phải làm — nhập lại API key — nên
+// giữ lại chuỗi lỗi hệ thống chỉ thêm một chuỗi nữa phải soi mà không đổi được gì cho người
+// dùng. (Bản thân syscall.Errno là một con số, không mang được byte khoá; thứ phải cân nhắc là
+// câu chữ Windows dựng quanh nó.)
 func unprotectProviderSecret(cipher []byte) ([]byte, error) {
-	if len(cipher) == 0 {
+	// Ciphertext dài quá mức cũng là không đọc được: uint32 bên dưới sẽ cắt cụt nó, và một blob
+	// bị cắt thì DPAPI từ chối — nói thẳng ở đây đỡ phải đoán qua errno.
+	if len(cipher) == 0 || uint64(len(cipher)) > math.MaxUint32 {
 		return nil, fmt.Errorf("unprotect provider credential: %w", ErrCredentialUnreadable)
 	}
 	in := newDataBlob(cipher)
