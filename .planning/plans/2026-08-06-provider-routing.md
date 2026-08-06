@@ -347,7 +347,7 @@
   Run:
 
   ```powershell
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
   ```
 
   Expected: FAIL because the duty seam and `appZaloRunner` do not exist.
@@ -358,7 +358,7 @@
 
 - [ ] **Step 4: Run focused and full verification**
 
-  Run the Pester command, then the staged-build command with output prefix `provider-runtime-green-`.
+  Run the build-script fixture command from Step 2, then the staged-build command with output prefix `provider-runtime-green-`.
 
   Expected: both PASS; the source repository status is unchanged and the existing Zalo tests remain green.
 
@@ -578,7 +578,7 @@
   Run:
 
   ```powershell
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
   ```
 
   Expected: FAIL until the package gate includes the Provider canary scan and the cross-layer fallback fixture reports the expected status.
@@ -593,7 +593,7 @@
 
   ```powershell
   npm --prefix appmode test
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
   $out = Join-Path $env:TEMP ('provider-final-' + [guid]::NewGuid().ToString('N'))
   pwsh -NoProfile -File .\build-app.ps1 -Repo $env:ZALOBOT_REPO -PersonaSource $env:ZALOBOT_PERSONA -Out $out
   git -C $env:ZALOBOT_REPO status --short
