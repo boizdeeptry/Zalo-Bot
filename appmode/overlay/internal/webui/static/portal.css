@@ -161,25 +161,37 @@
 #drop .small { font-size:11.5px; color:var(--dim); }
 
 .row { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin:16px 0; }
-.models-page .picks { display:flex; flex-direction:column; gap:9px; max-width:560px; }
-.models-page .pick {
-  display:flex; gap:12px; align-items:flex-start; text-align:left; width:100%;
-  padding:13px 15px; border-radius:9px; cursor:pointer; font:inherit; color:inherit;
-  background:var(--panel); border:1px solid var(--line);
+
+/* models:begin — Trang Models là bảng chuỗi fallback: mỗi hàng là một mắt xích Provider/model.
+
+   MỌI luật từ đây tới models:end phải bắt đầu bằng .models-page. models.test.mjs đọc đúng
+   khoảng giữa hai dấu này để kiểm, nên đừng xoá cặp dấu — không có chúng thì phép kiểm không
+   còn gì để đọc. */
+.models-page .chainstatus { font-size:12.5px; color:var(--dim); margin:14px 0 0; }
+.models-page .chainstatus:empty { display:none; }
+.models-page .facts { border:1px solid var(--line); border-radius:8px; overflow:hidden; margin:12px 0; background:var(--panel); }
+.models-page .fact {
+  display:grid; grid-template-columns:auto minmax(0, 1fr) minmax(0, 1fr) auto auto;
+  gap:6px 12px; align-items:center; padding:9px 11px; border-bottom:1px solid var(--line);
+  font-size:12.5px;
 }
-.models-page .pick:hover { border-color:var(--dim); }
-.models-page .pick.on { border-color:var(--live); background:rgba(63,199,127,.07); }
-.models-page .pick .dot {
-  width:15px; height:15px; border-radius:50%; border:2px solid var(--line);
-  flex:0 0 15px; margin-top:2px;
+.models-page .fact:last-child { border-bottom:0; }
+.models-page .fp { display:flex; flex-direction:column; gap:2px; font-weight:600; }
+.models-page .fc { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.models-page .fc.check { flex-direction:row; align-items:center; gap:7px; }
+.models-page .fk { font-size:11px; color:var(--dim); }
+.models-page .fc select {
+  box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:7px;
+  padding:6px 8px; color:var(--ink); background:var(--sunk); font:inherit; font-size:12.5px;
 }
-.models-page .pick.on .dot { border-color:var(--live); background:var(--live); box-shadow:inset 0 0 0 3px var(--panel); }
-.models-page .pick .nm { font-weight:600; font-size:13.5px; }
-.models-page .pick .ds { font-size:12px; color:var(--dim); margin-top:2px; }
-.models-page .pick .tag {
-  margin-left:auto; font-size:10px; color:var(--dim); border:1px solid var(--line);
-  border-radius:5px; padding:2px 6px; white-space:nowrap;
-}
+.models-page .fb { display:flex; gap:6px; flex-wrap:wrap; }
+.models-page .live { font-size:11px; color:var(--live); white-space:nowrap; }
+.models-page .fn { grid-column:1 / -1; color:var(--dim); font-size:11.5px; }
+.models-page .fn:empty { display:none; }
+.models-page .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
+.models-page .reslot:empty { display:none; }
+/* models:end */
+
 .cols { display:flex; gap:16px; flex-wrap:wrap; }
 .cols > div { flex:1 1 264px; min-width:0; }
 .cols h3 {
@@ -228,4 +240,11 @@
   /* Ba cột không còn chỗ ở bề ngang điện thoại; xếp dọc để tên và nút không bị bóp. */
   .providers-page .fact { grid-template-columns:1fr; gap:5px; }
   /* providers:end */
+  /* models:begin — cùng luật phạm vi như khối trên.
+
+     Năm cột xếp dọc thành một; nhãn "Provider"/"Model"/"Bật" của từng ô là thứ duy nhất còn nói
+     được ô đó là gì khi hàng đã mất hàng tiêu đề ngầm của bố cục lưới. */
+  .models-page .fact { grid-template-columns:1fr; gap:7px; }
+  .models-page .fp { flex-direction:row; gap:8px; align-items:baseline; }
+  /* models:end */
 }
