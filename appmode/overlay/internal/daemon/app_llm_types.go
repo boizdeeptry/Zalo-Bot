@@ -1,0 +1,105 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+
+	"agentdc/internal/store"
+)
+
+// llmRequest là một lượt gọi đã chuẩn hoá về dạng nhỏ nhất mà mọi Provider đều nói được.
+//
+// Chỉ prompt và model, KHÔNG phải một cuộc hội thoại: bốn API dưới đây có bốn cách biểu diễn
+// lịch sử hội thoại khác nhau, và dịch xuôi ngược giữa chúng là lớp mà thiết kế cố ý không mang
+// về (xem .planning/research/9router-RESEARCH.md §5). Router ghép lịch sử thành prompt trước.
+type llmRequest struct {
+	Model  string
+	Prompt string
+}
+
+// llmResponse là phần duy nhất của phản hồi mà lượt trả lời cần: văn bản.
+type llmResponse struct {
+	Text string
+}
+
+// llmErrorKind phân loại một lần gọi hỏng theo VIỆC PHẢI LÀM, không theo mã lỗi.
+//
+// Đây là thứ quyết định chuỗi fallback đi tiếp hay dừng, nên nó chặt hơn nguồn tham khảo
+// (9Router không công bố taxonomy nào) và không được nới ra cho giống: credential sai, model
+// không tồn tại, request sai và nội dung bị từ chối đều là những thứ đổi Provider không chữa
+// được — riêng cái cuối còn là hành vi ta chủ động không muốn có.
+type llmErrorKind string
+
+const (
+	llmErrorNetwork    llmErrorKind = "network"
+	llmErrorTimeout    llmErrorKind = "timeout"
+	llmErrorRateLimit  llmErrorKind = "rate_limit"
+	llmErrorUpstream   llmErrorKind = "upstream"
+	llmErrorCredential llmErrorKind = "credential"
+	llmErrorModel      llmErrorKind = "model"
+	llmErrorRequest    llmErrorKind = "request"
+	llmErrorPolicy     llmErrorKind = "policy"
+)
+
+// isFallbackEligible nói một lỗi có đáng thử Provider kế tiếp hay không.
+//
+// Đúng bốn loại: bốn thứ mà cùng một request gửi tới một nơi khác có thể thành công. Mọi loại
+// còn lại thử lại vẫn hỏng y hệt, nên đi tiếp chỉ nhân số lần chờ của khách lên.
+func isFallbackEligible(kind llmErrorKind) bool {
+	switch kind {
+	case llmErrorNetwork, llmErrorTimeout, llmErrorRateLimit, llmErrorUpstream:
+		return true
+	default:
+		return false
+	}
+}
+
+// providerAdapter là những gì router cần ở một API Provider, và không hơn.
+//
+// credential là THAM SỐ của từng lượt gọi chứ không phải trường của struct: adapter sống suốt
+// đời daemon còn khoá thì được giải mã ngay trước khi dùng và rơi đi ngay sau đó, nên cất nó
+// vào struct là kéo dài thời gian bản rõ nằm trong bộ nhớ mà không ai còn nhớ tại sao.
+type providerAdapter interface {
+	Generate(ctx context.Context, req llmRequest, credential []byte) (llmResponse, error)
+	Test(ctx context.Context, model string, credential []byte) error
+	Discover(ctx context.Context, credential []byte) ([]store.LLMModel, error)
+}
+
+// llmError là một lần gọi Provider hỏng, kèm phân loại để router quyết định đi tiếp hay dừng.
+//
+// Thông báo được che NGAY LÚC DỰNG chứ không lúc in ra: một lỗi đi qua nhiều lớp bọc, và lớp
+// nào quên gọi hàm che thì lớp đó là chỗ khoá rò ra.
+type llmError struct {
+	Kind  llmErrorKind
+	msg   string
+	cause error
+}
+
+func (e *llmError) Error() string { return e.msg }
+
+// Unwrap để errors.Is(err, context.DeadlineExceeded) còn dùng được ở tầng trên. cause chỉ bao
+// giờ là lỗi tầng vận chuyển — body của Provider KHÔNG đi vào đây.
+func (e *llmError) Unwrap() error { return e.cause }
+
+func newLLMError(kind llmErrorKind, cause error, format string, args ...any) *llmError {
+	msg := fmt.Sprintf(format, args...)
+	if cause != nil {
+		msg += ": " + cause.Error()
+	}
+	return &llmError{Kind: kind, msg: sanitizeProviderError(msg), cause: cause}
+}
+
+// transportError phân loại lỗi trước khi có phản hồi: quá hạn là timeout, còn lại là network.
+//
+// Xét cả net.Error.Timeout() chứ không chỉ context.DeadlineExceeded vì hai nguồn hết giờ khác
+// nhau — deadline của ctx và http.Client.Timeout — và chúng không cùng một lỗi gốc.
+func transportError(op string, err error) *llmError {
+	kind := llmErrorNetwork
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+		kind = llmErrorTimeout
+	}
+	return newLLMError(kind, err, "%s: không gọi được Provider", op)
+}
