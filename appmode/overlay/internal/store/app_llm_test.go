@@ -415,6 +415,48 @@ func TestLLMAttemptsAggregateWithoutContent(t *testing.T) {
 	if status.LastSuccessAt == nil || !status.LastSuccessAt.Equal(start.Add(time.Second)) {
 		t.Errorf("LLMStatus().LastSuccessAt = %v; want %v", status.LastSuccessAt, start.Add(time.Second))
 	}
+	// Lượt hỏng gần nhất KHÔNG bị lượt thành công sau nó xoá đi: cả hai là hai hàng khác nhau, và
+	// một chuỗi đang rơi xuống lưới an toàn thì người trực cần đọc được cả hai.
+	if status.LastErrorKind != "rate_limit" || status.LastErrorProviderID != "openai-1" {
+		t.Errorf("LLMStatus() lastError kind/provider = %q/%q; want rate_limit/openai-1",
+			status.LastErrorKind, status.LastErrorProviderID)
+	}
+}
+
+// Chuỗi hỏng sạch là lúc phân loại lỗi đáng giá NHẤT — và cũng là lúc dễ mất nhất: LLMStatus trả
+// về sớm khi không có lượt thành công nào, nên một phép đọc đặt sau nhánh đó sẽ luôn trả về rỗng
+// đúng vào tình huống này.
+func TestLLMStatusReportsTheLastErrorWithNoSuccessAtAll(t *testing.T) {
+	st := newLLMStore(t)
+
+	start := time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC)
+	for _, a := range []LLMAttempt{
+		{
+			ProviderID: "openai-1", ModelID: "gpt-5-mini", StartedAt: start,
+			Outcome: LLMAttemptError, ErrorKind: "upstream", FellBack: true, NextProviderID: "gemini-1",
+		},
+		{
+			ProviderID: "gemini-1", ModelID: "gemini-2.5-flash", StartedAt: start.Add(time.Second),
+			Outcome: LLMAttemptError, ErrorKind: "policy",
+		},
+	} {
+		if err := st.RecordLLMAttempt(a); err != nil {
+			t.Fatalf("RecordLLMAttempt(%q) = %v; want nil", a.ProviderID, err)
+		}
+	}
+
+	status, err := st.LLMStatus()
+	if err != nil {
+		t.Fatalf("LLMStatus() = %v; want nil", err)
+	}
+	if status.ActiveProviderID != "" || status.LastSuccessAt != nil {
+		t.Errorf("LLMStatus() active/lastSuccess = %q/%v; want rỗng (chưa lượt nào thành công)",
+			status.ActiveProviderID, status.LastSuccessAt)
+	}
+	if status.LastErrorKind != "policy" || status.LastErrorProviderID != "gemini-1" {
+		t.Errorf("LLMStatus() lastError kind/provider = %q/%q; want policy/gemini-1 (hàng mới nhất)",
+			status.LastErrorKind, status.LastErrorProviderID)
+	}
 }
 
 // Hai cột dưới đây có CHECK trong schema, nên một giá trị lệch VẪN bị chặn nếu thiếu guard —

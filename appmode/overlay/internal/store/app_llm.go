@@ -101,6 +101,16 @@ type LLMStatus struct {
 	// phải tổng từ đầu: sau lượt thứ 500 chúng đứng yên mãi. Nhãn "tổng số lượt" là sai.
 	Attempts  int
 	Fallbacks int
+	// LastErrorKind và LastErrorProviderID là lượt HỎNG gần nhất, độc lập với lượt thành công
+	// gần nhất: hai lượt đó thường là hai hàng khác nhau, và một chuỗi đang rơi xuống lưới an
+	// toàn thì cả hai đều có.
+	//
+	// Cần thiết vì error_kind là thứ DUY NHẤT phân biệt "Provider từ chối nội dung nên chuỗi
+	// dừng trước Claude Code" với "Claude Code cũng hỏng": trên đường trả lời cả hai đều ra một
+	// dòng bàn giao giống hệt nhau. Chỉ loại lỗi và id Provider — không câu chữ nào từ Provider,
+	// vì hai trường này đi thẳng ra Portal.
+	LastErrorKind       string
+	LastErrorProviderID string
 }
 
 // --- providers ---
@@ -542,6 +552,18 @@ func (s *Store) LLMStatus() (LLMStatus, error) {
 		`SELECT COUNT(*), COALESCE(SUM(fell_back), 0) FROM llm_attempts`).
 		Scan(&status.Attempts, &status.Fallbacks); err != nil {
 		return LLMStatus{}, fmt.Errorf("read llm attempt totals: %w", err)
+	}
+
+	// Lượt hỏng đọc TRƯỚC lượt thành công, vì nhánh "chưa có lượt thành công nào" bên dưới trả về
+	// sớm — và đó chính là lúc lượt hỏng gần nhất đáng đọc nhất: mọi lượt đều hỏng.
+	switch err := s.db.QueryRow(`
+SELECT provider_id, error_kind FROM llm_attempts
+WHERE outcome = ? ORDER BY id DESC LIMIT 1`, LLMAttemptError).
+		Scan(&status.LastErrorProviderID, &status.LastErrorKind); {
+	case errors.Is(err, sql.ErrNoRows):
+		// Chưa có lượt nào hỏng là trạng thái BÌNH THƯỜNG, không phải lỗi đọc.
+	case err != nil:
+		return LLMStatus{}, fmt.Errorf("read last llm error: %w", err)
 	}
 
 	var startedAt string

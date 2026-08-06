@@ -154,7 +154,11 @@ function entryWarning(providers, entry) {
   // mà chuỗi còn trỏ tới, nên trạng thái đó không tới được qua API. Dấu ? chỉ để một hàng dữ
   // liệu hỏng làm sai một dòng cảnh báo thay vì ném lỗi và bỏ trắng cả trang.
   if (!provider?.enabled) {
-    return `${provider?.name || entry.provider_id} đang tắt — bật lại ở mục Providers hoặc chọn Provider khác.`;
+    // "Bỏ qua", không phải "hỏng": router xét trạng thái bật/tắt của Provider ở từng lượt gọi, nên
+    // chuỗi bước qua mắt xích này và thử mắt xích kế tiếp. Chuỗi vẫn chạy được, và câu chữ ở đây
+    // phải nói đúng điều đó thay vì bắt người dùng đi sửa một thứ không chặn gì cả.
+    return `${provider?.name || entry.provider_id} đang tắt — chuỗi bỏ qua mắt xích này.`
+      + " Bật lại ở mục Providers hoặc chọn Provider khác.";
   }
   if (!entry.model_id) return "Chưa chọn model cho mắt xích này.";
   const model = modelsOf(providers, entry.provider_id)
@@ -179,13 +183,66 @@ function labelledCell(controlID, label, control) {
   );
 }
 
-// statusText chỉ nói điều huy hiệu trên hàng KHÔNG nói được: không mắt xích nào đang chạy thì
-// không có hàng nào đeo huy hiệu, và một bảng im lặng trông y hệt một lượt đọc hỏng. Lúc đang
-// chạy thì hàng đã tự khoe, nên dòng này để trống; lỗi đọc do refreshStatus tự viết vào đây.
-function statusText(status) {
-  return status && !status.active_provider_id
-    ? "Chưa có lượt gọi nào kể từ lần khởi động gần nhất."
-    : "";
+// LLM_ERROR_FIX là VIỆC PHẢI LÀM cho từng loại lỗi mà router ghi lại.
+//
+// Chỉ loại lỗi và tên Provider ra màn hình, KHÔNG bao giờ câu chữ của Provider: /llm/status cố ý
+// không mang thân phản hồi, nên bảng này là chỗ duy nhất sinh ra chữ — và nó không đọc gì từ
+// bên ngoài.
+//
+// Loại thứ chín, "canceled", cố ý vắng mặt: router trả về trước khi ghi telemetry cho một lượt bị
+// huỷ, nên nó không tới được đây. Câu chung bên dưới lo nốt trường hợp bảng này thiếu một loại.
+const LLM_ERROR_FIX = {
+  credential: "API key sai hoặc hết hạn — nhập lại ở mục Providers.",
+  model: "Model không gọi được — chọn model khác cho mắt xích đó.",
+  request: "Request sai định dạng — chuỗi dừng tại đây, báo kỹ thuật.",
+  policy: "Provider từ chối nội dung — chuỗi DỪNG tại đây, không rơi xuống Claude Code.",
+  rate_limit: "Bị giới hạn tần suất — chuỗi đã thử mắt xích kế tiếp.",
+  network: "Không gọi tới được — chuỗi đã thử mắt xích kế tiếp.",
+  timeout: "Quá hạn — chuỗi đã thử mắt xích kế tiếp.",
+  upstream: "Provider báo lỗi — chuỗi đã thử mắt xích kế tiếp.",
+};
+
+// failureText là lý do khách nhận được dòng bàn giao thay vì câu trả lời.
+//
+// Không có dòng này thì mọi kiểu hỏng trông y hệt nhau trên terminal Runtime — kể cả những kiểu
+// người trực chữa trong 30 giây (khoá hết hạn, model đã gỡ).
+function failureText(status, nameOf) {
+  const kind = status.last_error_kind;
+  if (!kind) return "";
+  const who = nameOf(status.last_error_provider_id) || "Provider";
+  return `Lượt hỏng gần nhất: ${who} (${kind}).`
+    + ` ${LLM_ERROR_FIX[kind] || "Xem log Runtime để biết thêm."}`;
+}
+
+// tallyText đếm trên CỬA SỔ telemetry còn giữ lại, không phải từ đầu — nên nhãn không nói "tổng".
+function tallyText(status) {
+  const attempts = Number(status.attempts) || 0;
+  if (attempts === 0) return "";
+  return `${attempts} lượt gần đây, ${Number(status.fallbacks) || 0} lần né.`;
+}
+
+// clockOf đổi một mốc RFC3339 sang giờ máy này. Mốc rỗng hoặc hỏng trả về "" chứ không để
+// "Invalid Date" chạy ra màn hình.
+function clockOf(iso) {
+  const at = new Date(iso ?? "");
+  return Number.isNaN(at.getTime()) ? "" : at.toLocaleTimeString();
+}
+
+// statusText nói những điều huy hiệu trên hàng KHÔNG nói được: lượt trả lời gần nhất là lúc nào,
+// lượt hỏng gần nhất hỏng vì gì và phải làm gì với nó, và chuỗi đã né bao nhiêu lần.
+//
+// status còn null (trước lượt hỏi đầu tiên) thì để trống — .chainstatus:empty tự ẩn. Lỗi đọc
+// trạng thái do refreshStatus tự viết vào ô này.
+function statusText(status, nameOf) {
+  if (!status) return "";
+  const idle = !status.active_provider_id;
+  const clock = clockOf(status.last_success_at);
+  return [
+    idle ? "Chưa có lượt gọi nào kể từ lần khởi động gần nhất." : "",
+    !idle && clock ? `Trả lời gần nhất lúc ${clock}.` : "",
+    failureText(status, nameOf),
+    tallyText(status),
+  ].filter(Boolean).join(" ");
 }
 
 export function createModelsPage({
@@ -260,7 +317,7 @@ export function createModelsPage({
             && status.active_model_id === entry.model_id;
           node.textContent = running ? "đang chạy" : "";
         });
-        statusLine.textContent = statusError || statusText(status);
+        statusLine.textContent = statusError || statusText(status, nameOf);
       }
 
       function buildRow(entry, index) {

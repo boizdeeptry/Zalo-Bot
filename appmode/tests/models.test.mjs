@@ -378,7 +378,7 @@ test("only enabled providers are offered as chain links", async (t) => {
   assert.deepEqual(optionIDs(selects(rows(main)[0])[0]), ["openai-1", "gemini", "claude-code"]);
 });
 
-test("a link on a disabled provider keeps its choice and says how to repair it", async (t) => {
+test("a link on a disabled provider keeps its choice and says the chain steps over it", async (t) => {
   const { main } = await mounted(t, routeAPI({
     route: {
       revision: 4,
@@ -391,7 +391,12 @@ test("a link on a disabled provider keeps its choice and says how to repair it",
 
   const row = rows(main)[0];
   assert.equal(selects(row)[0].value, "anthropic-1");
-  assert.match(text(find(row, (node) => hasClass(node, "fn"))), /Anthropic dự phòng đang tắt/);
+  // "Bỏ qua", không phải "hỏng": router xét cờ bật/tắt của Provider ở từng lượt gọi, nên chuỗi
+  // bước qua mắt xích này và vẫn trả lời được.
+  assert.match(
+    text(find(row, (node) => hasClass(node, "fn"))),
+    /Anthropic dự phòng đang tắt — chuỗi bỏ qua mắt xích này/,
+  );
 });
 
 test("a link on a model the provider no longer offers keeps it with a warning", async (t) => {
@@ -509,10 +514,49 @@ test("the status line explains a chain where no badge is showing", async (t) => 
   assert.match(text(find(main, (node) => hasClass(node, "chainstatus"))), /Chưa có lượt gọi nào/);
 });
 
-test("the status line stays quiet while a badge is doing the talking", async (t) => {
+test("the status line carries the counts the badge cannot show", async (t) => {
   const { main } = await mounted(t);
 
-  assert.equal(text(find(main, (node) => hasClass(node, "chainstatus"))), "");
+  assert.match(text(find(main, (node) => hasClass(node, "chainstatus"))), /12 lượt gần đây, 2 lần né/);
+});
+
+// Loại lỗi là thứ DUY NHẤT phân biệt "khoá hết hạn, sửa 30 giây" với "Claude Code cũng hỏng":
+// trên đường trả lời khách cả hai chỉ ra một dòng bàn giao giống hệt nhau.
+test("the status line names the provider that failed and what to do about it", async (t) => {
+  const { main } = await mounted(t, routeAPI({
+    status: { ...STATUS, last_error_kind: "credential", last_error_provider_id: "openai-1" },
+  }));
+
+  const line = text(find(main, (node) => hasClass(node, "chainstatus")));
+  assert.match(line, /OpenAI chính \(credential\)/);
+  assert.match(line, /nhập lại ở mục Providers/i);
+});
+
+// Chuỗi dừng TRƯỚC lưới an toàn là tình huống dễ hiểu sai nhất: khách nhận dòng bàn giao trong
+// khi Claude Code chưa hề được gọi, nên dòng này phải nói ra rằng chuỗi đã dừng.
+test("the status line says a policy refusal stopped the chain short of Claude Code", async (t) => {
+  const { main } = await mounted(t, routeAPI({
+    status: {
+      ...STATUS,
+      active_provider_id: "",
+      active_model_id: "",
+      last_success_at: "",
+      last_error_kind: "policy",
+      last_error_provider_id: "gemini",
+    },
+  }));
+
+  assert.match(text(find(main, (node) => hasClass(node, "chainstatus"))), /Gemini \(policy\).*DỪNG/s);
+});
+
+// Một loại lỗi ngoài bảng (hay một cột error_kind rỗng của bản cũ) không được làm trắng cả dòng:
+// tên Provider vẫn là nửa thông tin đáng giá nhất.
+test("the status line still names the provider for an error kind it does not know", async (t) => {
+  const { main } = await mounted(t, routeAPI({
+    status: { ...STATUS, last_error_kind: "canceled", last_error_provider_id: "gemini" },
+  }));
+
+  assert.match(text(find(main, (node) => hasClass(node, "chainstatus"))), /Gemini \(canceled\)/);
 });
 
 test("a failed status poll says so instead of leaving the chain looking idle", async (t) => {
@@ -551,9 +595,9 @@ test("a status poll that recovers clears the error it left behind", async (t) =>
   broken = false;
   await tick();
 
-  assert.equal(
+  assert.doesNotMatch(
     text(find(main, (node) => hasClass(node, "chainstatus"))),
-    "",
+    /không đọc được trạng thái/,
     "a recovered poll must take its old error off the screen",
   );
 });

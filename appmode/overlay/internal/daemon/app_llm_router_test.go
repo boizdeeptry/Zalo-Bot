@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -190,6 +191,12 @@ type fakeCredentials struct {
 	plain  map[string]string
 	err    map[string]error
 	handed [][]byte
+	// opened là id của những Provider đã bị HỎI khoá, ghi lại ngay lúc hỏi.
+	//
+	// Tách khỏi handed vì handed không trả lời được câu đó: router xoá lát cắt nó vừa dùng, nên
+	// mọi phần tử trong handed đều là số 0 lúc test đọc tới — một phép so "có khoá của X không"
+	// dựa vào chúng thì không bao giờ đỏ được, kể cả khi khoá đã bị mở thật.
+	opened []string
 }
 
 func newFakeCredentials(plain map[string]string) *fakeCredentials {
@@ -202,6 +209,7 @@ func (c *fakeCredentials) open(providerID string) ([]byte, error) {
 	if err := c.err[providerID]; err != nil {
 		return nil, err
 	}
+	c.opened = append(c.opened, providerID)
 	out := []byte(c.plain[providerID])
 	c.handed = append(c.handed, out)
 	return out, nil
@@ -211,6 +219,12 @@ func (c *fakeCredentials) issued() [][]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([][]byte(nil), c.handed...)
+}
+
+func (c *fakeCredentials) unlocked() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.opened...)
 }
 
 // --- helpers ---
@@ -475,6 +489,54 @@ func TestAppLLMRunnerSkipsDisabledEntriesAndCallsEachProviderOnce(t *testing.T) 
 	}
 	if attempts[0].NextProviderID != "openrouter-1" {
 		t.Errorf("attempt[0].NextProviderID = %q; want openrouter-1 (bỏ qua mục đang tắt)",
+			attempts[0].NextProviderID)
+	}
+}
+
+// Mắt xích BẬT trỏ vào một Provider đang TẮT là hình dạng mà validateLLMRoute không canh được:
+// nó chạy lúc lưu chuỗi, còn việc tắt Provider xảy ra sau đó. Không có cửa này thì lượt kế tiếp
+// vẫn mở khoá và gửi prompt của khách tới đúng nhà cung cấp vừa bị ngắt.
+func TestAppLLMRunnerSkipsEntriesWhoseProviderIsDisabled(t *testing.T) {
+	first, off, third := failAdapter(llmErrorUpstream), okAdapter(`{"answer":"off"}`), okAdapter(`{"answer":"c"}`)
+	claude := okClaude(`{"answer":"claude"}`)
+	f := newRouterFixture(newRoute(
+		entry("openai-1", "gpt-5-mini", true),
+		entry("gemini-1", "gemini-2.5-flash", true),
+		entry("openrouter-1", "x-ai/grok-4", true),
+		entry("claude-code", "haiku", true),
+	), claude).
+		with("openai-1", "sk-one", first).
+		with("gemini-1", "sk-two", off).
+		with("openrouter-1", "sk-three", third)
+
+	got, err := f.runner(appLLMRunnerConfig{Disabled: map[string]bool{"gemini-1": true}}).
+		Run(t.Context(), "câu hỏi", f.step)
+	if err != nil {
+		t.Fatalf("Run() = _, %v; want nil", err)
+	}
+	if got != `{"answer":"c"}` {
+		t.Errorf("Run() = %q; want %q (chuỗi đi tiếp tới mắt xích sau)", got, `{"answer":"c"}`)
+	}
+	if len(off.seen()) != 0 {
+		t.Errorf("adapter của Provider đang tắt được gọi %d lần; want 0", len(off.seen()))
+	}
+	// Khoá của Provider tắt không được MỞ, chứ không chỉ không được gửi đi: giải mã rồi vứt vẫn
+	// là một lần bản rõ nằm trong bộ nhớ vì một Provider mà người trực đã ngắt.
+	if got := f.creds.unlocked(); !slices.Equal(got, []string{"openai-1", "openrouter-1"}) {
+		t.Errorf("các Provider bị mở khoá = %q; want [openai-1 openrouter-1]", got)
+	}
+	attempts := f.store.recorded()
+	if len(attempts) != 2 {
+		t.Fatalf("RecordLLMAttempt gọi %d lần; want 2 (Provider tắt không sinh telemetry)", len(attempts))
+	}
+	for _, a := range attempts {
+		if a.ProviderID == "gemini-1" {
+			t.Errorf("telemetry có hàng của Provider đang tắt; want không hàng nào")
+		}
+	}
+	// Cột next_provider_id phải nói đúng nơi lượt ĐÃ đi, không phải mắt xích kế tiếp trên giấy.
+	if attempts[0].NextProviderID != "openrouter-1" {
+		t.Errorf("attempt[0].NextProviderID = %q; want openrouter-1 (bỏ qua Provider đang tắt)",
 			attempts[0].NextProviderID)
 	}
 }
@@ -1107,6 +1169,63 @@ func TestAppZaloRunnerKeepsAnsweringWithoutASavedRoute(t *testing.T) {
 	}
 }
 
+// Cửa nối giữa hai tầng: router biết bỏ qua Provider đang tắt, nhưng chỉ appZaloRunner mới biết
+// Provider NÀO đang tắt. Kiểm riêng từng tầng thì cả hai xanh trong khi dây nối giữa chúng đứt.
+//
+// Test này KHÔNG chạm mạng, và đó chính là thứ khiến nó nói được điều gì đó: openai-1 chưa có
+// khoá, nên nếu cửa tắt không được chuyền xuống, Run dừng ngay ở bước mở khoá và trả về lỗi. Xanh
+// nghĩa là lượt đã bỏ qua mắt xích đó và rơi xuống lưới an toàn.
+func TestAppZaloRunnerSkipsAProviderTurnedOffAfterTheRouteWasSaved(t *testing.T) {
+	a := newAppRouteAPI(t)
+	if err := a.st.CreateLLMProvider(store.LLMProvider{
+		ID: "openai-1", Name: "OpenAI", Kind: "openai", Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMProvider(openai-1) = %v; want nil", err)
+	}
+	for _, m := range []store.LLMModel{
+		{ProviderID: "openai-1", ModelID: "gpt-5-mini", Name: "gpt-5-mini"},
+		{ProviderID: "claude-code", ModelID: "haiku", Name: "haiku"},
+	} {
+		m.Source, m.Available = store.LLMModelManual, true
+		if err := a.st.AddLLMModel(m); err != nil {
+			t.Fatalf("AddLLMModel(%s/%s) = %v; want nil", m.ProviderID, m.ModelID, err)
+		}
+	}
+	saveRoute(t, a,
+		store.LLMRouteEntry{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true},
+		store.LLMRouteEntry{ProviderID: "claude-code", ModelID: "haiku", Enabled: true},
+	)
+
+	// Đúng thao tác của người trực khi một khoá bị lộ: tắt Provider, KHÔNG đụng vào chuỗi. Mắt
+	// xích openai-1 vẫn ở đó và vẫn mang Enabled = true.
+	if err := a.st.UpdateLLMProvider(store.LLMProvider{
+		ID: "openai-1", Name: "OpenAI", Enabled: false,
+	}); err != nil {
+		t.Fatalf("UpdateLLMProvider(openai-1, enabled=false) = %v; want nil", err)
+	}
+
+	const answer = "trả lời từ lưới an toàn"
+	got, err := a.appZaloRunner(zaloConfig{Model: "haiku"}, okClaude(answer), "t1", false).
+		Run(t.Context(), "câu hỏi", func(string) {})
+	if err != nil {
+		t.Fatalf("Run() sau khi tắt openai-1 = _, %v; want nil (bỏ qua mắt xích, đi tiếp)", err)
+	}
+	if got != answer {
+		t.Errorf("Run() sau khi tắt openai-1 = %q; want %q", got, answer)
+	}
+	status, err := a.st.LLMStatus()
+	if err != nil {
+		t.Fatalf("LLMStatus() = _, %v; want nil", err)
+	}
+	if status.ActiveProviderID != "claude-code" {
+		t.Errorf("LLMStatus().ActiveProviderID = %q; want claude-code", status.ActiveProviderID)
+	}
+	if status.Attempts != 1 {
+		t.Errorf("LLMStatus().Attempts = %d; want 1 (Provider đã tắt không sinh lượt gọi nào)",
+			status.Attempts)
+	}
+}
+
 func TestAppClaudeRunnerCarriesTheRouteModel(t *testing.T) {
 	a := newAppRouteAPI(t)
 	base := okClaude("base")
@@ -1209,15 +1328,25 @@ func TestAppLLMAdaptersComeFromTheStoredProviderKind(t *testing.T) {
 		"o-1": "openai", "a-1": "anthropic", "g-1": "gemini", "r-1": "openrouter", "x-1": "chưa hỗ trợ",
 	} {
 		if err := a.st.CreateLLMProvider(store.LLMProvider{
-			ID: id, Name: id, Kind: kind, Enabled: true,
+			ID: id, Name: id, Kind: kind, Enabled: id != "a-1",
 		}); err != nil {
 			t.Fatalf("CreateLLMProvider(%q, %q) = %v; want nil", id, kind, err)
 		}
 	}
 
-	adapters, err := a.appLLMAdapters()
+	adapters, disabled, err := a.appLLMAdapters()
 	if err != nil {
-		t.Fatalf("appLLMAdapters() = _, %v; want nil", err)
+		t.Fatalf("appLLMAdapters() = _, _, %v; want nil", err)
+	}
+	// a-1 đang tắt nhưng VẪN có adapter: hai trạng thái này khác nhau ở chỗ router xử lý chúng
+	// khác nhau — thiếu adapter là cấu hình hỏng và chuỗi dừng, còn đang tắt thì chuỗi đi tiếp.
+	if !disabled["a-1"] {
+		t.Errorf("appLLMAdapters() disabled[a-1] = false; want true (Provider đang tắt)")
+	}
+	for _, id := range []string{"o-1", "g-1", "r-1", "claude-code"} {
+		if disabled[id] {
+			t.Errorf("appLLMAdapters() disabled[%q] = true; want false", id)
+		}
 	}
 
 	for _, tc := range []struct {
@@ -1299,11 +1428,10 @@ func TestAppLLMCredentialUnlocksExactlyOneProvider(t *testing.T) {
 // Provider biến thành câu trả lời. Ghép sai một trong hai thì chuỗi vẫn xanh trong test đơn vị và
 // vẫn im lặng trên máy người mua.
 //
-// Test này KHÔNG phân biệt được 429 với một lỗi được-fallback khác — 503 hay JSON hỏng cũng cho ra
-// đúng 2 lượt / 1 lần né. Đó là giới hạn CỐ Ý của LLMStatus, không phải chỗ bỏ sót: nó là telemetry
-// đã tổng hợp và không mang error_kind, vì thứ Portal cần trả lời là "ai đang phục vụ, có phải né
-// không". Ánh xạ 429 → rate_limit được ghim ở tầng nói được nó: bảng classifyStatus trong
-// app_llm_http_test.go, và các test theo từng loại lỗi bên trên.
+// Phân loại lỗi đi tới tận LLMStatus.LastErrorKind, nên test này chốt luôn ánh xạ 429 →
+// rate_limit trên đường thật: một Portal chỉ đếm được "2 lượt / 1 lần né" thì không nói được cho
+// người trực biết phải sửa gì. Bảng classifyStatus trong app_llm_http_test.go canh phần còn lại
+// của ánh xạ; ở đây là mắt xích nối nó với bề mặt /llm/status.
 func TestAppLLMRunnerFallsBackOverRealHTTP(t *testing.T) {
 	// Hình dạng answerZalo đòi ở đầu ra của runner. Nhánh clarify là nhánh DUY NHẤT được ra ngoài
 	// mà không cần trích dẫn, nên đây là câu trả lời hợp lệ ngắn nhất — test này nghiệm thu đường
@@ -1405,5 +1533,10 @@ func TestAppLLMRunnerFallsBackOverRealHTTP(t *testing.T) {
 	}
 	if status.LastSuccessAt == nil {
 		t.Errorf("LLMStatus().LastSuccessAt = nil; want thời điểm của lượt thành công")
+	}
+	// 429 trên dây phải đi hết đường tới bề mặt người trực đọc, không dừng lại ở cột database.
+	if status.LastErrorKind != string(llmErrorRateLimit) || status.LastErrorProviderID != "openai-1" {
+		t.Errorf("LLMStatus() lastError kind/provider = %q/%q; want rate_limit/openai-1",
+			status.LastErrorKind, status.LastErrorProviderID)
 	}
 }

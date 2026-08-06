@@ -52,6 +52,15 @@ type appLLMRunnerConfig struct {
 	// Luôn có mặt: validateLLMRoute không cho lưu chuỗi kết thúc bằng thứ khác Claude Code, nên
 	// router không cần một nhánh "nếu không còn gì".
 	Claude func(model string) zaloRunner
+	// Disabled là id của những Provider API đang TẮT, và nó là công tắc ngắt SỐNG.
+	//
+	// Cờ Enabled trên mắt xích route không thay được nó: hợp lệ hoá chỉ chạy lúc LƯU chuỗi, nên
+	// tắt một Provider sau đó để lại một mắt xích vẫn bật trỏ vào nó. Không có tập này thì lượt
+	// kế tiếp vẫn giải mã khoá và gửi prompt của khách tới đúng nhà cung cấp mà người trực vừa
+	// tắt — và lý do người ta tắt thường là khoá đã lộ.
+	//
+	// nil hợp lệ: đọc một map nil trả về false, nghĩa là "không Provider nào bị tắt".
+	Disabled map[string]bool
 	// Credential trả về BẢN RÕ MỚI cho mỗi lượt gọi. Router xoá nó ngay sau lượt gọi, nên một
 	// hiện thực trả về lát cắt dùng chung sẽ tự bắn vào chân mình ở lượt sau.
 	Credential func(providerID string) ([]byte, error)
@@ -110,7 +119,10 @@ func (r *appLLMRunner) Run(ctx context.Context, prompt string, step func(string)
 	apiCtx, cancel := context.WithTimeout(ctx, r.cfg.APIChainTimeout)
 	defer cancel()
 	for i, e := range apiEntries {
-		if !e.Enabled {
+		// Hai cửa tắt, không một: mắt xích tắt là lựa chọn của người dựng chuỗi, còn Provider tắt
+		// là lệnh ngắt của người trực. Cái sau tới SAU lúc lưu chuỗi nên nó phải được xét ở đây,
+		// tại lượt gọi, chứ không ở chỗ hợp lệ hoá.
+		if !e.Enabled || r.cfg.Disabled[e.ProviderID] {
 			continue
 		}
 		// Hai lỗi TRƯỚC lượt gọi, và cả hai đều dừng chuỗi mà không sinh telemetry: sổ vận hành
@@ -157,7 +169,7 @@ func (r *appLLMRunner) Run(ctx context.Context, prompt string, step func(string)
 			r.record(llmErrorAttempt(e, started, elapsed, kind, claude.ProviderID))
 			break
 		}
-		r.record(llmErrorAttempt(e, started, elapsed, kind, nextEnabledProvider(entries, i+1)))
+		r.record(llmErrorAttempt(e, started, elapsed, kind, r.nextProvider(entries, i+1)))
 	}
 	return r.runClaude(ctx, claude, prompt, step)
 }
@@ -252,10 +264,17 @@ func llmErrorKindOf(err error) llmErrorKind {
 	return llmErrorUpstream
 }
 
-// nextEnabledProvider là mục sẽ được thử tiếp, để telemetry nói đúng chuỗi đã đi.
-func nextEnabledProvider(entries []store.LLMRouteEntry, from int) string {
+// nextProvider là mục sẽ được thử tiếp, để telemetry nói đúng chuỗi đã đi.
+//
+// Cùng ĐÚNG hai cửa tắt như vòng lặp trong Run. Bỏ sót cửa Disabled ở đây thì sổ vận hành ghi
+// "né sang X" về một Provider mà lượt đó không hề gọi tới — và fell_back tính từ cùng chỗ này,
+// nên sai một chỗ là sai cả hai cột.
+//
+// Mắt xích cuối không nằm trong Disabled: tập đó chỉ chứa Provider gọi được qua HTTP, còn Claude
+// Code thì không (xem appLLMAdapters). Nhờ vậy dòng telemetry cuối vẫn trỏ đúng lưới an toàn.
+func (r *appLLMRunner) nextProvider(entries []store.LLMRouteEntry, from int) string {
 	for _, e := range entries[from:] {
-		if e.Enabled {
+		if e.Enabled && !r.cfg.Disabled[e.ProviderID] {
 			return e.ProviderID
 		}
 	}
@@ -309,7 +328,7 @@ func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, has
 	if len(snapshot.Entries) == 0 {
 		return base
 	}
-	adapters, err := a.appLLMAdapters()
+	adapters, disabled, err := a.appLLMAdapters()
 	if err != nil {
 		a.logger.Error("llm route: không dựng được adapter, lượt này đi thẳng Claude Code", "err", err)
 		return base
@@ -317,6 +336,7 @@ func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, has
 	return newAppLLMRunner(appLLMRunnerConfig{
 		Store:      a.st,
 		Adapters:   adapters,
+		Disabled:   disabled,
 		Claude:     func(model string) zaloRunner { return a.appClaudeRunner(zc, base, model) },
 		Credential: a.appLLMCredential,
 		// Tệp của CẢ LUỒNG, không phải của tin này. answerZalo gọi mergeZaloFiles để gộp tệp của
@@ -372,15 +392,21 @@ func (a *api) appClaudeRunner(zc zaloConfig, base zaloRunner, model string) zalo
 	return execZaloRunner{cfg: zc, logger: a.logger}
 }
 
-// appLLMAdapters dựng adapter cho mọi Provider API đang lưu, khoá theo id.
+// appLLMAdapters dựng adapter cho mọi Provider API đang lưu, khoá theo id, kèm tập những id đang
+// TẮT.
 //
-// Provider đang TẮT vẫn có adapter: cửa bật/tắt của một lượt là cờ Enabled trên mắt xích route, và
-// validateLLMRoute đã chặn việc lưu một chuỗi đi qua Provider tắt. Bỏ ở đây nữa thì tắt một
-// Provider sẽ làm chuỗi dừng giữa chừng thay vì bỏ qua nó.
-func (a *api) appLLMAdapters() (map[string]providerAdapter, error) {
+// Provider tắt vẫn có adapter, và đó là lý do phải trả thêm tập thứ hai: một mục route trỏ vào
+// Provider không có adapter là cấu hình hỏng và router DỪNG chuỗi để nói ra, còn một Provider bị
+// người trực tắt thì router phải BỎ QUA và đi tiếp. Hai cách xử lý khác nhau nên chúng không dùng
+// chung được một phép thử "có adapter không".
+//
+// Cửa này không thừa so với validateLLMRoute: chỗ đó chỉ chạy lúc LƯU chuỗi, nên nó chặn được
+// việc dựng một chuỗi qua Provider đang tắt, chứ không chặn được việc tắt một Provider mà chuỗi
+// đang dùng. Đường thứ hai mới là đường người trực đi khi khoá bị lộ.
+func (a *api) appLLMAdapters() (map[string]providerAdapter, map[string]bool, error) {
 	providers, err := a.st.LLMProviders()
 	if err != nil {
-		return nil, fmt.Errorf("llm route: đọc danh sách Provider: %w", err)
+		return nil, nil, fmt.Errorf("llm route: đọc danh sách Provider: %w", err)
 	}
 	// Hạn giờ trên client vì ctx chặn được một lượt gọi nhưng không chặn được lúc bắt tay TLS.
 	// Cùng mức với hạn giờ mỗi Provider của router, nên không có hai con số phải giữ đồng bộ.
@@ -389,12 +415,21 @@ func (a *api) appLLMAdapters() (map[string]providerAdapter, error) {
 	// nối vẫn dùng chung — chỉ mỗi trường Timeout là của riêng client này.
 	client := &http.Client{Timeout: defaultLLMProviderTimeout}
 	adapters := make(map[string]providerAdapter, len(providers))
+	disabled := map[string]bool{}
 	for _, p := range providers {
-		if adapter, ok := newLLMAdapter(p.Kind, p.ID, client); ok {
-			adapters[p.ID] = adapter
+		adapter, ok := newLLMAdapter(p.Kind, p.ID, client)
+		if !ok {
+			continue
+		}
+		adapters[p.ID] = adapter
+		// Chỉ Provider GỌI ĐƯỢC mới vào tập tắt. Claude Code không có adapter nên nó không bao giờ
+		// tới đây — đúng như phải thế: nó là lưới an toàn, và một hàng database sửa tay không được
+		// biến nó thành mắt xích bị bỏ qua.
+		if !p.Enabled {
+			disabled[p.ID] = true
 		}
 	}
-	return adapters, nil
+	return adapters, disabled, nil
 }
 
 // appLLMCredential mở khoá của một Provider, trả về BẢN RÕ MỚI mỗi lượt gọi.

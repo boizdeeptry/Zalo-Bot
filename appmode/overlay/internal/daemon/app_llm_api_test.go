@@ -977,10 +977,16 @@ func TestLLMAPIRouteRejectsAChainThatDoesNotEndInClaudeCode(t *testing.T) {
 
 func TestLLMAPIStatusReportsTelemetry(t *testing.T) {
 	h := newLLMAPIHarness(t)
-	if err := h.st.RecordLLMAttempt(store.LLMAttempt{
-		ProviderID: "claude-code", ModelID: "haiku", Outcome: store.LLMAttemptOK,
-	}); err != nil {
-		t.Fatalf("RecordLLMAttempt() = %v; want nil", err)
+	for _, a := range []store.LLMAttempt{
+		{
+			ProviderID: "openai-1", ModelID: "gpt-5-mini", Outcome: store.LLMAttemptError,
+			ErrorKind: "credential",
+		},
+		{ProviderID: "claude-code", ModelID: "haiku", Outcome: store.LLMAttemptOK},
+	} {
+		if err := h.st.RecordLLMAttempt(a); err != nil {
+			t.Fatalf("RecordLLMAttempt(%q) = %v; want nil", a.ProviderID, err)
+		}
 	}
 
 	got := h.mustStatus(h.do(http.MethodGet, "/llm/status", ""), http.StatusOK, "read status")
@@ -988,11 +994,19 @@ func TestLLMAPIStatusReportsTelemetry(t *testing.T) {
 	if provider, _ := body["active_provider_id"].(string); provider != "claude-code" {
 		t.Errorf("active_provider_id = %q, want %q", provider, "claude-code")
 	}
-	if attempts, _ := body["attempts"].(float64); attempts != 1 {
-		t.Errorf("attempts = %v, want 1", body["attempts"])
+	if attempts, _ := body["attempts"].(float64); attempts != 2 {
+		t.Errorf("attempts = %v, want 2", body["attempts"])
 	}
 	if fallbacks, _ := body["fallbacks"].(float64); fallbacks != 0 {
 		t.Errorf("fallbacks = %v, want 0", body["fallbacks"])
+	}
+	// Phân loại lỗi phải RA ĐƯỢC tới Portal: đây là thứ duy nhất phân biệt "khoá sai, sửa 30 giây"
+	// với "Claude Code cũng hỏng", và trên đường trả lời khách hai thứ đó giống hệt nhau.
+	if kind, _ := body["last_error_kind"].(string); kind != "credential" {
+		t.Errorf("last_error_kind = %v, want %q", body["last_error_kind"], "credential")
+	}
+	if provider, _ := body["last_error_provider_id"].(string); provider != "openai-1" {
+		t.Errorf("last_error_provider_id = %v, want %q", body["last_error_provider_id"], "openai-1")
 	}
 }
 

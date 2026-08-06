@@ -492,11 +492,16 @@ func (a *api) handleLLMStatus(w http.ResponseWriter, _ *http.Request) {
 	if status.LastSuccessAt != nil {
 		lastSuccess = status.LastSuccessAt.Format(time.RFC3339)
 	}
+	// Hai trường last_error_* là loại lỗi và id Provider, KHÔNG phải thông báo của Provider: bảng
+	// llm_attempts cố ý không giữ thân phản hồi, nên bề mặt này không có gì để rò kể cả khi Portal
+	// hiện thẳng ra màn hình.
 	a.writeJSON(w, http.StatusOK, map[string]any{
-		"active_provider_id": status.ActiveProviderID,
-		"active_model_id":    status.ActiveModelID,
-		"last_success_at":    lastSuccess,
-		"attempts":           status.Attempts,
-		"fallbacks":          status.Fallbacks,
+		"active_provider_id":     status.ActiveProviderID,
+		"active_model_id":        status.ActiveModelID,
+		"last_success_at":        lastSuccess,
+		"attempts":               status.Attempts,
+		"fallbacks":              status.Fallbacks,
+		"last_error_kind":        status.LastErrorKind,
+		"last_error_provider_id": status.LastErrorProviderID,
 	})
 }
