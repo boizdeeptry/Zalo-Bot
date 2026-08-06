@@ -36,7 +36,7 @@ function Assert-CleanGitSource {
   param([Parameter(Mandatory)][string]$Repo)
 
   $repoPath = [IO.Path]::GetFullPath($Repo)
-  $status = (& git -C $repoPath --no-optional-locks status --porcelain=v1 --untracked-files=all) -join "`n"
+  $status = (& git -C $repoPath status --porcelain=v1 --untracked-files=all) -join "`n"
   if ($LASTEXITCODE -ne 0) {
     throw "không đọc được Git status của '$repoPath'"
   }
@@ -134,7 +134,7 @@ function New-AppStage {
 
   [IO.Directory]::CreateDirectory($stagePath) | Out-Null
 
-  $trackedOutput = & git -C $repoPath --no-optional-locks ls-files -z
+  $trackedOutput = & git -C $repoPath ls-files -z
   if ($LASTEXITCODE -ne 0) {
     throw "git ls-files thất bại cho '$repoPath'"
   }
