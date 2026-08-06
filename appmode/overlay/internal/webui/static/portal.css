@@ -97,8 +97,12 @@
 [data-agents-overlay] .qr { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-top:10px; }
 [data-agents-overlay] .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0, 0, 0, 0); white-space:nowrap; border:0; }
 
-/* Legacy Providers page. Dùng lại .facts của AI Agents nhưng cột trái là TÊN Provider,
-   nên nó rộng hơn và được phép xuống dòng. */
+/* providers:begin — Legacy Providers page. Dùng lại .facts của AI Agents nhưng cột trái là TÊN
+   Provider, nên nó rộng hơn và được phép xuống dòng.
+
+   MỌI luật từ đây tới providers:end phải bắt đầu bằng .providers-page hoặc .provider-sheet.
+   shell.test.mjs đọc đúng khoảng giữa hai dấu này để kiểm, nên đừng xoá cặp dấu — không có
+   chúng thì phép kiểm không còn gì để đọc. */
 .providers-page .facts { border:1px solid var(--line); border-radius:8px; overflow:hidden; margin:18px 0; background:var(--panel); }
 .providers-page .fact { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1.4fr) auto; gap:12px; align-items:center; padding:9px 11px; border-bottom:1px solid var(--line); font-size:12.5px; }
 .providers-page .fact:last-child { border-bottom:0; }
@@ -137,6 +141,7 @@
 .provider-sheet .madd { flex:1 1 160px; min-width:0; border:1px solid var(--line); border-radius:7px; padding:6px 9px; color:var(--ink); background:var(--panel); }
 .provider-sheet .sheetfoot { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-top:12px; }
 .provider-sheet .sheetfoot .note:first-child { margin-right:auto; }
+/* providers:end */
 
 .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
 .card {
@@ -215,10 +220,12 @@
   [data-agents-overlay] .sheet {
     width:100%; height:auto; max-height:calc(100vh - 24px); border-radius:8px;
   }
+  /* providers:begin — cùng luật phạm vi như khối trên. */
   .provider-sheet.sheetback { padding:12px; }
   .provider-sheet .sheet {
     width:100%; height:auto; max-height:calc(100vh - 24px); border-radius:8px;
   }
   /* Ba cột không còn chỗ ở bề ngang điện thoại; xếp dọc để tên và nút không bị bóp. */
   .providers-page .fact { grid-template-columns:1fr; gap:5px; }
+  /* providers:end */
 }
