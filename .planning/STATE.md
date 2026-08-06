@@ -1,22 +1,24 @@
 # Planning state
 
-step: ready
-last_shipped: .planning/specs/2026-08-06-provider-routing-design.md
+step: research
+current_topic: cli-subscription-providers
+current_spec: .planning/specs/2026-08-06-cli-subscription-providers-design.md
 last_updated: 2026-08-06
 
-## Đã xong
+## Đã ship
 
-- **Provider routing** — merge vào `main` ở `40cd198` (31 commit trên nhánh
-  `feat/provider-routing`). Bốn API Provider với chuỗi fallback toàn cục, khoá mã
-  hoá DPAPI, lượt có tệp đi thẳng Claude Code, cổng quét credential trong gói.
-  Chưa push lên `origin`.
+- **Provider routing** — merge vào `main` ở `40cd198`. Bốn API Provider với chuỗi
+  fallback toàn cục, khoá mã hoá DPAPI, lượt có tệp đi thẳng Claude Code, cổng quét
+  credential trong gói. Chưa push lên `origin`.
 
-## Minor cố ý hoãn
+## Đang làm
 
-- `/llm` phát vài trường không trang nào đọc: `last_checked_at`, `position`,
-  envelope `{"provider":…}`, `{"ok":true}`.
-- `hintFields` trong `providers.js` bỏ qua `fields.kind` và `fields.model_id`.
-- Comment `providers.js:36` nói `/llm` từ chối thân thiếu — sai.
-- `selectorsIn` trùng nguyên văn ở `shell.test.mjs` và `models.test.mjs`.
-- `.providers-page .facts` là bản sao của `.agents-page .facts` chứ không phải
-  dùng lại.
+- **CLI subscription providers** — spec duyệt ở `d1e4799`, qua review độc lập. Gói
+  thuê bao (Claude/ChatGPT/Google AI) thành mắt xích chuỗi fallback bằng cách spawn
+  CLI chính chủ đã đăng nhập. Bước tiếp: `/plan`.
+
+## Xếp hàng, mỗi cái một vòng /discuss
+
+1. **Multi-account** — nhiều tài khoản mỗi Provider. Tiền đề cho Round Robin.
+2. **Combos** — chuỗi Models chọn chiến lược: Capacity auto-switch, Round Robin,
+   Fusion. Người dùng đã chọn cả ba.
