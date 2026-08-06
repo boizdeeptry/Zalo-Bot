@@ -414,32 +414,10 @@ func (s *Store) ReplaceLLMRoute(expectedRevision int64, entries []LLMRouteEntry)
 	return s.LLMRoute()
 }
 
-// BootstrapClaudeRoute gieo chuỗi mặc định một-mắt-xích khi chưa có gì.
-//
-// Chạy mỗi lần daemon khởi động, nên nó phải là no-op khi route đã có: gieo đè sẽ xoá chuỗi
-// người dùng vừa dựng mỗi lần mở máy, và không có gì báo cho họ biết.
+// BootstrapClaudeRoute từng seed một route claude-code trên máy mới. Không còn: §6 cho phép chuỗi
+// RỖNG, và máy mới đi qua màn onboarding (người vận hành chọn Provider) chứ không bị ép một mặc
+// định. Giữ hàm (và lời gọi ở app_routes.go, gỡ ở task sau) để lịch sử rõ; nó là no-op có chủ đích.
 func (s *Store) BootstrapClaudeRoute(model string) error {
-	if model == "" {
-		return fmt.Errorf("bootstrap claude route: thiếu model")
-	}
-	snapshot, err := s.LLMRoute()
-	if err != nil {
-		return fmt.Errorf("bootstrap claude route: %w", err)
-	}
-	if len(snapshot.Entries) > 0 {
-		return nil
-	}
-	if err := s.AddLLMModel(LLMModel{
-		ProviderID: systemProviderID, ModelID: model, Name: model,
-		Source: LLMModelManual, Available: true,
-	}); err != nil {
-		return fmt.Errorf("bootstrap claude route: %w", err)
-	}
-	if _, err := s.ReplaceLLMRoute(snapshot.Revision, []LLMRouteEntry{
-		{ProviderID: systemProviderID, ModelID: model, Enabled: true},
-	}); err != nil {
-		return fmt.Errorf("bootstrap claude route: %w", err)
-	}
 	return nil
 }
 
@@ -448,14 +426,13 @@ func (s *Store) BootstrapClaudeRoute(model string) error {
 // Kiểm ở đây chứ không ở tầng HTTP vì router đọc thẳng từ database: một chuỗi sai lọt vào chỉ
 // lộ ra lúc có tin nhắn khách, tức là lúc tệ nhất để phát hiện.
 func validateLLMRoute(tx *sql.Tx, entries []LLMRouteEntry) error {
-	if len(entries) == 0 {
-		return fmt.Errorf("route cần ít nhất một mục")
-	}
-	last := entries[len(entries)-1]
-	// Claude Code là lưới an toàn: nó không cần API key và xử lý được lượt có file, nên một
-	// chuỗi kết thúc bằng thứ khác là một chuỗi có thể cạn sạch và khách không nhận được gì.
-	if last.ProviderID != systemProviderID || !last.Enabled {
-		return fmt.Errorf("route phải kết thúc bằng %s đang bật", systemProviderID)
+	// Rỗng là HỢP LỆ: máy mới chưa nối Provider nào. Portal chặn ở onboarding và bot báo chưa
+	// sẵn sàng thay vì im lặng đánh rơi tin — xem §6. Không còn bắt buộc claude-code cuối chuỗi:
+	// chuỗi có thể toàn gói thuê bao (codex/gemini), claude-code chỉ là một mắt xích như mọi mắt xích.
+	// Chỉ giữ lại "mắt xích cuối phải đang bật": một chuỗi kết thúc bằng mục tắt là chuỗi cạn
+	// sạch mà không router nào đi hết được.
+	if n := len(entries); n > 0 && !entries[n-1].Enabled {
+		return fmt.Errorf("mắt xích cuối phải đang bật")
 	}
 	for _, e := range entries {
 		var enabled int

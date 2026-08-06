@@ -172,13 +172,48 @@ func TestLLMRouteReplaceIsCompareAndSwap(t *testing.T) {
 	}
 }
 
+// routeRevision đọc revision hiện tại — ReplaceLLMRoute cần đúng bản mới nhất (CAS), và mỗi lần
+// ghi thành công lại tăng nó, nên phải đọc lại trước từng lần gọi.
+func routeRevision(t *testing.T, st *Store) int64 {
+	t.Helper()
+	snap, err := st.LLMRoute()
+	if err != nil {
+		t.Fatalf("LLMRoute() = %v; want nil", err)
+	}
+	return snap.Revision
+}
+
+// TestRouteNoLongerRequiresClaudeCodeLast chốt §6: một chuỗi có thể toàn gói thuê bao (không có
+// claude-code cuối), chuỗi rỗng là hợp lệ (onboarding máy mới) — nhưng mắt xích cuối TẮT vẫn bị từ chối.
+func TestRouteNoLongerRequiresClaudeCodeLast(t *testing.T) {
+	st := newLLMStore(t)
+	// Chuỗi chỉ có codex, không có claude-code — trước đây bị từ chối, giờ hợp lệ.
+	addAPIProvider(t, st, "codex", "gpt-5.4", true)
+	if _, err := st.ReplaceLLMRoute(routeRevision(t, st), []LLMRouteEntry{
+		{Position: 0, ProviderID: "codex", ModelID: "gpt-5.4", Enabled: true},
+	}); err != nil {
+		t.Fatalf("chuỗi codex-only bị từ chối: %v; giờ phải hợp lệ", err)
+	}
+	// Chuỗi rỗng: hợp lệ (onboarding máy mới).
+	if _, err := st.ReplaceLLMRoute(routeRevision(t, st), nil); err != nil {
+		t.Fatalf("chuỗi rỗng bị từ chối: %v; rỗng-là-hợp-lệ", err)
+	}
+	// Mắt xích cuối đang TẮT: vẫn bị từ chối.
+	if _, err := st.ReplaceLLMRoute(routeRevision(t, st), []LLMRouteEntry{
+		{Position: 0, ProviderID: "codex", ModelID: "gpt-5.4", Enabled: false},
+	}); err == nil {
+		t.Fatal("chuỗi kết thúc bằng mắt xích TẮT phải bị từ chối")
+	}
+}
+
 func TestLLMRouteRejectsInvalidChains(t *testing.T) {
 	claudeTail := LLMRouteEntry{ProviderID: "claude-code", ModelID: "sonnet", Enabled: true}
+	// §6: chuỗi rỗng và chuỗi không-claude-cuối giờ HỢP LỆ (xem TestRouteNoLongerRequiresClaudeCodeLast),
+	// nên chỉ còn các chuỗi router thật sự không đi hết được ở đây.
 	tests := []struct {
 		name    string
 		entries []LLMRouteEntry
 	}{
-		{"empty", nil},
 		{
 			"missing provider",
 			[]LLMRouteEntry{{ProviderID: "ghost", ModelID: "gpt-5-mini", Enabled: true}, claudeTail},
@@ -192,11 +227,7 @@ func TestLLMRouteRejectsInvalidChains(t *testing.T) {
 			[]LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-nope", Enabled: true}, claudeTail},
 		},
 		{
-			"claude not last",
-			[]LLMRouteEntry{claudeTail, {ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}},
-		},
-		{
-			"claude last but disabled",
+			"last entry disabled",
 			[]LLMRouteEntry{
 				{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true},
 				{ProviderID: "claude-code", ModelID: "sonnet", Enabled: false},
@@ -284,7 +315,9 @@ func TestLLMRouteSnapshotIsIndependentCopy(t *testing.T) {
 	}
 }
 
-func TestLLMBootstrapClaudeRouteSeedsOnceOnly(t *testing.T) {
+// BootstrapClaudeRoute không còn gieo route: §6 cho phép chuỗi RỖNG và máy mới đi qua onboarding
+// (người vận hành chọn Provider) chứ không bị ép một mặc định claude-code.
+func TestLLMBootstrapClaudeRouteDoesNotSeed(t *testing.T) {
 	st := newLLMStore(t)
 
 	if err := st.BootstrapClaudeRoute("sonnet"); err != nil {
@@ -294,31 +327,11 @@ func TestLLMBootstrapClaudeRouteSeedsOnceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LLMRoute() = %v; want nil", err)
 	}
-	if len(snap.Entries) != 1 {
-		t.Fatalf("LLMRoute().Entries after bootstrap = %v; want 1 entry", snap.Entries)
+	if len(snap.Entries) != 0 {
+		t.Errorf("LLMRoute().Entries after bootstrap = %v; want empty (bootstrap không còn gieo)", snap.Entries)
 	}
-	if snap.Entries[0].ProviderID != "claude-code" || snap.Entries[0].ModelID != "sonnet" {
-		t.Errorf("LLMRoute().Entries[0] = %q/%q; want claude-code/sonnet", snap.Entries[0].ProviderID, snap.Entries[0].ModelID)
-	}
-
-	// Người dùng sửa chuỗi rồi khởi động lại: bootstrap không được đè lên.
-	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
-	edited := []LLMRouteEntry{
-		{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true},
-		{ProviderID: "claude-code", ModelID: "sonnet", Enabled: true},
-	}
-	if _, err := st.ReplaceLLMRoute(snap.Revision, edited); err != nil {
-		t.Fatalf("ReplaceLLMRoute(%d, edited) = %v; want nil", snap.Revision, err)
-	}
-	if err := st.BootstrapClaudeRoute("opus"); err != nil {
-		t.Fatalf("BootstrapClaudeRoute(%q) second call = %v; want nil", "opus", err)
-	}
-	after, err := st.LLMRoute()
-	if err != nil {
-		t.Fatalf("LLMRoute() = %v; want nil", err)
-	}
-	if len(after.Entries) != 2 || after.Entries[0].ProviderID != "openai-1" {
-		t.Errorf("LLMRoute().Entries after second bootstrap = %v; want the edited chain", after.Entries)
+	if snap.Revision != 1 {
+		t.Errorf("LLMRoute().Revision after bootstrap = %d; want 1 (không ghi route nào)", snap.Revision)
 	}
 }
 
