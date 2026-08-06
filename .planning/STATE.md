@@ -1,8 +1,9 @@
 # Planning state
 
-step: research
+step: execute
 current_topic: cli-subscription-providers
 current_spec: .planning/specs/2026-08-06-cli-subscription-providers-design.md
+current_plan: .planning/plans/2026-08-06-cli-subscription-providers.md
 last_updated: 2026-08-06
 
 ## Đã ship
