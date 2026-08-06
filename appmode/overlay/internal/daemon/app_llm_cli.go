@@ -1,5 +1,12 @@
 package daemon
 
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"os/exec"
+)
+
 // cliDescriptor là DỮ LIỆU cho một vendor CLI, không phải code. Adapter thân duy nhất đọc nó.
 // Học từ 9Router: provider là descriptor, không phải một nhánh switch.
 type cliDescriptor struct {
@@ -73,4 +80,50 @@ func buildCLIArgv(d cliDescriptor, req llmRequest) []string {
 		}
 	}
 	return argv
+}
+
+// cliExit mang stderr để Task 4 phân loại lỗi (hết hạn mức vs chưa đăng nhập).
+type cliExit struct {
+	err    error
+	stderr string
+}
+
+func (e *cliExit) Error() string { return e.err.Error() }
+func (e *cliExit) Unwrap() error { return e.err }
+
+// runCLIProcess chạy một CLI đã dựng sẵn, ghi prompt vào stdin nếu có, đọc stdout, và khi ctx bị
+// huỷ thì giết CẢ CÂY bằng killPidTree (taskkill /T) — KHÔNG dựa exec.CommandContext, vì nó chỉ
+// giết con trực tiếp, để lại node→cli→[con] mồ côi (bug Task 5, headless.go nêu đúng hazard).
+//
+// childPID: nếu != nil PHẢI được đọc (buffered cap>=1, hoặc đọc ở goroutine khác) — send này CHẶN
+// tới khi pid được nhận, cố ý để pid vào sổ orphan-reap trước khi chờ tiến trình.
+func runCLIProcess(ctx context.Context, cmd *exec.Cmd, stdin []byte, childPID chan<- int, logger *slog.Logger) ([]byte, error) {
+	var out, errBuf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errBuf
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	} else {
+		cmd.Stdin = bytes.NewReader(nil) // codex exec đọc stdin mặc định → cấp rỗng, không để treo
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	if childPID != nil {
+		childPID <- cmd.Process.Pid
+	}
+	// Goroutine thoát khi cmd.Wait trả về; sau killPidTree (taskkill /F ép thoát cây, giết cả node
+	// con trực tiếp) Wait trả về ngay nên <-done không kẹt.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-ctx.Done():
+		_ = killPidTree(cmd.Process.Pid, "llm-cli", logger) // taskkill /T — giết cả cây
+		<-done
+		return nil, ctx.Err()
+	case err := <-done:
+		if err != nil {
+			return out.Bytes(), &cliExit{err: err, stderr: errBuf.String()}
+		}
+		return out.Bytes(), nil
+	}
 }
