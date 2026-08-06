@@ -38,14 +38,22 @@ type llmAdapterCase struct {
 	// authHeaders phải có mặt ở CẢ generate lẫn models: một lượt liệt kê model không kèm khoá
 	// trả về 401 trên máy thật nhưng vẫn xanh trên fake server dễ dãi.
 	authHeaders map[string]string
+	// modelsQuery là query string của lượt liệt kê model, so khớp đúng bằng: hai Provider phải
+	// nâng trần phân trang, và một danh sách bị cắt trông y hệt một danh sách đủ.
+	modelsQuery string
 	// wantRequest là toàn bộ body gửi đi, so khớp đúng bằng: một trường thừa hay thiếu tên đều
 	// là thứ chỉ lộ ra khi gọi API thật.
-	wantRequest    map[string]any
-	generateOK     string
-	generatePolicy string
+	wantRequest map[string]any
+	generateOK  string
+	// generatePolicy là MỌI tín hiệu từ chối của Provider, không phải một cái đại diện: bỏ sót
+	// một tín hiệu thì lượt bị từ chối rơi vào upstream, và upstream thì được đi tiếp — tức là
+	// chuỗi mang chính nội dung vừa bị từ chối sang Provider sau.
+	generatePolicy []llmPolicyFixture
 	modelsOK       string
 	wantModels     []store.LLMModel
 }
+
+type llmPolicyFixture struct{ name, body string }
 
 func llmAdapterCases() []llmAdapterCase {
 	return []llmAdapterCase{
@@ -63,7 +71,11 @@ func llmAdapterCases() []llmAdapterCase {
 			wantRequest:  map[string]any{"model": "gpt-4o", "input": llmTestPrompt},
 			generateOK: `{"output":[{"type":"message","content":[
 				{"type":"output_text","text":"` + llmTestReply + `"}]}]}`,
-			generatePolicy: `{"incomplete_details":{"reason":"content_filter"},"output":[]}`,
+			generatePolicy: []llmPolicyFixture{
+				{"incomplete_details", `{"incomplete_details":{"reason":"content_filter"},"output":[]}`},
+				{"khối refusal", `{"output":[{"type":"message","content":[
+					{"type":"refusal","refusal":"Tôi không hỗ trợ việc này"}]}]}`},
+			},
 			modelsOK: `{"object":"list","data":[
 				{"id":"gpt-4o-mini","object":"model"},{"id":"gpt-4o","object":"model"}]}`,
 			wantModels: []store.LLMModel{
@@ -90,8 +102,11 @@ func llmAdapterCases() []llmAdapterCase {
 				"max_tokens": float64(anthropicMaxTokens),
 				"messages":   []any{map[string]any{"role": "user", "content": llmTestPrompt}},
 			},
-			generateOK:     `{"content":[{"type":"text","text":"` + llmTestReply + `"}],"stop_reason":"end_turn"}`,
-			generatePolicy: `{"content":[],"stop_reason":"refusal"}`,
+			generateOK: `{"content":[{"type":"text","text":"` + llmTestReply + `"}],"stop_reason":"end_turn"}`,
+			generatePolicy: []llmPolicyFixture{
+				{"stop_reason refusal", `{"content":[],"stop_reason":"refusal"}`},
+			},
+			modelsQuery: "limit=1000",
 			modelsOK: `{"data":[
 				{"type":"model","id":"claude-sonnet-4-5","display_name":"Claude Sonnet 4.5"},
 				{"type":"model","id":"claude-haiku-4-5","display_name":"Claude Haiku 4.5"}],"has_more":false}`,
@@ -121,7 +136,11 @@ func llmAdapterCases() []llmAdapterCase {
 			},
 			generateOK: `{"candidates":[{"content":{"role":"model","parts":[
 				{"text":"` + llmTestReply + `"}]},"finishReason":"STOP"}]}`,
-			generatePolicy: `{"promptFeedback":{"blockReason":"SAFETY"},"candidates":[]}`,
+			generatePolicy: []llmPolicyFixture{
+				{"promptFeedback blockReason", `{"promptFeedback":{"blockReason":"SAFETY"},"candidates":[]}`},
+				{"finishReason SAFETY", `{"candidates":[{"finishReason":"SAFETY","content":{"parts":[]}}]}`},
+			},
+			modelsQuery: "pageSize=1000",
 			modelsOK: `{"models":[
 				{"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","supportedGenerationMethods":["generateContent"]},
 				{"name":"models/text-embedding-004","displayName":"Embedding 004","supportedGenerationMethods":["embedContent"]},
@@ -152,7 +171,10 @@ func llmAdapterCases() []llmAdapterCase {
 			},
 			generateOK: `{"choices":[{"message":{"role":"assistant","content":"` + llmTestReply +
 				`"},"finish_reason":"stop"}]}`,
-			generatePolicy: `{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}`,
+			generatePolicy: []llmPolicyFixture{
+				{"finish_reason content_filter",
+					`{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}`},
+			},
 			modelsOK: `{"data":[
 				{"id":"openai/gpt-4o","name":"OpenAI: GPT-4o"},
 				{"id":"anthropic/claude-sonnet-4.5","name":"Anthropic: Claude Sonnet 4.5"}]}`,
@@ -169,6 +191,7 @@ type llmFakeServer struct {
 	*httptest.Server
 	method string
 	path   string
+	query  string
 	header http.Header
 	body   []byte
 }
@@ -178,6 +201,7 @@ func newLLMFakeServer(t *testing.T, status int, body string) *llmFakeServer {
 	f := &llmFakeServer{}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.method, f.path, f.header = r.Method, r.URL.Path, r.Header.Clone()
+		f.query = r.URL.RawQuery
 		f.body, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -242,6 +266,11 @@ func TestLLMAdapterGenerateSendsOfficialRequest(t *testing.T) {
 			if f.path != tc.generatePath {
 				t.Errorf("Generate(%s) path = %q; want %q", tc.name, f.path, tc.generatePath)
 			}
+			// Query rỗng là một khẳng định về BẢO MẬT, không phải về hình thức: không adapter nào
+			// được để credential vào URL, vì URL đi vào log truy cập và lịch sử proxy.
+			if f.query != "" {
+				t.Errorf("Generate(%s) query = %q; want rỗng", tc.name, f.query)
+			}
 			if ct := f.header.Get("Content-Type"); ct != "application/json" {
 				t.Errorf("Generate(%s) Content-Type = %q; want %q", tc.name, ct, "application/json")
 			}
@@ -268,6 +297,11 @@ func TestLLMAdapterDiscoverNormalizesAndSorts(t *testing.T) {
 			}
 			if f.path != tc.modelsPath {
 				t.Errorf("Discover(%s) path = %q; want %q", tc.name, f.path, tc.modelsPath)
+			}
+			// Trần phân trang: Anthropic mặc định trả 20 model, Gemini 50. Bỏ tham số đi thì danh
+			// sách cụt, và một danh sách cụt trông y hệt một danh sách đủ.
+			if f.query != tc.modelsQuery {
+				t.Errorf("Discover(%s) query = %q; want %q", tc.name, f.query, tc.modelsQuery)
 			}
 			f.assertHeaders(t, tc.authHeaders)
 			if diff := cmp.Diff(tc.wantModels, got); diff != "" {
@@ -390,22 +424,28 @@ func TestLLMAdapterMalformedSuccessIsFallbackEligibleUpstream(t *testing.T) {
 }
 
 // Nội dung bị từ chối DỪNG chuỗi: đổi Provider để né chính sách là hành vi thiết kế không muốn có.
+//
+// Chạy hết MỌI tín hiệu từ chối của từng Provider, không phải một cái đại diện. Một tín hiệu
+// không ai canh mà hỏng thì lượt đó rơi vào upstream — loại ĐƯỢC fallback — nên chuỗi sẽ mang
+// đúng nội dung vừa bị từ chối sang Provider kế tiếp. Đó là lỗi tệ nhất tệp này có thể có.
 func TestLLMAdapterPolicyRefusalStopsChain(t *testing.T) {
 	for _, tc := range llmAdapterCases() {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newLLMFakeServer(t, http.StatusOK, tc.generatePolicy)
-			a := tc.build(f.httpClient(), f.URL)
+		for _, fixture := range tc.generatePolicy {
+			t.Run(tc.name+"/"+fixture.name, func(t *testing.T) {
+				f := newLLMFakeServer(t, http.StatusOK, fixture.body)
+				a := tc.build(f.httpClient(), f.URL)
 
-			_, err := a.Generate(context.Background(),
-				llmRequest{Model: tc.model, Prompt: llmTestPrompt}, []byte(llmTestKey))
-			got := llmKindOf(t, err)
-			if got != llmErrorPolicy {
-				t.Fatalf("Generate(%s, phản hồi bị chặn) kind = %q; want %q", tc.name, got, llmErrorPolicy)
-			}
-			if isFallbackEligible(got) {
-				t.Fatalf("isFallbackEligible(%q) = true; want false", got)
-			}
-		})
+				_, err := a.Generate(context.Background(),
+					llmRequest{Model: tc.model, Prompt: llmTestPrompt}, []byte(llmTestKey))
+				got := llmKindOf(t, err)
+				if got != llmErrorPolicy {
+					t.Fatalf("Generate(%s, %s) kind = %q; want %q", tc.name, fixture.name, got, llmErrorPolicy)
+				}
+				if isFallbackEligible(got) {
+					t.Fatalf("isFallbackEligible(%q) = true; want false", got)
+				}
+			})
+		}
 	}
 }
 
@@ -488,6 +528,28 @@ func TestLLMAdapterErrorsHideCredentialAndBody(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Bốn endpoint sản xuất không có test nào khác chạm tới: mọi test ở trên ghi đè base để trỏ vào
+// fake server. Không ghim ở đây thì một lỗi gõ trong hằng số đi thẳng ra bản phát hành, và thứ
+// hỏng là một request mang khoá thật bay tới máy chủ của người khác.
+//
+// Đọc qua constructor chứ không đọc thẳng hằng số: cách này bắt được cả trường hợp constructor
+// bị nối nhầm sang hằng số của Provider khác.
+func TestLLMAdapterUsesPinnedProductionHosts(t *testing.T) {
+	tests := []struct{ name, got, want string }{
+		{"openai", newOpenAIAdapter("p", nil).base, "https://api.openai.com"},
+		{"anthropic", newAnthropicAdapter("p", nil).base, "https://api.anthropic.com"},
+		{"gemini", newGeminiAdapter("p", nil).base, "https://generativelanguage.googleapis.com"},
+		{"openrouter", newOpenRouterAdapter("p", nil).base, "https://openrouter.ai"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Fatalf("new%sAdapter().base = %q; want %q", tt.name, tt.got, tt.want)
+			}
+		})
 	}
 }
 

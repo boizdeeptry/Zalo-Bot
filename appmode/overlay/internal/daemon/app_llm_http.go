@@ -187,6 +187,11 @@ func discoveredModel(providerID, modelID, name string) (store.LLMModel, bool) {
 //
 // Thứ tự Provider trả về không có bảo đảm nào, và một danh sách nhảy chỗ mỗi lần làm mới khiến
 // người dùng không tin nổi cái mình đang nhìn.
+//
+// "Ổn định" ở đây nghĩa là XÁC ĐỊNH giữa các lần đồng bộ, không phải nghĩa stable-sort: khoá
+// sắp xếp là model id, mà (provider_id, model_id) là khoá chính của bảng llm_models nên không
+// có hai mục cùng khoá để mà giữ thứ tự tương đối. SortStableFunc chỉ là bảo hiểm rẻ tiền cho
+// trường hợp Provider trả trùng id — lúc đó upsert dưới database cũng gộp chúng lại.
 func sortLLMModels(models []store.LLMModel) []store.LLMModel {
 	slices.SortStableFunc(models, func(a, b store.LLMModel) int {
 		return strings.Compare(a.ModelID, b.ModelID)

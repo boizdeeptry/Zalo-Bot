@@ -71,24 +71,24 @@ type providerAdapter interface {
 //
 // Thông báo được che NGAY LÚC DỰNG chứ không lúc in ra: một lỗi đi qua nhiều lớp bọc, và lớp
 // nào quên gọi hàm che thì lớp đó là chỗ khoá rò ra.
+//
+// KHÔNG giữ lỗi gốc và KHÔNG có Unwrap: lỗi của net/http mang nguyên URL đã gọi, nên một
+// Unwrap() là một đường vòng qua lượt che — người gọi lấy được bản chưa che mà không biết. Chữ
+// nghĩa cần chẩn đoán đã nằm trong msg (đã che), còn câu hỏi duy nhất mà router hỏi tiếp là
+// "loại gì", và Kind trả lời nó mà không cần chuỗi bọc.
 type llmError struct {
-	Kind  llmErrorKind
-	msg   string
-	cause error
+	Kind llmErrorKind
+	msg  string
 }
 
 func (e *llmError) Error() string { return e.msg }
-
-// Unwrap để errors.Is(err, context.DeadlineExceeded) còn dùng được ở tầng trên. cause chỉ bao
-// giờ là lỗi tầng vận chuyển — body của Provider KHÔNG đi vào đây.
-func (e *llmError) Unwrap() error { return e.cause }
 
 func newLLMError(kind llmErrorKind, cause error, format string, args ...any) *llmError {
 	msg := fmt.Sprintf(format, args...)
 	if cause != nil {
 		msg += ": " + cause.Error()
 	}
-	return &llmError{Kind: kind, msg: sanitizeProviderError(msg), cause: cause}
+	return &llmError{Kind: kind, msg: sanitizeProviderError(msg)}
 }
 
 // transportError phân loại lỗi trước khi có phản hồi: quá hạn là timeout, còn lại là network.
