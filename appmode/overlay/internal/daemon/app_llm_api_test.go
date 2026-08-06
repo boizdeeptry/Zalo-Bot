@@ -520,6 +520,49 @@ func TestLLMAPICredentialReplaceAndClearAreExplicit(t *testing.T) {
 	h.assertNoSecret("credential mutations", "replace", replace.raw, "clear", clearResp.raw, "blank", blank.raw)
 }
 
+// TestLLMAPIUnreadableCredentialAsksForReentry canh trạng thái DPAPI-không-mở-được: ciphertext
+// còn nguyên nhưng database đã sang máy hoặc tài khoản Windows khác.
+//
+// Đây là trạng thái phải phân biệt được với "chưa nhập khoá" và với một lỗi tạm thời: metadata
+// Provider sống sót, chỉ khoá là mất, và lối ra DUY NHẤT là nhập lại. Hiện "thử lại sau" cho nó
+// là bắt người trực chờ một thứ không bao giờ tự khỏi.
+func TestLLMAPIUnreadableCredentialAsksForReentry(t *testing.T) {
+	h := newLLMAPIHarness(t)
+	id := h.createProvider("openai", "OpenAI", llmAPIKey)
+	// Ciphertext rác: đúng hình dạng "đã có khoá" nhưng unprotect từ chối — cùng thứ DPAPI trả
+	// về khi blob được mã hoá bởi một tài khoản khác.
+	if err := h.st.SetLLMCredentialCipher(id, []byte("rác không giải mã được")); err != nil {
+		t.Fatalf("SetLLMCredentialCipher(%q, rác) = %v; want nil", id, err)
+	}
+
+	list := h.mustStatus(h.do(http.MethodGet, "/llm/providers", ""), http.StatusOK, "list providers")
+	provider := llmAPIProvider(t, list, id)
+	if configured, _ := provider["credential_configured"].(bool); !configured {
+		t.Errorf("provider %q credential_configured = false; ciphertext còn đó nên nó phải là true", id)
+	}
+	if unreadable, _ := provider["credential_unreadable"].(bool); !unreadable {
+		t.Errorf("provider %q credential_unreadable = false, want true", id)
+	}
+
+	got := h.do(http.MethodPost, "/llm/providers/"+id+"/test", `{"model":"gpt-4o"}`)
+	if got.status != http.StatusUnprocessableEntity {
+		t.Fatalf("test với khoá không mở được: status = %d, want 422; body = %s", got.status, got.raw)
+	}
+	if code := got.errorCode(t); code != "PROVIDER_CREDENTIAL_UNREADABLE" {
+		t.Errorf("khoá không mở được: error code = %q, want PROVIDER_CREDENTIAL_UNREADABLE", code)
+	}
+	// Gợi ý phải gắn vào ô credential: đó là thứ biến 422 này thành một trạng thái nhập lại được
+	// thay vì một câu báo lỗi cụt.
+	envelope, _ := got.object(t)["error"].(map[string]any)
+	fields, _ := envelope["fields"].(map[string]any)
+	if hint, _ := fields["credential"].(string); hint == "" {
+		t.Errorf("khoá không mở được: thiếu gợi ý ở trường credential; body = %s", got.raw)
+	}
+	if h.stub.testCalls != 0 {
+		t.Errorf("adapter được gọi với một khoá không mở được: %d lượt", h.stub.testCalls)
+	}
+}
+
 // --- test và discover ---
 
 func TestLLMAPIDraftTestWritesNothingAndZeroesThePlaintext(t *testing.T) {
@@ -641,6 +684,29 @@ func TestLLMAPIFailedDiscoveryKeepsCachedModels(t *testing.T) {
 	h.assertNoSecret("failed discover", "response", got.raw, "list", list.raw)
 }
 
+// TestLLMAPIDiscoverTakesNoParameters giữ discover trong cùng luật giải mã như mọi mutation khác.
+//
+// Endpoint không có tham số nào, nên thân rỗng phải đi lọt còn một trường lạ phải bị chặn: im
+// lặng bỏ qua nó là để người gọi tin rằng mình vừa truyền được một tuỳ chọn khám phá.
+func TestLLMAPIDiscoverTakesNoParameters(t *testing.T) {
+	h := newLLMAPIHarness(t)
+	id := h.createProvider("openai", "OpenAI", llmAPIKey)
+
+	got := h.do(http.MethodPost, "/llm/providers/"+id+"/discover", `{"model":"gpt-4o"}`)
+	if got.status != http.StatusBadRequest {
+		t.Fatalf("discover với trường lạ: status = %d, want 400; body = %s", got.status, got.raw)
+	}
+	if code := got.errorCode(t); code != "INVALID_REQUEST" {
+		t.Errorf("discover với trường lạ: error code = %q, want INVALID_REQUEST", code)
+	}
+	if h.stub.discoverCalls != 0 {
+		t.Errorf("adapter được gọi dù thân request bị từ chối: %d lượt", h.stub.discoverCalls)
+	}
+	// Thân rỗng vẫn là lượt gọi hợp lệ — đó là hình dạng bình thường của endpoint này.
+	h.mustStatus(h.do(http.MethodPost, "/llm/providers/"+id+"/discover", ""),
+		http.StatusOK, "discover với thân rỗng")
+}
+
 func TestLLMAPIRejectsCallsWithoutAStoredCredential(t *testing.T) {
 	h := newLLMAPIHarness(t)
 	id := h.createProvider("openai", "OpenAI", "")
@@ -740,6 +806,38 @@ func TestLLMAPISystemProviderCannotBeEditedOrDeleted(t *testing.T) {
 	}
 	if enabled, _ := system["enabled"].(bool); !enabled {
 		t.Error("system provider enabled = false; a refused edit still landed")
+	}
+}
+
+// TestLLMAPIDeleteRemovesAnUnroutedProviderWithItsKeyAndModels canh đường xoá THÀNH CÔNG.
+//
+// Không chỉ đếm số Provider còn lại: khoá và model phải đi theo. Một hàng credential mồ côi là
+// ciphertext nằm lại trong database cho một Provider không còn tồn tại, còn model mồ côi thì hiện
+// ra trở lại nếu ai đó tạo lại Provider trùng id.
+func TestLLMAPIDeleteRemovesAnUnroutedProviderWithItsKeyAndModels(t *testing.T) {
+	h := newLLMAPIHarness(t)
+	id := h.createProvider("openai", "OpenAI", llmAPIKey)
+	h.mustStatus(h.do(http.MethodPost, "/llm/providers/"+id+"/models", `{"model_id":"gpt-4o"}`),
+		http.StatusCreated, "add model")
+
+	h.mustStatus(h.do(http.MethodDelete, "/llm/providers/"+id, ""),
+		http.StatusNoContent, "delete provider")
+
+	list := h.mustStatus(h.do(http.MethodGet, "/llm/providers", ""), http.StatusOK, "list providers")
+	providers, _ := list.object(t)["providers"].([]any)
+	if len(providers) != 1 {
+		t.Fatalf("providers after delete = %d, want 1 (chỉ còn claude-code); body = %s",
+			len(providers), list.raw)
+	}
+	if _, err := h.st.LLMCredentialCipher(id); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("LLMCredentialCipher(%q) after delete = %v, want store.ErrNotFound", id, err)
+	}
+	models, err := h.st.LLMModels(id)
+	if err != nil {
+		t.Fatalf("LLMModels(%q) = %v; want nil", id, err)
+	}
+	if len(models) != 0 {
+		t.Errorf("models of %q after delete = %v, want none", id, models)
 	}
 }
 

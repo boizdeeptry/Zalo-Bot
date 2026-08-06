@@ -66,9 +66,13 @@ func (a *api) handleLLMProviderCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Mã hoá TRƯỚC khi tạo hàng: đó là bước duy nhất ở đây thực sự có thể hỏng (máy không có
-	// DPAPI, khoá dài quá mức), và hỏng sau khi đã tạo hàng thì bỏ lại một Provider trống mà
-	// người dùng không yêu cầu — kèm một thông báo lỗi nói rằng chẳng có gì được tạo.
+	// Mã hoá TRƯỚC khi tạo hàng: đó là bước dễ hỏng nhất ở đây (máy không có DPAPI, khoá dài quá
+	// mức), nên làm trước thì phần lớn lượt hỏng không bỏ lại Provider trống nào.
+	//
+	// Cửa sổ vẫn CÒN, không đóng hẳn: SetLLMCredentialCipher bên dưới vẫn có thể hỏng sau khi
+	// hàng đã tạo, để lại một Provider chưa có khoá kèm một thông báo lỗi. Trạng thái đó còn cứu
+	// được (nhập lại khoá), và đóng hẳn cần một hàm store ghi cả hai trong MỘT transaction —
+	// thuộc về tệp store chứ không phải chỗ này.
 	var cipher []byte
 	if credential := strings.TrimSpace(req.Credential); credential != "" {
 		protected, ok := a.protectLLMCredential(w, credential)
@@ -304,6 +308,13 @@ func (a *api) handleLLMProviderTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) handleLLMProviderDiscover(w http.ResponseWriter, r *http.Request) {
+	// Không nhận tham số nào, nhưng vẫn đi qua decodeLLMBody: endpoint này khi đó cũng có trần
+	// 1 MiB và cũng TỪ CHỐI trường lạ. Một thân có nội dung ở đây nghĩa là người gọi tưởng mình
+	// truyền được tuỳ chọn khám phá — im lặng bỏ qua thì họ tin rằng nó đã có hiệu lực.
+	var req struct{}
+	if !a.decodeLLMBody(w, r, &req) {
+		return
+	}
 	p, adapter, ok := a.llmProviderAdapter(w, r.PathValue("id"))
 	if !ok {
 		return
@@ -463,8 +474,15 @@ func (a *api) handleLLMRoutePut(w http.ResponseWriter, r *http.Request) {
 		a.writeLLMErr(w, http.StatusConflict, "ROUTE_REVISION_CONFLICT",
 			"Chuỗi đã được lưu ở nơi khác trong lúc bạn đang sửa; tải lại rồi lưu tiếp", nil)
 	case err != nil:
-		// Mọi lỗi còn lại của ReplaceLLMRoute đến từ validateLLMRoute, và câu chữ của nó nói
-		// đúng mắt xích nào sai — không có bí mật nào trong đó, chỉ có id Provider và model.
+		// PHẦN LỚN lỗi ở đây đến từ validateLLMRoute, và câu chữ của nó chỉ ra đúng mắt xích sai
+		// — đó chính là thứ Portal cần hiện, và nó chỉ chứa id Provider/model mà người gọi vừa
+		// gửi lên.
+		//
+		// Nhưng KHÔNG phải tất cả: validateLLMRoute trả thẳng cả lỗi database ra (xem
+		// store/app_llm.go), và store chưa có sentinel để tách hai loại — nên chỗ này không phân
+		// biệt được. Vì vậy log đầy đủ: không có dòng này thì một lỗi database lúc lưu route biến
+		// mất không dấu vết, chỉ còn lại một 422 nói rằng chuỗi sai trong khi chuỗi không hề sai.
+		a.logger.Warn("llm api: không lưu được chuỗi fallback", "err", err)
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ROUTE_INVALID",
 			"Chuỗi không hợp lệ: "+err.Error(), nil)
 	default:
