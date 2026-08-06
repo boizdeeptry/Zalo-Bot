@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS llm_models (
   provider_id TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
   model_id    TEXT NOT NULL,
   name        TEXT NOT NULL DEFAULT '',
-  source      TEXT NOT NULL DEFAULT 'manual',
+  -- source có CHECK vì ReplaceLLMModels khoanh vùng XOÁ theo đúng cột này: một giá trị lệch
+  -- ('Discovered', thừa dấu cách) tạo ra model không lần đồng bộ nào dọn được, và chúng trông
+  -- y hệt model thật trong danh sách.
+  source      TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'discovered')),
   available   INTEGER NOT NULL DEFAULT 1 CHECK (available IN (0, 1)),
   PRIMARY KEY (provider_id, model_id)
 );
@@ -62,7 +65,9 @@ CREATE TABLE IF NOT EXISTS llm_attempts (
   model_id         TEXT NOT NULL,
   started_at       TEXT NOT NULL,
   duration_ms      INTEGER NOT NULL DEFAULT 0,
-  outcome          TEXT NOT NULL,
+  -- outcome cùng lý do: LLMStatus tìm Provider đang phục vụ bằng outcome = 'ok', nên một giá
+  -- trị ngoài danh sách làm lượt thành công đó lặng lẽ không bao giờ được tính.
+  outcome          TEXT NOT NULL CHECK (outcome IN ('ok', 'error')),
   error_kind       TEXT NOT NULL DEFAULT '',
   fell_back        INTEGER NOT NULL DEFAULT 0 CHECK (fell_back IN (0, 1)),
   next_provider_id TEXT NOT NULL DEFAULT ''

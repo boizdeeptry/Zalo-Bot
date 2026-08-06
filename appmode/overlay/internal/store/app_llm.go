@@ -47,10 +47,13 @@ const llmRouteRevisionKey = "llm_route_revision"
 const llmAttemptCap = 500
 
 // LLMProvider là một nơi gọi model được: bốn API chính thức, cộng Claude Code hệ thống.
+//
+// KHÔNG mang ciphertext của credential, chỉ mang CredentialConfigured. Danh sách này đi thẳng
+// ra Portal, nên một trường bytes ở đây chỉ cách việc lộ khoá đúng một json.Marshal — và nơi
+// duy nhất cần bytes thật là lúc gọi API cho MỘT Provider, tức một hàm đọc riêng.
 type LLMProvider struct {
 	ID, Name, Kind                        string
 	Enabled, System, CredentialConfigured bool
-	CredentialCipher                      []byte
 	LastCheckStatus, LastError            string
 	LastCheckedAt                         *time.Time
 }
@@ -94,8 +97,10 @@ type LLMStatus struct {
 	ActiveProviderID string
 	ActiveModelID    string
 	LastSuccessAt    *time.Time
-	Attempts         int
-	Fallbacks        int
+	// Attempts và Fallbacks đếm trên CỬA SỔ còn giữ lại (llmAttemptCap lượt gần nhất), không
+	// phải tổng từ đầu: sau lượt thứ 500 chúng đứng yên mãi. Nhãn "tổng số lượt" là sai.
+	Attempts  int
+	Fallbacks int
 }
 
 // --- providers ---
@@ -114,14 +119,17 @@ FROM llm_providers ORDER BY system_provider, id`)
 	for rows.Next() {
 		var p LLMProvider
 		var enabled, system int
+		var cipher []byte
 		var checkedAt string
-		if err := rows.Scan(&p.ID, &p.Name, &p.Kind, &enabled, &system, &p.CredentialCipher,
+		if err := rows.Scan(&p.ID, &p.Name, &p.Kind, &enabled, &system, &cipher,
 			&p.LastCheckStatus, &p.LastError, &checkedAt); err != nil {
 			return nil, fmt.Errorf("scan llm provider: %w", err)
 		}
 		p.Enabled = enabled == 1
 		p.System = system == 1
-		p.CredentialConfigured = len(p.CredentialCipher) > 0
+		// Ciphertext chết ở đây, trong một biến cục bộ: nó chỉ dùng để trả lời "đã có khoá
+		// chưa", và không rời khỏi vòng lặp này.
+		p.CredentialConfigured = len(cipher) > 0
 		if p.LastCheckedAt, err = parseNullableTS(checkedAt); err != nil {
 			return nil, fmt.Errorf("parse llm provider %s last_checked_at: %w", p.ID, err)
 		}
@@ -133,6 +141,12 @@ FROM llm_providers ORDER BY system_provider, id`)
 	return out, nil
 }
 
+// CreateLLMProvider dựng một Provider do người dùng thêm.
+//
+// system_provider và credential được ghi cứng, KHÔNG lấy từ p: cờ hệ thống là thứ bảo vệ
+// Claude Code khỏi bị sửa/xoá, nên để người gọi đặt được nó là để bất kỳ ai tạo thêm một
+// Provider bất khả xâm phạm thứ hai. Credential đi qua SetLLMCredentialCipher vì nó phải
+// được mã hoá trước, và một đường ghi thứ hai là một đường quên mã hoá.
 func (s *Store) CreateLLMProvider(p LLMProvider) error {
 	if p.ID == "" || p.Name == "" || p.Kind == "" {
 		return fmt.Errorf("create llm provider: cần id, tên và loại")
@@ -172,15 +186,21 @@ func (s *Store) DeleteLLMProvider(id string) error {
 		return fmt.Errorf("check llm provider %s route references: %w", id, err)
 	}
 	if referenced > 0 {
-		return ErrLLMProviderInUse
+		return fmt.Errorf("delete llm provider %s: %w", id, ErrLLMProviderInUse)
 	}
 	return s.inLLMTx(fmt.Sprintf("delete llm provider %s", id), func(tx *sql.Tx) error {
 		res, err := tx.Exec(`DELETE FROM llm_providers WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
-		if err := assertOneRow(res, fmt.Sprintf("delete llm provider %s", id)); err != nil {
+		// Không gọi assertOneRow ở đây: inLLMTx đã gắn tên thao tác, nên bọc lần nữa cho ra
+		// "delete llm provider x: delete llm provider x: not found".
+		changed, err := res.RowsAffected()
+		if err != nil {
 			return err
+		}
+		if changed == 0 {
+			return ErrNotFound
 		}
 		// ON DELETE CASCADE không chạy vì SQLite mặc định tắt khoá ngoại, nên model mồ côi
 		// phải xoá tay — nếu không, tạo lại Provider cùng id sẽ thấy model của bản trước.

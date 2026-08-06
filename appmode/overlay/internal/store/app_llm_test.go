@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -281,15 +282,6 @@ func TestLLMRouteSnapshotIsIndependentCopy(t *testing.T) {
 	if snap.Entries[0].ModelID != "gpt-5-mini" {
 		t.Errorf("LLMRoute().Entries[0].ModelID = %q; want gpt-5-mini", snap.Entries[0].ModelID)
 	}
-
-	snap.Entries[0].ModelID = "tampered-again"
-	again, err := st.LLMRoute()
-	if err != nil {
-		t.Fatalf("LLMRoute() = %v; want nil", err)
-	}
-	if again.Entries[0].ModelID != "gpt-5-mini" {
-		t.Errorf("LLMRoute().Entries[0].ModelID after caller mutation = %q; want gpt-5-mini", again.Entries[0].ModelID)
-	}
 }
 
 func TestLLMBootstrapClaudeRouteSeedsOnceOnly(t *testing.T) {
@@ -338,17 +330,15 @@ func TestLLMCredentialCipherIsStoredAndCleared(t *testing.T) {
 	if err := st.SetLLMCredentialCipher("openai-1", cipher); err != nil {
 		t.Fatalf("SetLLMCredentialCipher(%q) = %v; want nil", "openai-1", err)
 	}
-	p := findProvider(t, st, "openai-1")
-	if !p.CredentialConfigured || string(p.CredentialCipher) != string(cipher) {
-		t.Errorf("provider after SetLLMCredentialCipher = configured %v cipher %v; want true %v", p.CredentialConfigured, p.CredentialCipher, cipher)
+	if p := findProvider(t, st, "openai-1"); !p.CredentialConfigured {
+		t.Errorf("provider.CredentialConfigured after SetLLMCredentialCipher = false; want true")
 	}
 
 	if err := st.ClearLLMCredential("openai-1"); err != nil {
 		t.Fatalf("ClearLLMCredential(%q) = %v; want nil", "openai-1", err)
 	}
-	p = findProvider(t, st, "openai-1")
-	if p.CredentialConfigured || len(p.CredentialCipher) != 0 {
-		t.Errorf("provider after ClearLLMCredential = configured %v cipher %v; want false empty", p.CredentialConfigured, p.CredentialCipher)
+	if p := findProvider(t, st, "openai-1"); p.CredentialConfigured {
+		t.Errorf("provider.CredentialConfigured after ClearLLMCredential = true; want false")
 	}
 
 	if err := st.SetLLMCredentialCipher("ghost", cipher); !errors.Is(err, ErrNotFound) {
@@ -424,6 +414,37 @@ func TestLLMAttemptsAggregateWithoutContent(t *testing.T) {
 	}
 	if status.LastSuccessAt == nil || !status.LastSuccessAt.Equal(start.Add(time.Second)) {
 		t.Errorf("LLMStatus().LastSuccessAt = %v; want %v", status.LastSuccessAt, start.Add(time.Second))
+	}
+}
+
+// Cắt phải giữ lượt MỚI, và chiều đó không có gì trong SQL tự bảo vệ: đổi DESC thành ASC vẫn
+// chạy, vẫn giữ đúng 500 hàng, và xoá sạch đúng phần telemetry mà tính năng này sinh ra để xem.
+func TestLLMAttemptsCapKeepsNewestRows(t *testing.T) {
+	st := newLLMStore(t)
+
+	start := time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC)
+	total := llmAttemptCap + 2
+	for i := range total {
+		err := st.RecordLLMAttempt(LLMAttempt{
+			ProviderID: fmt.Sprintf("provider-%03d", i), ModelID: "m",
+			StartedAt: start.Add(time.Duration(i) * time.Second), Outcome: LLMAttemptOK,
+		})
+		if err != nil {
+			t.Fatalf("RecordLLMAttempt(#%d) = %v; want nil", i, err)
+		}
+	}
+
+	status, err := st.LLMStatus()
+	if err != nil {
+		t.Fatalf("LLMStatus() = %v; want nil", err)
+	}
+	if status.Attempts != llmAttemptCap {
+		t.Errorf("LLMStatus().Attempts after %d records = %d; want %d", total, status.Attempts, llmAttemptCap)
+	}
+	newest := fmt.Sprintf("provider-%03d", total-1)
+	if status.ActiveProviderID != newest {
+		t.Errorf("LLMStatus().ActiveProviderID after %d records = %q; want %q (newest rows must survive the cap)",
+			total, status.ActiveProviderID, newest)
 	}
 }
 
