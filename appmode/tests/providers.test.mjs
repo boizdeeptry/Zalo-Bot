@@ -821,6 +821,12 @@ test("a failed provider list renders the shared error panel", async (t) => {
 //
 // Không in ra chuỗi khớp: thông báo hỏng của test đi vào log, và chuỗi đó chính là thứ đang bị tố
 // cáo. Tên tệp và số lượng đủ để biết phải đi tìm ở đâu.
+//
+// Cờ /g vì phép kiểm đếm mọi lần khớp trong một tệp. Dùng lại được qua nhiều lượt: String.match
+// với mẫu global đặt lastIndex về 0 trước khi chạy, nên assert.match ở đầu test không làm lệch
+// vòng lặp phía sau.
+const KEY_SHAPE = /\b(?:sk-|xai-|gsk_|AIza)[A-Za-z0-9_-]{8,}/g;
+
 test("no embedded Portal asset carries an API-key literal", async () => {
   // .html và .css chứ không riêng .js: `//go:embed static` lấy CẢ thư mục, nên index.html và
   // portal.css cũng nằm trong agentdc.exe — và một thẻ <script> nội tuyến trong index.html là chỗ
@@ -829,10 +835,14 @@ test("no embedded Portal asset carries an API-key literal", async () => {
   // Ghim ĐỆ QUY bằng một mục lồng có tên, không bằng số lượng: một ngưỡng đếm đặt đúng bằng con số
   // hôm nay sẽ đỏ khi ai đó xoá một trang, với thông báo nói rằng phép duyệt hỏng.
   assert.ok(names.includes(join("pages", "providers.js")), `walk missed pages/providers.js: ${names}`);
+  // Chính mẫu này là toàn bộ cơ chế phát hiện, và mọi khẳng định bên dưới đều là khẳng định VẮNG
+  // MẶT: thay nó bằng một mẫu không khớp gì thì cả vòng lặp vẫn xanh. Một dòng khoá mẫu ở đây là
+  // thứ duy nhất phân biệt "không có khoá nào" với "không tìm nữa".
+  assert.match("sk-live-AbCdEfGh12345678", KEY_SHAPE);
 
   for (const name of names) {
     const source = await readFile(new URL(name, staticRoot), "utf8");
-    const found = source.match(/\b(?:sk-|xai-|gsk_|AIza)[A-Za-z0-9_-]{8,}/g) ?? [];
+    const found = source.match(KEY_SHAPE) ?? [];
     assert.equal(found.length, 0, `${name} carries ${found.length} key-shaped literal(s)`);
   }
 });

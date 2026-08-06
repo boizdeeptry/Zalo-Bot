@@ -319,11 +319,13 @@ function Assert-NoProviderCredential {
   # sạch, và tính chất đó quá quan trọng để nằm trong một biến ở ngoài hàm này. Đường .exe bên dưới
   # đã hỏng-đóng sẵn: ngoại lệ của một phương thức .NET luôn là lỗi kết thúc.
   #
-  # '*\node_modules\*' chứ không '*node_modules*': mẫu sau là so chuỗi con, nên nó bỏ qua luôn
-  # brain\node_modules-notes\. Lệch với cửa quét dấu khách hàng ở build-app.ps1 là cố ý — cửa này
-  # canh credential, và một thư mục đặt tên gần giống không được là chỗ trốn.
+  # Loại trừ xét trên đường dẫn TƯƠNG ĐỐI so với gốc gói, và xét cả dấu phân cách. Hai chi tiết,
+  # hai lỗ khác nhau: so trên đường dẫn tuyệt đối thì một gói dựng vào ...\node_modules\... nào đó
+  # tự loại trừ SẠCH mọi tệp của chính nó, còn so chuỗi con không có dấu '\' thì
+  # brain\node_modules-notes\ cũng được miễn. Lệch với cửa quét dấu khách hàng ở build-app.ps1 là
+  # cố ý — cửa này canh credential, và một thư mục đặt tên gần giống không được là chỗ trốn.
   $files = Get-ChildItem -LiteralPath $packagePath -Recurse -File -Force -ErrorAction Stop |
-    Where-Object { $_.FullName -notlike '*\node_modules\*' }
+    Where-Object { [IO.Path]::GetRelativePath($packagePath, $_.FullName) -notlike '*node_modules\*' }
 
   # .exe đi đường byte chứ không qua Select-String: đó là hai tệp cỡ chục MB gần như không có dấu
   # xuống dòng, và đọc chúng theo dòng là dựng một chuỗi khổng lồ để tìm đúng một chuỗi con. Cùng
