@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -159,6 +160,132 @@ func TestClassifyCLIError(t *testing.T) {
 				t.Errorf("classifyCLIError(%q, installed=%v) = %q; want %q", tc.stderr, !tc.notInstalled, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGeminiAuthProbe chốt ngữ nghĩa đã hoà giải giữa test và skeleton của plan: thiếu hẳn file →
+// loggedOut (biết chắc chưa đăng nhập, đi login được — hành động đúng và thật); file có mặt nhưng
+// KHÔNG đọc được nội dung (rỗng / khoá) → unknown, KHÔNG dám kết luận "chưa đăng nhập" khi ta chỉ là
+// không đọc nổi; file có nội dung → loggedIn. Đoán "chưa đăng nhập" sai đẩy người dùng vào vòng login
+// lại vô ích.
+func TestGeminiAuthProbe(t *testing.T) {
+	// Thiếu hẳn file (os.IsNotExist) → biết chắc chưa đăng nhập.
+	missing := filepath.Join(t.TempDir(), "khong-ton-tai", "oauth_creds.json")
+	if st := probeGeminiAuth(missing); st != authLoggedOut {
+		t.Errorf("probeGeminiAuth(thiếu file) = %v; want authLoggedOut", st)
+	}
+	// File rỗng: có mặt nhưng không mang credential → unknown (KHÔNG phải loggedOut). Đây là nhánh
+	// "có-nhưng-không-đọc-được" test được sạch trên Windows, thay cho việc ép quyền/khoá file.
+	empty := filepath.Join(t.TempDir(), "oauth_creds.json")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st := probeGeminiAuth(empty); st != authUnknown {
+		t.Errorf("probeGeminiAuth(file rỗng) = %v; want authUnknown", st)
+	}
+	// File có nội dung → coi như đã đăng nhập.
+	present := filepath.Join(t.TempDir(), "oauth_creds.json")
+	if err := os.WriteFile(present, []byte(`{"access_token":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st := probeGeminiAuth(present); st != authLoggedIn {
+		t.Errorf("probeGeminiAuth(file có) = %v; want authLoggedIn", st)
+	}
+}
+
+// TestCodexAuthFromExit: exit 0 = đã đăng nhập, khác 0 = chưa. Test LOGIC không spawn (spawn codex
+// qua node+codex.js được chốt ở task sau) — đúng theo kế hoạch: ưu tiên kiểm ánh xạ, không dựng CLI.
+func TestCodexAuthFromExit(t *testing.T) {
+	if got := codexAuthFromExit(0); got != authLoggedIn {
+		t.Errorf("codexAuthFromExit(0) = %v; want authLoggedIn", got)
+	}
+	for _, code := range []int{1, 2, 127} {
+		if got := codexAuthFromExit(code); got != authLoggedOut {
+			t.Errorf("codexAuthFromExit(%d) = %v; want authLoggedOut", code, got)
+		}
+	}
+}
+
+// TestClaudeAuthFromJSON chốt shape thật của `claude auth status --json`. loggedIn vắng / output hỏng
+// → unknown (không đoán loggedOut khi ta không chắc).
+func TestClaudeAuthFromJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want authState
+	}{
+		{"đã đăng nhập", `{"loggedIn":true,"subscriptionType":"team"}`, authLoggedIn},
+		{"chưa đăng nhập", `{"loggedIn":false}`, authLoggedOut},
+		{"thiếu trường", `{"email":"x"}`, authUnknown},
+		{"rác", `not json`, authUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := claudeAuthFromJSON([]byte(tc.in)); got != tc.want {
+				t.Errorf("claudeAuthFromJSON(%q) = %v; want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckCLIAuthDispatch: dispatcher chọn đúng nhánh theo authMethod. Dùng nhánh gemini-file (dò
+// file, không spawn) để kiểm việc phân nhánh mà không phụ thuộc CLI cài sẵn; codex-exit chưa wire
+// spawn nên phải trả unknown (an toàn), KHÔNG loggedOut.
+func TestCheckCLIAuthDispatch(t *testing.T) {
+	present := filepath.Join(t.TempDir(), "oauth_creds.json")
+	if err := os.WriteFile(present, []byte(`{"access_token":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	discard := slog.New(slog.DiscardHandler)
+	if got := checkCLIAuth(t.Context(), cliDescriptors["gemini-cli"], present, discard); got != authLoggedIn {
+		t.Errorf("checkCLIAuth(gemini, file có) = %v; want authLoggedIn", got)
+	}
+	if got := checkCLIAuth(t.Context(), cliDescriptors["codex"], "", discard); got != authUnknown {
+		t.Errorf("checkCLIAuth(codex) = %v; want authUnknown (chưa wire spawn)", got)
+	}
+}
+
+// TestClaudeAuthLive chạy `claude auth status --json` THẬT qua checkCLIAuth. Skip sạch nếu claude
+// vắng. Máy này claude ĐÃ đăng nhập → loggedIn; nếu máy khác đã logout thì skip thay vì fail giả.
+func TestClaudeAuthLive(t *testing.T) {
+	if _, err := exec.LookPath("claude"); err != nil {
+		t.Skip("claude không có trên PATH")
+	}
+	got := checkCLIAuth(t.Context(), cliDescriptors["claude-code"], "", slog.New(slog.DiscardHandler))
+	switch got {
+	case authLoggedIn: // đúng kỳ vọng máy này
+	case authLoggedOut:
+		t.Skip("claude cài nhưng đã logout — bỏ qua (test này cần trạng thái đăng nhập)")
+	default:
+		t.Fatalf("checkCLIAuth(claude) = %v; muốn một trạng thái xác định (spawn/parse hỏng?)", got)
+	}
+}
+
+// TestCodexAuthLive chạy `codex login status` THẬT rồi ánh xạ exit qua codexAuthFromExit. Resolve
+// codex.js là việc nặng nên để trong test (skip nếu vắng); production checkCLIAuth CHƯA wire nhánh
+// này. Máy này codex ĐÃ logout → exit khác 0 → loggedOut.
+func TestCodexAuthLive(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node không có trên PATH")
+	}
+	// node global root trên Windows là <nodedir>\node_modules; binJS là đường dẫn tương đối trong đó.
+	codexJS := filepath.Join(filepath.Dir(node), "node_modules", cliDescriptors["codex"].binJS)
+	if _, err := os.Stat(codexJS); err != nil {
+		t.Skipf("không thấy codex.js ở %s — bỏ qua", codexJS)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	code := 0
+	if err := exec.CommandContext(ctx, node, codexJS, "login", "status").Run(); err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Skipf("chạy codex login status lỗi ngoài exit code: %v", err)
+		}
+		code = ee.ExitCode()
+	}
+	if got := codexAuthFromExit(code); got != authLoggedOut {
+		t.Skipf("codex login status exit=%d → %v (máy này kỳ vọng logged-out; có thể đã đăng nhập)", code, got)
 	}
 }
 

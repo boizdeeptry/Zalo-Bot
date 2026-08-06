@@ -3,9 +3,12 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // cliDescriptor là DỮ LIỆU cho một vendor CLI, không phải code. Adapter thân duy nhất đọc nó.
@@ -111,6 +114,109 @@ func containsAny(s string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// authState là trạng thái đăng nhập của một CLI vendor. authUnknown ("không xác định được") KHÁC hẳn
+// authLoggedOut ("biết chắc chưa đăng nhập"): nhầm hai cái này đẩy người dùng vào vòng login lại vô
+// ích khi thực ra ta chỉ là không dò/không đọc được.
+type authState int
+
+const (
+	authUnknown   authState = iota // không kết luận được (chưa wire / không đọc được / output lạ)
+	authLoggedIn                   // biết chắc đã đăng nhập
+	authLoggedOut                  // biết chắc CHƯA đăng nhập — hành động được: đi login
+)
+
+// checkCLIAuth dò trạng thái đăng nhập theo authMethod của descriptor — RẺ, không tốn một lượt
+// subscription. Mỗi vendor dò một kiểu, bất đối xứng này là THẬT (từ research): claude có lệnh
+// `auth status --json`, codex chỉ có exit code, gemini KHÔNG có lệnh status nên phải dò file
+// credential.
+//
+// credPath chỉ dùng cho nhánh gemini-file; các nhánh khác bỏ qua. Là THAM SỐ (không hardcode) để
+// Task 8 ghim đúng tên file thật ở một nơi duy nhất.
+func checkCLIAuth(ctx context.Context, d cliDescriptor, credPath string, logger *slog.Logger) authState {
+	switch d.authMethod {
+	case "gemini-file":
+		return probeGeminiAuth(credPath)
+	case "claude-json":
+		return probeClaudeAuth(ctx, d, logger)
+	case "codex-exit":
+		// codex chạy qua `node <codex.js> login status`; việc RESOLVE codex.js (node global root)
+		// được chốt ở task spawn sau, nên nhánh này chưa wire → unknown (an toàn, KHÔNG bịa "chưa
+		// đăng nhập"). Ánh xạ exit→state đã sẵn trong codexAuthFromExit, cắm exit code vào là xong.
+		return authUnknown
+	default:
+		return authUnknown
+	}
+}
+
+// probeGeminiAuth: Gemini KHÔNG có lệnh status. Dò sự tồn tại file credential — đây là chi tiết NỘI
+// BỘ của hãng, có thể vỡ khi Google đổi CLI, nên cô lập sau hàm này với test ghim. Tên file thật là
+// LOW confidence (Task 8 xác nhận sau khi đăng nhập), vì thế credPath là tham số, không hardcode.
+//
+//   - thiếu file (os.IsNotExist)          → loggedOut: chưa đăng nhập thật, đi login được
+//   - có file nhưng không đọc được / rỗng → unknown: KHÔNG kết luận "chưa đăng nhập" khi chỉ là quyền
+//     /khoá file hay file 0 byte — nếu không sẽ loop người dùng login vô ích
+//   - có file, khác rỗng                  → loggedIn
+func probeGeminiAuth(credPath string) authState {
+	info, err := os.Stat(credPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return authLoggedOut
+		}
+		return authUnknown // quyền/khoá file → không kết luận chưa-đăng-nhập
+	}
+	if info.Size() == 0 {
+		return authUnknown // có mặt nhưng rỗng → không mang credential → không dám kết luận
+	}
+	return authLoggedIn
+}
+
+// probeClaudeAuth chạy `claude auth status --json` (native exe) rồi đọc trường loggedIn. Rẻ, chỉ đọc,
+// KHÔNG sinh nội dung. Không dò được (chưa cài / spawn lỗi) → unknown, KHÔNG suy ra loggedOut.
+func probeClaudeAuth(ctx context.Context, d cliDescriptor, logger *slog.Logger) authState {
+	bin, err := exec.LookPath(d.nativeBin)
+	if err != nil {
+		return authUnknown // chưa cài → không biết trạng thái đăng nhập
+	}
+	// status là tức thì; chặn thời gian để một exe treo không giữ cả lời gọi Test. claude là tiến
+	// trình đơn (không có cháu node) nên CommandContext giết-con-trực-tiếp là đủ, không cần killPidTree.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "auth", "status", "--json").Output()
+	if err != nil {
+		if logger != nil {
+			logger.Debug("claude auth status thất bại", "err", err)
+		}
+		return authUnknown
+	}
+	return claudeAuthFromJSON(out)
+}
+
+// claudeAuthFromJSON đọc {"loggedIn": bool} từ output `claude auth status --json`. loggedIn vắng /
+// output hỏng → unknown (KHÔNG đoán loggedOut). Con trỏ *bool để phân biệt "trường vắng" với
+// "trường = false". Tách hàm để test ghim đúng shape thật của lệnh.
+func claudeAuthFromJSON(out []byte) authState {
+	var v struct {
+		LoggedIn *bool `json:"loggedIn"`
+	}
+	if err := json.Unmarshal(out, &v); err != nil || v.LoggedIn == nil {
+		return authUnknown
+	}
+	if *v.LoggedIn {
+		return authLoggedIn
+	}
+	return authLoggedOut
+}
+
+// codexAuthFromExit ánh xạ exit code của `codex login status`: 0 = đã đăng nhập, khác 0 = chưa. codex
+// KHÔNG có --json cho status, exit code là tín hiệu duy nhất. Hàm thuần để test được không cần spawn
+// (spawn qua node+codex.js chốt ở task sau).
+func codexAuthFromExit(code int) authState {
+	if code == 0 {
+		return authLoggedIn
+	}
+	return authLoggedOut
 }
 
 // cliExit mang stderr để Task 4 phân loại lỗi (hết hạn mức vs chưa đăng nhập).
