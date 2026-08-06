@@ -15,6 +15,10 @@ const implementedPages = Object.freeze({
     const page = await import("./pages/models.js");
     return { mount: page.mount };
   },
+  providers: async () => {
+    const page = await import("./pages/providers.js");
+    return { mount: page.mount };
+  },
 });
 
 async function loadRoutePage(route) {

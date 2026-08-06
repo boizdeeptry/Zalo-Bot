@@ -43,6 +43,11 @@ function Write-TestFile {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+# Bản sao của canary trong BuildApp.psm1, cố ý KHÔNG đọc lại từ module: hai chuỗi lệch nhau thì
+# fixture dưới đây gieo chuỗi này còn cửa chặn tìm chuỗi kia, không ai ném lỗi, và Assert-ThrowsLike
+# đỏ ngay. Tức bản sao này tự canh chính nó.
+$providerCanary = 'sk-package-must-never-contain-7f36d2'
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('portal-path-' + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -192,6 +197,74 @@ try {
   foreach ($relative in $required) {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
+  $gotPackage = Assert-AppPackage -Out $packageRoot
+
+  # Gieo canary rồi gọi lại chính Assert-AppPackage, KHÔNG gọi thẳng Assert-NoProviderCredential:
+  # câu hỏi ở đây là "mỗi lần build có quét không", và build-app.ps1 chỉ gọi hàm ngoài. Một phép
+  # quét đúng mà không được cắm vào cửa nào vẫn để gói mang khoá đi bán.
+  #
+  # Hỏng ở CẢ HAI đường, vì chúng canh hai chỗ khác nhau và một đường gãy không làm đường kia đỏ.
+  # README.txt nằm trong danh sách trắng đuôi tệp; agentdc.exe thì không, nên chỉ lượt đọc binary
+  # thấy nó.
+  $readme = Join-Path $gotPackage 'README.txt'
+  Write-TestFile $readme ("huong dan`n" + $providerCanary + "`n")
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'plaintext provider credential' -Message 'A package text asset carrying the canary was accepted'
+  Write-TestFile $readme "fixture`n"
+
+  $binary = Join-Path $gotPackage 'app\agentdc.exe'
+  [IO.File]::WriteAllBytes($binary, [Text.Encoding]::UTF8.GetBytes("MZ`0" + $providerCanary))
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'plaintext provider credential' -Message 'A binary carrying the canary was accepted'
+  Write-TestFile $binary "fixture`n"
+
+  # Đuôi tệp mà một danh sách trắng sẽ bỏ sót, và đây là tệp CÓ THẬT: bản đầu của cửa chặn liệt
+  # kê mười đuôi văn bản và để lọt brain\.claude\settings.local.json.example, tệp cấu hình duy
+  # nhất của gói nằm ngoài node_modules.
+  $config = Join-Path $gotPackage 'brain\.claude\settings.local.json.example'
+  Write-TestFile $config ('{"canary":"' + $providerCanary + '"}' + "`n")
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'plaintext provider credential' -Message 'A package config file carrying the canary was accepted'
+  Remove-Item -LiteralPath $config -Force
+
+  # Tệp ẩn và tệp dưới thư mục ẩn: Get-ChildItem thiếu -Force bỏ qua cả hai KHÔNG một tiếng động.
+  # Đường vào có thật chứ không phải giả định — cả ba chỗ chép vào gói đều dùng Copy-Item -Force và
+  # nó giữ nguyên thuộc tính Hidden, còn đúng lớp tệp hay mang khoá (.env, .npmrc, settings.local)
+  # là lớp mà công cụ Windows thỉnh thoảng đánh dấu ẩn.
+  $hidden = Join-Path $gotPackage 'app\.env'
+  Write-TestFile $hidden ('KEY=' + $providerCanary + "`n")
+  (Get-Item -LiteralPath $hidden -Force).Attributes = [IO.FileAttributes]::Hidden
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'plaintext provider credential' -Message 'A hidden package file carrying the canary was accepted'
+  Remove-Item -LiteralPath $hidden -Force
+
+  $hiddenDir = Join-Path $gotPackage 'app\.config'
+  Write-TestFile (Join-Path $hiddenDir 'keys.json') ('{"k":"' + $providerCanary + '"}' + "`n")
+  (Get-Item -LiteralPath $hiddenDir -Force).Attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::Hidden
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'plaintext provider credential' -Message 'A file under a hidden directory carrying the canary was accepted'
+  Remove-Item -LiteralPath $hiddenDir -Recurse -Force
+
+  # Hỏng-đóng phải là tính chất của CHÍNH hàm quét, không phải của $ErrorActionPreference mà người
+  # gọi tình cờ đang đặt. Hạ nó xuống 'Continue' quanh lời gọi là cách duy nhất phân biệt hai điều
+  # đó: đo được là thiếu -ErrorAction Stop tại chỗ gọi thì một tệp không đọc được chỉ sinh lỗi
+  # không kết thúc, phép quét bỏ qua tệp ấy và gói báo SẠCH.
+  #
+  # Đặt ở scope của tệp test chứ không bên trong scriptblock của Assert-ThrowsLike: đặt bên trong
+  # thì hàm trong module không thấy, và phép kiểm này xanh cả khi cửa chặn đã hỏng.
+  $locked = Join-Path $gotPackage 'app\locked.txt'
+  Write-TestFile $locked "khong doc duoc`n"
+  $handle = [IO.File]::Open($locked, 'Open', 'Read', 'None')
+  $savedPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+      -Pattern 'locked\.txt' -Message 'An unreadable package file was skipped instead of failing the scan'
+  } finally {
+    $ErrorActionPreference = $savedPreference
+    $handle.Close()
+  }
+  Remove-Item -LiteralPath $locked -Force
   Assert-AppPackage -Out $packageRoot | Out-Null
 
   Write-TestFile (Join-Path $packageRoot 'data\zalo\credentials.json') "secret`n"
@@ -199,6 +272,7 @@ try {
     -Pattern 'Zalo credentials' -Message 'A package containing Zalo credentials was accepted'
 
   Write-Host 'PASS: Assert-AppPackage requires runtime files and rejects credentials.'
+  Write-Host 'PASS: Assert-AppPackage finds a provider credential in text, config, binary, hidden files, and fails closed on an unreadable one.'
 } finally {
   if (Test-Path -LiteralPath $packageRoot) {
     Remove-Item -LiteralPath $packageRoot -Recurse -Force
@@ -241,6 +315,22 @@ func incoming() {
 		a.batch.add(req.ThreadID, kind, msg.Body, delay, ipc.ZaloOutboxDraft{})
 }
 '@
+  Write-TestFile (Join-Path $repo 'internal\daemon\duty.go') @'
+package daemon
+
+func trigger() {
+	err := a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)
+}
+'@
+  # Test upstream gọi answerZalo hàng chục lần. Chúng có mặt ở đây để cửa đếm chỗ gọi phải thật
+  # sự loại _test.go ra — bỏ sót thì cửa đó đỏ ngay trên repo thật và không ai build được.
+  Write-TestFile (Join-Path $repo 'internal\daemon\duty_test.go') @'
+package daemon
+
+func TestAnswer(t *testing.T) {
+	_ = a.answerZalo(ctx, zc, run, "t1", "câu hỏi", nil, ipc.ZaloOutboxDraft{})
+}
+'@
   Write-TestFile (Join-Path $repo 'README.md') "tracked`n"
   Write-TestFile (Join-Path $repo 'untracked.txt') "must not be staged`n"
   $upstreamStyles = @{
@@ -269,6 +359,7 @@ func incoming() {
   & git -C $repo add -- 'internal' 'README.md'
   if ($LASTEXITCODE -ne 0) { throw 'Could not stage fixture files' }
   $statusBefore = (& git -C $repo status --short) -join "`n"
+  $dutyBefore = [IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\duty.go'))
 
   $gotStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot $stage
   Assert-Equal $gotStage ([IO.Path]::GetFullPath($stage)) 'Stage path was not normalized'
@@ -291,9 +382,19 @@ func incoming() {
   $stagedServer = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\server.go'))
   $stagedStore = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\store\store.go'))
   $stagedZalo = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\zalo.go'))
+  $stagedDuty = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\duty.go'))
   if ([regex]::Matches($stagedServer, 'a\.registerAppRoutes\(mux\)').Count -ne 1) { throw 'Route seam was not applied exactly once' }
   if ([regex]::Matches($stagedStore, 'migrateApp\(db\)').Count -ne 1) { throw 'Migration seam was not applied exactly once' }
   if ([regex]::Matches($stagedZalo, 'evaluateAppWorkflow\(req, msg\)').Count -ne 1) { throw 'Workflow seam was not applied exactly once' }
+  $runnerSeam = 'a\.appZaloRunner\(deps\.cfg, deps\.run, threadID, len\(files\) > 0\)'
+  if ([regex]::Matches($stagedDuty, $runnerSeam).Count -ne 1) { throw 'Runner seam was not applied exactly once' }
+  # Chuỗi gọi phải còn nguyên hình dạng cũ quanh chỗ chèn: một seam khớp đúng chữ nhưng đặt sai
+  # chỗ vẫn đếm ra 1, và cách duy nhất phân biệt là đọc cả lời gọi.
+  $expectedCall = 'a.answerZalo(ctx, deps.cfg, a.appZaloRunner(deps.cfg, deps.run, threadID, ' +
+    'len(files) > 0), threadID, question, step, reply, files...)'
+  if ($stagedDuty.IndexOf($expectedCall, [StringComparison]::Ordinal) -lt 0) {
+    throw 'Runner seam did not rewrite the answerZalo call in place'
+  }
   Assert-ThrowsLike -Action { Apply-AppSeams -Stage $gotStage } `
     -Pattern 'route seam: inserted signature already present' -Message 'Applying seams twice was accepted'
   if ([regex]::Matches([IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\server.go')), 'a\.registerAppRoutes\(mux\)').Count -ne 1) {
@@ -302,6 +403,8 @@ func incoming() {
 
   $sourceServer = [IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\server.go'))
   if ($sourceServer -match 'registerAppRoutes') { throw 'Source repo was changed by staging' }
+  Assert-Equal ([IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\duty.go'))) $dutyBefore `
+    'Source duty.go was changed by staging'
   $statusAfter = (& git -C $repo status --short) -join "`n"
   Assert-Equal $statusAfter $statusBefore 'Source Git status changed during staging'
 
@@ -340,6 +443,37 @@ func incoming() {
   Assert-ThrowsLike -Action { Apply-AppSeams -Stage $duplicateWorkflowStage } `
     -Pattern 'workflow seam: expected exactly 1 match' -Message 'A duplicate workflow marker was accepted'
 
+  $duplicateRunnerStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Trùng runner')
+  $duplicateDutyPath = Join-Path $duplicateRunnerStage 'internal\daemon\duty.go'
+  $duplicateDuty = [IO.File]::ReadAllText($duplicateDutyPath)
+  $duplicateDuty += "`n`ta.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)`n"
+  [IO.File]::WriteAllText($duplicateDutyPath, $duplicateDuty, [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $duplicateRunnerStage } `
+    -Pattern 'runner seam: expected exactly 1 match' -Message 'A duplicate runner marker was accepted'
+
+  # Chữ ký đã có sẵn phải chặn TRƯỚC khi Replace chạy, và nó phải chặn của CHÍNH seam này: ba
+  # seam kia đều sạch ở stage này, nên nếu Apply-AppSeams đi qua được thì cửa chặn duty không có.
+  $appliedRunnerStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Runner đã áp')
+  $appliedDutyPath = Join-Path $appliedRunnerStage 'internal\daemon\duty.go'
+  [IO.File]::WriteAllText($appliedDutyPath, ([IO.File]::ReadAllText($appliedDutyPath).Replace(
+    'deps.run, threadID', 'a.appZaloRunner(deps.cfg, deps.run, threadID, len(files) > 0), threadID')),
+    [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $appliedRunnerStage } `
+    -Pattern 'runner seam: inserted signature already present' -Message 'An already-patched duty.go was accepted'
+
+  # Một lượt trả lời thứ hai ở tệp KHÁC là cách duy nhất seam này hỏng lặng lẽ: duty.go vẫn khớp
+  # đúng một lần, seam vẫn áp, và đường mới đi thẳng tới Claude Code không qua định tuyến.
+  $driftStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Hai chỗ gọi')
+  Write-TestFile (Join-Path $driftStage 'internal\daemon\duty2.go') @'
+package daemon
+
+func triggerAgain() {
+	_ = a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply)
+}
+'@
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $driftStage } `
+    -Pattern 'runner seam: answerZalo has 2 call sites' -Message 'A second answerZalo call site was accepted'
+
   $orchestrator = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\build-app.ps1'))
   if ($orchestrator -notmatch 'New-AppStage' -or $orchestrator -notmatch 'Apply-AppSeams') {
     throw 'Build orchestration does not use the guarded staging functions'
@@ -353,7 +487,7 @@ func incoming() {
     throw 'Launcher does not open the management Portal at /'
   }
 
-  Write-Host 'PASS: staging copies tracked files and applies three guarded seams.'
+  Write-Host 'PASS: staging copies tracked files and applies four guarded seams.'
 } finally {
   if (Test-Path -LiteralPath $stageTestRoot) {
     Remove-Item -LiteralPath $stageTestRoot -Recurse -Force

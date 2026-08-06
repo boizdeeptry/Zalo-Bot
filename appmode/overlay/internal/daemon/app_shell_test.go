@@ -15,20 +15,22 @@ func TestAppPortalShellAssetsAreEmbedded(t *testing.T) {
 		"portal.css",
 		"core/router.js",
 		"core/api.js",
-		"core/state.js",
 		"core/ui.js",
 		"core/shell.js",
 		"pages/agents.js",
 		"pages/knowledge.js",
 		"pages/models.js",
+		"pages/providers.js",
 		"pages/roadmap.js",
 	} {
 		if _, err := fs.ReadFile(assetFS, name); err != nil {
 			t.Errorf("read Portal asset %q: %v", name, err)
 		}
 	}
-	if _, err := fs.ReadFile(assetFS, "pages/overview.js"); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("read removed Portal overview asset: got %v; want fs.ErrNotExist", err)
+	for _, name := range []string{"pages/overview.js", "core/state.js"} {
+		if _, err := fs.ReadFile(assetFS, name); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("read removed Portal asset %q: got %v; want fs.ErrNotExist", name, err)
+		}
 	}
 
 	index, err := fs.ReadFile(assetFS, "index.html")

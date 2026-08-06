@@ -252,7 +252,7 @@
   OpenRouter: POST https://openrouter.ai/api/v1/chat/completions; GET /api/v1/models
   ```
 
-  Set the required bearer, `x-api-key`, and `anthropic-version: 2023-06-01` headers. `Test` must perform a harmless model-list request. `Discover` returns the old cached list unchanged at the service layer when the adapter errors; the adapter itself returns an error and no partial list. Implement `isFallbackEligible` to return true only for network, timeout, rate-limit, and upstream kinds.
+  Set the required bearer, `x-api-key`, and `anthropic-version: 2023-06-01` headers. OpenRouter also gets the static `HTTP-Referer` and `X-Title` attribution headers its docs ask for (see `.planning/research/9router-RESEARCH.md` §4). OpenAI and OpenRouter share the `GET models` envelope, the bearer header, and all transport/decode/status plumbing — factor those once rather than twice (§1 of that note explains why). They do NOT share a generate codec: this plan pins OpenAI to the Responses API (`{model, input}` → `output[].content[].output_text`) and OpenRouter to chat completions (`{model, messages}` → `choices[].message.content`). Merging those two would send a payload one provider rejects. Endpoint accuracy outranks codec sharing. `Test` must perform a harmless model-list request. `Discover` returns the old cached list unchanged at the service layer when the adapter errors; the adapter itself returns an error and no partial list. Implement `isFallbackEligible` to return true only for network, timeout, rate-limit, and upstream kinds.
 
 - [ ] **Step 4: Run and confirm GREEN**
 
@@ -347,7 +347,7 @@
   Run:
 
   ```powershell
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
   ```
 
   Expected: FAIL because the duty seam and `appZaloRunner` do not exist.
@@ -358,7 +358,7 @@
 
 - [ ] **Step 4: Run focused and full verification**
 
-  Run the Pester command, then the staged-build command with output prefix `provider-runtime-green-`.
+  Run the build-script fixture command from Step 2, then the staged-build command with output prefix `provider-runtime-green-`.
 
   Expected: both PASS; the source repository status is unchanged and the existing Zalo tests remain green.
 
@@ -431,7 +431,7 @@
   Share strict decoding, Provider lookup, credential loading, and error writing helpers.
 
   ```powershell
-  git add appmode/overlay/internal/daemon/app_llm_api.go appmode/overlay/internal/daemon/app_llm_api_test.go appmode/overlay/internal/daemon/app_routes.go appmode/overlay/internal/daemon/app_foundation_test.go
+  git add appmode/overlay/internal/daemon/app_llm_api.go appmode/overlay/internal/daemon/app_llm_api_shared.go appmode/overlay/internal/daemon/app_llm_api_test.go appmode/overlay/internal/daemon/app_routes.go appmode/overlay/internal/daemon/app_foundation_test.go
   git commit -m "feat: expose secure provider management API"
   ```
 
@@ -578,7 +578,7 @@
   Run:
 
   ```powershell
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
   ```
 
   Expected: FAIL until the package gate includes the Provider canary scan and the cross-layer fallback fixture reports the expected status.
@@ -593,7 +593,7 @@
 
   ```powershell
   npm --prefix appmode test
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
   $out = Join-Path $env:TEMP ('provider-final-' + [guid]::NewGuid().ToString('N'))
   pwsh -NoProfile -File .\build-app.ps1 -Repo $env:ZALOBOT_REPO -PersonaSource $env:ZALOBOT_PERSONA -Out $out
   git -C $env:ZALOBOT_REPO status --short

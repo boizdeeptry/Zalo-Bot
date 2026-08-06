@@ -42,6 +42,20 @@ func TestAppRoutesAreRegisteredAndCookieReachable(t *testing.T) {
 		{"DELETE /kb/ingest", "/kb/ingest"},
 		{"GET /kb/model", "/kb/model"},
 		{"PUT /kb/model", "/kb/model"},
+		{"GET /llm/providers", "/llm/providers"},
+		{"POST /llm/providers", "/llm/providers"},
+		{"PUT /llm/providers/{id}", "/llm/providers/openai"},
+		{"DELETE /llm/providers/{id}", "/llm/providers/openai"},
+		{"PUT /llm/providers/{id}/credential", "/llm/providers/openai/credential"},
+		{"DELETE /llm/providers/{id}/credential", "/llm/providers/openai/credential"},
+		{"POST /llm/providers/test", "/llm/providers/test"},
+		{"POST /llm/providers/{id}/test", "/llm/providers/openai/test"},
+		{"POST /llm/providers/{id}/discover", "/llm/providers/openai/discover"},
+		{"POST /llm/providers/{id}/models", "/llm/providers/openai/models"},
+		{"DELETE /llm/providers/{id}/models", "/llm/providers/openai/models"},
+		{"GET /llm/route", "/llm/route"},
+		{"PUT /llm/route", "/llm/route"},
+		{"GET /llm/status", "/llm/status"},
 	}
 
 	for _, tt := range tests {

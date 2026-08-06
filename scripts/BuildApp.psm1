@@ -205,10 +205,12 @@ function Apply-AppSeams {
   $serverPath = Join-Path $stagePath 'internal\daemon\server.go'
   $storePath = Join-Path $stagePath 'internal\store\store.go'
   $zaloPath = Join-Path $stagePath 'internal\daemon\zalo.go'
+  $dutyPath = Join-Path $stagePath 'internal\daemon\duty.go'
 
   $server = [IO.File]::ReadAllText($serverPath)
   $store = [IO.File]::ReadAllText($storePath)
   $zalo = [IO.File]::ReadAllText($zaloPath)
+  $duty = [IO.File]::ReadAllText($dutyPath)
   $serverNewline = if ($server.Contains("`r`n")) { "`r`n" } else { "`n" }
   $storeNewline = if ($store.Contains("`r`n")) { "`r`n" } else { "`n" }
   $zaloNewline = if ($zalo.Contains("`r`n")) { "`r`n" } else { "`n" }
@@ -216,6 +218,7 @@ function Apply-AppSeams {
   Assert-SignatureAbsent -Text $server -Signature 'a.registerAppRoutes(mux)' -Label 'route seam'
   Assert-SignatureAbsent -Text $store -Signature 'migrateApp(db)' -Label 'migration seam'
   Assert-SignatureAbsent -Text $zalo -Signature 'evaluateAppWorkflow(req, msg)' -Label 'workflow seam'
+  Assert-SignatureAbsent -Text $duty -Signature 'a.appZaloRunner(' -Label 'runner seam'
 
   $routeNeedle = "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))"
   $serverUpdated = Replace-ExactlyOnce -Text $server -Needle $routeNeedle `
@@ -243,10 +246,109 @@ function Apply-AppSeams {
     -Replacement ($workflowPrefix + $zaloNewline + $workflowNeedle) `
     -Label 'workflow seam'
 
+  # Runner seam: mỗi lượt Zalo đi qua chuỗi fallback đang lưu thay vì thẳng tới Claude Code.
+  # Thay ngay tại tham số runner của lời gọi, nên không có dòng nào chèn thêm và cấu hình cùng
+  # tệp đính kèm của chính lượt đó vẫn là thứ quyết định đường đi.
+  $runnerNeedle = 'a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)'
+  $runnerReplacement = 'a.answerZalo(ctx, deps.cfg, a.appZaloRunner(deps.cfg, deps.run, threadID, ' +
+    'len(files) > 0), threadID, question, step, reply, files...)'
+  $dutyUpdated = Replace-ExactlyOnce -Text $duty -Needle $runnerNeedle `
+    -Replacement $runnerReplacement -Label 'runner seam'
+
+  # Replace-ExactlyOnce chỉ chứng minh duty.go có đúng một lượt trả lời, không chứng minh cả cây
+  # có. Một đường trả lời thứ hai ở tệp khác là cách DUY NHẤT seam này hỏng lặng lẽ: nó vẫn áp,
+  # và đường mới đi thẳng tới Claude Code không qua định tuyến. Đếm sau khi Replace chạy, để một
+  # duty.go có hai lời gọi vẫn báo bằng thông điệp của Replace.
+  $callSites = (Get-ChildItem (Join-Path $stagePath 'internal\daemon') -Filter '*.go' |
+    Where-Object { -not $_.Name.EndsWith('_test.go') } |
+    ForEach-Object { [regex]::Matches([IO.File]::ReadAllText($_.FullName), 'a\.answerZalo\(').Count } |
+    Measure-Object -Sum).Sum
+  if ($callSites -ne 1) { throw "runner seam: answerZalo has $callSites call sites, expected 1" }
+
   $utf8NoBom = [Text.UTF8Encoding]::new($false)
   [IO.File]::WriteAllText($serverPath, $serverUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($storePath, $storeUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($zaloPath, $zaloUpdated, $utf8NoBom)
+  [IO.File]::WriteAllText($dutyPath, $dutyUpdated, $utf8NoBom)
+}
+
+# Khoá thử nghiệm dùng chung của mọi tầng test: llmPackageCanary trong app_llm_router_test.go,
+# llmAPIKey/llmAPINextKey trong app_llm_api_test.go, CANARY_KEY trong providers.test.mjs.
+#
+# Quét một chuỗi mà KHÔNG tệp nào trong repo mang thì luôn ra 0 lần khớp, kể cả khi cửa chặn đã
+# hỏng — một phép kiểm như thế trông như đang canh cửa mà không canh gì. Chuỗi này nằm trong
+# fixture của cả ba tầng, nên nó có đường thật vào gói: một hằng test bị nhấc lên tệp sản xuất,
+# hay một khoá dán vào trang Portal (assets nhúng thẳng vào agentdc.exe).
+#
+# Tệp này KHÔNG đi vào stage lẫn vào gói (nó thuộc repo đóng gói, không thuộc repo nguồn), nên
+# chuỗi ở đây không tự làm cửa chặn đỏ.
+$script:ProviderCredentialCanary = 'sk-package-must-never-contain-7f36d2'
+
+# Assert-NoProviderCredential từ chối một gói còn mang khoá Provider thử nghiệm.
+#
+# MỌI tệp ngoài node_modules đều bị quét — không có danh sách trắng đuôi tệp. Bản đầu có một danh
+# sách như thế và nó bỏ sót brain\.claude\settings.local.json.example, tệp cấu hình DUY NHẤT của
+# gói: gieo canary vào đó thì cửa chặn báo sạch. Một danh sách trắng phải đoán trước mọi đuôi tệp
+# tương lai, và mỗi lần đoán thiếu là một lần cửa xanh nhầm. node_modules mới là thứ gánh phần
+# giới hạn: 1209 tệp của gói chỉ có 52 tệp nằm ngoài nó.
+#
+# Tách khỏi Assert-AppPackage để hàm kia đọc được trong một màn hình, nhưng nó chạy MỖI lần
+# Assert-AppPackage chạy và không nhận công tắc bỏ qua — một cửa chặn phải nhớ bật thì không phải
+# cửa chặn. Không xuất khẩu: build-app.ps1 và test đều đi qua Assert-AppPackage, vì "mỗi lần build
+# có quét không" mới là câu hỏi, và chỉ lời gọi ngoài đó trả lời được.
+function Assert-NoProviderCredential {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Package,
+    [string]$Canary = $script:ProviderCredentialCanary
+  )
+
+  $packagePath = [IO.Path]::GetFullPath($Package)
+  if (-not (Test-Path -LiteralPath $packagePath -PathType Container)) {
+    throw "không thấy gói ở '$packagePath'"
+  }
+
+  # -Force là BẮT BUỘC: không có nó, Get-ChildItem lặng lẽ bỏ qua tệp ẩn và mọi thứ nằm dưới một
+  # thư mục ẩn. Đó không phải chuyện lý thuyết — cả ba chỗ chép vào gói đều dùng Copy-Item -Force
+  # và Copy-Item giữ nguyên thuộc tính Hidden, còn đúng lớp tệp hay mang khoá thật (.env, .npmrc,
+  # .claude\settings.local.json) lại là lớp mà công cụ Windows thỉnh thoảng đánh dấu ẩn. Một bit
+  # thuộc tính là đủ để cửa chặn báo sạch trên một gói đang mang khoá.
+  #
+  # -ErrorAction Stop tại CHỖ GỌI chứ không dựa vào $ErrorActionPreference của người gọi: một tệp
+  # không liệt kê hay không đọc được mà bị nuốt lặng thì phép quét trả về 0 lần khớp y hệt một gói
+  # sạch, và tính chất đó quá quan trọng để nằm trong một biến ở ngoài hàm này. Đường .exe bên dưới
+  # đã hỏng-đóng sẵn: ngoại lệ của một phương thức .NET luôn là lỗi kết thúc.
+  #
+  # Loại trừ xét trên đường dẫn TƯƠNG ĐỐI so với gốc gói, và xét cả dấu phân cách. Hai chi tiết,
+  # hai lỗ khác nhau: so trên đường dẫn tuyệt đối thì một gói dựng vào ...\node_modules\... nào đó
+  # tự loại trừ SẠCH mọi tệp của chính nó, còn so chuỗi con không có dấu '\' thì
+  # brain\node_modules-notes\ cũng được miễn. Lệch với cửa quét dấu khách hàng ở build-app.ps1 là
+  # cố ý — cửa này canh credential, và một thư mục đặt tên gần giống không được là chỗ trốn.
+  $files = Get-ChildItem -LiteralPath $packagePath -Recurse -File -Force -ErrorAction Stop |
+    Where-Object { [IO.Path]::GetRelativePath($packagePath, $_.FullName) -notlike '*node_modules\*' }
+
+  # .exe đi đường byte chứ không qua Select-String: đó là hai tệp cỡ chục MB gần như không có dấu
+  # xuống dòng, và đọc chúng theo dòng là dựng một chuỗi khổng lồ để tìm đúng một chuỗi con. Cùng
+  # lý do khiến đường này phải tồn tại: assets Portal được go:embed vào agentdc.exe, nên một khoá
+  # dán vào pages/providers.js không nằm trong tệp văn bản nào của gói — chỉ ở trong binary.
+  $binaries, $texts = ($files | Where-Object { $_.Extension -eq '.exe' }),
+                      ($files | Where-Object { $_.Extension -ne '.exe' })
+
+  $hits = $texts | Select-String -SimpleMatch -Pattern $Canary -Encoding UTF8 -ErrorAction Stop
+  $binaryHits = @($binaries | Where-Object {
+    [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($_.FullName)).
+      IndexOf($Canary, [StringComparison]::Ordinal) -ge 0
+  })
+
+  if ($hits -or $binaryHits) {
+    # Chỉ đường dẫn và số dòng, KHÔNG in dòng khớp: dòng đó chính là bí mật đang bị tố cáo, và
+    # thông báo hỏng này đi vào log build, tức đi xa hơn cái gói.
+    $where = @($hits | ForEach-Object { '{0}:{1}' -f $_.Path, $_.LineNumber }) +
+             @($binaryHits | ForEach-Object { $_.FullName })
+    throw ('package contains plaintext provider credential: ' + ($where -join '; '))
+  }
+
+  return $packagePath
 }
 
 function Assert-AppPackage {
@@ -276,6 +378,10 @@ function Assert-AppPackage {
   if (-not $AllowZaloCredentials -and (Test-Path -LiteralPath $credentials -PathType Leaf)) {
     throw 'package contains Zalo credentials'
   }
+
+  # Không có công tắc bỏ qua, khác cửa Zalo ở trên: -KeepData tồn tại vì giữ phiên đăng nhập qua
+  # nhiều lần build là việc hợp lệ lúc đang thử, còn một khoá Provider trong gói thì không bao giờ.
+  Assert-NoProviderCredential -Package $outPath | Out-Null
 
   return $outPath
 }

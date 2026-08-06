@@ -97,6 +97,52 @@
 [data-agents-overlay] .qr { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-top:10px; }
 [data-agents-overlay] .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0, 0, 0, 0); white-space:nowrap; border:0; }
 
+/* providers:begin — Legacy Providers page. Dùng lại .facts của AI Agents nhưng cột trái là TÊN
+   Provider, nên nó rộng hơn và được phép xuống dòng.
+
+   MỌI luật từ đây tới providers:end phải bắt đầu bằng .providers-page hoặc .provider-sheet.
+   shell.test.mjs đọc đúng khoảng giữa hai dấu này để kiểm, nên đừng xoá cặp dấu — không có
+   chúng thì phép kiểm không còn gì để đọc. */
+.providers-page .facts { border:1px solid var(--line); border-radius:8px; overflow:hidden; margin:18px 0; background:var(--panel); }
+.providers-page .fact { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1.4fr) auto; gap:12px; align-items:center; padding:9px 11px; border-bottom:1px solid var(--line); font-size:12.5px; }
+.providers-page .fact:last-child { border-bottom:0; }
+.providers-page .fkk { font-weight:600; overflow-wrap:anywhere; }
+.providers-page .fvv { min-width:0; overflow-wrap:anywhere; }
+.providers-page .fn { display:block; color:var(--dim); font-size:11.5px; margin-top:2px; }
+
+.provider-sheet.sheetback { position:fixed; z-index:40; inset:0; display:flex; align-items:center; justify-content:center; padding:22px; background:rgba(9, 12, 16, .58); }
+.provider-sheet .sheet { box-sizing:border-box; width:min(620px, 100%); max-height:calc(100vh - 44px); overflow:auto; border:1px solid var(--line); border-radius:10px; padding:16px; background:var(--panel); box-shadow:0 16px 55px rgba(0, 0, 0, .35); }
+.provider-sheet .sheethead { display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:12px; }
+.provider-sheet .sheethead .st { font-size:15px; font-weight:600; }
+.provider-sheet .sheethead .sp { font:11.5px ui-monospace, Consolas, monospace; color:var(--dim); overflow-wrap:anywhere; }
+.provider-sheet .field { margin:0 0 11px; }
+.provider-sheet .field label { display:flex; align-items:baseline; gap:9px; margin:0 0 5px; }
+.provider-sheet .fk { font-weight:600; font-size:12.5px; }
+.provider-sheet .fs { display:block; font-size:11.5px; color:var(--dim); margin-top:4px; }
+.provider-sheet .fs:empty { display:none; }
+.provider-sheet .field input[type="text"],
+.provider-sheet .field input[type="password"],
+.provider-sheet .field select {
+  box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:7px;
+  padding:7px 9px; color:var(--ink); background:var(--sunk);
+}
+.provider-sheet .field.check { display:flex; align-items:center; gap:8px; }
+.provider-sheet .field.check label { margin:0; font-size:12.5px; }
+.provider-sheet .models { margin:14px 0 0; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--sunk); }
+.provider-sheet .mh { font-size:12.5px; font-weight:600; margin-bottom:8px; }
+.provider-sheet .mlist { border:1px solid var(--line); border-radius:7px; max-height:212px; overflow-y:auto; background:var(--panel); }
+.provider-sheet .mrow { display:flex; gap:9px; align-items:center; flex-wrap:wrap; padding:5px 9px; border-bottom:1px solid var(--line); font-size:12.5px; }
+.provider-sheet .mlist .mrow:last-child { border-bottom:0; }
+.provider-sheet .mid { font:12px ui-monospace, Consolas, monospace; overflow-wrap:anywhere; }
+.provider-sheet .mrow .fn { margin-left:auto; color:var(--dim); font-size:11.5px; }
+.provider-sheet .mrow.none { color:var(--dim); font-style:italic; }
+.provider-sheet .maddrow { border:0; padding:9px 0 0; }
+.provider-sheet .maddrow label { font-size:11.5px; color:var(--dim); }
+.provider-sheet .madd { flex:1 1 160px; min-width:0; border:1px solid var(--line); border-radius:7px; padding:6px 9px; color:var(--ink); background:var(--panel); }
+.provider-sheet .sheetfoot { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-top:12px; }
+.provider-sheet .sheetfoot .note:first-child { margin-right:auto; }
+/* providers:end */
+
 .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
 .card {
   border:1px solid var(--line); border-radius:9px; padding:13px 17px; min-width:132px;
@@ -115,25 +161,37 @@
 #drop .small { font-size:11.5px; color:var(--dim); }
 
 .row { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin:16px 0; }
-.models-page .picks { display:flex; flex-direction:column; gap:9px; max-width:560px; }
-.models-page .pick {
-  display:flex; gap:12px; align-items:flex-start; text-align:left; width:100%;
-  padding:13px 15px; border-radius:9px; cursor:pointer; font:inherit; color:inherit;
-  background:var(--panel); border:1px solid var(--line);
+
+/* models:begin — Trang Models là bảng chuỗi fallback: mỗi hàng là một mắt xích Provider/model.
+
+   MỌI luật từ đây tới models:end phải bắt đầu bằng .models-page. models.test.mjs đọc đúng
+   khoảng giữa hai dấu này để kiểm, nên đừng xoá cặp dấu — không có chúng thì phép kiểm không
+   còn gì để đọc. */
+.models-page .chainstatus { font-size:12.5px; color:var(--dim); margin:14px 0 0; }
+.models-page .chainstatus:empty { display:none; }
+.models-page .facts { border:1px solid var(--line); border-radius:8px; overflow:hidden; margin:12px 0; background:var(--panel); }
+.models-page .fact {
+  display:grid; grid-template-columns:auto minmax(0, 1fr) minmax(0, 1fr) auto auto;
+  gap:6px 12px; align-items:center; padding:9px 11px; border-bottom:1px solid var(--line);
+  font-size:12.5px;
 }
-.models-page .pick:hover { border-color:var(--dim); }
-.models-page .pick.on { border-color:var(--live); background:rgba(63,199,127,.07); }
-.models-page .pick .dot {
-  width:15px; height:15px; border-radius:50%; border:2px solid var(--line);
-  flex:0 0 15px; margin-top:2px;
+.models-page .fact:last-child { border-bottom:0; }
+.models-page .fp { display:flex; flex-direction:column; gap:2px; font-weight:600; }
+.models-page .fc { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.models-page .fc.check { flex-direction:row; align-items:center; gap:7px; }
+.models-page .fk { font-size:11px; color:var(--dim); }
+.models-page .fc select {
+  box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:7px;
+  padding:6px 8px; color:var(--ink); background:var(--sunk); font:inherit; font-size:12.5px;
 }
-.models-page .pick.on .dot { border-color:var(--live); background:var(--live); box-shadow:inset 0 0 0 3px var(--panel); }
-.models-page .pick .nm { font-weight:600; font-size:13.5px; }
-.models-page .pick .ds { font-size:12px; color:var(--dim); margin-top:2px; }
-.models-page .pick .tag {
-  margin-left:auto; font-size:10px; color:var(--dim); border:1px solid var(--line);
-  border-radius:5px; padding:2px 6px; white-space:nowrap;
-}
+.models-page .fb { display:flex; gap:6px; flex-wrap:wrap; }
+.models-page .live { font-size:11px; color:var(--live); white-space:nowrap; }
+.models-page .fn { grid-column:1 / -1; color:var(--dim); font-size:11.5px; }
+.models-page .fn:empty { display:none; }
+.models-page .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
+.models-page .reslot:empty { display:none; }
+/* models:end */
+
 .cols { display:flex; gap:16px; flex-wrap:wrap; }
 .cols > div { flex:1 1 264px; min-width:0; }
 .cols h3 {
@@ -174,4 +232,19 @@
   [data-agents-overlay] .sheet {
     width:100%; height:auto; max-height:calc(100vh - 24px); border-radius:8px;
   }
+  /* providers:begin — cùng luật phạm vi như khối trên. */
+  .provider-sheet.sheetback { padding:12px; }
+  .provider-sheet .sheet {
+    width:100%; height:auto; max-height:calc(100vh - 24px); border-radius:8px;
+  }
+  /* Ba cột không còn chỗ ở bề ngang điện thoại; xếp dọc để tên và nút không bị bóp. */
+  .providers-page .fact { grid-template-columns:1fr; gap:5px; }
+  /* providers:end */
+  /* models:begin — cùng luật phạm vi như khối trên.
+
+     Năm cột xếp dọc thành một; nhãn "Provider"/"Model"/"Bật" của từng ô là thứ duy nhất còn nói
+     được ô đó là gì khi hàng đã mất hàng tiêu đề ngầm của bố cục lưới. */
+  .models-page .fact { grid-template-columns:1fr; gap:7px; }
+  .models-page .fp { flex-direction:row; gap:8px; align-items:baseline; }
+  /* models:end */
 }

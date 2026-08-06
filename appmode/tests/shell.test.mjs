@@ -32,7 +32,8 @@ test("desktop navigation renders every group and roadmap pages stay offline", (t
   assert.deepEqual(headings.map(text), ["BUILD", "OPERATE", "GOVERN", "SYSTEM"]);
 
   const items = findAll(nav, (node) => node.classList?.contains("nav"));
-  assert.equal(items.length, 13);
+  assert.equal(items.length, 14);
+  assert.ok(find(nav, (node) => node.dataset?.route === "providers"));
   const knowledge = find(nav, (node) => node.dataset?.route === "knowledge");
   assert.equal(knowledge.getAttribute("aria-current"), "page");
   const workflows = find(nav, (node) => node.dataset?.route === "workflows");
@@ -75,4 +76,43 @@ test("desktop shell loads isolated Portal CSS with the legacy rail dimensions", 
   assert.match(css, /@media\s*\(max-width:\s*720px\)/);
   assert.match(css, /#rail\.is-open\s*\{/);
   assert.match(css, /#rail-toggle\s*\{/);
+  // Outline hướng vào trong là bản vá cho #main chạm mép; một trang mới không được xoá nó.
+  assert.match(css, /#main:focus-visible\s*\{[^}]*outline-offset:\s*-2px/s);
+});
+
+// providerRegions lấy phần thân giữa mỗi cặp dấu providers:begin/end.
+//
+// Cắt theo DẤU chứ không lọc theo chữ "provider" trong selector: một luật xổng phạm vi là một
+// luật KHÔNG còn chữ đó, nên lọc theo tên chỉ soi được đúng những luật vốn đã đúng.
+function providerRegions(css) {
+  return [...css.matchAll(/\/\* providers:begin[\s\S]*?\*\/([\s\S]*?)\/\* providers:end \*\//g)]
+    .map(([, body]) => body);
+}
+
+// selectorsIn tách theo "}" chứ không theo dòng, nên một danh sách selector trải nhiều dòng vẫn
+// được xét đủ từng phần.
+function selectorsIn(region) {
+  return region
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("}")
+    .map((rule) => rule.split("{")[0].trim())
+    .filter(Boolean)
+    .flatMap((list) => list.split(",").map((part) => part.trim()).filter(Boolean));
+}
+
+test("every rule in the Provider CSS regions stays scoped to its page or sheet", async () => {
+  const css = await readFile(new URL("portal.css", staticRoot), "utf8");
+
+  const regions = providerRegions(css);
+  assert.equal(regions.length, 2, "expected a desktop and a mobile Provider region");
+
+  const selectors = regions.flatMap(selectorsIn);
+  assert.ok(selectors.length >= 20, `expected the Provider rules inside the markers, got ${selectors.length}`);
+  for (const selector of selectors) {
+    assert.match(
+      selector,
+      /^\.providers-page\b|^\.provider-sheet\b/,
+      `Provider rule "${selector}" must stay scoped`,
+    );
+  }
 });
