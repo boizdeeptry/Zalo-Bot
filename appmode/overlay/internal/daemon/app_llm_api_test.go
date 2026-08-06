@@ -20,12 +20,16 @@ import (
 // Canary của tầng Portal. Khác llmTestKey của app_llm_http_test.go có chủ đích: khi một trong hai
 // chuỗi này xuất hiện ở chỗ không được phép, cái tên nói ngay nó rò từ tầng adapter hay tầng API.
 //
+// Cả hai MỌC RA từ llmPackageCanary thay vì là hai chuỗi rời: cửa chặn gói
+// (tests/build-app.Tests.ps1) quét đúng một chuỗi con trong gói đã dựng, nên một khoá thử nghiệm
+// không mang chuỗi con đó sẽ đi ra bản bán mà không phép quét nào thấy.
+//
 // Cả hai mang tiền tố "sk-" vì đó là hình dạng thật của khoá OpenAI, và mẫu che cuối cùng trong
 // sanitizeProviderError bám vào chính tiền tố đó — canary không giống khoá thật thì test che sẽ
 // xanh trên một mẫu không bao giờ chạy.
 const (
-	llmAPIKey     = "sk-canary-portal-4Hn8Qw2ZxL6vB9td"
-	llmAPINextKey = "sk-canary-portal-7Rk1Mv5YcT3pE8ws"
+	llmAPIKey     = llmPackageCanary + "-portal-4Hn8Qw2ZxL6vB9td"
+	llmAPINextKey = llmPackageCanary + "-portal-7Rk1Mv5YcT3pE8ws"
 	llmAPIToken   = "master-token-for-llm-api-tests"
 )
 

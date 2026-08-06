@@ -961,3 +961,13 @@ test("the Models CSS lays rows out in columns and stacks them at phone width", a
   assert.match(desktop, /\.models-page \.fact\s*\{[^}]*grid-template-columns:\s*auto/s);
   assert.match(mobile, /\.models-page \.fact\s*\{[^}]*grid-template-columns:\s*1fr/s);
 });
+
+// Nửa Models của cửa chặn nguồn trong providers.test.mjs. Trang này không có ô nhập khoá, nhưng nó
+// đọc cùng danh sách Provider và cũng được nhúng vào agentdc.exe — một khoá dán vào đây rời khỏi
+// máy y hệt, và không phép kiểm nào khác của tầng này nhìn vào nội dung tệp nguồn.
+test("the Models page source carries no API-key literal", async () => {
+  const source = await readFile(new URL("pages/models.js", staticRoot), "utf8");
+
+  const found = source.match(/\b(?:sk-|xai-|gsk_|AIza)[A-Za-z0-9_-]{8,}/g) ?? [];
+  assert.equal(found.length, 0, `pages/models.js carries ${found.length} key-shaped literal(s)`);
+});

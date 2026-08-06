@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import { AppAPIError } from "../overlay/internal/webui/static/core/api.js";
 import {
@@ -8,7 +9,16 @@ import {
 } from "../overlay/internal/webui/static/pages/providers.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
 
+const staticRoot = new URL("../overlay/internal/webui/static/", import.meta.url);
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+// Khoá thử nghiệm của tầng Portal, cùng một chuỗi với llmPackageCanary bên Go. Cửa chặn gói
+// (tests/build-app.Tests.ps1) quét đúng chuỗi con này trong gói đã dựng và đòi 0 lần khớp; quét
+// một chuỗi không tệp nào trong repo mang thì luôn xanh, nên mọi khoá gõ vào test phải là nó.
+//
+// Đường rò có thật: trang này được nhúng thẳng vào agentdc.exe, nên một khoá copy từ đây sang
+// pages/providers.js đi ra bản bán mà không nằm trong tệp văn bản nào của gói.
+const CANARY_KEY = "sk-package-must-never-contain-7f36d2";
 
 function hasClass(node, className) {
   return node.classList?.contains(className) ?? false;
@@ -137,12 +147,12 @@ test("provider service issues the documented paths and methods", async () => {
   const service = createProviderService(request);
 
   await service.list();
-  await service.create({ kind: "openai", name: "Chính", enabled: true, credential: "sk-new" });
+  await service.create({ kind: "openai", name: "Chính", enabled: true, credential: CANARY_KEY });
   await service.update("openai-1", { name: "Đổi tên", enabled: false, credential: "" });
   await service.remove("openai-1");
-  await service.replaceCredential("openai-1", "sk-test");
+  await service.replaceCredential("openai-1", CANARY_KEY);
   await service.clearCredential("openai-1");
-  await service.testDraft({ kind: "openai", credential: "sk-test" });
+  await service.testDraft({ kind: "openai", credential: CANARY_KEY });
   await service.testSaved("openai-1");
   await service.discover("openai-1");
   await service.addModel("openai-1", "gpt-5");
@@ -154,7 +164,7 @@ test("provider service issues the documented paths and methods", async () => {
       path: "/llm/providers",
       options: {
         method: "POST",
-        body: { kind: "openai", name: "Chính", enabled: true, credential: "sk-new" },
+        body: { kind: "openai", name: "Chính", enabled: true, credential: CANARY_KEY },
       },
     },
     {
@@ -164,12 +174,12 @@ test("provider service issues the documented paths and methods", async () => {
     { path: "/llm/providers/openai-1", options: { method: "DELETE" } },
     {
       path: "/llm/providers/openai-1/credential",
-      options: { method: "PUT", body: { credential: "sk-test" } },
+      options: { method: "PUT", body: { credential: CANARY_KEY } },
     },
     { path: "/llm/providers/openai-1/credential", options: { method: "DELETE" } },
     {
       path: "/llm/providers/test",
-      options: { method: "POST", body: { kind: "openai", credential: "sk-test", model: "" } },
+      options: { method: "POST", body: { kind: "openai", credential: CANARY_KEY, model: "" } },
     },
     { path: "/llm/providers/openai-1/test", options: { method: "POST" } },
     { path: "/llm/providers/openai-1/discover", options: { method: "POST" } },
@@ -320,7 +330,7 @@ test("creating a provider posts the chosen type, name, and typed key", async (t)
   const sheet = await openAddSheet(main);
   find(sheet, (node) => node.tagName === "SELECT").value = "anthropic";
   find(sheet, (node) => node.getAttribute?.("type") === "text").value = "Anthropic phụ";
-  keyInput(sheet).value = "sk-ant-new";
+  keyInput(sheet).value = CANARY_KEY;
   find(sheet, (node) => node.tagName === "FORM").dispatchEvent({ type: "submit" });
   await flush();
 
@@ -328,7 +338,7 @@ test("creating a provider posts the chosen type, name, and typed key", async (t)
     path: "/llm/providers",
     options: {
       method: "POST",
-      body: { kind: "anthropic", name: "Anthropic phụ", enabled: true, credential: "sk-ant-new" },
+      body: { kind: "anthropic", name: "Anthropic phụ", enabled: true, credential: CANARY_KEY },
     },
   });
 });
@@ -343,13 +353,13 @@ test("replacing the credential is its own action carrying only the typed key", a
   });
   await flush();
   const sheet = await openSheet(main, "OpenAI chính");
-  keyInput(sheet).value = "sk-rotated";
+  keyInput(sheet).value = CANARY_KEY;
   button(sheet, "Thay khoá").click();
   await flush();
 
   assert.deepEqual(calls.at(-1), {
     path: "/llm/providers/openai/credential",
-    options: { method: "PUT", body: { credential: "sk-rotated" } },
+    options: { method: "PUT", body: { credential: CANARY_KEY } },
   });
   // Bản rõ vừa gõ không được ở lại trong DOM sau khi đã gửi đi.
   assert.equal(keyInput(sheet).value, "");
@@ -376,7 +386,7 @@ test("clearing the credential is a separate explicit action", async (t) => {
   });
   await flush();
   const sheet = await openSheet(main, "OpenAI chính");
-  keyInput(sheet).value = "sk-typed-but-ignored";
+  keyInput(sheet).value = CANARY_KEY;
   button(sheet, "Xoá khoá").click();
   await flush();
 
@@ -397,13 +407,13 @@ test("testing an unsaved provider posts the typed key to the draft endpoint", as
   });
   await flush();
   const sheet = await openAddSheet(main);
-  keyInput(sheet).value = "sk-draft";
+  keyInput(sheet).value = CANARY_KEY;
   button(sheet, "Kiểm tra kết nối").click();
   await flush();
 
   assert.deepEqual(calls.at(-1), {
     path: "/llm/providers/test",
-    options: { method: "POST", body: { kind: "openai", credential: "sk-draft", model: "" } },
+    options: { method: "POST", body: { kind: "openai", credential: CANARY_KEY, model: "" } },
   });
 });
 
@@ -795,4 +805,21 @@ test("a failed provider list renders the shared error panel", async (t) => {
   await flush();
 
   assert.match(text(find(main, (node) => hasClass(node, "banner"))), /không đọc được danh sách Provider/);
+});
+
+// Cửa chặn nguồn của tầng Portal: đây là trang người dùng gõ API key, nên cũng là trang một khoá
+// dễ bị dán vào nhất lúc ai đó đang gỡ lỗi. Assets nhúng thẳng vào agentdc.exe, nên một khoá còn
+// sót ở đây đi ra bản bán mà không nằm trong tệp văn bản nào của gói để mà quét.
+//
+// Bắt theo HÌNH DẠNG chứ không theo canary: cửa chặn gói tìm đúng chuỗi canary, nên nó bỏ lọt khoá
+// THẬT của người đang gỡ lỗi — đúng thứ tệ nhất được để lại. Bốn tiền tố là bốn nhà cung cấp đang
+// hỗ trợ, cùng bộ với mẫu che cuối cùng trong sanitizeProviderError.
+//
+// Không in ra chuỗi khớp: thông báo hỏng của test đi vào log, và chuỗi đó chính là thứ đang bị tố
+// cáo. Số lượng đủ để biết phải đi tìm cái gì.
+test("the Providers page source carries no API-key literal", async () => {
+  const source = await readFile(new URL("pages/providers.js", staticRoot), "utf8");
+
+  const found = source.match(/\b(?:sk-|xai-|gsk_|AIza)[A-Za-z0-9_-]{8,}/g) ?? [];
+  assert.equal(found.length, 0, `pages/providers.js carries ${found.length} key-shaped literal(s)`);
 });

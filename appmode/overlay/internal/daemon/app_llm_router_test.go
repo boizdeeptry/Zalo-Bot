@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -18,6 +19,17 @@ import (
 	"agentdc/internal/ipc"
 	"agentdc/internal/store"
 )
+
+// llmPackageCanary là khoá thử nghiệm gốc của MỌI tầng test: tệp này, app_llm_api_test.go,
+// providers.test.mjs và models.test.mjs. Cửa chặn gói trong tests/build-app.Tests.ps1 tìm đúng
+// chuỗi con này trong gói đã dựng và đòi 0 lần khớp.
+//
+// Một chuỗi gốc cho mọi khoá thử nghiệm, và đó là ĐIỀU KIỆN để phép quét kia nói được điều gì:
+// quét một chuỗi mà không tệp nào trong repo mang thì luôn xanh, kể cả khi cửa chặn đã hỏng. Có
+// mặt trong fixture nghĩa là chuỗi này thật sự có đường vào gói — một hằng test bị nhấc lên tệp
+// sản xuất, hay một khoá dán nhầm vào trang Portal (assets nhúng thẳng vào agentdc.exe) — nên
+// "0 lần khớp" là một khẳng định có thể sai.
+const llmPackageCanary = "sk-package-must-never-contain-7f36d2"
 
 // --- fakes ---
 
@@ -1274,5 +1286,118 @@ func TestAppLLMCredentialUnlocksExactlyOneProvider(t *testing.T) {
 	// Chưa nhập khoá là một lỗi NÓI RA, không phải một lát cắt rỗng gửi đi làm Provider trả 401.
 	if plain, err := a.appLLMCredential("o-2"); err == nil {
 		t.Errorf("appLLMCredential(o-2) khi chưa có khoá = %q, nil; want lỗi", plain)
+	}
+}
+
+// --- nghiệm thu xuyên tầng ---
+
+// TestAppLLMRunnerFallsBackOverRealHTTP là lượt nghiệm thu xuyên tầng: store thật, adapter thật,
+// HTTP thật, và trạng thái đọc lại từ chính database ngay sau khi Run trả về.
+//
+// Mọi test bên trên tiêm fakeAdapter, nên chúng bỏ qua đúng hai mắt xích mà một lượt fallback
+// thật đi qua: 429 trên dây biến thành llmErrorRateLimit (classifyStatus), và thân JSON của
+// Provider biến thành câu trả lời. Ghép sai một trong hai thì chuỗi vẫn xanh trong test đơn vị và
+// vẫn im lặng trên máy người mua.
+func TestAppLLMRunnerFallsBackOverRealHTTP(t *testing.T) {
+	// Hình dạng answerZalo đòi ở đầu ra của runner. Nhánh clarify là nhánh DUY NHẤT được ra ngoài
+	// mà không cần trích dẫn, nên đây là câu trả lời hợp lệ ngắn nhất — test này nghiệm thu đường
+	// đi của một lượt, không nghiệm thu phần soát trích dẫn của upstream.
+	const answer = `{"clarify":"Dạ mình cần tư vấn phần nào ạ?"}`
+
+	rateLimited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":{"message":"rate limit"}}`, http.StatusTooManyRequests)
+	}))
+	t.Cleanup(rateLimited.Close)
+
+	answering := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Kiểm ngay trong handler chứ không cất lại rồi kiểm sau: handler chạy trên goroutine của
+		// httptest còn phần kiểm chạy trên goroutine của test, và t.Errorf là thứ duy nhất trong
+		// hai cách đó an toàn với -race mà không phải dựng thêm một cái khoá.
+		if got, want := r.Header.Get("Authorization"), "Bearer "+llmPackageCanary; got != want {
+			t.Errorf("Provider thứ hai nhận Authorization = %q; want %q", got, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprintf(w,
+			`{"output":[{"type":"message","content":[{"type":"output_text","text":%q}]}]}`,
+			answer); err != nil {
+			t.Errorf("ghi phản hồi giả = %v; want nil", err)
+		}
+	}))
+	t.Cleanup(answering.Close)
+
+	a := newAppRouteAPI(t)
+	client := &http.Client{Timeout: 10 * time.Second}
+	adapters := map[string]providerAdapter{}
+	var route []store.LLMRouteEntry
+	for _, p := range []struct{ id, model, base string }{
+		{"openai-1", "gpt-5-mini", rateLimited.URL},
+		{"openai-2", "gpt-5", answering.URL},
+	} {
+		if err := a.st.CreateLLMProvider(store.LLMProvider{
+			ID: p.id, Name: p.id, Kind: "openai", Enabled: true,
+		}); err != nil {
+			t.Fatalf("CreateLLMProvider(%q) = %v; want nil", p.id, err)
+		}
+		if err := a.st.AddLLMModel(store.LLMModel{
+			ProviderID: p.id, ModelID: p.model, Name: p.model,
+			Source: store.LLMModelManual, Available: true,
+		}); err != nil {
+			t.Fatalf("AddLLMModel(%s/%s) = %v; want nil", p.id, p.model, err)
+		}
+		// Constructor sản xuất không nhận base — endpoint là hằng của Provider, không phải một ô
+		// nhập — nên test trỏ nó vào máy chủ giả bằng cách đổi trường, y như app_llm_http_test.go.
+		adapter := newOpenAIAdapter(p.id, client)
+		adapter.base = p.base
+		adapters[p.id] = adapter
+		route = append(route, store.LLMRouteEntry{ProviderID: p.id, ModelID: p.model, Enabled: true})
+	}
+	if err := a.st.AddLLMModel(store.LLMModel{
+		ProviderID: "claude-code", ModelID: "haiku", Name: "haiku",
+		Source: store.LLMModelManual, Available: true,
+	}); err != nil {
+		t.Fatalf("AddLLMModel(claude-code/haiku) = %v; want nil", err)
+	}
+	route = append(route, store.LLMRouteEntry{ProviderID: "claude-code", ModelID: "haiku", Enabled: true})
+	saveRoute(t, a, route...)
+
+	claude := okClaude(`{"clarify":"Claude Code không được gọi trong lượt này"}`)
+	runner := newAppLLMRunner(appLLMRunnerConfig{
+		Store:    a.st,
+		Adapters: adapters,
+		Claude:   func(string) zaloRunner { return claude },
+		// Bản rõ MỚI mỗi lượt: router xoá lát cắt nó vừa dùng, nên một lát cắt dùng chung sẽ phát
+		// ra toàn số 0 từ Provider thứ hai và test đỏ vì một lý do không liên quan.
+		Credential: func(string) ([]byte, error) { return []byte(llmPackageCanary), nil },
+		Logger:     slog.New(slog.DiscardHandler),
+	})
+
+	got, err := runner.Run(t.Context(), "khách hỏi giá combo", func(string) {})
+	if err != nil {
+		t.Fatalf("Run() qua hai Provider HTTP = _, %v; want nil", err)
+	}
+	if got != answer {
+		t.Errorf("Run() qua hai Provider HTTP = %q; want %q", got, answer)
+	}
+	if len(claude.seen()) != 0 {
+		t.Errorf("claude được gọi %d lần khi Provider thứ hai trả lời được; want 0", len(claude.seen()))
+	}
+
+	// Đọc NGAY sau khi Run trả về. Portal lấy trạng thái bằng một request khác, và không có gì
+	// đồng bộ hai đường đó — telemetry chưa nằm trong database lúc Run kết thúc thì trang Models
+	// hiện một Provider đang phục vụ khác với Provider vừa trả lời.
+	status, err := a.st.LLMStatus()
+	if err != nil {
+		t.Fatalf("LLMStatus() = _, %v; want nil", err)
+	}
+	if status.ActiveProviderID != "openai-2" || status.ActiveModelID != "gpt-5" {
+		t.Errorf("LLMStatus() provider/model = %s/%s; want openai-2/gpt-5",
+			status.ActiveProviderID, status.ActiveModelID)
+	}
+	if status.Attempts != 2 || status.Fallbacks != 1 {
+		t.Errorf("LLMStatus() attempts/fallbacks = %d/%d; want 2/1 (một lượt 429 rồi một lượt được)",
+			status.Attempts, status.Fallbacks)
+	}
+	if status.LastSuccessAt == nil {
+		t.Errorf("LLMStatus().LastSuccessAt = nil; want thời điểm của lượt thành công")
 	}
 }
