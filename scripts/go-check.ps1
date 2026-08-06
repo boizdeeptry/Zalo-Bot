@@ -49,6 +49,37 @@ $stage = Join-Path $env:TEMP ('gocheck-' + [guid]::NewGuid().ToString('N').Subst
 $stage = New-AppStage -Repo $Repo -Overlay $overlay -StageRoot $stage
 Apply-AppSeams -Stage $stage
 
+# gofmt CHI tren tep overlay, va so sau khi chuan hoa xuong LF.
+#
+# `gofmt -l .` tren stage bao 17 tep, gom ca internal\store\store.go cua UPSTREAM -- vi tep trong
+# repo nay duoc checkout ra CRLF con gofmt viet LF. Chay tho thi cong nay do ngay tu dau va khong
+# ai doc no nua. Chuan hoa hai ben rui so thi loc dung phan lech that.
+#
+# Chi xet tep overlay: repo nguon la thu chi doc, va mot canh bao ve tep khong sua duoc la nhieu.
+function Get-UnformattedOverlayFiles {
+  param([Parameter(Mandatory)][string]$Overlay, [Parameter(Mandatory)][string]$Stage)
+
+  $bad = @()
+  foreach ($file in Get-ChildItem -LiteralPath $Overlay -Recurse -File -Filter *.go) {
+    $rel = [IO.Path]::GetRelativePath($Overlay, $file.FullName)
+    $staged = Join-Path $Stage $rel
+    $have = ([IO.File]::ReadAllText($staged)) -replace "`r`n", "`n"
+    $want = (& gofmt $staged | Out-String) -replace "`r`n", "`n"
+    if ($LASTEXITCODE -ne 0) { throw "gofmt thất bại trên '$rel'" }
+    if ($have.TrimEnd("`n") -ne $want.TrimEnd("`n")) { $bad += $rel }
+  }
+  return $bad
+}
+
+$unformatted = Get-UnformattedOverlayFiles -Overlay $overlay -Stage $stage
+if ($unformatted) {
+  Write-Host 'gofmt: cac tep sau chua duoc dinh dang' -ForegroundColor Red
+  $unformatted | ForEach-Object { Write-Host ("  {0}" -f $_) -ForegroundColor Red }
+  Write-Host ("  sua bang: gofmt -w " + (($unformatted | ForEach-Object { "appmode\overlay\$_" }) -join ' '))
+  Remove-Item -LiteralPath $stage -Recurse -Force
+  exit 1
+}
+
 $goArgs = @('test', '-skip', (Get-AppGoTestSkipPattern))
 if ($Run) { $goArgs += @('-run', $Run) }
 $goArgs += './...'

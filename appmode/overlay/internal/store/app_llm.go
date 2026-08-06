@@ -615,7 +615,7 @@ func boolInt(v bool) int {
 	return 0
 }
 
-// Timestamp rỗng nghĩa là "chưa có", vì cột TEXT NOT NULL DEFAULT '' đi theo lối của các bảng
+// Timestamp rỗng nghĩa là "chưa có", vì cột TEXT NOT NULL DEFAULT ” đi theo lối của các bảng
 // zalo_* sẵn có thay vì thêm một kiểu NULL thứ hai cho cùng một ý.
 func formatNullableTS(t *time.Time) string {
 	if t == nil {

@@ -315,8 +315,8 @@ func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, has
 		return base
 	}
 	return newAppLLMRunner(appLLMRunnerConfig{
-		Store:          a.st,
-		Adapters:       adapters,
+		Store:      a.st,
+		Adapters:   adapters,
 		Claude:     func(model string) zaloRunner { return a.appClaudeRunner(zc, base, model) },
 		Credential: a.appLLMCredential,
 		// Tệp của CẢ LUỒNG, không phải của tin này. answerZalo gọi mergeZaloFiles để gộp tệp của
