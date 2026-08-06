@@ -73,13 +73,9 @@ func (a *api) handleLLMProviderCreate(w http.ResponseWriter, r *http.Request) {
 	// hàng đã tạo, để lại một Provider chưa có khoá kèm một thông báo lỗi. Trạng thái đó còn cứu
 	// được (nhập lại khoá), và đóng hẳn cần một hàm store ghi cả hai trong MỘT transaction —
 	// thuộc về tệp store chứ không phải chỗ này.
-	var cipher []byte
-	if credential := strings.TrimSpace(req.Credential); credential != "" {
-		protected, ok := a.protectLLMCredential(w, credential)
-		if !ok {
-			return
-		}
-		cipher = protected
+	cipher, ok := a.optionalLLMCredential(w, req.Credential)
+	if !ok {
+		return
 	}
 
 	id := nextLLMProviderID(req.Kind, providers)
@@ -139,16 +135,10 @@ func (a *api) handleLLMProviderUpdate(w http.ResponseWriter, r *http.Request) {
 			"Provider cần một tên", map[string]string{"name": "Nhập tên để nhận ra Provider này"})
 		return
 	}
-	// Khoá để TRỐNG nghĩa là giữ nguyên khoá cũ, và đó phải là mặc định của một form sửa: form
-	// không bao giờ hiện lại khoá đang lưu, nên "ô trống" là trạng thái BÌNH THƯỜNG của nó —
-	// hiểu thành "xoá khoá" thì mỗi lần đổi tên là một lần vô tình ngắt Provider.
-	var cipher []byte
-	if credential := strings.TrimSpace(req.Credential); credential != "" {
-		protected, ok := a.protectLLMCredential(w, credential)
-		if !ok {
-			return
-		}
-		cipher = protected
+	// Mã hoá TRƯỚC khi ghi tên: một khoá hỏng không được để lại một Provider đã đổi tên.
+	cipher, ok := a.optionalLLMCredential(w, req.Credential)
+	if !ok {
+		return
 	}
 
 	// Sửa TẠI CHỖ trên bản đọc từ store: UpdateLLMProvider ghi đè cả ba cột kết quả kiểm tra,

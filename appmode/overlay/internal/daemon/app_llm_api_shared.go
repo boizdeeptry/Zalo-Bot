@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"agentdc/internal/store"
@@ -30,6 +31,11 @@ const llmRequestCap = 1 << 20
 // CHỈ bề mặt /llm đi qua biến này; router vẫn gọi thẳng newLLMAdapter. Đó là chủ đích: một seam
 // của test tầng quản trị không được với tới đường trả lời khách.
 var llmAdapterFor = newLLMAdapter
+
+// protectSecret là protectProviderSecret, tách thành biến vì lát cắt bản rõ mà
+// protectLLMCredential dựng rồi xoá nằm hoàn toàn bên trong hàm đó — không có seam này thì lượt
+// xoá ấy không kiểm được từ ngoài, và một lượt xoá không ai kiểm là một lượt xoá sẽ có ngày rụng.
+var protectSecret = protectProviderSecret
 
 // llmProviderKind là một loại Provider được phép tạo, kèm endpoint CỐ ĐỊNH của nó.
 //
@@ -245,8 +251,14 @@ func (a *api) llmAPIClient() *http.Client {
 // --- credential ---
 
 // protectLLMCredential mã hoá một khoá, tự trả lời khi hỏng.
+//
+// Bản rõ bị xoá NGAY sau lượt mã hoá, cùng lý do như đường kiểm thử nháp: chuỗi Go bất biến nên
+// req.Credential không dọn được, còn lát cắt này thì dọn được — và đây là đường người dùng đi
+// nhiều nhất (mỗi lần tạo, sửa, hay thay khoá), không phải một nhánh hiếm.
 func (a *api) protectLLMCredential(w http.ResponseWriter, credential string) ([]byte, bool) {
-	cipher, err := protectProviderSecret([]byte(credential))
+	plain := []byte(credential)
+	cipher, err := protectSecret(plain)
+	clear(plain)
 	if errors.Is(err, ErrCredentialUnsupported) {
 		a.writeLLMErr(w, http.StatusInternalServerError, "CREDENTIAL_STORE_UNAVAILABLE",
 			"Bản phần mềm này không có kho khoá nên không lưu được API key", nil)
@@ -257,6 +269,20 @@ func (a *api) protectLLMCredential(w http.ResponseWriter, credential string) ([]
 		return nil, false
 	}
 	return cipher, true
+}
+
+// optionalLLMCredential mã hoá khoá nếu người dùng có nhập; TRỐNG trả về nil.
+//
+// nil ở đây nghĩa là "giữ nguyên khoá cũ", và luật đó sống ở MỘT chỗ vì cả tạo lẫn sửa đều dùng
+// nó: form không bao giờ hiện lại khoá đang lưu, nên ô trống là trạng thái BÌNH THƯỜNG của nó —
+// hiểu thành "xoá khoá" thì mỗi lần đổi tên là một lần vô tình ngắt Provider. Xoá có cửa tường
+// minh riêng (DELETE .../credential).
+func (a *api) optionalLLMCredential(w http.ResponseWriter, credential string) ([]byte, bool) {
+	trimmed := strings.TrimSpace(credential)
+	if trimmed == "" {
+		return nil, true
+	}
+	return a.protectLLMCredential(w, trimmed)
 }
 
 // loadLLMCredential mở khoá đang lưu; người gọi PHẢI clear() bản rõ sau khi dùng.
@@ -292,6 +318,13 @@ func (a *api) loadLLMCredential(w http.ResponseWriter, p store.LLMProvider) ([]b
 func (a *api) llmCredentialUnreadable(providerID string) bool {
 	cipher, err := a.st.LLMCredentialCipher(providerID)
 	if err != nil {
+		// ErrNotFound là bình thường: chưa nhập khoá thì không có gì để gọi là "không đọc được".
+		// Lỗi KHÁC thì không bình thường — nhánh này đang trả lời "khoá vẫn tốt" về một hàng vừa
+		// đọc hỏng, nên nó phải để lại dấu vết thay vì biến mất.
+		if !errors.Is(err, store.ErrNotFound) {
+			a.logger.Warn("llm api: không đọc được ciphertext để kiểm tra",
+				"provider", providerID, "err", err)
+		}
 		return false
 	}
 	plain, err := unprotectProviderSecret(cipher)

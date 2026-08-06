@@ -563,6 +563,48 @@ func TestLLMAPIUnreadableCredentialAsksForReentry(t *testing.T) {
 	}
 }
 
+// TestLLMAPISavingACredentialZeroesThePlaintext canh lượt xoá bản rõ trên đường ĐI NHIỀU NHẤT:
+// mỗi lần tạo, sửa hay thay khoá đều dựng một lát cắt bản rõ để đưa vào DPAPI.
+//
+// Chuỗi trong request thì không xoá được (chuỗi Go bất biến), nên lát cắt là phần duy nhất dọn
+// được — và nó là phần sống lâu hơn, vì nó đi tiếp xuống lớp syscall.
+func TestLLMAPISavingACredentialZeroesThePlaintext(t *testing.T) {
+	h := newLLMAPIHarness(t)
+
+	// Khoá vì hàm này chạy trên goroutine của httptest.Server còn phần kiểm chạy trên goroutine
+	// của test — cùng lý do stubLLMAdapter có khoá.
+	var mu sync.Mutex
+	var seen [][]byte
+	previous := protectSecret
+	protectSecret = func(plain []byte) ([]byte, error) {
+		mu.Lock()
+		seen = append(seen, plain)
+		mu.Unlock()
+		return previous(plain)
+	}
+	t.Cleanup(func() { protectSecret = previous })
+
+	id := h.createProvider("openai", "OpenAI", llmAPIKey)
+	h.mustStatus(h.do(http.MethodPut, "/llm/providers/"+id+"/credential",
+		fmt.Sprintf(`{"credential":%q}`, llmAPINextKey)), http.StatusNoContent, "replace credential")
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Hai lượt: một lúc tạo, một lúc thay. Đếm trước khi xét nội dung, vì isAllZero trên một lát
+	// cắt rỗng là true — không có cửa này thì test xanh cả khi chẳng lượt nào chạy qua đây.
+	if len(seen) != 2 {
+		t.Fatalf("protectSecret nhận %d lượt, want 2 (tạo và thay khoá)", len(seen))
+	}
+	for i, plain := range seen {
+		if len(plain) == 0 {
+			t.Fatalf("lượt %d đưa vào một lát cắt rỗng; want bản rõ của khoá", i)
+		}
+		if !isAllZero(plain) {
+			t.Errorf("lượt %d để lại bản rõ trong lát cắt: %q", i, plain)
+		}
+	}
+}
+
 // --- test và discover ---
 
 func TestLLMAPIDraftTestWritesNothingAndZeroesThePlaintext(t *testing.T) {
@@ -648,6 +690,15 @@ func TestLLMAPIDiscoveryReplacesDiscoveredAndKeepsManual(t *testing.T) {
 	got := h.mustStatus(h.do(http.MethodPost, "/llm/providers/"+id+"/discover", ""),
 		http.StatusOK, "discover models")
 
+	// Cùng hợp đồng bản rõ như hai đường kiểm thử: khoá đúng đi vào adapter, rồi lát cắt bị xoá.
+	// Câu hỏi thứ nhất KHÔNG phải là thừa — isAllZero(nil) là true, nên thiếu nó thì lượt kiểm
+	// thứ hai xanh cả khi handler chẳng truyền khoá nào cho adapter.
+	if h.stub.secret() != llmAPIKey {
+		t.Fatalf("discover passed credential %q to the adapter, want the stored key", h.stub.secret())
+	}
+	if remaining := h.stub.slice(); !isAllZero(remaining) {
+		t.Fatalf("discover left plaintext in the credential slice: %q", remaining)
+	}
 	if want := []string{"gpt-4o", "gpt-4o-mini", "gpt-preview"}; !equalStrings(llmAPIModelIDs(t, got), want) {
 		t.Fatalf("discover returned models %v, want %v", llmAPIModelIDs(t, got), want)
 	}
