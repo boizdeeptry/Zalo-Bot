@@ -1,8 +1,3 @@
-# -Package trỏ vào một GÓI THẬT đã dựng xong (thư mục -Out của build-app.ps1). Bỏ trống thì chỉ
-# chạy fixture. Có tham số này vì phép quét credential dưới đây chỉ nói được điều gì khi nó chạy
-# trên gói sắp bán, chứ không phải trên bảy tệp giả do chính test viết ra.
-param([string]$Package)
-
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot '..\scripts\BuildApp.psm1') -Force
@@ -48,58 +43,10 @@ function Write-TestFile {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
-# Khoá thử nghiệm dùng chung của mọi tầng test: llmPackageCanary trong app_llm_router_test.go,
-# llmAPIKey/llmAPINextKey trong app_llm_api_test.go, CANARY_KEY trong providers.test.mjs.
-#
-# Quét một chuỗi mà KHÔNG tệp nào trong repo mang thì luôn ra 0 lần khớp, kể cả khi cửa chặn đã
-# hỏng — một phép kiểm như thế trông như đang canh cửa mà không canh gì. Chuỗi này nằm trong
-# fixture của cả ba tầng, nên nó có đường thật vào gói: một hằng test bị nhấc lên tệp sản xuất,
-# hay một khoá dán vào trang Portal (assets nhúng thẳng vào agentdc.exe).
+# Bản sao của canary trong BuildApp.psm1, cố ý KHÔNG đọc lại từ module: hai chuỗi lệch nhau thì
+# fixture dưới đây gieo chuỗi này còn cửa chặn tìm chuỗi kia, không ai ném lỗi, và Assert-ThrowsLike
+# đỏ ngay. Tức bản sao này tự canh chính nó.
 $providerCanary = 'sk-package-must-never-contain-7f36d2'
-
-function Assert-NoProviderCredential {
-  param(
-    [Parameter(Mandatory)][string]$Package,
-    [Parameter(Mandatory)][string]$Canary
-  )
-
-  $packagePath = [IO.Path]::GetFullPath($Package)
-  if (-not (Test-Path -LiteralPath $packagePath -PathType Container)) {
-    throw "không thấy gói ở '$packagePath'"
-  }
-
-  # Danh sách trắng theo đuôi tệp, và bỏ node_modules. Gói thật có ~1200 tệp và 94 MB mà gần hết
-  # là dependency của transport; quét tất cả biến một cửa chặn thành một lượt chờ.
-  #
-  # KHÔNG -ErrorAction SilentlyContinue ở đâu trong chuỗi này, dù cửa quét dấu khách hàng ở
-  # build-app.ps1 có: một tệp không liệt kê hay không đọc được mà bị nuốt lặng thì phép quét trả
-  # về 0 lần khớp y hệt một gói sạch. $ErrorActionPreference = 'Stop' ở đầu tệp lo phần còn lại,
-  # nên cửa này hỏng theo hướng đóng.
-  $textExtensions = @('.md', '.txt', '.js', '.mjs', '.cjs', '.json', '.html', '.css', '.bat', '.vbs')
-  $hits = Get-ChildItem -LiteralPath $packagePath -Recurse -File |
-    Where-Object { $textExtensions -contains $_.Extension } |
-    Where-Object { $_.FullName -notlike '*node_modules*' } |
-    Select-String -SimpleMatch -Pattern $Canary -Encoding UTF8
-
-  # Binary đọc riêng, và đó không phải phần thừa: assets Portal được go:embed vào agentdc.exe, nên
-  # một khoá dán vào pages/providers.js KHÔNG nằm trong tệp văn bản nào của gói — chỉ ở trong đây.
-  $binary = Join-Path $packagePath 'app\agentdc.exe'
-  $binaryHit = $false
-  if (Test-Path -LiteralPath $binary -PathType Leaf) {
-    $bytes = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($binary))
-    $binaryHit = $bytes.IndexOf($Canary, [StringComparison]::Ordinal) -ge 0
-  }
-
-  if ($hits -or $binaryHit) {
-    # Chỉ đường dẫn và số dòng, KHÔNG in dòng khớp: dòng đó chính là bí mật đang bị tố cáo, và
-    # thông báo hỏng này đi xa hơn cái gói.
-    $where = @($hits | ForEach-Object { '{0}:{1}' -f $_.Path, $_.LineNumber })
-    if ($binaryHit) { $where += $binary }
-    throw ('package contains plaintext provider credential: ' + ($where -join '; '))
-  }
-
-  return $packagePath
-}
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('portal-path-' + [guid]::NewGuid().ToString('N'))
 
@@ -251,30 +198,33 @@ try {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
   $gotPackage = Assert-AppPackage -Out $packageRoot
-  Assert-NoProviderCredential -Package $gotPackage -Canary $providerCanary | Out-Null
 
-  # Cửa chặn phải HỎNG được, và hỏng ở CẢ HAI đường — chúng canh hai chỗ khác nhau và một đường
-  # gãy không làm đường kia đỏ. README.txt nằm trong danh sách trắng đuôi tệp; agentdc.exe thì
-  # không, nên chỉ lượt đọc binary thấy nó.
+  # Gieo canary rồi gọi lại chính Assert-AppPackage, KHÔNG gọi thẳng Assert-NoProviderCredential:
+  # câu hỏi ở đây là "mỗi lần build có quét không", và build-app.ps1 chỉ gọi hàm ngoài. Một phép
+  # quét đúng mà không được cắm vào cửa nào vẫn để gói mang khoá đi bán.
+  #
+  # Hỏng ở CẢ HAI đường, vì chúng canh hai chỗ khác nhau và một đường gãy không làm đường kia đỏ.
+  # README.txt nằm trong danh sách trắng đuôi tệp; agentdc.exe thì không, nên chỉ lượt đọc binary
+  # thấy nó.
   $readme = Join-Path $gotPackage 'README.txt'
   Write-TestFile $readme ("huong dan`n" + $providerCanary + "`n")
-  Assert-ThrowsLike -Action { Assert-NoProviderCredential -Package $gotPackage -Canary $providerCanary } `
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'plaintext provider credential' -Message 'A package text asset carrying the canary was accepted'
   Write-TestFile $readme "fixture`n"
 
   $binary = Join-Path $gotPackage 'app\agentdc.exe'
   [IO.File]::WriteAllBytes($binary, [Text.Encoding]::UTF8.GetBytes("MZ`0" + $providerCanary))
-  Assert-ThrowsLike -Action { Assert-NoProviderCredential -Package $gotPackage -Canary $providerCanary } `
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'plaintext provider credential' -Message 'A binary carrying the canary was accepted'
   Write-TestFile $binary "fixture`n"
-  Assert-NoProviderCredential -Package $gotPackage -Canary $providerCanary | Out-Null
+  Assert-AppPackage -Out $packageRoot | Out-Null
 
   Write-TestFile (Join-Path $packageRoot 'data\zalo\credentials.json') "secret`n"
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'Zalo credentials' -Message 'A package containing Zalo credentials was accepted'
 
   Write-Host 'PASS: Assert-AppPackage requires runtime files and rejects credentials.'
-  Write-Host 'PASS: the package scan rejects a provider credential in text assets and in the binary.'
+  Write-Host 'PASS: Assert-AppPackage rejects a provider credential in text assets and in the binary.'
 } finally {
   if (Test-Path -LiteralPath $packageRoot) {
     Remove-Item -LiteralPath $packageRoot -Recurse -Force
@@ -494,11 +444,4 @@ func triggerAgain() {
   if (Test-Path -LiteralPath $stageTestRoot) {
     Remove-Item -LiteralPath $stageTestRoot -Recurse -Force
   }
-}
-
-# Fixture ở trên chứng minh phép quét BẮT được, không chứng minh gói sắp bán sạch. Chỉ lượt này
-# làm điều đó, và nó cần một gói thật nên nó không tự chạy được.
-if ($Package) {
-  $scanned = Assert-NoProviderCredential -Package $Package -Canary $providerCanary
-  Write-Host "PASS: the built package at $scanned carries no test provider credential."
 }

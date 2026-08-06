@@ -272,6 +272,68 @@ function Apply-AppSeams {
   [IO.File]::WriteAllText($dutyPath, $dutyUpdated, $utf8NoBom)
 }
 
+# Khoá thử nghiệm dùng chung của mọi tầng test: llmPackageCanary trong app_llm_router_test.go,
+# llmAPIKey/llmAPINextKey trong app_llm_api_test.go, CANARY_KEY trong providers.test.mjs.
+#
+# Quét một chuỗi mà KHÔNG tệp nào trong repo mang thì luôn ra 0 lần khớp, kể cả khi cửa chặn đã
+# hỏng — một phép kiểm như thế trông như đang canh cửa mà không canh gì. Chuỗi này nằm trong
+# fixture của cả ba tầng, nên nó có đường thật vào gói: một hằng test bị nhấc lên tệp sản xuất,
+# hay một khoá dán vào trang Portal (assets nhúng thẳng vào agentdc.exe).
+#
+# Tệp này KHÔNG đi vào stage lẫn vào gói (nó thuộc repo đóng gói, không thuộc repo nguồn), nên
+# chuỗi ở đây không tự làm cửa chặn đỏ.
+$script:ProviderCredentialCanary = 'sk-package-must-never-contain-7f36d2'
+
+# Đuôi tệp văn bản có mặt trong gói. Danh sách trắng, và bỏ node_modules: gói thật có ~1200 tệp và
+# 94 MB mà gần hết là dependency của transport, nên quét tất cả biến một cửa chặn thành một lượt chờ.
+$script:PackageTextExtensions = @('.md', '.txt', '.js', '.mjs', '.cjs', '.json', '.html', '.css', '.bat', '.vbs')
+
+# Assert-NoProviderCredential từ chối một gói còn mang khoá Provider thử nghiệm.
+#
+# Tách khỏi Assert-AppPackage để test dựng được đúng tình huống này mà không phải dựng cả bảy tệp
+# bắt buộc, nhưng nó chạy MỖI lần Assert-AppPackage chạy — một cửa chặn phải nhớ bật thì không
+# phải cửa chặn.
+function Assert-NoProviderCredential {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Package,
+    [string]$Canary = $script:ProviderCredentialCanary
+  )
+
+  $packagePath = [IO.Path]::GetFullPath($Package)
+  if (-not (Test-Path -LiteralPath $packagePath -PathType Container)) {
+    throw "không thấy gói ở '$packagePath'"
+  }
+
+  # KHÔNG -ErrorAction SilentlyContinue ở đâu trong chuỗi này, dù cửa quét dấu khách hàng ở
+  # build-app.ps1 có: một tệp không liệt kê hay không đọc được mà bị nuốt lặng thì phép quét trả
+  # về 0 lần khớp y hệt một gói sạch. Set-StrictMode + $ErrorActionPreference của người gọi lo
+  # phần còn lại, nên cửa này hỏng theo hướng đóng.
+  $hits = Get-ChildItem -LiteralPath $packagePath -Recurse -File |
+    Where-Object { $script:PackageTextExtensions -contains $_.Extension } |
+    Where-Object { $_.FullName -notlike '*node_modules*' } |
+    Select-String -SimpleMatch -Pattern $Canary -Encoding UTF8
+
+  # Binary đọc riêng, và đó không phải phần thừa: assets Portal được go:embed vào agentdc.exe, nên
+  # một khoá dán vào pages/providers.js KHÔNG nằm trong tệp văn bản nào của gói — chỉ ở trong đây.
+  $binary = Join-Path $packagePath 'app\agentdc.exe'
+  $binaryHit = $false
+  if (Test-Path -LiteralPath $binary -PathType Leaf) {
+    $bytes = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($binary))
+    $binaryHit = $bytes.IndexOf($Canary, [StringComparison]::Ordinal) -ge 0
+  }
+
+  if ($hits -or $binaryHit) {
+    # Chỉ đường dẫn và số dòng, KHÔNG in dòng khớp: dòng đó chính là bí mật đang bị tố cáo, và
+    # thông báo hỏng này đi vào log build, tức đi xa hơn cái gói.
+    $where = @($hits | ForEach-Object { '{0}:{1}' -f $_.Path, $_.LineNumber })
+    if ($binaryHit) { $where += $binary }
+    throw ('package contains plaintext provider credential: ' + ($where -join '; '))
+  }
+
+  return $packagePath
+}
+
 function Assert-AppPackage {
   [CmdletBinding()]
   param(
@@ -300,7 +362,11 @@ function Assert-AppPackage {
     throw 'package contains Zalo credentials'
   }
 
+  # Không có công tắc bỏ qua, khác cửa Zalo ở trên: -KeepData tồn tại vì giữ phiên đăng nhập qua
+  # nhiều lần build là việc hợp lệ lúc đang thử, còn một khoá Provider trong gói thì không bao giờ.
+  Assert-NoProviderCredential -Package $outPath | Out-Null
+
   return $outPath
 }
 
-Export-ModuleMember -Function Resolve-BuildPaths, Assert-CleanGitSource, Get-AppGoTestSkipPattern, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams, Assert-AppPackage
+Export-ModuleMember -Function Resolve-BuildPaths, Assert-CleanGitSource, Get-AppGoTestSkipPattern, Clear-AppOutput, Resolve-PersonaSource, New-AppStage, Apply-AppSeams, Assert-AppPackage, Assert-NoProviderCredential

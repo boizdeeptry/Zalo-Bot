@@ -1298,6 +1298,12 @@ func TestAppLLMCredentialUnlocksExactlyOneProvider(t *testing.T) {
 // thật đi qua: 429 trên dây biến thành llmErrorRateLimit (classifyStatus), và thân JSON của
 // Provider biến thành câu trả lời. Ghép sai một trong hai thì chuỗi vẫn xanh trong test đơn vị và
 // vẫn im lặng trên máy người mua.
+//
+// Test này KHÔNG phân biệt được 429 với một lỗi được-fallback khác — 503 hay JSON hỏng cũng cho ra
+// đúng 2 lượt / 1 lần né. Đó là giới hạn CỐ Ý của LLMStatus, không phải chỗ bỏ sót: nó là telemetry
+// đã tổng hợp và không mang error_kind, vì thứ Portal cần trả lời là "ai đang phục vụ, có phải né
+// không". Ánh xạ 429 → rate_limit được ghim ở tầng nói được nó: bảng classifyStatus trong
+// app_llm_http_test.go, và các test theo từng loại lỗi bên trên.
 func TestAppLLMRunnerFallsBackOverRealHTTP(t *testing.T) {
 	// Hình dạng answerZalo đòi ở đầu ra của runner. Nhánh clarify là nhánh DUY NHẤT được ra ngoài
 	// mà không cần trích dẫn, nên đây là câu trả lời hợp lệ ngắn nhất — test này nghiệm thu đường
