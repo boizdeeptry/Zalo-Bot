@@ -431,7 +431,7 @@
   Share strict decoding, Provider lookup, credential loading, and error writing helpers.
 
   ```powershell
-  git add appmode/overlay/internal/daemon/app_llm_api.go appmode/overlay/internal/daemon/app_llm_api_test.go appmode/overlay/internal/daemon/app_routes.go appmode/overlay/internal/daemon/app_foundation_test.go
+  git add appmode/overlay/internal/daemon/app_llm_api.go appmode/overlay/internal/daemon/app_llm_api_shared.go appmode/overlay/internal/daemon/app_llm_api_test.go appmode/overlay/internal/daemon/app_routes.go appmode/overlay/internal/daemon/app_foundation_test.go
   git commit -m "feat: expose secure provider management API"
   ```
 
