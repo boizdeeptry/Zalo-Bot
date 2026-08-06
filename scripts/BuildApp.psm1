@@ -205,10 +205,12 @@ function Apply-AppSeams {
   $serverPath = Join-Path $stagePath 'internal\daemon\server.go'
   $storePath = Join-Path $stagePath 'internal\store\store.go'
   $zaloPath = Join-Path $stagePath 'internal\daemon\zalo.go'
+  $dutyPath = Join-Path $stagePath 'internal\daemon\duty.go'
 
   $server = [IO.File]::ReadAllText($serverPath)
   $store = [IO.File]::ReadAllText($storePath)
   $zalo = [IO.File]::ReadAllText($zaloPath)
+  $duty = [IO.File]::ReadAllText($dutyPath)
   $serverNewline = if ($server.Contains("`r`n")) { "`r`n" } else { "`n" }
   $storeNewline = if ($store.Contains("`r`n")) { "`r`n" } else { "`n" }
   $zaloNewline = if ($zalo.Contains("`r`n")) { "`r`n" } else { "`n" }
@@ -216,6 +218,7 @@ function Apply-AppSeams {
   Assert-SignatureAbsent -Text $server -Signature 'a.registerAppRoutes(mux)' -Label 'route seam'
   Assert-SignatureAbsent -Text $store -Signature 'migrateApp(db)' -Label 'migration seam'
   Assert-SignatureAbsent -Text $zalo -Signature 'evaluateAppWorkflow(req, msg)' -Label 'workflow seam'
+  Assert-SignatureAbsent -Text $duty -Signature 'a.appZaloRunner(' -Label 'runner seam'
 
   $routeNeedle = "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))"
   $serverUpdated = Replace-ExactlyOnce -Text $server -Needle $routeNeedle `
@@ -243,10 +246,30 @@ function Apply-AppSeams {
     -Replacement ($workflowPrefix + $zaloNewline + $workflowNeedle) `
     -Label 'workflow seam'
 
+  # Runner seam: mỗi lượt Zalo đi qua chuỗi fallback đang lưu thay vì thẳng tới Claude Code.
+  # Thay ngay tại tham số runner của lời gọi, nên không có dòng nào chèn thêm và cấu hình cùng
+  # tệp đính kèm của chính lượt đó vẫn là thứ quyết định đường đi.
+  $runnerNeedle = 'a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)'
+  $runnerReplacement = 'a.answerZalo(ctx, deps.cfg, a.appZaloRunner(deps.cfg, deps.run, threadID, ' +
+    'len(files) > 0), threadID, question, step, reply, files...)'
+  $dutyUpdated = Replace-ExactlyOnce -Text $duty -Needle $runnerNeedle `
+    -Replacement $runnerReplacement -Label 'runner seam'
+
+  # Replace-ExactlyOnce chỉ chứng minh duty.go có đúng một lượt trả lời, không chứng minh cả cây
+  # có. Một đường trả lời thứ hai ở tệp khác là cách DUY NHẤT seam này hỏng lặng lẽ: nó vẫn áp,
+  # và đường mới đi thẳng tới Claude Code không qua định tuyến. Đếm sau khi Replace chạy, để một
+  # duty.go có hai lời gọi vẫn báo bằng thông điệp của Replace.
+  $callSites = (Get-ChildItem (Join-Path $stagePath 'internal\daemon') -Filter '*.go' |
+    Where-Object { -not $_.Name.EndsWith('_test.go') } |
+    ForEach-Object { [regex]::Matches([IO.File]::ReadAllText($_.FullName), 'a\.answerZalo\(').Count } |
+    Measure-Object -Sum).Sum
+  if ($callSites -ne 1) { throw "runner seam: answerZalo has $callSites call sites, expected 1" }
+
   $utf8NoBom = [Text.UTF8Encoding]::new($false)
   [IO.File]::WriteAllText($serverPath, $serverUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($storePath, $storeUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($zaloPath, $zaloUpdated, $utf8NoBom)
+  [IO.File]::WriteAllText($dutyPath, $dutyUpdated, $utf8NoBom)
 }
 
 function Assert-AppPackage {

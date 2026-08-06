@@ -209,6 +209,28 @@ func (s *Store) DeleteLLMProvider(id string) error {
 	})
 }
 
+// LLMCredentialCipher đọc ciphertext của ĐÚNG một Provider.
+//
+// Tách khỏi LLMProviders có chủ đích: danh sách kia đi thẳng ra Portal, còn đây là đường DUY NHẤT
+// lấy được bytes thật — một hàm một Provider, gọi ngay trước lượt gọi API và không đi đâu khác.
+//
+// Chưa nhập khoá trả về ErrNotFound chứ không phải một lát cắt rỗng: gửi khoá rỗng đi thì Provider
+// trả 401, và người trực đọc ra là khoá SAI thay vì khoá CHƯA CÓ.
+func (s *Store) LLMCredentialCipher(providerID string) ([]byte, error) {
+	var cipher []byte
+	switch err := s.db.QueryRow(
+		`SELECT credential_cipher FROM llm_providers WHERE id = ?`, providerID).Scan(&cipher); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, fmt.Errorf("read llm credential %s: %w", providerID, ErrNotFound)
+	case err != nil:
+		return nil, fmt.Errorf("read llm credential %s: %w", providerID, err)
+	}
+	if len(cipher) == 0 {
+		return nil, fmt.Errorf("read llm credential %s: chưa nhập khoá: %w", providerID, ErrNotFound)
+	}
+	return cipher, nil
+}
+
 func (s *Store) SetLLMCredentialCipher(providerID string, cipher []byte) error {
 	if len(cipher) == 0 {
 		return fmt.Errorf("set llm credential %s: ciphertext rỗng", providerID)

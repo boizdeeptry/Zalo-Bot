@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"time"
 
+	"agentdc/internal/ipc"
 	"agentdc/internal/store"
 )
 
@@ -40,9 +42,16 @@ var _ llmRouteStore = (*store.Store)(nil)
 type appLLMRunnerConfig struct {
 	Store    llmRouteStore
 	Adapters map[string]providerAdapter
-	// Claude là mắt xích cuối, luôn có mặt: validateLLMRoute không cho lưu một chuỗi kết thúc
-	// bằng thứ khác, nên router không cần một nhánh "nếu không còn gì".
-	Claude zaloRunner
+	// Claude dựng mắt xích cuối cho ĐÚNG model mà snapshot của lượt này nêu tên.
+	//
+	// Là hàm chứ không phải một runner dựng sẵn vì model của mắt xích cuối nằm TRONG snapshot, và
+	// snapshot chỉ đọc lúc Run. Một runner dựng trước lượt phải đọc route lần thứ hai để biết gọi
+	// model nào, và giữa hai lần đọc đó route đổi được — khi ấy lượt chạy một model trong khi
+	// telemetry ghi model kia.
+	//
+	// Luôn có mặt: validateLLMRoute không cho lưu chuỗi kết thúc bằng thứ khác Claude Code, nên
+	// router không cần một nhánh "nếu không còn gì".
+	Claude func(model string) zaloRunner
 	// Credential trả về BẢN RÕ MỚI cho mỗi lượt gọi. Router xoá nó ngay sau lượt gọi, nên một
 	// hiện thực trả về lát cắt dùng chung sẽ tự bắn vào chân mình ở lượt sau.
 	Credential func(providerID string) ([]byte, error)
@@ -180,7 +189,7 @@ func (r *appLLMRunner) runClaude(ctx context.Context, e store.LLMRouteEntry,
 		return "", fmt.Errorf("llm route: lượt bị huỷ trước khi tới %s: %w", e.ProviderID, err)
 	}
 	started := time.Now()
-	text, err := r.cfg.Claude.Run(ctx, prompt, step)
+	text, err := r.cfg.Claude(e.ModelID).Run(ctx, prompt, step)
 	elapsed := time.Since(started)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -251,4 +260,151 @@ func nextEnabledProvider(entries []store.LLMRouteEntry, from int) string {
 		}
 	}
 	return ""
+}
+
+// --- dây nối bản chạy ---
+
+// newLLMAdapter chọn giao thức theo kind của Provider.
+//
+// Kind lạ trả về false chứ không một adapter mặc định: đoán bừa giao thức nghĩa là gửi khoá thật
+// tới một máy chủ theo hình dạng request của nhà cung cấp khác.
+func newLLMAdapter(kind, providerID string, client *http.Client) (providerAdapter, bool) {
+	switch kind {
+	case "openai":
+		return newOpenAIAdapter(providerID, client), true
+	case "anthropic":
+		return newAnthropicAdapter(providerID, client), true
+	case "gemini":
+		return newGeminiAdapter(providerID, client), true
+	case "openrouter":
+		return newOpenRouterAdapter(providerID, client), true
+	}
+	return nil, false
+}
+
+// appZaloRunner dựng runner cho ĐÚNG một lượt Zalo.
+//
+// Dựng mới mỗi lượt chứ không cất vào api: đó là toàn bộ lý do một lần lưu route có hiệu lực ngay
+// mà không phải mở lại phần mềm. Danh sách Provider cũng đọc lại ở đây, nên một Provider vừa thêm
+// gọi được từ tin nhắn kế tiếp.
+//
+// Không trả về lỗi vì chỗ gọi nó là một tham số của answerZalo. Đọc hỏng thì lượt này đi thẳng
+// Claude Code — đúng hành vi trước khi có định tuyến, và trả lời được vẫn hơn im lặng.
+//
+// hasNewFiles là tệp của TIN NÀY. Tệp của cả luồng mới là thứ quyết định — xem HasAttachments.
+func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, hasNewFiles bool) zaloRunner {
+	// Chuỗi rỗng nghĩa là chưa có định tuyến, KHÔNG phải "không còn gì để gọi": router coi rỗng
+	// là lỗi và lượt sẽ chết, nên cửa này phải ở đây chứ không ở trong router. Xảy ra khi lần
+	// gieo lúc khởi động hỏng, và ở đó im lặng bỏ tin của khách là cách hỏng tệ nhất.
+	//
+	// Đây là lần đọc route THỨ NHẤT; Run đọc lần nữa để chụp snapshot của lượt. Chúng không đá
+	// nhau: một chuỗi đã có không thể trở lại rỗng (validateLLMRoute từ chối danh sách rỗng, và
+	// DeleteLLMProvider không xoá nổi mắt xích cuối). Bất đối xứng còn lại là cố ý — đọc hỏng ở
+	// đây rơi về base, đọc hỏng trong Run thì giết lượt, vì tới đó đã không còn base để rơi về.
+	snapshot, err := a.st.LLMRoute()
+	if err != nil {
+		a.logger.Error("llm route: không đọc được chuỗi, lượt này đi thẳng Claude Code", "err", err)
+		return base
+	}
+	if len(snapshot.Entries) == 0 {
+		return base
+	}
+	adapters, err := a.appLLMAdapters()
+	if err != nil {
+		a.logger.Error("llm route: không dựng được adapter, lượt này đi thẳng Claude Code", "err", err)
+		return base
+	}
+	return newAppLLMRunner(appLLMRunnerConfig{
+		Store:          a.st,
+		Adapters:       adapters,
+		Claude:     func(model string) zaloRunner { return a.appClaudeRunner(zc, base, model) },
+		Credential: a.appLLMCredential,
+		// Tệp của CẢ LUỒNG, không phải của tin này. answerZalo gọi mergeZaloFiles để gộp tệp của
+		// 10 tin gần nhất vào lượt, rồi buildConsultPrompt viết đường dẫn tuyệt đối của chúng vào
+		// prompt kèm câu "đọc trước khi trả lời". Tính theo mỗi tin thì một câu hỏi tiếp nối chỉ
+		// có chữ sẽ mang prompt đó ra API: Provider không có ổ đĩa nên nó trả lời mù — đúng hồi
+		// quy 2026-08-04 mà mergeZaloFiles sinh ra để chữa — và đường dẫn kèm tên người dùng
+		// Windows cùng tiêu đề khách đặt rời khỏi máy này.
+		HasAttachments: hasNewFiles || a.threadHasAttachments(threadID),
+		Logger:         a.logger,
+	})
+}
+
+// threadHasAttachments nói luồng này có tệp mở được trong tầm lịch sử mà một lượt nhìn thấy.
+//
+// Cùng tầm (zaloHistoryTurns) và cùng bộ lọc (Path != "") với mergeZaloFiles, vì câu hỏi ở đây
+// đúng là "lượt sắp tới có tệp trong prompt không". Sticker và vị trí không bao giờ có Path, nên
+// một hội thoại lỡ có sticker không bị đẩy sang đường chậm tới hết đời luồng.
+//
+// Đọc hỏng thì trả về true: Claude Code chạy được mọi lượt, còn đoán "không có tệp" mà đoán sai
+// là gửi đường dẫn của khách ra ngoài. Sai về phía chậm, không sai về phía rò.
+func (a *api) threadHasAttachments(threadID string) bool {
+	history, err := a.st.ZaloMessages(threadID, zaloHistoryTurns)
+	if err != nil {
+		a.logger.Warn("llm route: không đọc được lịch sử, lượt này đi thẳng Claude Code",
+			"thread", threadID, "err", err)
+		return true
+	}
+	return slices.ContainsFunc(history, func(m ipc.ZaloMessage) bool {
+		return slices.ContainsFunc(m.Attachments, func(at ipc.ZaloAttachment) bool {
+			return at.Path != ""
+		})
+	})
+}
+
+// appClaudeRunner là mắt xích cuối chạy đúng model mà route nêu tên.
+//
+// zc là BẢN SAO (tham số theo giá trị), nên đổi Model ở đây không chạm tới cấu hình của vòng trực
+// — hai lượt song song trên hai model khác nhau vẫn đúng.
+//
+// Trùng model thì giữ nguyên base đã tiêm vào. Không phải để tiết kiệm: base là chỗ duy nhất
+// duty_test.go tiêm được một runner giả, và dựng mới ở đây biến mọi test đó thành lượt gọi tiến
+// trình claude thật.
+//
+// Model rỗng cũng giữ base. validateLLMRoute không cho lưu một mắt xích như thế, nên đây là hàng
+// bị sửa tay trong database — và `claude --model ""` là một dòng lệnh hỏng, còn cấu hình đang chạy
+// thì vẫn trả lời được.
+func (a *api) appClaudeRunner(zc zaloConfig, base zaloRunner, model string) zaloRunner {
+	if model == "" || model == zc.Model {
+		return base
+	}
+	zc.Model = model
+	return execZaloRunner{cfg: zc, logger: a.logger}
+}
+
+// appLLMAdapters dựng adapter cho mọi Provider API đang lưu, khoá theo id.
+//
+// Provider đang TẮT vẫn có adapter: cửa bật/tắt của một lượt là cờ Enabled trên mắt xích route, và
+// validateLLMRoute đã chặn việc lưu một chuỗi đi qua Provider tắt. Bỏ ở đây nữa thì tắt một
+// Provider sẽ làm chuỗi dừng giữa chừng thay vì bỏ qua nó.
+func (a *api) appLLMAdapters() (map[string]providerAdapter, error) {
+	providers, err := a.st.LLMProviders()
+	if err != nil {
+		return nil, fmt.Errorf("llm route: đọc danh sách Provider: %w", err)
+	}
+	// Hạn giờ trên client vì ctx chặn được một lượt gọi nhưng không chặn được lúc bắt tay TLS.
+	// Cùng mức với hạn giờ mỗi Provider của router, nên không có hai con số phải giữ đồng bộ.
+	//
+	// Client mới mỗi lượt là RẺ: Transport để nil nghĩa là http.DefaultTransport, nên pool kết
+	// nối vẫn dùng chung — chỉ mỗi trường Timeout là của riêng client này.
+	client := &http.Client{Timeout: defaultLLMProviderTimeout}
+	adapters := make(map[string]providerAdapter, len(providers))
+	for _, p := range providers {
+		if adapter, ok := newLLMAdapter(p.Kind, p.ID, client); ok {
+			adapters[p.ID] = adapter
+		}
+	}
+	return adapters, nil
+}
+
+// appLLMCredential mở khoá của một Provider, trả về BẢN RÕ MỚI mỗi lượt gọi.
+//
+// Mới mỗi lượt vì router xoá lát cắt nó nhận ngay sau lời gọi adapter: một hiện thực trả về lát
+// cắt dùng chung sẽ phát ra toàn số 0 từ lượt thứ hai.
+func (a *api) appLLMCredential(providerID string) ([]byte, error) {
+	cipher, err := a.st.LLMCredentialCipher(providerID)
+	if err != nil {
+		return nil, err
+	}
+	return unprotectProviderSecret(cipher)
 }

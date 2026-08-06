@@ -1,16 +1,21 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"agentdc/internal/config"
+	"agentdc/internal/ipc"
 	"agentdc/internal/store"
 )
 
@@ -262,7 +267,7 @@ func (f *routerFixture) seenSteps() []string {
 func (f *routerFixture) runner(cfg appLLMRunnerConfig) *appLLMRunner {
 	cfg.Store = f.store
 	cfg.Adapters = f.adapters
-	cfg.Claude = f.claude
+	cfg.Claude = func(string) zaloRunner { return f.claude }
 	cfg.Credential = f.creds.open
 	// Vứt log đi: một test cố ý làm hỏng telemetry sẽ in WARN vào slog mặc định, tức là vào
 	// giữa đầu ra của những test không liên quan.
@@ -847,5 +852,427 @@ func TestAppLLMRunnerKeepsAnsweringWhenTelemetryFails(t *testing.T) {
 	}
 	if got != `{"answer":"claude"}` {
 		t.Errorf("Run() = %q; want %q", got, `{"answer":"claude"}`)
+	}
+}
+
+// --- dây nối thật: appZaloRunner, appClaudeRunner, bootstrap ---
+
+// newAppRouteAPI dựng một api có store THẬT.
+//
+// Store thật chứ không fakeRouteStore: appZaloRunner là nơi DUY NHẤT appLLMRunnerConfig được ghép
+// trong bản chạy, và newAppLLMRunner không canh nil ở Store/Adapters/Claude/Credential. Một test
+// dựng config bằng tay sẽ xanh trong khi lượt đầu tiên trên máy người mua panic.
+func newAppRouteAPI(t *testing.T) *api {
+	t.Helper()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store.Open(memory) = _, %v; want nil", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return &api{
+		cfg:    config.Config{Dir: t.TempDir()},
+		st:     st,
+		logger: slog.New(slog.DiscardHandler),
+	}
+}
+
+// saveClaudeRoute lưu chuỗi một-mắt-xích claude-code/model qua đúng đường ghi Portal dùng.
+func saveClaudeRoute(t *testing.T, a *api, model string) {
+	t.Helper()
+	if err := a.st.AddLLMModel(store.LLMModel{
+		ProviderID: "claude-code", ModelID: model, Name: model,
+		Source: store.LLMModelManual, Available: true,
+	}); err != nil {
+		t.Fatalf("AddLLMModel(claude-code, %q) = %v; want nil", model, err)
+	}
+	saveRoute(t, a, store.LLMRouteEntry{ProviderID: "claude-code", ModelID: model, Enabled: true})
+}
+
+// saveRoute lưu một chuỗi bất kỳ, giả định model của từng mắt xích đã có sẵn.
+func saveRoute(t *testing.T, a *api, entries ...store.LLMRouteEntry) {
+	t.Helper()
+	snapshot, err := a.st.LLMRoute()
+	if err != nil {
+		t.Fatalf("LLMRoute() = _, %v; want nil", err)
+	}
+	if _, err := a.st.ReplaceLLMRoute(snapshot.Revision, entries); err != nil {
+		t.Fatalf("ReplaceLLMRoute(%+v) = _, %v; want nil", entries, err)
+	}
+}
+
+// routeTail đọc mắt xích cuối của chuỗi đang lưu.
+func routeTail(t *testing.T, a *api) store.LLMRouteEntry {
+	t.Helper()
+	snapshot, err := a.st.LLMRoute()
+	if err != nil {
+		t.Fatalf("LLMRoute() = _, %v; want nil", err)
+	}
+	if len(snapshot.Entries) == 0 {
+		t.Fatalf("LLMRoute().Entries rỗng; want ít nhất một mắt xích")
+	}
+	return snapshot.Entries[len(snapshot.Entries)-1]
+}
+
+// awaitSignal chờ một TÍN HIỆU, không chờ một khoảng thời gian.
+//
+// Hạn giờ ở đây chỉ để lỗi đọc được: runner dựng nhầm một execZaloRunner thì nó đi gọi tiến trình
+// claude thật, và không có nhánh này thì test treo tới hạn 10 phút của go test rồi đổ ra toàn bộ
+// goroutine thay vì một dòng nói đúng chỗ hỏng.
+func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("chờ %s quá 30s; runner không gọi tới base runner đã tiêm vào", what)
+	}
+}
+
+// blockingClaude dừng giữa lượt để test chèn một lần lưu route vào đúng khoảng đó.
+type blockingClaude struct {
+	entered chan struct{}
+	release chan struct{}
+	answer  string
+}
+
+func (c *blockingClaude) Run(ctx context.Context, _ string, _ func(string)) (string, error) {
+	c.entered <- struct{}{}
+	select {
+	case <-c.release:
+		return c.answer, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func TestAppZaloRunnerFollowsTheNewestSavedRoute(t *testing.T) {
+	a := newAppRouteAPI(t)
+	saveClaudeRoute(t, a, "haiku")
+
+	// zc.Model khớp mắt xích cuối của route A, nên runner GIỮ base này — xem appClaudeRunner. Đó
+	// cũng là phép kiểm: chuyền sai model xuống thì base không được gọi và test dừng ở awaitSignal.
+	inFlight := &blockingClaude{
+		entered: make(chan struct{}, 1), release: make(chan struct{}), answer: "trả lời theo route A",
+	}
+	runner := a.appZaloRunner(zaloConfig{Model: "haiku"}, inFlight, "t1", false)
+
+	done := make(chan error, 1)
+	go func() {
+		got, err := runner.Run(t.Context(), "câu hỏi 1", func(string) {})
+		if err == nil && got != inFlight.answer {
+			err = fmt.Errorf("Run() = %q; want %q", got, inFlight.answer)
+		}
+		done <- err
+	}()
+	awaitSignal(t, inFlight.entered, "lượt đang bay vào Claude Code")
+
+	// Lưu ĐÈ giữa lượt: lượt đang bay đã chụp route A và không được đổi sang B.
+	saveClaudeRoute(t, a, "opus")
+	close(inFlight.release)
+	if err := <-done; err != nil {
+		t.Fatalf("lượt đang bay: %v", err)
+	}
+	status, err := a.st.LLMStatus()
+	if err != nil {
+		t.Fatalf("LLMStatus() = _, %v; want nil", err)
+	}
+	if status.ActiveProviderID != "claude-code" || status.ActiveModelID != "haiku" {
+		t.Errorf("sau lượt đang bay LLMStatus() = %s/%s; want claude-code/haiku (route A)",
+			status.ActiveProviderID, status.ActiveModelID)
+	}
+
+	// Tin tiếp theo đi theo route B, và daemon KHÔNG khởi động lại giữa hai lượt.
+	next := okClaude("trả lời theo route B")
+	got, err := a.appZaloRunner(zaloConfig{Model: "opus"}, next, "t1", false).
+		Run(t.Context(), "câu hỏi 2", func(string) {})
+	if err != nil {
+		t.Fatalf("Run() lượt sau khi lưu route B = _, %v; want nil", err)
+	}
+	if got != "trả lời theo route B" {
+		t.Errorf("Run() lượt sau = %q; want %q", got, "trả lời theo route B")
+	}
+	if status, err = a.st.LLMStatus(); err != nil {
+		t.Fatalf("LLMStatus() = _, %v; want nil", err)
+	}
+	if status.ActiveModelID != "opus" {
+		t.Errorf("sau lượt thứ hai LLMStatus().ActiveModelID = %q; want opus (route B)", status.ActiveModelID)
+	}
+}
+
+// TestAppZaloRunnerKeepsThreadsWithEarlierFilesOffTheAPIChain ghim ranh giới an toàn của tệp.
+//
+// Tin của LƯỢT NÀY không có tệp, nhưng answerZalo gộp tệp của 10 tin gần nhất vào (mergeZaloFiles)
+// và buildConsultPrompt viết đường dẫn TUYỆT ĐỐI cùng tiêu đề khách đặt vào prompt. Cửa chặn tính
+// theo mỗi tin đến sẽ để prompt đó đi ra API: Provider không có ổ đĩa nên trả lời mù — đúng hồi
+// quy mà mergeZaloFiles sinh ra để chữa — và đường dẫn kèm tên người dùng Windows rời khỏi máy.
+func TestAppZaloRunnerKeepsThreadsWithEarlierFilesOffTheAPIChain(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		attachments []ipc.ZaloAttachment
+		wantClaude  bool
+	}{
+		{"lịch sử có tệp mở được", []ipc.ZaloAttachment{
+			{Kind: "chat.photo", Path: `C:\Users\Admin\.agentdc\zalo-files\anh.jpg`, Title: "đơn thuốc"},
+		}, true},
+		{"lịch sử không có tệp nào", nil, false},
+		// Sticker và vị trí không bao giờ có Path, nên mergeZaloFiles bỏ chúng. Ép đường chậm ở
+		// đây là bắt mọi hội thoại có một sticker phải đi Claude Code tới hết đời luồng.
+		{"lịch sử chỉ có sticker", []ipc.ZaloAttachment{{Kind: "chat.sticker"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAppRouteAPI(t)
+			// Provider API cố ý CHƯA có khoá: cửa chặn hỏng thì lượt dừng ở bước mở khoá, chứ
+			// không gửi đường dẫn tệp của khách tới một máy chủ thật.
+			if err := a.st.CreateLLMProvider(store.LLMProvider{
+				ID: "openai-1", Name: "openai-1", Kind: "openai", Enabled: true,
+			}); err != nil {
+				t.Fatalf("CreateLLMProvider(openai-1) = %v; want nil", err)
+			}
+			for _, m := range []store.LLMModel{
+				{ProviderID: "openai-1", ModelID: "gpt-5-mini", Name: "gpt-5-mini", Source: store.LLMModelManual, Available: true},
+				{ProviderID: "claude-code", ModelID: "haiku", Name: "haiku", Source: store.LLMModelManual, Available: true},
+			} {
+				if err := a.st.AddLLMModel(m); err != nil {
+					t.Fatalf("AddLLMModel(%s/%s) = %v; want nil", m.ProviderID, m.ModelID, err)
+				}
+			}
+			saveRoute(t, a,
+				store.LLMRouteEntry{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true},
+				store.LLMRouteEntry{ProviderID: "claude-code", ModelID: "haiku", Enabled: true},
+			)
+			if err := a.st.UpsertZaloThread("t1", "Khách lẻ"); err != nil {
+				t.Fatalf("UpsertZaloThread(t1) = %v; want nil", err)
+			}
+			if err := a.st.AddZaloMessage(ipc.ZaloMessage{
+				ThreadID: "t1", Direction: ipc.ZaloIn, Body: "ảnh đây ạ",
+				Attachments: tc.attachments, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("AddZaloMessage(t1) = %v; want nil", err)
+			}
+
+			claude := okClaude("claude đọc được tệp")
+			// hasNewFiles = false: tin của lượt này chỉ có chữ.
+			got, err := a.appZaloRunner(zaloConfig{Model: "haiku"}, claude, "t1", false).
+				Run(t.Context(), "trong hình là gì", func(string) {})
+
+			if !tc.wantClaude {
+				// Không có tệp thì chuỗi API PHẢI được đi vào — và nó dừng ở mắt xích đầu vì
+				// Provider chưa có khoá. Đó là bằng chứng lượt không nhảy thẳng tới Claude Code.
+				if !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("Run() = %q, %v; want lỗi mở khoá openai-1 (chuỗi API được đi vào)", got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Run() = _, %v; want nil", err)
+			}
+			if got != "claude đọc được tệp" {
+				t.Errorf("Run() = %q; want câu trả lời của Claude Code", got)
+			}
+			status, serr := a.st.LLMStatus()
+			if serr != nil {
+				t.Fatalf("LLMStatus() = _, %v; want nil", serr)
+			}
+			if status.ActiveProviderID != "claude-code" {
+				t.Errorf("LLMStatus().ActiveProviderID = %q; want claude-code", status.ActiveProviderID)
+			}
+		})
+	}
+}
+
+func TestAppZaloRunnerKeepsAnsweringWithoutASavedRoute(t *testing.T) {
+	a := newAppRouteAPI(t)
+	base := okClaude("trả lời như trước khi có định tuyến")
+
+	// Chưa gieo chuỗi nào. Router coi chuỗi rỗng là lỗi, nên không có cửa chặn trong
+	// appZaloRunner thì mọi tin của khách rơi vào im lặng cho tới khi có người mở Portal.
+	got, err := a.appZaloRunner(zaloConfig{Model: "haiku"}, base, "t1", false).
+		Run(t.Context(), "câu hỏi", func(string) {})
+	if err != nil {
+		t.Fatalf("Run() khi chưa có chuỗi = _, %v; want nil", err)
+	}
+	if got != "trả lời như trước khi có định tuyến" {
+		t.Errorf("Run() khi chưa có chuỗi = %q; want câu trả lời của base runner", got)
+	}
+}
+
+func TestAppClaudeRunnerCarriesTheRouteModel(t *testing.T) {
+	a := newAppRouteAPI(t)
+	base := okClaude("base")
+	zc := zaloConfig{Model: "haiku", WorkDir: `C:\work`, ThinkingTokens: 512}
+
+	for _, tc := range []struct {
+		name     string
+		model    string
+		wantBase bool
+	}{
+		{"model của route trùng cấu hình đang chạy", "haiku", true},
+		{"model của route khác cấu hình đang chạy", "opus", false},
+		// Hàng bị sửa tay trong database: `claude --model ""` là dòng lệnh hỏng, còn cấu hình
+		// đang chạy thì vẫn trả lời được.
+		{"model rỗng giữ cấu hình đang chạy", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := a.appClaudeRunner(zc, base, tc.model)
+			if tc.wantBase {
+				// Giữ base là điều kiện để test upstream (duty_test.go) còn tiêm được runner giả:
+				// dựng mới ở đây biến chúng thành lượt gọi tiến trình claude thật.
+				if got != zaloRunner(base) {
+					t.Fatalf("appClaudeRunner(zc, base, %q) = %T; want chính base đã tiêm vào", tc.model, got)
+				}
+				return
+			}
+			fresh, ok := got.(execZaloRunner)
+			if !ok {
+				t.Fatalf("appClaudeRunner(zc, base, %q) = %T; want execZaloRunner", tc.model, got)
+			}
+			if fresh.cfg.Model != tc.model {
+				t.Errorf("appClaudeRunner(zc, base, %q).cfg.Model = %q; want %q",
+					tc.model, fresh.cfg.Model, tc.model)
+			}
+			// Chỉ Model đổi: phần còn lại của cấu hình lượt dựng ra dòng lệnh claude, và mất nó
+			// thì lượt chạy sai thư mục hoặc sai hạn suy nghĩ.
+			if fresh.cfg.WorkDir != zc.WorkDir || fresh.cfg.ThinkingTokens != zc.ThinkingTokens {
+				t.Errorf("appClaudeRunner(zc, base, %q).cfg workdir/thinking = %q/%d; want %q/%d",
+					tc.model, fresh.cfg.WorkDir, fresh.cfg.ThinkingTokens, zc.WorkDir, zc.ThinkingTokens)
+			}
+		})
+	}
+	if zc.Model != "haiku" {
+		t.Errorf("zaloConfig của người gọi bị sửa: Model = %q; want haiku", zc.Model)
+	}
+}
+
+func TestAppRoutesBootstrapMigratesTheLegacyModelFile(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		saved string
+		want  string
+	}{
+		{"lựa chọn cũ được mang sang", "sonnet\r\n", "sonnet"},
+		{"không có tệp thì theo model đang chạy", "", "haiku"},
+		{"giá trị ngoài danh sách cho phép bị bỏ", "sonnet && shutdown /s\r\n", "haiku"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAppRouteAPI(t)
+			a.zalo = &zaloDeps{cfg: zaloConfig{Model: "haiku"}}
+			if tc.saved != "" {
+				if err := os.WriteFile(modelFile(a.cfg.Dir), []byte(tc.saved), 0o600); err != nil {
+					t.Fatalf("ghi model.txt = %v; want nil", err)
+				}
+			}
+
+			a.registerAppRoutes(http.NewServeMux())
+
+			tail := routeTail(t, a)
+			if tail.ProviderID != "claude-code" || tail.ModelID != tc.want {
+				t.Errorf("mắt xích cuối = %s/%s; want claude-code/%s", tail.ProviderID, tail.ModelID, tc.want)
+			}
+			// model.txt phải còn NGUYÊN: gỡ bản Portal ra thì Chay.bat vẫn đọc nó để chọn model.
+			if tc.saved != "" {
+				b, err := os.ReadFile(modelFile(a.cfg.Dir))
+				if err != nil || string(b) != tc.saved {
+					t.Errorf("model.txt sau bootstrap = %q, %v; want %q, nil", b, err, tc.saved)
+				}
+			}
+		})
+	}
+
+	t.Run("lần khởi động sau không đè chuỗi người dùng đã sửa", func(t *testing.T) {
+		a := newAppRouteAPI(t)
+		a.zalo = &zaloDeps{cfg: zaloConfig{Model: "haiku"}}
+		a.registerAppRoutes(http.NewServeMux())
+		saveClaudeRoute(t, a, "opus")
+
+		a.registerAppRoutes(http.NewServeMux())
+
+		if tail := routeTail(t, a); tail.ModelID != "opus" {
+			t.Errorf("mắt xích cuối sau lần bootstrap thứ hai = %q; want opus", tail.ModelID)
+		}
+	})
+}
+
+func TestAppLLMAdaptersComeFromTheStoredProviderKind(t *testing.T) {
+	a := newAppRouteAPI(t)
+	for id, kind := range map[string]string{
+		"o-1": "openai", "a-1": "anthropic", "g-1": "gemini", "r-1": "openrouter", "x-1": "chưa hỗ trợ",
+	} {
+		if err := a.st.CreateLLMProvider(store.LLMProvider{
+			ID: id, Name: id, Kind: kind, Enabled: true,
+		}); err != nil {
+			t.Fatalf("CreateLLMProvider(%q, %q) = %v; want nil", id, kind, err)
+		}
+	}
+
+	adapters, err := a.appLLMAdapters()
+	if err != nil {
+		t.Fatalf("appLLMAdapters() = _, %v; want nil", err)
+	}
+
+	for _, tc := range []struct {
+		id   string
+		want providerAdapter
+	}{
+		{"o-1", (*openAIAdapter)(nil)},
+		{"a-1", (*anthropicAdapter)(nil)},
+		{"g-1", (*geminiAdapter)(nil)},
+		{"r-1", (*openRouterAdapter)(nil)},
+	} {
+		got, ok := adapters[tc.id]
+		if !ok {
+			t.Errorf("appLLMAdapters()[%q] thiếu; want %T", tc.id, tc.want)
+			continue
+		}
+		if fmt.Sprintf("%T", got) != fmt.Sprintf("%T", tc.want) {
+			t.Errorf("appLLMAdapters()[%q] = %T; want %T", tc.id, got, tc.want)
+		}
+	}
+	// Claude Code không đi qua HTTP, và một kind lạ là cấu hình sai: cả hai KHÔNG được có adapter,
+	// để router dừng chuỗi và nói ra thay vì gọi nhầm giao thức.
+	for _, id := range []string{"claude-code", "x-1"} {
+		if _, ok := adapters[id]; ok {
+			t.Errorf("appLLMAdapters()[%q] có adapter; want không có", id)
+		}
+	}
+}
+
+func TestAppLLMCredentialUnlocksExactlyOneProvider(t *testing.T) {
+	requireCredentialProtection(t)
+	a := newAppRouteAPI(t)
+	for _, id := range []string{"o-1", "o-2"} {
+		if err := a.st.CreateLLMProvider(store.LLMProvider{
+			ID: id, Name: id, Kind: "openai", Enabled: true,
+		}); err != nil {
+			t.Fatalf("CreateLLMProvider(%q) = %v; want nil", id, err)
+		}
+	}
+	key := []byte("sk-runtime-wiring")
+	cipher, err := protectProviderSecret(key)
+	if err != nil {
+		t.Fatalf("protectProviderSecret() = _, %v; want nil", err)
+	}
+	if err := a.st.SetLLMCredentialCipher("o-1", cipher); err != nil {
+		t.Fatalf("SetLLMCredentialCipher(o-1) = %v; want nil", err)
+	}
+
+	got, err := a.appLLMCredential("o-1")
+	if err != nil {
+		t.Fatalf("appLLMCredential(o-1) = _, %v; want nil", err)
+	}
+	if !bytes.Equal(got, key) {
+		t.Errorf("appLLMCredential(o-1) = %q; want %q", got, key)
+	}
+	// Bản rõ phải MỚI mỗi lượt: router xoá lát cắt nó nhận, nên dùng chung mảng nền nghĩa là lượt
+	// thứ hai phát ra toàn số 0 và Provider trả 401 mà không ai hiểu vì sao.
+	again, err := a.appLLMCredential("o-1")
+	if err != nil {
+		t.Fatalf("appLLMCredential(o-1) lần hai = _, %v; want nil", err)
+	}
+	clear(again)
+	if !bytes.Equal(got, key) {
+		t.Errorf("xoá bản rõ lượt hai làm hỏng lượt một: %q; want %q", got, key)
+	}
+	// Chưa nhập khoá là một lỗi NÓI RA, không phải một lát cắt rỗng gửi đi làm Provider trả 401.
+	if plain, err := a.appLLMCredential("o-2"); err == nil {
+		t.Errorf("appLLMCredential(o-2) khi chưa có khoá = %q, nil; want lỗi", plain)
 	}
 }

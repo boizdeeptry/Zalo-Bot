@@ -241,6 +241,22 @@ func incoming() {
 		a.batch.add(req.ThreadID, kind, msg.Body, delay, ipc.ZaloOutboxDraft{})
 }
 '@
+  Write-TestFile (Join-Path $repo 'internal\daemon\duty.go') @'
+package daemon
+
+func trigger() {
+	err := a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)
+}
+'@
+  # Test upstream gọi answerZalo hàng chục lần. Chúng có mặt ở đây để cửa đếm chỗ gọi phải thật
+  # sự loại _test.go ra — bỏ sót thì cửa đó đỏ ngay trên repo thật và không ai build được.
+  Write-TestFile (Join-Path $repo 'internal\daemon\duty_test.go') @'
+package daemon
+
+func TestAnswer(t *testing.T) {
+	_ = a.answerZalo(ctx, zc, run, "t1", "câu hỏi", nil, ipc.ZaloOutboxDraft{})
+}
+'@
   Write-TestFile (Join-Path $repo 'README.md') "tracked`n"
   Write-TestFile (Join-Path $repo 'untracked.txt') "must not be staged`n"
   $upstreamStyles = @{
@@ -269,6 +285,7 @@ func incoming() {
   & git -C $repo add -- 'internal' 'README.md'
   if ($LASTEXITCODE -ne 0) { throw 'Could not stage fixture files' }
   $statusBefore = (& git -C $repo status --short) -join "`n"
+  $dutyBefore = [IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\duty.go'))
 
   $gotStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot $stage
   Assert-Equal $gotStage ([IO.Path]::GetFullPath($stage)) 'Stage path was not normalized'
@@ -291,9 +308,19 @@ func incoming() {
   $stagedServer = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\server.go'))
   $stagedStore = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\store\store.go'))
   $stagedZalo = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\zalo.go'))
+  $stagedDuty = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\duty.go'))
   if ([regex]::Matches($stagedServer, 'a\.registerAppRoutes\(mux\)').Count -ne 1) { throw 'Route seam was not applied exactly once' }
   if ([regex]::Matches($stagedStore, 'migrateApp\(db\)').Count -ne 1) { throw 'Migration seam was not applied exactly once' }
   if ([regex]::Matches($stagedZalo, 'evaluateAppWorkflow\(req, msg\)').Count -ne 1) { throw 'Workflow seam was not applied exactly once' }
+  $runnerSeam = 'a\.appZaloRunner\(deps\.cfg, deps\.run, threadID, len\(files\) > 0\)'
+  if ([regex]::Matches($stagedDuty, $runnerSeam).Count -ne 1) { throw 'Runner seam was not applied exactly once' }
+  # Chuỗi gọi phải còn nguyên hình dạng cũ quanh chỗ chèn: một seam khớp đúng chữ nhưng đặt sai
+  # chỗ vẫn đếm ra 1, và cách duy nhất phân biệt là đọc cả lời gọi.
+  $expectedCall = 'a.answerZalo(ctx, deps.cfg, a.appZaloRunner(deps.cfg, deps.run, threadID, ' +
+    'len(files) > 0), threadID, question, step, reply, files...)'
+  if ($stagedDuty.IndexOf($expectedCall, [StringComparison]::Ordinal) -lt 0) {
+    throw 'Runner seam did not rewrite the answerZalo call in place'
+  }
   Assert-ThrowsLike -Action { Apply-AppSeams -Stage $gotStage } `
     -Pattern 'route seam: inserted signature already present' -Message 'Applying seams twice was accepted'
   if ([regex]::Matches([IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\server.go')), 'a\.registerAppRoutes\(mux\)').Count -ne 1) {
@@ -302,6 +329,8 @@ func incoming() {
 
   $sourceServer = [IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\server.go'))
   if ($sourceServer -match 'registerAppRoutes') { throw 'Source repo was changed by staging' }
+  Assert-Equal ([IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\duty.go'))) $dutyBefore `
+    'Source duty.go was changed by staging'
   $statusAfter = (& git -C $repo status --short) -join "`n"
   Assert-Equal $statusAfter $statusBefore 'Source Git status changed during staging'
 
@@ -340,6 +369,37 @@ func incoming() {
   Assert-ThrowsLike -Action { Apply-AppSeams -Stage $duplicateWorkflowStage } `
     -Pattern 'workflow seam: expected exactly 1 match' -Message 'A duplicate workflow marker was accepted'
 
+  $duplicateRunnerStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Trùng runner')
+  $duplicateDutyPath = Join-Path $duplicateRunnerStage 'internal\daemon\duty.go'
+  $duplicateDuty = [IO.File]::ReadAllText($duplicateDutyPath)
+  $duplicateDuty += "`n`ta.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)`n"
+  [IO.File]::WriteAllText($duplicateDutyPath, $duplicateDuty, [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $duplicateRunnerStage } `
+    -Pattern 'runner seam: expected exactly 1 match' -Message 'A duplicate runner marker was accepted'
+
+  # Chữ ký đã có sẵn phải chặn TRƯỚC khi Replace chạy, và nó phải chặn của CHÍNH seam này: ba
+  # seam kia đều sạch ở stage này, nên nếu Apply-AppSeams đi qua được thì cửa chặn duty không có.
+  $appliedRunnerStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Runner đã áp')
+  $appliedDutyPath = Join-Path $appliedRunnerStage 'internal\daemon\duty.go'
+  [IO.File]::WriteAllText($appliedDutyPath, ([IO.File]::ReadAllText($appliedDutyPath).Replace(
+    'deps.run, threadID', 'a.appZaloRunner(deps.cfg, deps.run, threadID, len(files) > 0), threadID')),
+    [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $appliedRunnerStage } `
+    -Pattern 'runner seam: inserted signature already present' -Message 'An already-patched duty.go was accepted'
+
+  # Một lượt trả lời thứ hai ở tệp KHÁC là cách duy nhất seam này hỏng lặng lẽ: duty.go vẫn khớp
+  # đúng một lần, seam vẫn áp, và đường mới đi thẳng tới Claude Code không qua định tuyến.
+  $driftStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Hai chỗ gọi')
+  Write-TestFile (Join-Path $driftStage 'internal\daemon\duty2.go') @'
+package daemon
+
+func triggerAgain() {
+	_ = a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply)
+}
+'@
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $driftStage } `
+    -Pattern 'runner seam: answerZalo has 2 call sites' -Message 'A second answerZalo call site was accepted'
+
   $orchestrator = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\build-app.ps1'))
   if ($orchestrator -notmatch 'New-AppStage' -or $orchestrator -notmatch 'Apply-AppSeams') {
     throw 'Build orchestration does not use the guarded staging functions'
@@ -353,7 +413,7 @@ func incoming() {
     throw 'Launcher does not open the management Portal at /'
   }
 
-  Write-Host 'PASS: staging copies tracked files and applies three guarded seams.'
+  Write-Host 'PASS: staging copies tracked files and applies four guarded seams.'
 } finally {
   if (Test-Path -LiteralPath $stageTestRoot) {
     Remove-Item -LiteralPath $stageTestRoot -Recurse -Force

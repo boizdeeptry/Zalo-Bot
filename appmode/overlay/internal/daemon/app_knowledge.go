@@ -168,6 +168,16 @@ var modelChoices = []string{"haiku", "sonnet", "opus"}
 // đã biết và nói rõ trên trang: KHÔNG có hiệu lực ngay.
 func modelFile(homeDir string) string { return filepath.Join(homeDir, "model.txt") }
 
+// normalizeModelChoice chuẩn hoá rồi đối chiếu với danh sách CHO PHÉP.
+//
+// Một hàm cho cả hai chỗ đọc (PUT /kb/model và lần gieo route lúc khởi động) vì luật là một:
+// giá trị này đi thẳng vào dòng lệnh của claude, nên hai bản chuẩn hoá lệch nhau là một đường
+// nhận được thứ đường kia đã từ chối.
+func normalizeModelChoice(raw string) (string, bool) {
+	m := strings.ToLower(strings.TrimSpace(raw))
+	return m, slices.Contains(modelChoices, m)
+}
+
 func (a *api) handleKBModelGet(w http.ResponseWriter, _ *http.Request) {
 	// Giá trị ĐANG CHẠY lấy từ cấu hình đã nạp, không từ tệp: hai thứ khác nhau đúng trong
 	// khoảng giữa lúc bấm Lưu và lúc mở lại, và đó là khoảng người dùng cần thấy rõ nhất.
@@ -194,10 +204,10 @@ func (a *api) handleKBModelPut(w http.ResponseWriter, r *http.Request) {
 		a.writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	m := strings.ToLower(strings.TrimSpace(req.Model))
 	// Danh sách CHO PHÉP: giá trị này đi thẳng vào dòng lệnh của claude, nên một chuỗi tự do ở
 	// đây là một tham số tự do ở đó.
-	if !slices.Contains(modelChoices, m) {
+	m, ok := normalizeModelChoice(req.Model)
+	if !ok {
 		a.writeErr(w, http.StatusBadRequest, "mô hình không hợp lệ")
 		return
 	}
