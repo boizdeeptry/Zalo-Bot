@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"os/exec"
+	"strings"
 )
 
 // cliDescriptor là DỮ LIỆU cho một vendor CLI, không phải code. Adapter thân duy nhất đọc nó.
@@ -80,6 +81,36 @@ func buildCLIArgv(d cliDescriptor, req llmRequest) []string {
 		}
 	}
 	return argv
+}
+
+// classifyCLIError ánh xạ output CLI về taxonomy CHUNG. Mặc định rate_limit khi mơ hồ: đoán sai
+// hướng đó chỉ tốn một lượt thử Provider sau; đoán sai thành credential thì chết cả chuỗi.
+//
+// Danh sách chuỗi con cố ý để RỘNG: codex/gemini chưa đăng nhập nên message hết-hạn-mức/xác-thực
+// thật chưa kiểm chứng — Task 8 chạy CLI thật, bắt stderr thật rồi ghim lại. Đừng khớp chính xác.
+func classifyCLIError(stderr string, notInstalled bool) llmErrorKind {
+	if notInstalled {
+		return llmErrorCredential // cần cài + đăng nhập; thử tiếp vô ích
+	}
+	s := strings.ToLower(stderr)
+	switch {
+	case containsAny(s, "not logged in", "please run", "authenticate", "login"):
+		return llmErrorCredential
+	case containsAny(s, "usage limit", "rate limit", "quota", "too many requests", "try again later"):
+		return llmErrorRateLimit
+	default:
+		return llmErrorRateLimit // mơ hồ → cho chuỗi đi tiếp
+	}
+}
+
+// containsAny trả true nếu s chứa bất kỳ chuỗi con nào trong subs.
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // cliExit mang stderr để Task 4 phân loại lỗi (hết hạn mức vs chưa đăng nhập).

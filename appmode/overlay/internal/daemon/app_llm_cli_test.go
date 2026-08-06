@@ -138,6 +138,30 @@ func TestCLIRunKillsTheWholeTreeOnCancel(t *testing.T) {
 	<-done // đảm bảo runCLIProcess (và cmd.Wait bên trong) đã kết thúc trước khi test rời đi
 }
 
+// TestClassifyCLIError chốt việc ánh xạ output CLI về taxonomy: hết hạn mức → rate_limit (đi tiếp),
+// chưa cài / chưa đăng nhập → credential (dừng chuỗi), và mơ hồ mặc định rate_limit — không bao giờ
+// rơi vào một loại chặn-chuỗi.
+func TestClassifyCLIError(t *testing.T) {
+	cases := []struct {
+		name, stderr string
+		notInstalled bool
+		want         llmErrorKind
+	}{
+		{"chưa cài", "", true, llmErrorCredential},
+		{"chưa đăng nhập codex", "Not logged in", false, llmErrorCredential},
+		{"hết hạn mức", "You've hit your usage limit. Try again later.", false, llmErrorRateLimit},
+		{"mơ hồ mặc định rate_limit", "some unrecognized failure", false, llmErrorRateLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyCLIError(tc.stderr, tc.notInstalled)
+			if got != tc.want {
+				t.Errorf("classifyCLIError(%q, installed=%v) = %q; want %q", tc.stderr, !tc.notInstalled, got, tc.want)
+			}
+		})
+	}
+}
+
 // readGrandchildPID poll file cho tới khi node ghi xong pid cháu rồi parse. Poll ngắn có giới hạn:
 // đang chờ một tiến trình NGOẠI khởi động, không có channel để đợi.
 func readGrandchildPID(t *testing.T, pidFile string) int {
