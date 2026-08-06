@@ -69,7 +69,7 @@ rem nguoi dung DANG mo mot tab, va tab do tu tai lai khi may chu song lai. Mo th
 rem mot tab nua thi ho co hai site giong nhau va khong biet nhin cai nao -- va cai
 rem tab cu con o dung muc Models ho vua bam.
 if /i "%~1"=="nobrowser" goto skipbrowser
-start "" /min cmd /c "timeout /t 4 >nul & start "" http://127.0.0.1:8770/zalo"
+start "" /min cmd /c "timeout /t 4 >nul & start "" http://127.0.0.1:8770/"
 :skipbrowser
 
 rem Duong dan TUONG MINH, khong dua "agentdc.exe" tran.

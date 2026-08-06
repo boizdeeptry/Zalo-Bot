@@ -1,0 +1,80 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  createRouteHost,
+  routeFromHash,
+} from "../overlay/internal/webui/static/core/router.js";
+
+test("known and unknown hashes resolve predictably", () => {
+  assert.equal(routeFromHash("#models"), "models");
+  assert.equal(routeFromHash("#workflows"), "workflows");
+  assert.equal(routeFromHash("#not-a-page"), "knowledge");
+  assert.equal(routeFromHash(""), "knowledge");
+});
+
+test("mounting a route disposes the old page before clearing its DOM", async () => {
+  const events = [];
+  const container = {
+    replaceChildren() {
+      events.push("clear");
+    },
+  };
+  const host = createRouteHost(container);
+
+  await host.mount({
+    mount() {
+      events.push("mount:first");
+      return { dispose: () => events.push("dispose:first") };
+    },
+  });
+  await host.mount({
+    mount() {
+      events.push("mount:second");
+      return { dispose: () => events.push("dispose:second") };
+    },
+  });
+  host.dispose();
+
+  assert.deepEqual(events, [
+    "clear",
+    "mount:first",
+    "dispose:first",
+    "clear",
+    "mount:second",
+    "dispose:second",
+  ]);
+});
+
+test("a throwing page disposer is consumed before the next mount", () => {
+  let disposeCalls = 0;
+  const host = createRouteHost({ replaceChildren() {} });
+
+  host.mount({
+    mount() {
+      return {
+        dispose() {
+          disposeCalls += 1;
+          throw new Error("cleanup failed");
+        },
+      };
+    },
+  });
+
+  assert.throws(
+    () => host.mount({ mount: () => ({ dispose() {} }) }),
+    /cleanup failed/,
+  );
+  assert.equal(disposeCalls, 1);
+  assert.doesNotThrow(() => host.dispose());
+  assert.equal(disposeCalls, 1);
+});
+
+test("page mount must return its disposer synchronously", () => {
+  const host = createRouteHost({ replaceChildren() {} });
+
+  assert.throws(
+    () => host.mount({ mount: async () => ({ dispose() {} }) }),
+    /synchronously/,
+  );
+});
