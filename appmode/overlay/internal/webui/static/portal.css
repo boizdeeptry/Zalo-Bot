@@ -1,10 +1,4 @@
 .portal-body {
-  --panel: var(--surface);
-  --sunk: var(--surface-soft);
-  --line: var(--border);
-  --ink: var(--text);
-  --dim: var(--muted);
-  --live: var(--accent);
   margin:0; display:flex; min-height:100vh;
 }
 
