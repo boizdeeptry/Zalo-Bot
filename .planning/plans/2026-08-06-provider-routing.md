@@ -252,7 +252,7 @@
   OpenRouter: POST https://openrouter.ai/api/v1/chat/completions; GET /api/v1/models
   ```
 
-  Set the required bearer, `x-api-key`, and `anthropic-version: 2023-06-01` headers. `Test` must perform a harmless model-list request. `Discover` returns the old cached list unchanged at the service layer when the adapter errors; the adapter itself returns an error and no partial list. Implement `isFallbackEligible` to return true only for network, timeout, rate-limit, and upstream kinds.
+  Set the required bearer, `x-api-key`, and `anthropic-version: 2023-06-01` headers. OpenRouter also gets the static `HTTP-Referer` and `X-Title` attribution headers its docs ask for (see `.planning/research/9router-RESEARCH.md` §4). OpenAI and OpenRouter speak the same wire protocol, so share one request/response codec between them rather than writing it twice — §1 of that note explains why. `Test` must perform a harmless model-list request. `Discover` returns the old cached list unchanged at the service layer when the adapter errors; the adapter itself returns an error and no partial list. Implement `isFallbackEligible` to return true only for network, timeout, rate-limit, and upstream kinds.
 
 - [ ] **Step 4: Run and confirm GREEN**
 
