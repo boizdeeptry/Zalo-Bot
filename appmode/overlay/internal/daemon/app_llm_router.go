@@ -114,16 +114,23 @@ func (r *appLLMRunner) Run(ctx context.Context, prompt string, step func(string)
 	if len(entries) == 0 {
 		return "", errors.New("llm route: chuỗi fallback rỗng, không có gì để gọi")
 	}
-	// Lượt có tệp chỉ đi tới Claude Code, nơi tệp nằm im trên đĩa máy này. Tìm mắt xích claude-code
-	// ở BẤT KỲ vị trí nào; không có thì lượt này không phục vụ được — KHÔNG để đường dẫn/nội dung
-	// tệp của khách chạm một adapter HTTP. (§9 nới ra "local_cli đầu tiên", KHÔNG làm ở task này.)
+	// Lượt có tệp chỉ đi tới một mắt xích local_cli — nơi tệp nằm im trên đĩa máy này (codex,
+	// gemini-cli đều chạy chỉ-đọc, và claude-code). Chọn cái ĐẦU TIÊN đủ điều kiện ở bất kỳ vị trí
+	// nào; không có thì lượt này không phục vụ được — KHÔNG để đường dẫn/nội dung tệp của khách chạm
+	// một adapter HTTP. Đó là ranh giới an toàn mà cả thiết kế bảo vệ.
 	if r.cfg.HasAttachments {
-		claude, ok := findClaudeEntry(entries)
+		e, ok := r.firstEligibleCLIEntry(entries)
 		if !ok {
 			return "", newLLMError(llmErrorRequest, nil,
-				"llm route: lượt có tệp nhưng chuỗi không có mắt xích Claude Code")
+				"llm route: lượt có tệp nhưng chuỗi không có mắt xích local_cli")
 		}
-		return r.runClaude(ctx, claude, prompt, step)
+		// claude-code giữ NGUYÊN đường runClaude (mang step gốc, ngân sách lượt dài) — Task 11 sở hữu
+		// path đó. codex/gemini-cli chạy qua adapter, cũng dưới ctx CHA: một lượt CLI đọc tệp là một
+		// lượt thật, KHÔNG phải một API treo 25s. Cả hai đều terminal — một mắt xích, không fallback.
+		if e.ProviderID == claudeCodeProviderID {
+			return r.runClaude(ctx, e, prompt, step)
+		}
+		return r.runCLIAttachment(ctx, r.cfg.Adapters[e.ProviderID], e, prompt)
 	}
 
 	apiCtx, cancel := context.WithTimeout(ctx, r.cfg.APIChainTimeout)
@@ -219,6 +226,34 @@ func findClaudeEntry(entries []store.LLMRouteEntry) (store.LLMRouteEntry, bool) 
 	return store.LLMRouteEntry{}, false
 }
 
+// firstEligibleCLIEntry tìm mắt xích local_cli ĐẦU TIÊN đủ điều kiện phục vụ một lượt có tệp.
+//
+// "Đủ điều kiện" = đang bật, KHÔNG nằm trong Disabled, VÀ thuộc họ local_cli. Ba nơi tệp đọc được
+// ngay trên đĩa máy này: codex, gemini-cli (đều chỉ-đọc) và claude-code. Bốn Provider HTTP thì
+// KHÔNG — chúng không có ổ đĩa, và gửi đường dẫn/nội dung tệp của khách sang đó là phá ranh giới an
+// toàn. Cùng HAI cửa tắt như vòng lặp trong Run: mắt xích tắt là lựa chọn người dựng chuỗi, Provider
+// tắt là lệnh ngắt của người trực (tới SAU lúc lưu chuỗi).
+//
+// Nhận diện kind theo cấu trúc sẵn có, không cần một map kind riêng: claude-code CHƯA có adapter
+// (Task 11) nên nhận bằng ProviderID; codex/gemini-cli nhận bằng type-assert *cliAdapter — đúng type
+// mà newLLMAdapter dựng cho hai kind local_cli đó. Một adapter vắng mặt hoặc là adapter HTTP đều
+// trả về ok=false ở phép assert này, nên bốn Provider HTTP tự động rớt. "Đầu tiên" = vị trí thấp
+// nhất trong chuỗi, nên trả về ngay mục khớp đầu tiên.
+func (r *appLLMRunner) firstEligibleCLIEntry(entries []store.LLMRouteEntry) (store.LLMRouteEntry, bool) {
+	for _, e := range entries {
+		if !e.Enabled || r.cfg.Disabled[e.ProviderID] {
+			continue
+		}
+		if e.ProviderID == claudeCodeProviderID {
+			return e, true
+		}
+		if _, ok := r.cfg.Adapters[e.ProviderID].(*cliAdapter); ok {
+			return e, true
+		}
+	}
+	return store.LLMRouteEntry{}, false
+}
+
 // generate giữ bản rõ sống đúng bằng một lượt gọi.
 //
 // defer clear đứng cạnh lời gọi duy nhất truyền bản rõ đi, nên không nhánh trả về nào lách qua
@@ -259,6 +294,37 @@ func (r *appLLMRunner) runClaude(ctx context.Context, e store.LLMRouteEntry,
 	}
 	r.record(llmOKAttempt(e, started, elapsed))
 	return text, nil
+}
+
+// runCLIAttachment giao một lượt có tệp cho một mắt xích codex/gemini-cli, bằng ctx GỐC.
+//
+// Cùng lẽ ngân sách với runClaude: một lượt CLI đọc tệp là một lượt thật (đo được hàng chục giây),
+// không phải một lượt gọi API 25s — nên nó chạy dưới ctx cha, KHÔNG dưới apiCtx. Terminal như
+// runClaude: một mắt xích local_cli duy nhất phục vụ rồi trả về, KHÔNG chạy vòng fallback.
+//
+// KHÔNG mở khoá: codex/gemini-cli là CLI thuê bao mang phiên đăng nhập riêng và bỏ qua credential
+// (xem cliAdapter.Generate), y như claude-code — nên truyền nil, không có bản rõ nào để lộ hay xoá.
+func (r *appLLMRunner) runCLIAttachment(ctx context.Context, adapter providerAdapter,
+	e store.LLMRouteEntry, prompt string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("llm route: lượt bị huỷ trước khi tới %s: %w", e.ProviderID, err)
+	}
+	started := time.Now()
+	resp, err := adapter.Generate(ctx, llmRequest{Model: e.ModelID, Prompt: prompt}, nil)
+	elapsed := time.Since(started)
+	if err != nil {
+		// Lượt chết KHÔNG phải lỗi Provider: ctx cha chết (tắt daemon / hết hạn mức lượt) thì không
+		// ghi telemetry — cùng kỷ luật "không đổ tội" như vòng lặp API và runClaude.
+		kind := llmErrorKindOf(err)
+		if kind == llmErrorCanceled || ctx.Err() != nil {
+			return "", fmt.Errorf("llm route: lượt bị huỷ trong %s: %w", e.ProviderID, err)
+		}
+		// Không còn mắt xích nào sau nó (terminal): "không khả dụng", ghi hàng lỗi với next rỗng.
+		r.record(llmErrorAttempt(e, started, elapsed, kind, ""))
+		return "", fmt.Errorf("llm route: cạn chuỗi fallback, %s cũng hỏng: %w", e.ProviderID, err)
+	}
+	r.record(llmOKAttempt(e, started, elapsed))
+	return resp.Text, nil
 }
 
 // record ghi một lần gọi vào sổ vận hành. Sổ hỏng KHÔNG được làm hỏng câu trả lời.

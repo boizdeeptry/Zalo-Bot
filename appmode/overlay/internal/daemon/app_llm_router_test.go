@@ -152,6 +152,24 @@ func hangAdapter() *fakeAdapter {
 	return a
 }
 
+// fakeCLI dựng một *cliAdapter THẬT với seam run giả. Router nhận diện một mắt xích local_cli bằng
+// type *cliAdapter (xem firstEligibleCLIEntry), nên một lượt có tệp trên codex/gemini-cli phải đi
+// qua đúng type đó — một fakeAdapter dán nhãn "codex" sẽ bị coi là HTTP và không đủ điều kiện.
+//
+// seam run trả về answer đã dựng sẵn và ghi lại phần đầu vào (argv+stdin) vào seen, để test soi
+// được prompt của khách CÓ tới CLI cục bộ (được phép) mà KHÔNG tới một adapter HTTP.
+func fakeCLI(kind, providerID, answer string, seen *[]string) *cliAdapter {
+	return &cliAdapter{
+		d:          cliDescriptors[kind],
+		providerID: providerID,
+		logger:     slog.New(slog.DiscardHandler),
+		run: func(_ context.Context, argv []string, stdin []byte) ([]byte, error) {
+			*seen = append(*seen, strings.Join(argv, " ")+string(stdin))
+			return []byte(answer), nil
+		},
+	}
+}
+
 type fakeClaude struct {
 	mu      sync.Mutex
 	prompts []string
@@ -272,6 +290,14 @@ func newRouterFixture(snapshot store.LLMRouteSnapshot, claude *fakeClaude) *rout
 }
 
 func (f *routerFixture) with(providerID, credential string, a *fakeAdapter) *routerFixture {
+	f.adapters[providerID] = a
+	f.creds.plain[providerID] = credential
+	return f
+}
+
+// withCLI đăng ký một mắt xích local_cli THẬT (*cliAdapter) thay vì một fakeAdapter, để router nhận
+// diện đúng nó là local_cli chứ không phải một Provider HTTP.
+func (f *routerFixture) withCLI(providerID, credential string, a *cliAdapter) *routerFixture {
 	f.adapters[providerID] = a
 	f.creds.plain[providerID] = credential
 	return f
@@ -841,30 +867,38 @@ func TestAppLLMRunnerSendsAttachmentTurnsOnlyToClaude(t *testing.T) {
 	}
 }
 
-// TestAppLLMRunnerRefusesAttachmentTurnWithNoClaudeEntry canh mặt còn lại của ranh giới an toàn:
-// sau §6, người trực dựng được một chuỗi TOÀN gói thuê bao (codex), không có Claude Code. Một lượt
-// có tệp trên chuỗi đó không có đích an toàn — Claude Code là nơi DUY NHẤT tệp nằm im trên đĩa máy
-// này — nên nó phải trả LỖI, KHÔNG được rơi xuống vòng lặp và gửi đường dẫn/nội dung tệp của khách
-// sang một adapter (Provider HTTP). Canary claude-tail (TestAppLLMRunnerSendsAttachmentTurnsOnlyToClaude)
-// KHÔNG đi qua nhánh này, nên một hồi quy rơi-xuống-vòng-lặp vẫn qua được nó.
-func TestAppLLMRunnerRefusesAttachmentTurnWithNoClaudeEntry(t *testing.T) {
-	const canaryPath = `C:\Users\Admin\.agentdc\zalo-files\CANARY-NOCLAUDE-3c9e.pdf`
-	const canaryBytes = "CANARY-BYTES-noclaude-noi-dung-rieng-tu-cua-khach"
+// TestAppLLMRunnerRefusesAttachmentTurnWithNoLocalCLI canh mặt còn lại của ranh giới an toàn: người
+// trực dựng được một chuỗi TOÀN Provider HTTP, không có mắt xích local_cli nào. Một lượt có tệp trên
+// chuỗi đó không có đích an toàn — local_cli là nơi DUY NHẤT tệp nằm im trên đĩa máy này — nên nó
+// phải trả LỖI, KHÔNG được rơi xuống vòng lặp và gửi đường dẫn/nội dung tệp của khách sang một
+// adapter HTTP. Canary claude-tail (TestAppLLMRunnerSendsAttachmentTurnsOnlyToClaude) và first-cli
+// (TestAttachmentTurnUsesFirstLocalCLINotHTTP) KHÔNG đi qua nhánh này, nên một hồi quy rơi-xuống-vòng-lặp
+// vẫn qua được chúng — chỉ test này canh đúng đường đó.
+//
+// (Lưu ý §9: một chuỗi codex-only KHÔNG còn thuộc nhánh này — codex là local_cli hợp lệ nên nó PHỤC
+// VỤ lượt có tệp, xem TestAttachmentTurnUsesFirstLocalCLINotHTTP. "Không có đích" giờ nghĩa là
+// toàn-HTTP.)
+func TestAppLLMRunnerRefusesAttachmentTurnWithNoLocalCLI(t *testing.T) {
+	const canaryPath = `C:\Users\Admin\.agentdc\zalo-files\CANARY-NOCLI-3c9e.pdf`
+	const canaryBytes = "CANARY-BYTES-nocli-noi-dung-rieng-tu-cua-khach"
 
 	prompt := "Khách gửi tệp:\n  " + canaryPath + "\nNội dung đọc được: " + canaryBytes + "\nCâu hỏi: giá bao nhiêu?"
-	codex := okAdapter(`{"answer":"codex"}`)
+	openai, gemini := okAdapter(`{"answer":"api"}`), okAdapter(`{"answer":"api2"}`)
 	claude := okClaude(`{"answer":"claude"}`)
-	f := newRouterFixture(newRoute(entry("codex-1", "gpt-5.4", true)), claude).
-		with("codex-1", "sub-token", codex)
+	// Hai Provider HTTP (fakeAdapter), KHÔNG cái nào là *cliAdapter: chuỗi toàn-HTTP, không đích an toàn.
+	f := newRouterFixture(newRoute(
+		entry("openai-1", "gpt-5-mini", true),
+		entry("gemini-1", "gemini-2.5-flash", true),
+	), claude).with("openai-1", "sk-one", openai).with("gemini-1", "sk-two", gemini)
 
 	got, err := f.runner(appLLMRunnerConfig{HasAttachments: true}).Run(t.Context(), prompt, f.step)
 	if err == nil {
-		t.Fatalf("lượt có tệp trên route không có claude-code = %q, nil; want lỗi", got)
+		t.Fatalf("lượt có tệp trên route toàn-HTTP = %q, nil; want lỗi", got)
 	}
 	if got != "" {
 		t.Errorf("Run() = %q; want chuỗi rỗng khi từ chối", got)
 	}
-	// Không mắt xích claude-code thì không có đích nào cả — cả Claude giả cũng không được gọi.
+	// Không mắt xích local_cli thì không có đích nào cả — cả Claude giả cũng không được gọi.
 	if len(claude.seen()) != 0 {
 		t.Errorf("claude được gọi %d lần; want 0", len(claude.seen()))
 	}
@@ -884,6 +918,104 @@ func TestAppLLMRunnerRefusesAttachmentTurnWithNoClaudeEntry(t *testing.T) {
 		if blob := serialize(t, f.store.recorded()); strings.Contains(blob, canary) {
 			t.Errorf("telemetry chứa canary %q: %s", canary, blob)
 		}
+	}
+}
+
+// TestAttachmentTurnUsesFirstLocalCLINotHTTP là hành vi cốt lõi của §9: một lượt có tệp đi tới mắt
+// xích local_cli ĐẦU TIÊN đang bật (codex ở đây), KHÔNG tới Provider HTTP đứng trước nó trong chuỗi.
+// Đường dẫn/nội dung tệp của khách ĐƯỢC tới CLI cục bộ (nó đọc trên đĩa máy này) nhưng KHÔNG BAO GIỜ
+// tới một adapter HTTP — đó là ranh giới an toàn mà cả thiết kế bảo vệ.
+func TestAttachmentTurnUsesFirstLocalCLINotHTTP(t *testing.T) {
+	const canaryPath = `C:\Users\Admin\.agentdc\zalo-files\CANARY-FIRSTCLI-1a2b.pdf`
+	const canaryBytes = "CANARY-BYTES-firstcli-noi-dung-rieng-tu-cua-khach"
+	prompt := "Khách gửi tệp:\n  " + canaryPath + "\nNội dung đọc được: " + canaryBytes + "\nCâu hỏi: giá bao nhiêu?"
+
+	openai := okAdapter(`{"answer":"api"}`)
+	var codexSaw []string
+	codex := fakeCLI("codex", "codex-1", `{"answer":"codex"}`, &codexSaw)
+	claude := okClaude(`{"answer":"claude"}`)
+	f := newRouterFixture(newRoute(
+		entry("openai-1", "gpt-5-mini", true),
+		entry("codex-1", "gpt-5.4", true),
+	), claude).with("openai-1", "sk-one", openai).withCLI("codex-1", "sub-token", codex)
+
+	got, err := f.runner(appLLMRunnerConfig{HasAttachments: true}).Run(t.Context(), prompt, f.step)
+	if err != nil {
+		t.Fatalf("Run() lượt có tệp trên [openai, codex] = _, %v; want nil", err)
+	}
+	if got != `{"answer":"codex"}` {
+		t.Errorf("Run() = %q; want %q (local_cli đầu tiên phục vụ, không phải HTTP đứng trước)", got, `{"answer":"codex"}`)
+	}
+	// codex là CLI cục bộ — nó ĐƯỢC thấy tệp; đây là kiểm tra fixture thật sự mang canary tới đích,
+	// nếu không thì mọi khẳng định "vắng mặt" dưới đây đều rỗng nghĩa.
+	if len(codexSaw) != 1 || !strings.Contains(codexSaw[0], canaryPath) || !strings.Contains(codexSaw[0], canaryBytes) {
+		t.Errorf("codex nhận %q; want đúng 1 lượt chứa cả hai canary", codexSaw)
+	}
+	if len(openai.seen()) != 0 {
+		t.Errorf("openai-1 (HTTP) được gọi %d lần trong lượt có tệp; want 0", len(openai.seen()))
+	}
+	if len(claude.seen()) != 0 {
+		t.Errorf("claude được gọi %d lần; want 0 (đích là codex)", len(claude.seen()))
+	}
+	// Không adapter HTTP nào được gọi thì không khoá nào được mở: đúng như lượt claude — một lượt có
+	// tệp không đi qua đường HTTP nên không cần bản rõ nào.
+	if issued := f.creds.issued(); len(issued) != 0 {
+		t.Errorf("mở khoá %d lần trong lượt có tệp; want 0", len(issued))
+	}
+	// Ranh giới an toàn: canary không có đường vào đầu vào của adapter HTTP hay vào telemetry.
+	for _, canary := range []string{jsonForm(t, canaryPath), jsonForm(t, canaryBytes)} {
+		if blob := serialize(t, openai); strings.Contains(blob, canary) {
+			t.Errorf("đầu vào adapter HTTP chứa canary %q: %s", canary, blob)
+		}
+		if blob := serialize(t, f.store.recorded()); strings.Contains(blob, canary) {
+			t.Errorf("telemetry chứa canary %q: %s", canary, blob)
+		}
+	}
+	attempts := f.store.recorded()
+	if len(attempts) != 1 || attempts[0].ProviderID != "codex-1" || attempts[0].Outcome != store.LLMAttemptOK {
+		t.Fatalf("telemetry = %+v; want đúng một hàng codex-1/ok", attempts)
+	}
+}
+
+// TestAttachmentTurnPicksFirstEligibleLocalCLIInOrder chốt nghĩa của "đầu tiên": chuỗi
+// [openai, gemini-cli, codex] cho một lượt có tệp phải chạy mắt xích local_cli ĐẦU TIÊN theo thứ tự
+// chuỗi (gemini-cli), KHÔNG phải codex đứng sau — thứ tự quan trọng, không phải một local_cli bất kỳ.
+func TestAttachmentTurnPicksFirstEligibleLocalCLIInOrder(t *testing.T) {
+	const canaryPath = `C:\Users\Admin\.agentdc\zalo-files\CANARY-ORDER-7e8f.pdf`
+	prompt := "Khách gửi tệp:\n  " + canaryPath + "\nCâu hỏi: giá bao nhiêu?"
+
+	openai := okAdapter(`{"answer":"api"}`)
+	var geminiSaw, codexSaw []string
+	gemini := fakeCLI("gemini-cli", "gemini-cli-1", `{"answer":"gemini"}`, &geminiSaw)
+	codex := fakeCLI("codex", "codex-1", `{"answer":"codex"}`, &codexSaw)
+	claude := okClaude(`{"answer":"claude"}`)
+	f := newRouterFixture(newRoute(
+		entry("openai-1", "gpt-5-mini", true),
+		entry("gemini-cli-1", "gemini-2.5-flash", true),
+		entry("codex-1", "gpt-5.4", true),
+	), claude).with("openai-1", "sk-one", openai).
+		withCLI("gemini-cli-1", "sub-gemini", gemini).
+		withCLI("codex-1", "sub-codex", codex)
+
+	got, err := f.runner(appLLMRunnerConfig{HasAttachments: true}).Run(t.Context(), prompt, f.step)
+	if err != nil {
+		t.Fatalf("Run() = _, %v; want nil", err)
+	}
+	if got != `{"answer":"gemini"}` {
+		t.Errorf("Run() = %q; want %q (local_cli ĐẦU TIÊN, không phải codex sau nó)", got, `{"answer":"gemini"}`)
+	}
+	if len(geminiSaw) != 1 {
+		t.Errorf("gemini-cli nhận %d lượt; want 1 (nó là local_cli đầu tiên)", len(geminiSaw))
+	}
+	if len(codexSaw) != 0 {
+		t.Errorf("codex nhận %d lượt; want 0 (đứng sau gemini-cli nên không được gọi)", len(codexSaw))
+	}
+	if len(openai.seen()) != 0 {
+		t.Errorf("openai-1 (HTTP) được gọi %d lần; want 0", len(openai.seen()))
+	}
+	attempts := f.store.recorded()
+	if len(attempts) != 1 || attempts[0].ProviderID != "gemini-cli-1" || attempts[0].Outcome != store.LLMAttemptOK {
+		t.Fatalf("telemetry = %+v; want đúng một hàng gemini-cli-1/ok", attempts)
 	}
 }
 
