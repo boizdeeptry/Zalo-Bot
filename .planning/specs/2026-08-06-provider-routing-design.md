@@ -1,8 +1,11 @@
 # Thiết kế quản lý Provider và fallback nhẹ cho Portal Zalo
 
-**Ngày:** 2026-08-06  
-**Trạng thái:** Chờ người dùng duyệt spec  
-**Repository:** `D:\TuvanZalo\_build\.worktrees\portal-m1`  
+**Ngày:** 2026-08-06
+
+**Trạng thái:** Đã được người dùng xác nhận
+
+**Repository:** `D:\TuvanZalo\_build\.worktrees\portal-m1`
+
 **Nhánh:** `feature/portal-m1-foundation`
 
 ## 1. Bối cảnh
@@ -39,6 +42,7 @@ Portal hiện cấu hình một model cho Claude Code và cần mở rộng đ�
 - Thay đổi cấu hình có hiệu lực từ tin nhắn kế tiếp; lượt đang chạy tiếp tục dùng snapshot cũ.
 - MVP chỉ dùng endpoint chính thức của bốn API Provider, không cho nhập URL tùy ý.
 - Telemetry không lưu prompt, tin nhắn khách hoặc nội dung câu trả lời.
+- API Provider chỉ nhận prompt cùng các đoạn knowledge mà Go đã truy xuất và chèn sẵn. Tin nhắn có file hoặc ảnh đi thẳng đến Claude Code, không upload dữ liệu khách sang API Provider trong MVP.
 
 ## 5. Kiến trúc
 
@@ -133,13 +137,14 @@ Route hợp lệ phải có ít nhất một mục bật và kết thúc bằng 
 
 1. Bot nhận tin Zalo và dựng request nội bộ theo hành vi hiện tại.
 2. Router lấy một snapshot route bất biến.
-3. Với từng mục đang bật theo thứ tự:
+3. Nếu lượt có file hoặc ảnh, router chọn thẳng Claude Code với model được ghim trong route hệ thống; không gọi API Provider.
+4. Với lượt chỉ có text, router thử từng mục đang bật theo thứ tự:
    - Gọi adapter đúng Provider/model.
    - Thành công: trả kết quả ngay và ghi telemetry.
    - Timeout, lỗi mạng, `429`, `5xx`: ghi fallback event và thử mục tiếp theo.
    - Credential/model/request/content error: dừng route và trả lỗi cấu hình đã làm sạch.
-4. Nếu các API Provider đều lỗi tạm thời, Claude Code được thử cuối cùng.
-5. Nếu toàn bộ chuỗi thất bại, bot không gửi câu trả lời giả và Portal ghi nhận trạng thái không khả dụng.
+5. Nếu các API Provider đều lỗi tạm thời, Claude Code được thử cuối cùng.
+6. Nếu toàn bộ chuỗi thất bại, bot không gửi câu trả lời giả và Portal ghi nhận trạng thái không khả dụng.
 
 Timeout mặc định:
 
@@ -215,6 +220,7 @@ Thông báo Portal phải nêu Provider/model và hành động khắc phục nh
 
 - Unit test mapping request/response và error classification cho từng adapter.
 - Router test: thành công ngay, fallback đúng loại lỗi, dừng đúng loại lỗi, Claude Code cuối chuỗi, timeout tổng và cancellation.
+- Router test: một lượt có attachment bỏ qua mọi API Provider và dùng Claude Code, không serialize hoặc upload nội dung file.
 - Store test: transaction, revision conflict, delete guard và snapshot isolation.
 - DPAPI test trên Windows: round-trip, API không trả secret và credential không đọc được chuyển sang trạng thái nhập lại.
 - HTTP test cho CRUD, connection test, discovery, route validation và mutation header.
@@ -239,6 +245,7 @@ Thông báo Portal phải nêu Provider/model và hành động khắc phục nh
 - Người dùng cấu hình và sắp xếp được chuỗi fallback toàn cục.
 - Route mới có hiệu lực từ tin nhắn kế tiếp mà daemon không restart.
 - Router chỉ fallback trên timeout/network/`429`/`5xx`, dừng trên lỗi cấu hình hoặc policy.
+- Tin có file/ảnh chỉ dùng Claude Code; API Provider không nhận đường dẫn hoặc nội dung attachment.
 - Claude Code luôn tồn tại ở cuối chuỗi và giữ tương thích với cấu hình hiện tại.
 - Telemetry đủ để biết Provider/model, trạng thái và fallback nhưng không chứa nội dung khách.
 - Giao diện legacy và toàn bộ hành vi Knowledge, Agents, Models cũ đã thay đổi có chủ đích, `/zalo`, mobile rail và build package vẫn qua regression test.
