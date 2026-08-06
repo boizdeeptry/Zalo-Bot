@@ -7,7 +7,6 @@ last_updated: 2026-08-06
 
 ## Notes
 
-- Spec và plan được viết trên một máy khác (`D:\TuvanZalo\_build\.worktrees\portal-m1`).
-  Đường dẫn build trong plan đã được sửa về máy này: repo `C:\Users\Admin\Desktop\AgentDC`,
-  persona `F:\dist\TuvanZalo\brain\reference\persona`.
+- Spec và plan được viết trên một máy khác, nên lệnh kiểm chứng trỏ vào những đường dẫn không
+  tồn tại ở đây. Đã đổi sang `$env:ZALOBOT_REPO` và `$env:ZALOBOT_PERSONA`; xem `README.md`.
 - STATE.md này được tạo lúc `/execute` vì dự án chưa từng chạy `/new-project`.

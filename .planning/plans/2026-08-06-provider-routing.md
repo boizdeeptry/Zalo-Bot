@@ -104,7 +104,7 @@
   Run:
 
   ```powershell
-  pwsh -NoProfile -File .\build-app.ps1 -Repo 'C:\Users\Admin\Desktop\AgentDC' -PersonaSource 'F:\dist\TuvanZalo\brain\reference\persona' -Out (Join-Path $env:TEMP ('provider-store-red-' + [guid]::NewGuid().ToString('N')))
+  pwsh -NoProfile -File .\build-app.ps1 -Repo $env:ZALOBOT_REPO -PersonaSource $env:ZALOBOT_PERSONA -Out (Join-Path $env:TEMP ('provider-store-red-' + [guid]::NewGuid().ToString('N')))
   ```
 
   Expected: FAIL during `go test` because `LLMProvider`, `LLMRouteSnapshot`, and the new `Store` methods do not exist.
@@ -595,8 +595,8 @@
   npm --prefix appmode test
   Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
   $out = Join-Path $env:TEMP ('provider-final-' + [guid]::NewGuid().ToString('N'))
-  pwsh -NoProfile -File .\build-app.ps1 -Repo 'C:\Users\Admin\Desktop\AgentDC' -PersonaSource 'F:\dist\TuvanZalo\brain\reference\persona' -Out $out
-  git -C 'C:\Users\Admin\Desktop\AgentDC' status --short
+  pwsh -NoProfile -File .\build-app.ps1 -Repo $env:ZALOBOT_REPO -PersonaSource $env:ZALOBOT_PERSONA -Out $out
+  git -C $env:ZALOBOT_REPO status --short
   git status --short
   ```
 

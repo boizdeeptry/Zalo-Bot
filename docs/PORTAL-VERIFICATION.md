@@ -1,22 +1,23 @@
 # Portal Zalo — biên bản xác minh Milestone 1
 
 - Ngày xác minh: 2026-08-05
-- Nguồn AgentDC chỉ đọc: `C:\Users\manva\OneDrive\Máy tính\agentdc`
 - Commit nguồn AgentDC: `84612cc9f0c2491dbd10346269a41378e7633c9b`
 - Nhánh overlay: `feature/portal-m1-foundation`
-- Gói đã xác minh: `C:\Users\manva\AppData\Local\Temp\Kiểm thử Portal M1 final a013`
+
+Biên bản này ghi lại một lần chạy trên máy của người xác minh. Đường dẫn cụ thể của máy đó đã
+được bỏ vì chúng không tái lập được ở nơi khác; xem `README.md` để chuẩn bị máy của bạn.
 
 ## Lệnh checkpoint
 
-Chạy từ repository `_build`/worktree của nhánh overlay:
+Chạy từ gốc repo đóng gói, trên nhánh overlay:
 
 ```powershell
 pwsh -NoProfile -File .\tests\build-app.Tests.ps1
 
 pwsh -NoProfile -File .\build-app.ps1 `
-  -Repo 'C:\Users\manva\OneDrive\Máy tính\agentdc' `
-  -PersonaSource 'D:\TuvanZalo\brain\reference\persona' `
-  -Out 'C:\Users\manva\AppData\Local\Temp\Kiểm thử Portal M1 final a013'
+  -Repo $env:ZALOBOT_REPO `
+  -PersonaSource $env:ZALOBOT_PERSONA `
+  -Out (Join-Path $env:TEMP 'Kiem thu Portal M1')
 ```
 
 Lệnh build thứ hai tự chạy checkpoint trước khi tạo binary: bộ Go test với đúng bảy assertion asset cũ được bỏ qua, Portal test, Zalo compile/test/typecheck, build, cắt dependency phát triển và kiểm tra gói cuối.

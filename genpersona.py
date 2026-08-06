@@ -2,7 +2,7 @@
 #
 #   python genpersona.py <thu-muc-goi>
 #
-# Chi sua ban trong goi. F:\brain khong bi cham.
+# Chi sua ban trong goi. Nguon persona khong bi cham.
 #
 # Vi sao khong bo han persona: no LA thu duoc ban. Cach noi, do dai cau, khi nao tach thanh
 # nhieu tin, khi nao chuyen cho nguoi that -- 315 dong day la san pham. Phan rieng cua mot
