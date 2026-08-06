@@ -378,6 +378,9 @@ func TestLLMAdapterMapsStatusToKind(t *testing.T) {
 		{http.StatusNotFound, llmErrorModel},
 		{http.StatusBadRequest, llmErrorRequest},
 		{http.StatusUnprocessableEntity, llmErrorRequest},
+		// 2xx khác 200: không nằm trong hợp đồng của bốn API này, nên Provider đang trả về thứ
+		// ta không hiểu — coi như họ hỏng, và được thử Provider sau.
+		{http.StatusCreated, llmErrorUpstream},
 	}
 	for _, tc := range llmAdapterCases() {
 		for _, st := range statuses {
@@ -496,6 +499,31 @@ func TestLLMAdapterMapsDeadlineToTimeout(t *testing.T) {
 	}
 }
 
+// Huỷ ctx KHÔNG được fallback. Đây là loại lỗi duy nhất mà nguyên nhân nằm ở PHÍA TA: lượt đã
+// bị bỏ (tắt daemon, hết hạn mức lượt), nên gọi tiếp Provider sau chỉ là gọi bằng một ctx đã
+// chết — hỏng ngay, hỏng hết chuỗi, rồi báo một lỗi đổ tội cho các Provider.
+func TestLLMAdapterMapsCancellationToCanceled(t *testing.T) {
+	for _, tc := range llmAdapterCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLLMFakeServer(t, http.StatusOK, tc.generateOK)
+			a := tc.build(f.httpClient(), f.URL)
+
+			// Huỷ trước khi gọi: xác định hoàn toàn, không cần server phải treo.
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			_, err := a.Generate(ctx, llmRequest{Model: tc.model, Prompt: llmTestPrompt}, []byte(llmTestKey))
+			got := llmKindOf(t, err)
+			if got != llmErrorCanceled {
+				t.Fatalf("Generate(%s, ctx đã huỷ) kind = %q; want %q", tc.name, got, llmErrorCanceled)
+			}
+			if isFallbackEligible(got) {
+				t.Fatalf("isFallbackEligible(%q) = true; want false", got)
+			}
+		})
+	}
+}
+
 // Câu lỗi phải dựng từ status, method và URL — KHÔNG từ body. sanitizeProviderError là lưới cuối
 // chứ không phải cái cớ để chuyển tiếp nguyên body: một khoá không mang tiền tố nào lọt vào giữa
 // câu văn của Provider thì không mẫu nào bắt được.
@@ -566,6 +594,7 @@ func TestIsFallbackEligible(t *testing.T) {
 		{llmErrorModel, false},
 		{llmErrorRequest, false},
 		{llmErrorPolicy, false},
+		{llmErrorCanceled, false},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.kind), func(t *testing.T) {

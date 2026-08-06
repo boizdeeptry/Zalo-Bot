@@ -109,8 +109,11 @@ func (h llmHTTP) do(op string, req *http.Request) ([]byte, error) {
 // hình dạng credential đã biết, nên một khoá không mang tiền tố nào mà Provider chép vào câu văn
 // của họ sẽ đi thẳng ra log. Không đọc body vào thông báo thì không có gì để rò.
 func statusError(op string, req *http.Request, status int) *llmError {
-	// Bỏ query khỏi URL: hiện tại không adapter nào để khoá ở đó, và đây là thứ giữ cho câu nói
-	// trên vẫn đúng nếu mai có người thêm một adapter dùng ?key=.
+	// Bỏ query khỏi URL. Đây là bảo đảm của RIÊNG hàm này, không phải của cả tệp: transportError
+	// nhúng err.Error() của net/http, mà chuỗi đó mang nguyên URL kèm query — nhánh ấy chỉ được
+	// mẫu "key=" trong sanitizeProviderError đỡ, tức là cố gắng tối đa chứ không phải bảo đảm.
+	// Hôm nay không adapter nào để khoá vào URL (Gemini đi bằng header), nên khoảng cách này
+	// chưa phải lỗ hổng — nhưng một adapter ?key= trong tương lai sẽ CHỈ an toàn ở đây.
 	safe := *req.URL
 	safe.RawQuery, safe.Fragment = "", ""
 	return newLLMError(classifyStatus(status), nil, "%s: %s %s trả %d", op, req.Method, safe.String(), status)
@@ -318,11 +321,12 @@ func (a *openAIAdapter) Generate(ctx context.Context, req llmRequest, credential
 }
 
 func (a *openAIAdapter) Test(ctx context.Context, model string, credential []byte) error {
+	const op = "openai test"
 	models, err := a.Discover(ctx, credential)
 	if err != nil {
 		return err
 	}
-	return assertModelListed("openai test", model, models)
+	return assertModelListed(op, model, models)
 }
 
 func (a *openAIAdapter) Discover(ctx context.Context, credential []byte) ([]store.LLMModel, error) {
@@ -401,11 +405,12 @@ func (a *anthropicAdapter) Generate(ctx context.Context, req llmRequest, credent
 }
 
 func (a *anthropicAdapter) Test(ctx context.Context, model string, credential []byte) error {
+	const op = "anthropic test"
 	models, err := a.Discover(ctx, credential)
 	if err != nil {
 		return err
 	}
-	return assertModelListed("anthropic test", model, models)
+	return assertModelListed(op, model, models)
 }
 
 func (a *anthropicAdapter) Discover(ctx context.Context, credential []byte) ([]store.LLMModel, error) {
@@ -513,11 +518,12 @@ func (a *geminiAdapter) Generate(ctx context.Context, req llmRequest, credential
 }
 
 func (a *geminiAdapter) Test(ctx context.Context, model string, credential []byte) error {
+	const op = "gemini test"
 	models, err := a.Discover(ctx, credential)
 	if err != nil {
 		return err
 	}
-	return assertModelListed("gemini test", model, models)
+	return assertModelListed(op, model, models)
 }
 
 func (a *geminiAdapter) Discover(ctx context.Context, credential []byte) ([]store.LLMModel, error) {
@@ -600,11 +606,12 @@ func (a *openRouterAdapter) Generate(ctx context.Context, req llmRequest, creden
 }
 
 func (a *openRouterAdapter) Test(ctx context.Context, model string, credential []byte) error {
+	const op = "openrouter test"
 	models, err := a.Discover(ctx, credential)
 	if err != nil {
 		return err
 	}
-	return assertModelListed("openrouter test", model, models)
+	return assertModelListed(op, model, models)
 }
 
 func (a *openRouterAdapter) Discover(ctx context.Context, credential []byte) ([]store.LLMModel, error) {

@@ -41,6 +41,13 @@ const (
 	llmErrorModel      llmErrorKind = "model"
 	llmErrorRequest    llmErrorKind = "request"
 	llmErrorPolicy     llmErrorKind = "policy"
+	// llmErrorCanceled là loại thứ CHÍN, ngoài tám loại spec liệt kê.
+	//
+	// Thêm vào vì taxonomy cũ không có ngăn nào cho việc huỷ, và xếp nó vào "network" là sai
+	// theo đúng định nghĩa ngay dưới đây: ctx chết rồi thì gửi cùng request đi đâu cũng chết.
+	// Không có ngăn riêng thì một lượt bị huỷ (tắt daemon, hết hạn mức lượt) sẽ đi hết phần
+	// còn lại của chuỗi rồi kết thúc bằng một lỗi đổ tội cho các Provider.
+	llmErrorCanceled llmErrorKind = "canceled"
 )
 
 // isFallbackEligible nói một lỗi có đáng thử Provider kế tiếp hay không.
@@ -96,6 +103,12 @@ func newLLMError(kind llmErrorKind, cause error, format string, args ...any) *ll
 // Xét cả net.Error.Timeout() chứ không chỉ context.DeadlineExceeded vì hai nguồn hết giờ khác
 // nhau — deadline của ctx và http.Client.Timeout — và chúng không cùng một lỗi gốc.
 func transportError(op string, err error) *llmError {
+	// Huỷ xét TRƯỚC, vì context.Canceled không phải DeadlineExceeded và cũng không phải net.Error
+	// có Timeout() — nó sẽ rơi thẳng vào "network", loại ĐƯỢC fallback. Khi đó một lượt bị huỷ
+	// đi hết chuỗi, gọi từng Provider còn lại bằng một ctx đã chết, rồi báo lỗi như thể họ hỏng.
+	if errors.Is(err, context.Canceled) {
+		return newLLMError(llmErrorCanceled, err, "%s: lượt gọi bị huỷ", op)
+	}
 	kind := llmErrorNetwork
 	var ne net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
