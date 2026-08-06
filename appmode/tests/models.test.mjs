@@ -536,6 +536,28 @@ test("a status poll failure survives an unrelated edit to the chain", async (t) 
   assert.match(text(find(main, (node) => hasClass(node, "chainstatus"))), /không đọc được trạng thái/);
 });
 
+// Mặt còn lại của statusError: giữ câu lỗi qua mọi lượt sửa bản nháp mà không xoá nó khi lượt đọc
+// đã lành lại thì tệ hơn cái nó thay thế — một lượt hỏng duy nhất sẽ ghim câu lỗi tới hết đời
+// trang, đè lên mọi lượt đọc thành công về sau.
+test("a status poll that recovers clears the error it left behind", async (t) => {
+  let broken = true;
+  const backing = routeAPI();
+  const { main, tick } = await mounted(t, (path, options = {}) => {
+    if (path === "/llm/status" && broken) throw new Error("không đọc được trạng thái");
+    return backing(path, options);
+  });
+  assert.match(text(find(main, (node) => hasClass(node, "chainstatus"))), /không đọc được trạng thái/);
+
+  broken = false;
+  await tick();
+
+  assert.equal(
+    text(find(main, (node) => hasClass(node, "chainstatus"))),
+    "",
+    "a recovered poll must take its old error off the screen",
+  );
+});
+
 test("a chain with nothing enabled is refused before it reaches the API", async (t) => {
   const { calls, main } = await mounted(t, routeAPI({ route: { revision: 0, entries: [] } }));
   button(main, "Lưu").click();
