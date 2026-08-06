@@ -91,8 +91,11 @@ Cài đặt `providerAdapter{Generate, Test, Discover}` bằng spawn tiến trì
 - `Discover` — trả danh sách model tĩnh theo hãng. CLI không liệt kê model như API.
 
 Router không đổi. Nó vốn chỉ biết `providerAdapter`; timeout, huỷ, fallback, telemetry dùng lại
-nguyên vẹn. Context cancellation ánh xạ sang kill cây tiến trình — mẫu này đã có sẵn trong
-`stopZaloTransport`.
+nguyên vẹn. Context cancellation phải kill **cả cây tiến trình**, không chỉ tiến trình con trực
+tiếp: một lượt spawn `node → npm → cli` mà chỉ giết `node` sẽ để lại mồ côi — đúng bug Task 5 vừa
+sửa. Dùng lại `killPidTree`/`runTaskkillTree` (`taskkill /T`) đã có trong `internal/daemon/headless.go`,
+chính primitive đang giết cây con `node/rg/git` của Claude. Plan phải có test spawn một cây nhiều
+tầng thật rồi khẳng định không còn tiến trình mồ côi.
 
 ### 5.2 Claude Code nhập vào cùng họ
 
@@ -132,8 +135,11 @@ Thiết kế hiện tại **bắt buộc** Claude Code là mắt xích cuối đ
 lưu chuỗi nào khác. Điều đó mâu thuẫn với "máy mới chưa nối Provider nào".
 
 Quyết định: **chuỗi được phép rỗng**, và ràng buộc đổi từ "phải kết thúc bằng Claude Code" thành
-"mắt xích cuối phải đang bật". Portal chặn ở màn hình onboarding: chưa nối Provider nào thì hiện
-"Chọn một Provider để bắt đầu", và bot trả lời rõ là chưa sẵn sàng thay vì im lặng đánh rơi tin.
+"mắt xích cuối phải đang bật". Khi chuỗi rỗng, ràng buộc "mắt xích cuối phải đang bật" là vô nghĩa
+(không có mắt xích nào) — và rỗng-mà-hợp-lệ chính là trạng thái mà màn hình onboarding (§10) và
+đường "bot báo chưa sẵn sàng" (§11) tồn tại để phủ. Portal chặn ở onboarding: chưa nối Provider nào
+thì hiện "Chọn một Provider để bắt đầu", và bot trả lời rõ là chưa sẵn sàng thay vì im lặng đánh
+rơi tin.
 
 Đây là thay đổi có sức lan rộng nhất trong spec này. Nó chạm `validateLLMRoute`, `BootstrapClaudeRoute`,
 bất biến khoá control trong `models.js`, và cả những test đã ghim hành vi cũ.
@@ -233,8 +239,14 @@ học nhất từ 9Router, tách khỏi phần giả-app mà mình không lấy.
 
 ## 14. Câu hỏi còn mở, plan phải đóng trước khi khoá định dạng
 
-- Chi phí khởi động thật của mỗi CLI chưa đo. Nếu vượt ngân sách 25 giây mỗi Provider thì §5.1 phải
-  xét lại.
+Bốn câu dưới chỉ chỉnh một hằng số trong descriptor hoặc logic parse — kiến trúc không đổi theo câu
+trả lời. **Câu đầu thì khác về bản chất và phải đo TRƯỚC:** nếu chi phí khởi động một CLI vượt ngân
+sách 25 giây mỗi Provider, cả kiến trúc "spawn mỗi lượt" ở §5.1 sụp, và phải chuyển sang tiến trình
+thường trú. Đo nó ngay bước đầu của plan để bất ngờ kiến trúc lộ ra trước khi mọi thứ khác dựng lên
+trên nó.
+
+- **Chi phí khởi động thật của mỗi CLI — đo đầu tiên.** Nếu vượt 25 giây thì §5.1 phải xét lại
+  trước khi làm tiếp.
 - `codex exec --json` trả JSONL sự kiện; cần xác định sự kiện nào mang câu trả lời cuối. Chưa chạy
   vì chưa đăng nhập.
 - Gemini ghi credential ra file nào khi đăng nhập — chỉ biết được sau lần đăng nhập đầu.
