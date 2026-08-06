@@ -32,9 +32,11 @@ export function createProviderService(request = requestJSON) {
       body: { credential },
     }),
     clearCredential: (id) => request(providerPath(id, "/credential"), { method: "DELETE" }),
-    testDraft: ({ kind, credential, model = "" }) => request("/llm/providers/test", {
+    // model rỗng: adapter bỏ qua phép đối chiếu model khi chuỗi trống, nên lượt kiểm chỉ xác thực
+    // khoá — đúng thứ form hỏi. Trường vẫn phải có mặt vì /llm từ chối thân thiếu lẫn thừa.
+    testDraft: ({ kind, credential }) => request("/llm/providers/test", {
       method: "POST",
-      body: { kind, credential, model },
+      body: { kind, credential, model: "" },
     }),
     testSaved: (id) => request(providerPath(id, "/test"), { method: "POST" }),
     discover: (id) => request(providerPath(id, "/discover"), { method: "POST" }),
@@ -366,7 +368,11 @@ function providerSheet({ service, provider, kinds, editorId, onClose, onSaved })
     ),
   );
 
-  return { form, headingId, descriptionId };
+  // initialFocus nói rõ ô nào nhận focus, thay vì để "phần tử focus được đầu tiên" quyết định:
+  // trên sheet Claude Code phần tử đó là nút Xoá của một hàng model, tức là mở hộp thoại ra đã
+  // đứng sẵn trên một nút phá.
+  const initialFocus = creating ? kindSelect : (system ? modelInput : nameInput);
+  return { form, headingId, descriptionId, initialFocus };
 }
 
 export function createProvidersPage({ request = requestJSON } = {}) {
@@ -395,6 +401,16 @@ export function createProvidersPage({ request = requestJSON } = {}) {
         dismissSheet();
         const back = element("div", { className: "sheetback provider-sheet" });
         let closed = false;
+        // Mọi lượt ghi từ trong sheet đều làm hàng phía sau nói sai: thêm/xoá model, khám phá,
+        // thay/xoá khoá — và cả một lượt Kiểm tra kết nối, vì máy chủ ghi lại kết quả kiểm dù
+        // đạt hay hỏng. Đánh dấu ở TẦNG request chứ không trong từng handler: đó là chỗ duy nhất
+        // không thể quên khi thêm nút mới, và thừa một lượt tải lại thì vô hại, còn thiếu thì
+        // người dùng nhìn thấy số cũ và tưởng thao tác vừa rồi không lưu.
+        let dirty = false;
+        const sheetService = createProviderService((path, options = {}) => {
+          if (options.method && options.method !== "GET") dirty = true;
+          return request(path, { ...options, signal: controller.signal });
+        });
         const onKey = (event) => { if (event.key === "Escape") close(); };
         const dismiss = (restoreFocus) => {
           if (closed) return;
@@ -404,7 +420,16 @@ export function createProvidersPage({ request = requestJSON } = {}) {
           if (dismissSheet === disposeSheet) dismissSheet = () => {};
           if (restoreFocus) opener?.focus();
         };
-        const close = () => dismiss(true);
+        const close = () => {
+          // refresh() dựng lại .facts nên nút vừa mở sheet không còn tồn tại; trả focus về một
+          // node đã tháo còn tệ hơn là không trả. Đường lưu bên dưới cũng chọn đúng đánh đổi này.
+          if (dirty) {
+            dismiss(false);
+            void refresh();
+            return;
+          }
+          dismiss(true);
+        };
         const disposeSheet = () => dismiss(false);
         dismissSheet = disposeSheet;
         document.addEventListener?.("keydown", onKey);
@@ -424,7 +449,7 @@ export function createProvidersPage({ request = requestJSON } = {}) {
         });
 
         const sheet = providerSheet({
-          service,
+          service: sheetService,
           provider,
           kinds,
           editorId: `${++sheetSerial}`,
@@ -444,7 +469,7 @@ export function createProvidersPage({ request = requestJSON } = {}) {
           },
         }, sheet.form));
         document.body.append(back);
-        queueMicrotask(() => focusableNodes(back)[0]?.focus());
+        queueMicrotask(() => sheet.initialFocus?.focus());
       };
 
       const toolbar = () => element("div", { className: "row" },

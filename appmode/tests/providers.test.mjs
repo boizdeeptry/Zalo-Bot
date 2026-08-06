@@ -142,7 +142,7 @@ test("provider service issues the documented paths and methods", async () => {
   await service.remove("openai-1");
   await service.replaceCredential("openai-1", "sk-test");
   await service.clearCredential("openai-1");
-  await service.testDraft({ kind: "openai", credential: "sk-test", model: "" });
+  await service.testDraft({ kind: "openai", credential: "sk-test" });
   await service.testSaved("openai-1");
   await service.discover("openai-1");
   await service.addModel("openai-1", "gpt-5");
@@ -351,6 +351,8 @@ test("replacing the credential is its own action carrying only the typed key", a
     path: "/llm/providers/openai/credential",
     options: { method: "PUT", body: { credential: "sk-rotated" } },
   });
+  // Bản rõ vừa gõ không được ở lại trong DOM sau khi đã gửi đi.
+  assert.equal(keyInput(sheet).value, "");
 });
 
 test("replacing the credential refuses an empty field instead of calling the API", async (t) => {
@@ -382,6 +384,7 @@ test("clearing the credential is a separate explicit action", async (t) => {
     path: "/llm/providers/openai/credential",
     options: { method: "DELETE" },
   });
+  assert.equal(keyInput(sheet).value, "");
 });
 
 test("testing an unsaved provider posts the typed key to the draft endpoint", async (t) => {
@@ -534,7 +537,7 @@ test("deleting a provider closes the sheet and reloads the list", async (t) => {
   assert.equal(listLoads, 2);
 });
 
-test("a refused delete is announced through the page live region", async (t) => {
+test("a refused delete is announced through the sheet live region", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) {
       return { providers: [provider()], kinds: KINDS };
@@ -600,15 +603,103 @@ test("Tab wraps inside the sheet instead of escaping it", async (t) => {
   assert.equal(document.activeElement, save);
 });
 
-test("closing the sheet with the footer button restores focus to its trigger", async (t) => {
-  const { main } = mountPage(t, listOnly());
+test("closing an unchanged sheet restores focus and leaves the list alone", async (t) => {
+  let listLoads = 0;
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) {
+      listLoads++;
+      return { providers: [provider()], kinds: KINDS };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  });
   await flush();
   const trigger = button(rowFor(main, "OpenAI chính"), "Sửa");
   const sheet = await openSheet(main, "OpenAI chính");
   button(sheet, "Đóng").click();
+  await flush();
 
   assert.equal(find(document.body, (node) => hasClass(node, "provider-sheet")), null);
   assert.equal(document.activeElement, trigger);
+  assert.equal(listLoads, 1);
+});
+
+test("closing a sheet after a model change reloads the row behind it", async (t) => {
+  let listLoads = 0;
+  const stored = [{ model_id: "gpt-5", name: "GPT-5", source: "discovered", available: true }];
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) {
+      listLoads++;
+      return { providers: [provider({ models: [...stored] })], kinds: KINDS };
+    }
+    if (path === "/llm/providers/openai/models" && options.method === "POST") {
+      stored.push({ model_id: "o5", name: "o5", source: "manual", available: true });
+      return { models: [...stored] };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  assert.match(text(rowFor(main, "OpenAI chính")), /1 model/);
+
+  const sheet = await openSheet(main, "OpenAI chính");
+  find(sheet, (node) => hasClass(node, "madd")).value = "o5";
+  button(sheet, "Thêm model").click();
+  await flush();
+  button(sheet, "Đóng").click();
+  await flush();
+
+  assert.equal(listLoads, 2);
+  assert.match(text(rowFor(main, "OpenAI chính")), /2 model/);
+});
+
+// Kiểm tra kết nối KHÔNG đọc gì thêm nhưng máy chủ vẫn ghi lại kết quả kiểm, nên hàng phía sau
+// cũng cũ theo — đây là chỗ dễ sót nhất nếu đánh dấu theo từng nút thay vì theo lượt ghi.
+test("closing a sheet after a connection test reloads the stale check status", async (t) => {
+  let listLoads = 0;
+  let status = "";
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) {
+      listLoads++;
+      return { providers: [provider({ last_check_status: status })], kinds: KINDS };
+    }
+    if (path === "/llm/providers/openai/test" && options.method === "POST") {
+      status = "ok";
+      return { ok: true };
+    }
+    if (path === "/llm/providers/openai/discover" && options.method === "POST") {
+      return { models: [] };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  assert.match(text(rowFor(main, "OpenAI chính")), /chưa kiểm tra lần nào/);
+
+  const sheet = await openSheet(main, "OpenAI chính");
+  button(sheet, "Kiểm tra kết nối").click();
+  await flush();
+  button(sheet, "Đóng").click();
+  await flush();
+
+  assert.equal(listLoads, 2);
+  assert.match(text(rowFor(main, "OpenAI chính")), /đã kiểm, chạy tốt/);
+});
+
+test("the edit sheet opens with focus on the name field", async (t) => {
+  const { main } = mountPage(t, listOnly());
+  await flush();
+  const sheet = await openSheet(main, "OpenAI chính");
+
+  assert.equal(document.activeElement, find(sheet, (node) => node.getAttribute?.("type") === "text"));
+});
+
+// Phần tử focus được đầu tiên trên sheet này là nút Xoá của một hàng model; mở hộp thoại ra mà
+// con trỏ đã nằm sẵn trên một nút phá là điều không được xảy ra.
+test("the Claude Code sheet opens on the model input, not on a delete button", async (t) => {
+  const { main } = mountPage(t, listOnly());
+  await flush();
+  const sheet = await openSheet(main, "Claude Code");
+
+  assert.equal(document.activeElement, find(sheet, (node) => hasClass(node, "madd")));
+  assert.notEqual(text(document.activeElement), "Xoá");
 });
 
 test("dispose removes an open sheet and its Escape listener", async (t) => {
@@ -672,6 +763,29 @@ test("a provider list resolving after a newer load never replaces it", async (t)
     findAll(main, (node) => hasClass(node, "fkk")).map(text),
     ["Bản mới"],
   );
+});
+
+test("a failed provider list resolving after a newer one never replaces it", async (t) => {
+  const dom = installDOM();
+  installKeyDispatcher(document);
+  t.after(dom.restore);
+  const pending = [];
+  const page = createProvidersPage({
+    request: () => new Promise((_resolve, reject) => { pending.push(reject); }),
+  });
+  const main = document.createElement("main");
+  const mounted = page.mount(main);
+  t.after(mounted.dispose);
+  await flush();
+  button(main, "Tải lại").click();
+  await flush();
+
+  pending[1](new Error("hỏng lần mới"));
+  await flush();
+  pending[0](new Error("hỏng lần cũ"));
+  await flush();
+
+  assert.match(text(find(main, (node) => hasClass(node, "banner"))), /hỏng lần mới/);
 });
 
 test("a failed provider list renders the shared error panel", async (t) => {
