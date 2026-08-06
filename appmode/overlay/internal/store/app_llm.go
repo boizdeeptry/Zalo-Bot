@@ -22,9 +22,6 @@ var ErrLLMRouteConflict = errors.New("llm route revision conflict")
 // và lượt trả lời tiếp theo chết giữa chừng.
 var ErrLLMProviderInUse = errors.New("llm provider is referenced by the route")
 
-// systemProviderID là Provider được bảo vệ, luôn đứng cuối chuỗi fallback.
-const systemProviderID = "claude-code"
-
 // Nguồn của một model: do khám phá từ API Provider, hay do người dùng tự nhập.
 const (
 	LLMModelDiscovered = "discovered"

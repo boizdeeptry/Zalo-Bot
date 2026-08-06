@@ -26,6 +26,12 @@ const (
 	defaultLLMChainTimeout    = 60 * time.Second
 )
 
+// claudeCodeProviderID định danh mắt xích Claude Code — mắt xích DUY NHẤT router chạy qua runClaude
+// (ngân sách lượt dài) thay vì qua một adapter với ngân sách 25s. Là hằng của một id Provider cố
+// định (hàng seeded bởi migration), không phải kind. Task 11 gộp Claude Code thành một adapter
+// local_cli bình thường và gỡ nhánh đặc biệt này.
+const claudeCodeProviderID = "claude-code"
+
 // llmRouteStore là phần store mà router dùng, và không hơn.
 //
 // Khai ở phía NGƯỜI DÙNG chứ không phải phía store: router chỉ đọc chuỗi và ghi telemetry, nên
@@ -108,21 +114,39 @@ func (r *appLLMRunner) Run(ctx context.Context, prompt string, step func(string)
 	if len(entries) == 0 {
 		return "", errors.New("llm route: chuỗi fallback rỗng, không có gì để gọi")
 	}
-	// Mắt xích cuối LUÔN là Claude Code đang bật (validateLLMRoute giữ điều đó), nên phần API
-	// là mọi mục còn lại. Tách trước nhánh dưới đây để cửa chặn lượt có tệp là ĐÚNG MỘT câu
-	// return đứng trước vòng lặp, thay vì một câu if phải nhớ lặp lại trong thân vòng lặp.
-	claude, apiEntries := entries[len(entries)-1], entries[:len(entries)-1]
+	// Lượt có tệp chỉ đi tới Claude Code, nơi tệp nằm im trên đĩa máy này. Tìm mắt xích claude-code
+	// ở BẤT KỲ vị trí nào; không có thì lượt này không phục vụ được — KHÔNG để đường dẫn/nội dung
+	// tệp của khách chạm một adapter HTTP. (§9 nới ra "local_cli đầu tiên", KHÔNG làm ở task này.)
 	if r.cfg.HasAttachments {
+		claude, ok := findClaudeEntry(entries)
+		if !ok {
+			return "", newLLMError(llmErrorRequest, nil,
+				"llm route: lượt có tệp nhưng chuỗi không có mắt xích Claude Code")
+		}
 		return r.runClaude(ctx, claude, prompt, step)
 	}
 
 	apiCtx, cancel := context.WithTimeout(ctx, r.cfg.APIChainTimeout)
 	defer cancel()
-	for i, e := range apiEntries {
+	// Không tách mắt xích cuối: chuỗi này position-agnostic. Claude Code là mắt xích ĐẦU CUỐI ở
+	// bất kỳ vị trí nào; mọi mắt xích khác đi qua adapter với ngân sách 25s dưới apiCtx.
+	for i, e := range entries {
 		// Hai cửa tắt, không một: mắt xích tắt là lựa chọn của người dựng chuỗi, còn Provider tắt
 		// là lệnh ngắt của người trực. Cái sau tới SAU lúc lưu chuỗi nên nó phải được xét ở đây,
 		// tại lượt gọi, chứ không ở chỗ hợp lệ hoá.
 		if !e.Enabled || r.cfg.Disabled[e.ProviderID] {
+			continue
+		}
+		// Claude Code là mắt xích ĐẦU CUỐI: chạy dưới ctx CHA (ngân sách lượt dài — một lượt Claude
+		// Code đo được 42–114s — không phải 25s của một API treo) và mang step gốc, rồi trả kết quả.
+		// Mắt xích sau nó trong lượt này KHÔNG chạy; Task 11 cho Claude Code fallthrough như mọi cái.
+		if e.ProviderID == claudeCodeProviderID {
+			return r.runClaude(ctx, e, prompt, step)
+		}
+		// Ngân sách chuỗi API đã cạn: mọi mắt xích API còn lại chạy bằng một apiCtx đã chết chỉ sinh
+		// thêm một hàng telemetry đổ tội cho Provider sau. Bỏ qua chúng — vòng lặp đi tiếp để tới
+		// mắt xích claude-code, thứ DUY NHẤT còn chạy được (nó dùng ctx cha, không dùng apiCtx).
+		if apiCtx.Err() != nil {
 			continue
 		}
 		// Hai lỗi TRƯỚC lượt gọi, và cả hai đều dừng chuỗi mà không sinh telemetry: sổ vận hành
@@ -163,15 +187,36 @@ func (r *appLLMRunner) Run(ctx context.Context, prompt string, step func(string)
 			r.record(llmErrorAttempt(e, started, elapsed, kind, ""))
 			return "", err
 		}
-		// Ngân sách cả chuỗi cạn thì phần API dừng tại đây và lượt đi thẳng tới Claude Code:
-		// gọi tiếp bằng một ctx đã chết chỉ sinh thêm hàng telemetry đổ tội cho Provider sau.
+		// Nơi lượt THỰC SỰ đi tiếp, không phải mắt xích kế trên giấy: nếu ngân sách chuỗi API vừa
+		// cạn thì mọi mắt xích API còn lại bị bỏ qua, nên đích thật là mắt xích claude-code kế —
+		// nó chạy dưới ctx cha. Ghi đúng nơi đã đi để fell_back và next_provider_id không nói dối.
+		next := r.nextProvider(entries, i+1)
 		if apiCtx.Err() != nil {
-			r.record(llmErrorAttempt(e, started, elapsed, kind, claude.ProviderID))
-			break
+			next = ""
+			if claude, ok := findClaudeEntry(entries[i+1:]); ok {
+				next = claude.ProviderID
+			}
 		}
-		r.record(llmErrorAttempt(e, started, elapsed, kind, r.nextProvider(entries, i+1)))
+		r.record(llmErrorAttempt(e, started, elapsed, kind, next))
 	}
-	return r.runClaude(ctx, claude, prompt, step)
+	// Vòng lặp hết mà không mắt xích nào phục vụ (mọi mắt xích API hỏng, không tới được claude-code):
+	// "không khả dụng", KHÔNG im lặng trả rỗng — cả chuỗi đã cạn và không có câu trả lời để gửi.
+	return "", newLLMError(llmErrorUpstream, nil,
+		"llm route: cạn chuỗi fallback, không mắt xích nào trả lời được")
+}
+
+// findClaudeEntry tìm mắt xích Claude Code ĐANG BẬT trong chuỗi, ở bất kỳ vị trí nào.
+//
+// Là hàm riêng vì hai chỗ cần nó: cửa chặn lượt có tệp (phải đi Claude Code) và telemetry lúc
+// ngân sách chuỗi API cạn (đích thật là mắt xích claude-code kế). Chỉ xét Enabled — Claude Code
+// không bao giờ nằm trong Disabled (tập đó chỉ chứa Provider gọi được qua HTTP, xem appLLMAdapters).
+func findClaudeEntry(entries []store.LLMRouteEntry) (store.LLMRouteEntry, bool) {
+	for _, e := range entries {
+		if e.Enabled && e.ProviderID == claudeCodeProviderID {
+			return e, true
+		}
+	}
+	return store.LLMRouteEntry{}, false
 }
 
 // generate giữ bản rõ sống đúng bằng một lượt gọi.
@@ -287,7 +332,11 @@ func (r *appLLMRunner) nextProvider(entries []store.LLMRouteEntry, from int) str
 //
 // Kind lạ trả về false chứ không một adapter mặc định: đoán bừa giao thức nghĩa là gửi khoá thật
 // tới một máy chủ theo hình dạng request của nhà cung cấp khác.
-func newLLMAdapter(kind, providerID string, client *http.Client) (providerAdapter, bool) {
+//
+// logger chỉ đi tới adapter CLI (nó spawn tiến trình cần log); bốn adapter HTTP bỏ qua nó. KIND
+// "claude-code" CỐ Ý vắng: Claude Code vẫn chạy qua runClaude trong task này (Task 11 gộp nó vào
+// đây), nên một Provider claude-code không có adapter, và router nhận ra nó bằng ProviderID.
+func newLLMAdapter(kind, providerID string, client *http.Client, logger *slog.Logger) (providerAdapter, bool) {
 	switch kind {
 	case "openai":
 		return newOpenAIAdapter(providerID, client), true
@@ -297,6 +346,8 @@ func newLLMAdapter(kind, providerID string, client *http.Client) (providerAdapte
 		return newGeminiAdapter(providerID, client), true
 	case "openrouter":
 		return newOpenRouterAdapter(providerID, client), true
+	case "codex", "gemini-cli":
+		return newCLIAdapter(cliDescriptors[kind], providerID, logger), true
 	}
 	return nil, false
 }
@@ -417,7 +468,7 @@ func (a *api) appLLMAdapters() (map[string]providerAdapter, map[string]bool, err
 	adapters := make(map[string]providerAdapter, len(providers))
 	disabled := map[string]bool{}
 	for _, p := range providers {
-		adapter, ok := newLLMAdapter(p.Kind, p.ID, client)
+		adapter, ok := newLLMAdapter(p.Kind, p.ID, client, a.logger)
 		if !ok {
 			continue
 		}

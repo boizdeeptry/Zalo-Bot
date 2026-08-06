@@ -4,11 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"agentdc/internal/store"
 )
 
 // cliDescriptor là DỮ LIỆU cho một vendor CLI, không phải code. Adapter thân duy nhất đọc nó.
@@ -27,7 +32,7 @@ type cliDescriptor struct {
 	bannedArgs     []string   // cờ bỏ sandbox — test chặn adapter dựng chúng
 	authMethod     string     // "claude-json" | "codex-exit" | "gemini-file"
 	modelSeeds     []cliModel // Discover tĩnh
-	claudeBudget   bool       // true = dùng ctx gốc, không đặt dưới 25s (chỉ claude-code)
+	claudeBudget   bool       // Task 11 đọc khi claude-code chạy qua cliAdapter; hiện Run ép ngân sách dài theo providerID. true = dùng ctx gốc, không đặt dưới 25s (chỉ claude-code)
 }
 
 type cliModel struct{ id, name string }
@@ -159,6 +164,9 @@ func checkCLIAuth(ctx context.Context, d cliDescriptor, credPath string, logger 
 //     /khoá file hay file 0 byte — nếu không sẽ loop người dùng login vô ích
 //   - có file, khác rỗng                  → loggedIn
 func probeGeminiAuth(credPath string) authState {
+	if credPath == "" {
+		return authUnknown // không dựng được đường dẫn (home-dir lỗi) → không kết luận chưa-đăng-nhập
+	}
 	info, err := os.Stat(credPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -263,4 +271,161 @@ func runCLIProcess(ctx context.Context, cmd *exec.Cmd, stdin []byte, childPID ch
 		}
 		return out.Bytes(), nil
 	}
+}
+
+// --- adapter: một cliAdapter cho MỌI vendor CLI, dữ liệu ở descriptor ---
+
+var _ providerAdapter = (*cliAdapter)(nil)
+
+// cliAdapter chạy một vendor CLI như một Provider của router. Song song bốn adapter HTTP, nhưng
+// vận chuyển là một tiến trình cục bộ chứ không phải một request.
+type cliAdapter struct {
+	d          cliDescriptor
+	providerID string
+	logger     *slog.Logger
+	// run cho phép test tiêm một runner giả thay cho spawn thật — router test và adapter test không
+	// được spawn CLI. Mặc định (nil) = spawn thật qua runCLIProcess.
+	run func(ctx context.Context, argv []string, stdin []byte) ([]byte, error)
+}
+
+func newCLIAdapter(d cliDescriptor, providerID string, logger *slog.Logger) *cliAdapter {
+	return &cliAdapter{d: d, providerID: providerID, logger: logger}
+}
+
+// Generate dựng argv từ descriptor, chạy CLI, rồi parse câu trả lời.
+//
+// Tin nhắn khách (input KHÔNG tin được) chỉ đi vào req.Prompt, và buildCLIArgv đã canh nó không
+// thành một cờ bỏ sandbox — xem app_llm_cli.go. Lỗi trả về KHÔNG BAO GIỜ mang thân stderr: nó
+// dựng từ tên CLI + loại lỗi, vì stderr của CLI hay chép lại khoá/đường dẫn (hợp đồng che của
+// sanitizeProviderError).
+//
+// credential KHÔNG dùng: một CLI thuê bao mang phiên đăng nhập của riêng nó (ẩn ở ~/.codex,
+// ~/.gemini, ~/.claude), không nhận khoá qua tham số. Router vẫn xoá nó (r.generate defer clear).
+func (a *cliAdapter) Generate(ctx context.Context, req llmRequest, credential []byte) (llmResponse, error) {
+	argv := buildCLIArgv(a.d, req)
+	// claude đọc prompt qua stdin (Task 3); vendor khác đã có prompt trong argv.
+	var stdin []byte
+	if a.d.promptViaStdin {
+		stdin = []byte(req.Prompt)
+	}
+	out, err := a.spawn(ctx, argv, stdin)
+	if err != nil {
+		var exit *cliExit
+		if errors.As(err, &exit) {
+			// classifyCLIError đọc stderr để PHÂN LOẠI, nhưng thân stderr KHÔNG đi vào thông báo:
+			// chỉ tên CLI + loại lỗi ra ngoài.
+			kind := classifyCLIError(exit.stderr, false)
+			return llmResponse{}, newLLMError(kind, err, "%s: gọi CLI hỏng", a.d.kind)
+		}
+		// Đã là llmError (chưa cài) hoặc lỗi ctx (huỷ/hết giờ) — trả nguyên để router phân loại.
+		return llmResponse{}, err
+	}
+	return textOrUpstream(a.d.kind+" generate", parseCLIAnswer(a.d, out))
+}
+
+// spawn tách runner test khỏi spawn thật. Khi a.run != nil, seam thay TOÀN BỘ việc định vị +
+// chạy tiến trình — adapter test không phụ thuộc CLI có cài trên máy hay không.
+func (a *cliAdapter) spawn(ctx context.Context, argv []string, stdin []byte) ([]byte, error) {
+	if a.run != nil {
+		return a.run(ctx, argv, stdin)
+	}
+	program, prefixArgs, err := resolveCLIProgram(a.d)
+	if err != nil {
+		// Chưa cài → credential (cần cài + đăng nhập), loại DỪNG chuỗi: thử tiếp một CLI chưa cài
+		// chỉ tốn thời gian của khách.
+		return nil, newLLMError(classifyCLIError("", true), nil, "%s: CLI chưa cài", a.d.kind)
+	}
+	// exec.Command chứ không CommandContext: runCLIProcess tự xử lý huỷ ctx bằng killPidTree
+	// (giết cả cây node→cli→cháu), còn CommandContext chỉ giết con trực tiếp và để cháu mồ côi.
+	cmd := exec.Command(program, append(prefixArgs, argv...)...)
+	return runCLIProcess(ctx, cmd, stdin, nil, a.logger)
+}
+
+// Test dò trạng thái đăng nhập — RẺ, không tốn một lượt subscription. loggedIn → nil; mọi trạng
+// thái khác (chưa đăng nhập / không dò được) → lỗi credential để Portal nhắc đăng nhập lại.
+func (a *cliAdapter) Test(ctx context.Context, _ string, _ []byte) error {
+	switch checkCLIAuth(ctx, a.d, geminiCredPath(), a.logger) {
+	case authLoggedIn:
+		return nil
+	default:
+		return newLLMError(llmErrorCredential, nil, "%s: chưa đăng nhập hoặc không dò được trạng thái", a.d.kind)
+	}
+}
+
+// Discover trả danh sách model TĨNH từ descriptor. Không I/O: vendor CLI không có endpoint liệt kê
+// model, nên danh sách được ghim ở modelSeeds và Portal hiện đúng nó.
+func (a *cliAdapter) Discover(_ context.Context, _ []byte) ([]store.LLMModel, error) {
+	out := make([]store.LLMModel, 0, len(a.d.modelSeeds))
+	for _, m := range a.d.modelSeeds {
+		out = append(out, store.LLMModel{
+			ProviderID: a.providerID, ModelID: m.id, Name: m.name,
+			Source: store.LLMModelDiscovered, Available: true,
+		})
+	}
+	return out, nil
+}
+
+// parseCLIAnswer đọc câu trả lời từ output CLI.
+//
+// parse TẠM: Task 8 ghim theo output thật đã capture. codex ghi câu trả lời ra một `-o <file>`,
+// gemini phát `-o json`, claude phát stream-json — mỗi vendor một format. Bây giờ trả stdout đã
+// trim làm chỗ dựa; router test tiêm a.run nên format thật chưa bị đụng tới tới Task 8.
+func parseCLIAnswer(_ cliDescriptor, out []byte) string {
+	return strings.TrimSpace(string(out))
+}
+
+// resolveCLIProgram định vị chương trình chạy một vendor CLI.
+//
+//   - native (claude): exec.LookPath tên exe → (path, nil).
+//   - npm (codex/gemini): chạy `node <binJS>`, với binJS nằm dưới npm global root (`npm root -g`).
+//
+// Định vị thật được Task 8 ghim (spawn thật + capture output); ở đây đủ để đường sản xuất dựng
+// được lệnh. Test KHÔNG đi qua đây — a.run seam chặn trước.
+func resolveCLIProgram(d cliDescriptor) (program string, prefixArgs []string, err error) {
+	if d.nativeBin != "" {
+		bin, err := exec.LookPath(d.nativeBin)
+		if err != nil {
+			return "", nil, err
+		}
+		return bin, nil, nil
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		return "", nil, err
+	}
+	root, err := npmGlobalRoot()
+	if err != nil {
+		return "", nil, err
+	}
+	binJS := filepath.Join(root, d.binJS)
+	if _, err := os.Stat(binJS); err != nil {
+		return "", nil, err
+	}
+	return node, []string{binJS}, nil
+}
+
+// npmGlobalRoot đọc npm global root, nơi gói cài -g nằm.
+//
+// Cache MỘT lần cả đời daemon (OnceValues): root không đổi lúc chạy, còn `npm root -g` là một
+// spawn KHÔNG có ctx nên ngân sách 25s mỗi Provider của router không huỷ được nó — không cache thì
+// một npm cold-start chậm chạy trên MỌI lượt codex/gemini. Cache lại giới hạn cái treo đó về lần
+// resolve đầu tiên.
+var npmGlobalRoot = sync.OnceValues(func() (string, error) {
+	out, err := exec.Command("npm", "root", "-g").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+})
+
+// geminiCredPath là đường dò credential của Gemini CLI.
+//
+// Cô lập ở MỘT hàm vì tên file thật còn LOW confidence (Task 8 chốt sau khi đăng nhập). Chỉ nhánh
+// gemini-file trong checkCLIAuth đọc tới; các vendor khác bỏ qua tham số này.
+func geminiCredPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".gemini", "oauth_creds.json")
 }

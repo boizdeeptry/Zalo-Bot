@@ -1,7 +1,6 @@
 import { requestJSON } from "../core/api.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
 
-const CLAUDE_ID = "claude-code";
 const STATUS_POLL_MS = 5000;
 
 // createModelService dựng THÂN của lượt ghi tại đây thay vì chuyển tiếp thẳng bản nháp: /llm từ
@@ -35,29 +34,16 @@ function messageOf(error) {
 
 // --- bản nháp: hàm thuần, không đụng DOM ---
 //
-// Bốn hàm dưới đây được XUẤT để test gọi thẳng. Bất biến "Claude Code là mắt xích cuối" sống ở
-// đây, và kiểm nó qua DOM là không kiểm được: nút tương ứng đã disabled, mà một nút disabled thì
-// không phát sự kiện — phép khẳng định "bấm vào không có gì xảy ra" khi đó đúng vì lý do khác.
-
-// tailIndex là vị trí lưới an toàn: mắt xích CUỐI khi nó là Claude Code.
-//
-// Bất biến gắn với vị trí cuối chứ không với mọi mắt xích mang id đó — thử haiku trước rồi rơi
-// xuống sonnet là một chuỗi hợp lệ, và mắt xích haiku ở giữa phải sửa được như mọi cái khác.
-// Trả -1 khi chuỗi rỗng hoặc kết thúc bằng thứ khác; lúc đó không có gì để khoá và máy chủ sẽ
-// từ chối lượt lưu kèm lý do.
-export function tailIndex(entries) {
-  return entries.length > 0 && entries.at(-1).provider_id === CLAUDE_ID ? entries.length - 1 : -1;
-}
-
-function isLocked(entries, index) {
-  return index === tailIndex(entries);
-}
+// Ba hàm dưới đây được XUẤT để test gọi thẳng. Không còn bất biến "Claude Code là mắt xích cuối":
+// §6 cho router chạy chuỗi ở BẤT KỲ vị trí nào — kể cả một chuỗi không có Claude Code — nên mọi
+// mắt xích dời/tắt/xoá được như nhau. Máy chủ (validateLLMRoute) mới là nơi từ chối một chuỗi
+// không đi hết được.
 
 function canMove(entries, index, delta) {
   const target = index + delta;
   if (index < 0 || index >= entries.length) return false;
   if (target < 0 || target >= entries.length) return false;
-  return !isLocked(entries, index) && !isLocked(entries, target);
+  return true;
 }
 
 export function moveEntry(entries, index, delta) {
@@ -70,7 +56,7 @@ export function moveEntry(entries, index, delta) {
 }
 
 export function removeEntry(entries, index) {
-  if (index < 0 || index >= entries.length || isLocked(entries, index)) return entries;
+  if (index < 0 || index >= entries.length) return entries;
   return entries.filter((_, position) => position !== index);
 }
 
@@ -78,12 +64,10 @@ function patchEntry(entries, index, patch) {
   return entries.map((entry, position) => (position === index ? { ...entry, ...patch } : entry));
 }
 
-// addEntry chèn TRƯỚC lưới an toàn: Claude Code phải ở cuối, nên một mắt xích mới nối vào đuôi
-// là một chuỗi máy chủ từ chối ngay.
+// addEntry nối mắt xích mới vào CUỐI chuỗi. Không còn lưới an toàn cố định ở đuôi — người dùng tự
+// sắp thứ tự, và máy chủ từ chối một chuỗi không đi hết được.
 export function addEntry(entries, entry) {
-  const tail = tailIndex(entries);
-  if (tail === -1) return [...entries, entry];
-  return [...entries.slice(0, tail), entry, ...entries.slice(tail)];
+  return [...entries, entry];
 }
 
 function draftProblem(entries, nameOf) {
@@ -322,11 +306,10 @@ export function createModelsPage({
 
       function buildRow(entry, index) {
         const idBase = `chain-${index}`;
-        const locked = isLocked(draft.entries, index);
         const warning = element("div", { className: "fn" });
 
         const providerSelect = element("select", {
-          attributes: { id: `${idBase}-provider`, disabled: locked },
+          attributes: { id: `${idBase}-provider` },
         }, optionNodes(providerChoices(providers, entry.provider_id)));
         providerSelect.value = entry.provider_id;
 
@@ -364,7 +347,7 @@ export function createModelsPage({
         });
 
         const enabledBox = element("input", {
-          attributes: { id: `${idBase}-on`, type: "checkbox", disabled: locked },
+          attributes: { id: `${idBase}-on`, type: "checkbox" },
         });
         enabledBox.checked = Boolean(entry.enabled);
         enabledBox.addEventListener("change", () => {
@@ -400,7 +383,6 @@ export function createModelsPage({
           className: "btn",
           attributes: {
             type: "button",
-            disabled: locked,
             "aria-label": `Xoá mắt xích ${nameOf(entry.provider_id)}`,
           },
           text: "Xoá",
@@ -553,7 +535,7 @@ export function createModelsPage({
             element("div", {
               className: "hint",
               text: "Bot thử từ trên xuống và dừng ở mắt xích đầu tiên trả lời được."
-                + " Claude Code luôn nằm cuối làm lưới an toàn, nên không tắt, không dời và không xoá được.",
+                + " Sắp xếp, bật/tắt hoặc xoá mắt xích tuỳ ý; máy chủ từ chối một chuỗi không đi hết được.",
             }),
           );
           drawRows();

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"agentdc/internal/store"
 )
 
 func TestCLIRegistryHasThreeVendors(t *testing.T) {
@@ -286,6 +288,125 @@ func TestCodexAuthLive(t *testing.T) {
 	}
 	if got := codexAuthFromExit(code); got != authLoggedOut {
 		t.Skipf("codex login status exit=%d → %v (máy này kỳ vọng logged-out; có thể đã đăng nhập)", code, got)
+	}
+}
+
+// --- adapter: run seam tiêm, KHÔNG spawn CLI thật ---
+
+// TestCLIAdapterGenerateBuildsArgvAndReturnsTrimmedText: Generate dựng argv của descriptor, chạy
+// qua seam a.run, và parse TẠM chỉ trim stdout (Task 8 ghim format thật). codex đọc prompt qua argv.
+func TestCLIAdapterGenerateBuildsArgvAndReturnsTrimmedText(t *testing.T) {
+	var gotArgv []string
+	var gotStdin []byte
+	a := &cliAdapter{
+		d: cliDescriptors["codex"], providerID: "codex-1", logger: slog.New(slog.DiscardHandler),
+		run: func(_ context.Context, argv []string, stdin []byte) ([]byte, error) {
+			gotArgv, gotStdin = argv, stdin
+			return []byte("  codex trả lời  "), nil
+		},
+	}
+	resp, err := a.Generate(t.Context(), llmRequest{Model: "gpt-5.4", Prompt: "khách hỏi giá"}, []byte("cred"))
+	if err != nil {
+		t.Fatalf("Generate() = _, %v; want nil", err)
+	}
+	if resp.Text != "codex trả lời" {
+		t.Errorf("Generate().Text = %q; want %q (parse tạm trim stdout)", resp.Text, "codex trả lời")
+	}
+	for _, w := range []string{"exec", "-s", "read-only", "-m", "gpt-5.4"} {
+		if !slices.Contains(gotArgv, w) {
+			t.Errorf("argv %v thiếu %q", gotArgv, w)
+		}
+	}
+	if last := gotArgv[len(gotArgv)-1]; last != "khách hỏi giá" {
+		t.Errorf("argv cuối = %q; want prompt của khách (sau `--`)", last)
+	}
+	// codex đọc prompt qua argv, KHÔNG qua stdin.
+	if gotStdin != nil {
+		t.Errorf("codex stdin = %q; want nil", gotStdin)
+	}
+}
+
+// TestCLIAdapterGenerateFeedsClaudePromptViaStdin: claude bật promptViaStdin, nên prompt đi qua
+// stdin chứ không nằm trong argv.
+func TestCLIAdapterGenerateFeedsClaudePromptViaStdin(t *testing.T) {
+	var gotStdin []byte
+	a := &cliAdapter{
+		d: cliDescriptors["claude-code"], providerID: "claude-code", logger: slog.New(slog.DiscardHandler),
+		run: func(_ context.Context, _ []string, stdin []byte) ([]byte, error) {
+			gotStdin = stdin
+			return []byte("claude trả lời"), nil
+		},
+	}
+	if _, err := a.Generate(t.Context(), llmRequest{Model: "sonnet", Prompt: "câu hỏi"}, nil); err != nil {
+		t.Fatalf("Generate() = _, %v; want nil", err)
+	}
+	if string(gotStdin) != "câu hỏi" {
+		t.Errorf("claude stdin = %q; want prompt của khách", gotStdin)
+	}
+}
+
+// TestCLIAdapterGenerateClassifiesExitWithoutLeakingStderr: một *cliExit được phân loại theo
+// stderr, nhưng thân stderr KHÔNG BAO GIỜ vào thông báo lỗi (hợp đồng che).
+func TestCLIAdapterGenerateClassifiesExitWithoutLeakingStderr(t *testing.T) {
+	const stderr = "You've hit your usage limit. sk-canary-leak"
+	a := &cliAdapter{
+		d: cliDescriptors["codex"], providerID: "codex-1", logger: slog.New(slog.DiscardHandler),
+		run: func(context.Context, []string, []byte) ([]byte, error) {
+			return nil, &cliExit{err: errors.New("exit status 1"), stderr: stderr}
+		},
+	}
+	_, err := a.Generate(t.Context(), llmRequest{Model: "gpt-5.4", Prompt: "x"}, nil)
+	if err == nil {
+		t.Fatal("Generate() với cliExit = _, nil; want lỗi")
+	}
+	var le *llmError
+	if !errors.As(err, &le) {
+		t.Fatalf("Generate() error = %T; want *llmError", err)
+	}
+	// "usage limit" → rate_limit (đi tiếp), KHÔNG credential (dừng chuỗi).
+	if le.Kind != llmErrorRateLimit {
+		t.Errorf("Generate() error kind = %q; want rate_limit", le.Kind)
+	}
+	if strings.Contains(le.Error(), "usage limit") || strings.Contains(le.Error(), "sk-canary-leak") {
+		t.Errorf("Generate() error mang thân stderr: %q", le.Error())
+	}
+}
+
+// TestCLIAdapterTestReturnsCredentialErrorWhenAuthUnknown: codex-exit chưa wire spawn nên
+// checkCLIAuth trả authUnknown; Test ánh xạ mọi trạng thái khác loggedIn thành lỗi credential.
+func TestCLIAdapterTestReturnsCredentialErrorWhenAuthUnknown(t *testing.T) {
+	a := newCLIAdapter(cliDescriptors["codex"], "codex-1", slog.New(slog.DiscardHandler))
+	err := a.Test(t.Context(), "gpt-5.4", nil)
+	if err == nil {
+		t.Fatal("Test(codex, auth unknown) = nil; want lỗi credential")
+	}
+	var le *llmError
+	if !errors.As(err, &le) || le.Kind != llmErrorCredential {
+		t.Errorf("Test() error = %v; want *llmError kind=credential", err)
+	}
+}
+
+// TestCLIAdapterDiscoverReturnsDescriptorSeeds: Discover TĨNH — trả đúng modelSeeds gắn providerID.
+func TestCLIAdapterDiscoverReturnsDescriptorSeeds(t *testing.T) {
+	a := newCLIAdapter(cliDescriptors["gemini-cli"], "gemini-cli-1", slog.New(slog.DiscardHandler))
+	models, err := a.Discover(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("Discover() = _, %v; want nil", err)
+	}
+	seeds := cliDescriptors["gemini-cli"].modelSeeds
+	if len(models) != len(seeds) {
+		t.Fatalf("Discover() trả %d model; want %d (bằng modelSeeds)", len(models), len(seeds))
+	}
+	for i, m := range models {
+		if m.ProviderID != "gemini-cli-1" {
+			t.Errorf("model[%d].ProviderID = %q; want gemini-cli-1", i, m.ProviderID)
+		}
+		if m.ModelID != seeds[i].id || m.Name != seeds[i].name {
+			t.Errorf("model[%d] = %s/%s; want %s/%s", i, m.ModelID, m.Name, seeds[i].id, seeds[i].name)
+		}
+		if m.Source != store.LLMModelDiscovered || !m.Available {
+			t.Errorf("model[%d] source/available = %s/%v; want discovered/true", i, m.Source, m.Available)
+		}
 	}
 }
 

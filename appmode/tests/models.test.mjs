@@ -9,7 +9,6 @@ import {
   createModelsPage,
   moveEntry,
   removeEntry,
-  tailIndex,
 } from "../overlay/internal/webui/static/pages/models.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
 
@@ -105,6 +104,25 @@ const PROVIDERS = {
   ],
 };
 
+// CODEX_PROVIDERS thêm một Provider gói thuê bao (codex) vào danh sách mặc định, cho các test cần
+// một chuỗi kết thúc bằng thứ KHÁC Claude Code — §6 cho phép, và trang phải hiện nó như mọi mắt xích.
+const CODEX_PROVIDERS = {
+  kinds: PROVIDERS.kinds,
+  providers: [
+    ...PROVIDERS.providers,
+    {
+      id: "codex-1",
+      name: "Codex",
+      kind: "codex",
+      enabled: true,
+      system: false,
+      credential_configured: true,
+      credential_unreadable: false,
+      models: [{ model_id: "gpt-5.4", name: "GPT-5.4", source: "discovered", available: true }],
+    },
+  ],
+};
+
 const ROUTE = {
   revision: 4,
   entries: [
@@ -192,9 +210,8 @@ async function mounted(t, handler = routeAPI()) {
 
 // --- bản nháp: hàm thuần ---
 //
-// Kiểm thẳng chứ không qua DOM. Bất biến "Claude Code là mắt xích cuối" được canh hai lớp: nút
-// disabled ở lớp DOM, và các hàm này ở lớp dữ liệu. Lớp DOM không kiểm hộ được lớp dưới — nút đã
-// disabled thì không phát sự kiện, nên "bấm vào không có gì xảy ra" đúng dù cửa chặn có hay không.
+// Kiểm thẳng chứ không qua DOM. Không còn bất biến "Claude Code là mắt xích cuối" (§6): mọi mắt
+// xích dời/tắt/xoá được như nhau, và các hàm này chỉ còn canh biên (index trong khoảng).
 
 const link = (providerID, modelID, enabled = true) => ({
   provider_id: providerID,
@@ -203,15 +220,9 @@ const link = (providerID, modelID, enabled = true) => ({
 });
 const CLAUDE_TAIL = link("claude-code", "haiku");
 
-test("tailIndex locks the final link only when it is Claude Code", () => {
-  assert.equal(tailIndex([link("openai-1", "gpt-5"), CLAUDE_TAIL]), 1);
-  assert.equal(tailIndex([CLAUDE_TAIL, link("openai-1", "gpt-5")]), -1);
-  assert.equal(tailIndex([]), -1);
-});
-
-test("removeEntry refuses to drop the locked tail", () => {
+test("removeEntry drops the final link too", () => {
   const entries = [link("openai-1", "gpt-5"), CLAUDE_TAIL];
-  assert.deepEqual(removeEntry(entries, 1), entries);
+  assert.deepEqual(removeEntry(entries, 1), [link("openai-1", "gpt-5")]);
 });
 
 test("removeEntry drops any other link", () => {
@@ -221,14 +232,14 @@ test("removeEntry drops any other link", () => {
   );
 });
 
-test("moveEntry refuses to move the locked tail", () => {
+test("moveEntry swaps the final link with the one above it", () => {
   const entries = [link("openai-1", "gpt-5"), CLAUDE_TAIL];
-  assert.deepEqual(moveEntry(entries, 1, -1), entries);
+  assert.deepEqual(moveEntry(entries, 1, -1), [CLAUDE_TAIL, link("openai-1", "gpt-5")]);
 });
 
-test("moveEntry refuses to push a link past the locked tail", () => {
+test("moveEntry pushes a link down past a Claude Code link", () => {
   const entries = [link("openai-1", "gpt-5"), CLAUDE_TAIL];
-  assert.deepEqual(moveEntry(entries, 0, 1), entries);
+  assert.deepEqual(moveEntry(entries, 0, 1), [CLAUDE_TAIL, link("openai-1", "gpt-5")]);
 });
 
 test("moveEntry refuses to move off either end of the chain", () => {
@@ -246,7 +257,7 @@ test("moveEntry swaps neighbours without touching the original array", () => {
   assert.deepEqual(entries, [first, second, CLAUDE_TAIL]);
 });
 
-test("addEntry appends when the chain has no Claude Code tail", () => {
+test("addEntry appends to the chain without touching the original array", () => {
   const fresh = link("gemini", "gemini-2");
   const entries = [link("openai-1", "gpt-5")];
 
@@ -254,11 +265,11 @@ test("addEntry appends when the chain has no Claude Code tail", () => {
   assert.deepEqual(entries, [link("openai-1", "gpt-5")]);
 });
 
-test("addEntry inserts before the locked tail", () => {
+test("addEntry appends after a Claude Code link too", () => {
   const fresh = link("gemini", "gemini-2");
   assert.deepEqual(
     addEntry([link("openai-1", "gpt-5"), CLAUDE_TAIL], fresh),
-    [link("openai-1", "gpt-5"), fresh, CLAUDE_TAIL],
+    [link("openai-1", "gpt-5"), CLAUDE_TAIL, fresh],
   );
 });
 
@@ -311,11 +322,11 @@ test("Models renders the saved chain in order", async (t) => {
   assert.deepEqual(chain(main), ["openai-1/gpt-5", "claude-code/haiku"]);
 });
 
-test("adding a link inserts it above Claude Code", async (t) => {
+test("adding a link appends it to the end of the chain", async (t) => {
   const { main } = await mounted(t);
   button(main, "Thêm mắt xích").click();
 
-  assert.deepEqual(chain(main), ["openai-1/gpt-5", "openai-1/gpt-5", "claude-code/haiku"]);
+  assert.deepEqual(chain(main), ["openai-1/gpt-5", "claude-code/haiku", "openai-1/gpt-5"]);
 });
 
 test("adding a link says what is missing when no provider is switched on", async (t) => {
@@ -445,12 +456,16 @@ test("Up swaps a link with the one above it", async (t) => {
   assert.deepEqual(chain(main), ["gemini/gemini-2", "openai-1/gpt-5", "claude-code/haiku"]);
 });
 
-test("the first link cannot move up and the last movable link cannot move down", async (t) => {
+test("the first link cannot move up and the last link cannot move down", async (t) => {
   const { main } = await mounted(t);
-  const row = rows(main)[0];
+  const first = rows(main)[0];
+  const last = rows(main).at(-1);
 
-  assert.equal(button(row, "Lên").disabled, true);
-  assert.equal(button(row, "Xuống").disabled, true);
+  // Chỉ hai ĐẦU chuỗi bị chặn — theo biên, không theo lưới an toàn cố định.
+  assert.equal(button(first, "Lên").disabled, true);
+  assert.equal(button(last, "Xuống").disabled, true);
+  // Và mắt xích đầu giờ dời XUỐNG được: nó không còn bị Claude Code ở dưới khoá lại.
+  assert.equal(button(first, "Xuống").disabled, false);
 });
 
 // Nút gốc là <button>, nên bàn phím kích hoạt được mà không cần thêm gì; điều KHÔNG tự có là chỗ
@@ -628,32 +643,43 @@ test("a link with no model chosen is refused before it reaches the API", async (
   assert.match(text(notice(main)), /Chọn model cho OpenAI chính/);
 });
 
-test("Claude Code stays enabled and cannot be switched off", async (t) => {
+test("the Claude Code row is an ordinary link with full controls", async (t) => {
   const { main } = await mounted(t);
-  const box = toggle(rows(main)[1]);
+  const row = rows(main)[1]; // claude-code/haiku, mắt xích cuối của route mặc định
 
-  assert.equal(box.checked, true);
-  assert.equal(box.disabled, true);
+  // Không còn khoá: bật/tắt, dời lên và xoá được như mọi mắt xích khác.
+  assert.equal(toggle(row).disabled, false);
+  assert.equal(button(row, "Lên").disabled, false);
+  assert.equal(button(row, "Xoá").disabled, false);
+  // Xuống tắt CHỈ vì nó là mắt xích cuối, không phải vì một lưới an toàn.
+  assert.equal(button(row, "Xuống").disabled, true);
 });
 
-test("Claude Code cannot be removed or moved", async (t) => {
-  const { main } = await mounted(t);
-  const row = rows(main)[1];
+// Ngược lại của bài trên: một chuỗi kết thúc bằng gói thuê bao (codex) là HỢP LỆ sau §6, và trang
+// phải mở đủ nút cho mắt xích cuối đó rồi lưu được qua PUT /llm/route.
+test("a chain ending in a subscription CLI provider offers full controls and saves", async (t) => {
+  const { calls, main } = await mounted(t, routeAPI({
+    providers: CODEX_PROVIDERS,
+    route: {
+      revision: 4,
+      entries: [
+        { position: 0, provider_id: "claude-code", model_id: "haiku", enabled: true },
+        { position: 1, provider_id: "codex-1", model_id: "gpt-5.4", enabled: true },
+      ],
+    },
+  }));
+  const tail = rows(main).at(-1); // codex-1 — mắt xích cuối, KHÔNG phải Claude Code
 
-  // Chỉ khẳng định nút đã tắt. Bấm thêm rồi soi chuỗi là vô nghĩa: nút tắt không phát sự kiện,
-  // nên phép khẳng định đó đúng nhờ dòng ngay trên chứ không nhờ cửa chặn trong removeEntry —
-  // cửa chặn ấy có bài kiểm riêng gọi thẳng hàm.
-  for (const label of ["Lên", "Xuống", "Xoá"]) {
-    assert.equal(button(row, label).disabled, true, `Claude Code must not offer "${label}"`);
-  }
-});
+  assert.equal(button(tail, "Xoá").disabled, false);
+  assert.equal(button(tail, "Lên").disabled, false);
+  assert.equal(toggle(tail).disabled, false);
+  assert.equal(button(tail, "Xuống").disabled, true); // chỉ vì là mắt xích cuối
 
-test("Claude Code stays the final link when a new one is added", async (t) => {
-  const { main } = await mounted(t);
-  button(main, "Thêm mắt xích").click();
-  button(main, "Thêm mắt xích").click();
-
-  assert.equal(chain(main).at(-1), "claude-code/haiku");
+  button(main, "Lưu").click();
+  await flush();
+  assert.equal(calls.at(-1).options.method, "PUT");
+  assert.equal(calls.at(-1).path, "/llm/route");
+  assert.match(text(notice(main)), /Đã lưu/);
 });
 
 // Bất biến gắn với mắt xích CUỐI, không với mọi mắt xích mang tên Claude Code: thử haiku trước
@@ -678,11 +704,12 @@ test("a Claude Code link that is not the last one behaves like any other", async
   assert.deepEqual(chain(main), ["openai-1/gpt-5", "claude-code/sonnet", "claude-code/haiku"]);
 });
 
-test("the Claude Code provider is fixed while its model is not", async (t) => {
+test("the Claude Code provider select is editable and its models stay on the allowlist", async (t) => {
   const { main } = await mounted(t);
   const [provider, model] = selects(rows(main)[1]);
 
-  assert.equal(provider.disabled, true);
+  // Ô Provider của Claude Code giờ mở như mọi hàng khác; model vẫn là danh sách của nó.
+  assert.equal(provider.disabled, false);
   assert.equal(model.disabled, false);
   assert.deepEqual(optionIDs(model), ["haiku", "sonnet"]);
 });
@@ -782,11 +809,11 @@ test("a revision conflict keeps the draft and its controls exactly as they were"
   // ra một màn hình trông không đổi nhưng ném mất chỗ đứng của con trỏ và vị trí cuộn.
   assert.equal(rows(main).length, before.length);
   assert.ok(rows(main).every((row, index) => row === before[index]), "the 409 branch must not rebuild the rows");
-  assert.deepEqual(chain(main), ["openai-1/gpt-5-mini", "openai-1/gpt-5", "claude-code/haiku"]);
+  assert.deepEqual(chain(main), ["openai-1/gpt-5-mini", "claude-code/haiku", "openai-1/gpt-5"]);
   assert.match(text(notice(main)), /lưu ở nơi khác/);
   assert.ok(button(main, "Tải lại chuỗi"));
   // Các nút của hàng vẫn sống: bản nháp còn sửa được sau lượt hỏng, không phải chỉ còn nhìn.
-  button(rows(main)[1], "Xoá").click();
+  button(rows(main)[2], "Xoá").click();
   assert.deepEqual(chain(main), ["openai-1/gpt-5-mini", "claude-code/haiku"]);
 });
 

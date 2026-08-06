@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -842,6 +841,52 @@ func TestAppLLMRunnerSendsAttachmentTurnsOnlyToClaude(t *testing.T) {
 	}
 }
 
+// TestAppLLMRunnerRefusesAttachmentTurnWithNoClaudeEntry canh mặt còn lại của ranh giới an toàn:
+// sau §6, người trực dựng được một chuỗi TOÀN gói thuê bao (codex), không có Claude Code. Một lượt
+// có tệp trên chuỗi đó không có đích an toàn — Claude Code là nơi DUY NHẤT tệp nằm im trên đĩa máy
+// này — nên nó phải trả LỖI, KHÔNG được rơi xuống vòng lặp và gửi đường dẫn/nội dung tệp của khách
+// sang một adapter (Provider HTTP). Canary claude-tail (TestAppLLMRunnerSendsAttachmentTurnsOnlyToClaude)
+// KHÔNG đi qua nhánh này, nên một hồi quy rơi-xuống-vòng-lặp vẫn qua được nó.
+func TestAppLLMRunnerRefusesAttachmentTurnWithNoClaudeEntry(t *testing.T) {
+	const canaryPath = `C:\Users\Admin\.agentdc\zalo-files\CANARY-NOCLAUDE-3c9e.pdf`
+	const canaryBytes = "CANARY-BYTES-noclaude-noi-dung-rieng-tu-cua-khach"
+
+	prompt := "Khách gửi tệp:\n  " + canaryPath + "\nNội dung đọc được: " + canaryBytes + "\nCâu hỏi: giá bao nhiêu?"
+	codex := okAdapter(`{"answer":"codex"}`)
+	claude := okClaude(`{"answer":"claude"}`)
+	f := newRouterFixture(newRoute(entry("codex-1", "gpt-5.4", true)), claude).
+		with("codex-1", "sub-token", codex)
+
+	got, err := f.runner(appLLMRunnerConfig{HasAttachments: true}).Run(t.Context(), prompt, f.step)
+	if err == nil {
+		t.Fatalf("lượt có tệp trên route không có claude-code = %q, nil; want lỗi", got)
+	}
+	if got != "" {
+		t.Errorf("Run() = %q; want chuỗi rỗng khi từ chối", got)
+	}
+	// Không mắt xích claude-code thì không có đích nào cả — cả Claude giả cũng không được gọi.
+	if len(claude.seen()) != 0 {
+		t.Errorf("claude được gọi %d lần; want 0", len(claude.seen()))
+	}
+	// Không adapter nào được gọi, không khoá nào được mở: canary không có đường vào một Provider.
+	for id, a := range f.adapters {
+		if calls := a.(*fakeAdapter).seen(); len(calls) != 0 {
+			t.Errorf("adapter %s được gọi %d lần trong lượt có tệp bị từ chối; want 0", id, len(calls))
+		}
+	}
+	if issued := f.creds.issued(); len(issued) != 0 {
+		t.Errorf("mở khoá %d lần; want 0 (không gọi Provider thì không cần khoá)", len(issued))
+	}
+	for _, canary := range []string{jsonForm(t, canaryPath), jsonForm(t, canaryBytes)} {
+		if blob := serialize(t, f.adapters); strings.Contains(blob, canary) {
+			t.Errorf("đầu vào adapter chứa canary %q trong lượt bị từ chối: %s", canary, blob)
+		}
+		if blob := serialize(t, f.store.recorded()); strings.Contains(blob, canary) {
+			t.Errorf("telemetry chứa canary %q: %s", canary, blob)
+		}
+	}
+}
+
 func TestAppLLMRunnerZeroesTheCredentialAfterTheCall(t *testing.T) {
 	first := failAdapter(llmErrorUpstream)
 	second := okAdapter(`{"answer":"b"}`)
@@ -929,6 +974,59 @@ func TestAppLLMRunnerKeepsAnsweringWhenTelemetryFails(t *testing.T) {
 	}
 }
 
+// TestAppLLMRunnerServesACodexOnlyChain chốt tính position-agnostic: một chuỗi KHÔNG có Claude
+// Code — toàn gói thuê bao — vẫn chạy qua adapter, không được rơi nhầm vào runClaude. Router cũ
+// tách entries[len-1] làm Claude Code, nên với chuỗi này nó gọi fakeClaude thay vì adapter — đúng
+// giả định vị trí mà task này gỡ.
+func TestAppLLMRunnerServesACodexOnlyChain(t *testing.T) {
+	codex := okAdapter(`{"answer":"codex"}`)
+	claude := okClaude(`{"answer":"claude"}`)
+	f := newRouterFixture(newRoute(entry("codex-1", "gpt-5.4", true)), claude).
+		with("codex-1", "sub-token", codex)
+
+	got, err := f.runner(appLLMRunnerConfig{}).Run(t.Context(), "câu hỏi", f.step)
+	if err != nil {
+		t.Fatalf("Run() chuỗi codex-only = _, %v; want nil", err)
+	}
+	if got != `{"answer":"codex"}` {
+		t.Errorf("Run() chuỗi codex-only = %q; want %q (adapter, không phải Claude Code)", got, `{"answer":"codex"}`)
+	}
+	if len(claude.seen()) != 0 {
+		t.Errorf("claude được gọi %d lần trong chuỗi không có Claude Code; want 0", len(claude.seen()))
+	}
+	if calls := codex.seen(); len(calls) != 1 || calls[0].Model != "gpt-5.4" {
+		t.Fatalf("codex-1 nhận %+v; want đúng 1 lượt {gpt-5.4}", calls)
+	}
+	attempts := f.store.recorded()
+	if len(attempts) != 1 || attempts[0].ProviderID != "codex-1" || attempts[0].Outcome != store.LLMAttemptOK {
+		t.Fatalf("telemetry = %+v; want đúng một hàng codex-1/ok", attempts)
+	}
+}
+
+// TestAppLLMRunnerCodexOnlyChainReportsUnavailableWhenItFails: một chuỗi codex-only mà mắt xích
+// duy nhất hỏng KHÔNG được im lặng trả về rỗng — cả chuỗi cạn thì lượt phải nói ra "không khả dụng".
+func TestAppLLMRunnerCodexOnlyChainReportsUnavailableWhenItFails(t *testing.T) {
+	codex := failAdapter(llmErrorUpstream)
+	claude := okClaude(`{"answer":"claude"}`)
+	f := newRouterFixture(newRoute(entry("codex-1", "gpt-5.4", true)), claude).
+		with("codex-1", "sub-token", codex)
+
+	got, err := f.runner(appLLMRunnerConfig{}).Run(t.Context(), "câu hỏi", f.step)
+	if err == nil {
+		t.Fatalf("Run() chuỗi codex-only hỏng = %q, nil; want lỗi không khả dụng", got)
+	}
+	if got != "" {
+		t.Errorf("Run() chuỗi codex-only hỏng = %q; want chuỗi rỗng", got)
+	}
+	if len(claude.seen()) != 0 {
+		t.Errorf("claude được gọi %d lần; want 0 (chuỗi không có Claude Code)", len(claude.seen()))
+	}
+	attempts := f.store.recorded()
+	if len(attempts) != 1 || attempts[0].Outcome != store.LLMAttemptError || attempts[0].FellBack {
+		t.Fatalf("telemetry = %+v; want một hàng codex-1/error/fellBack=false", attempts)
+	}
+}
+
 // --- dây nối thật: appZaloRunner, appClaudeRunner, bootstrap ---
 
 // newAppRouteAPI dựng một api có store THẬT.
@@ -972,19 +1070,6 @@ func saveRoute(t *testing.T, a *api, entries ...store.LLMRouteEntry) {
 	if _, err := a.st.ReplaceLLMRoute(snapshot.Revision, entries); err != nil {
 		t.Fatalf("ReplaceLLMRoute(%+v) = _, %v; want nil", entries, err)
 	}
-}
-
-// routeTail đọc mắt xích cuối của chuỗi đang lưu.
-func routeTail(t *testing.T, a *api) store.LLMRouteEntry {
-	t.Helper()
-	snapshot, err := a.st.LLMRoute()
-	if err != nil {
-		t.Fatalf("LLMRoute() = _, %v; want nil", err)
-	}
-	if len(snapshot.Entries) == 0 {
-		t.Fatalf("LLMRoute().Entries rỗng; want ít nhất một mắt xích")
-	}
-	return snapshot.Entries[len(snapshot.Entries)-1]
 }
 
 // awaitSignal chờ một TÍN HIỆU, không chờ một khoảng thời gian.
@@ -1271,55 +1356,6 @@ func TestAppClaudeRunnerCarriesTheRouteModel(t *testing.T) {
 	if zc.Model != "haiku" {
 		t.Errorf("zaloConfig của người gọi bị sửa: Model = %q; want haiku", zc.Model)
 	}
-}
-
-func TestAppRoutesBootstrapMigratesTheLegacyModelFile(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		saved string
-		want  string
-	}{
-		{"lựa chọn cũ được mang sang", "sonnet\r\n", "sonnet"},
-		{"không có tệp thì theo model đang chạy", "", "haiku"},
-		{"giá trị ngoài danh sách cho phép bị bỏ", "sonnet && shutdown /s\r\n", "haiku"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := newAppRouteAPI(t)
-			a.zalo = &zaloDeps{cfg: zaloConfig{Model: "haiku"}}
-			if tc.saved != "" {
-				if err := os.WriteFile(modelFile(a.cfg.Dir), []byte(tc.saved), 0o600); err != nil {
-					t.Fatalf("ghi model.txt = %v; want nil", err)
-				}
-			}
-
-			a.registerAppRoutes(http.NewServeMux())
-
-			tail := routeTail(t, a)
-			if tail.ProviderID != "claude-code" || tail.ModelID != tc.want {
-				t.Errorf("mắt xích cuối = %s/%s; want claude-code/%s", tail.ProviderID, tail.ModelID, tc.want)
-			}
-			// model.txt phải còn NGUYÊN: gỡ bản Portal ra thì Chay.bat vẫn đọc nó để chọn model.
-			if tc.saved != "" {
-				b, err := os.ReadFile(modelFile(a.cfg.Dir))
-				if err != nil || string(b) != tc.saved {
-					t.Errorf("model.txt sau bootstrap = %q, %v; want %q, nil", b, err, tc.saved)
-				}
-			}
-		})
-	}
-
-	t.Run("lần khởi động sau không đè chuỗi người dùng đã sửa", func(t *testing.T) {
-		a := newAppRouteAPI(t)
-		a.zalo = &zaloDeps{cfg: zaloConfig{Model: "haiku"}}
-		a.registerAppRoutes(http.NewServeMux())
-		saveClaudeRoute(t, a, "opus")
-
-		a.registerAppRoutes(http.NewServeMux())
-
-		if tail := routeTail(t, a); tail.ModelID != "opus" {
-			t.Errorf("mắt xích cuối sau lần bootstrap thứ hai = %q; want opus", tail.ModelID)
-		}
-	})
 }
 
 func TestAppLLMAdaptersComeFromTheStoredProviderKind(t *testing.T) {

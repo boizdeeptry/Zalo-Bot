@@ -248,7 +248,7 @@ func (a *api) handleLLMProviderDraftTest(w http.ResponseWriter, r *http.Request)
 			"Cần một API key để kiểm tra", map[string]string{"credential": "Nhập API key"})
 		return
 	}
-	adapter, ok := llmAdapterFor(req.Kind, "draft", a.llmAPIClient())
+	adapter, ok := llmAdapterFor(req.Kind, "draft", a.llmAPIClient(), a.logger)
 	if !ok {
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "PROVIDER_KIND_UNSUPPORTED",
 			fmt.Sprintf("Loại Provider %q không được hỗ trợ", req.Kind),

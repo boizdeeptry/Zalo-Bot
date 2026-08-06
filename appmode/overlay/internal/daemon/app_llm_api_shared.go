@@ -222,7 +222,7 @@ func (a *api) llmProviderAdapter(w http.ResponseWriter, id string) (store.LLMPro
 	if !ok {
 		return store.LLMProvider{}, nil, false
 	}
-	adapter, ok := llmAdapterFor(p.Kind, p.ID, a.llmAPIClient())
+	adapter, ok := llmAdapterFor(p.Kind, p.ID, a.llmAPIClient(), a.logger)
 	if !ok {
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "PROVIDER_KIND_UNSUPPORTED",
 			p.Name+" không gọi được qua API", nil)

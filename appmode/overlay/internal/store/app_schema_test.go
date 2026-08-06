@@ -27,8 +27,9 @@ func TestMigrateAppIsIdempotent(t *testing.T) {
 		t.Fatalf("schema_version = %q; want 2", version)
 	}
 
-	// Provider hệ thống được gieo trong migration chứ không phải lúc chạy: route hợp lệ
-	// BẮT BUỘC kết thúc bằng Claude Code, nên thiếu hàng này thì không lưu nổi route nào.
+	// Provider hệ thống được gieo trong migration chứ không phải lúc chạy: sau §6 route không
+	// còn BẮT BUỘC kết thúc bằng Claude Code, nhưng hàng Provider này vẫn phải có — nó là lưới an
+	// toàn mà mọi chuỗi có Claude Code trỏ tới, và cửa chặn sửa/xoá Provider hệ thống dựa vào nó.
 	var kind string
 	var system int
 	if err := db.QueryRow(

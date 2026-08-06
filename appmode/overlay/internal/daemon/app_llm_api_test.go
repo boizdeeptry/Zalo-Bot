@@ -151,8 +151,8 @@ func newLLMAPIHarness(t *testing.T) *llmAPIHarness {
 	// chặn: nếu seam tự nhận mọi kind thì test "kind lạ bị từ chối" sẽ xanh vì lý do sai.
 	stub := &stubLLMAdapter{}
 	previous := llmAdapterFor
-	llmAdapterFor = func(kind, providerID string, client *http.Client) (providerAdapter, bool) {
-		if _, ok := previous(kind, providerID, client); !ok {
+	llmAdapterFor = func(kind, providerID string, client *http.Client, logger *slog.Logger) (providerAdapter, bool) {
+		if _, ok := previous(kind, providerID, client, logger); !ok {
 			return nil, false
 		}
 		return stub, true
@@ -244,6 +244,21 @@ func (h *llmAPIHarness) createProvider(kind, name, credential string) string {
 		h.t.Fatalf("create provider returned empty id; body = %s", resp.raw)
 	}
 	return id
+}
+
+// seedClaudeModel thêm một model cho Provider claude-code hệ thống.
+//
+// Bootstrap CŨ tự gieo claude-code/haiku lúc khởi động; §6 bỏ gieo (máy mới đi qua onboarding),
+// nên test nào lưu một chuỗi qua claude-code phải tự thêm model trước — validateLLMRoute từ chối
+// một mắt xích trỏ tới model không tồn tại.
+func (h *llmAPIHarness) seedClaudeModel(model string) {
+	h.t.Helper()
+	if err := h.st.AddLLMModel(store.LLMModel{
+		ProviderID: "claude-code", ModelID: model, Name: model,
+		Source: store.LLMModelManual, Available: true,
+	}); err != nil {
+		h.t.Fatalf("AddLLMModel(claude-code/%s) = %v; want nil", model, err)
+	}
 }
 
 // storedSecret mở khoá đang lưu của một Provider. Đây là cách DUY NHẤT test nhìn được bản rõ —
@@ -901,6 +916,7 @@ func TestLLMAPIDeleteRejectsAProviderTheRouteUses(t *testing.T) {
 	id := h.createProvider("openai", "OpenAI", llmAPIKey)
 	h.mustStatus(h.do(http.MethodPost, "/llm/providers/"+id+"/models", `{"model_id":"gpt-4o"}`),
 		http.StatusCreated, "add model")
+	h.seedClaudeModel("haiku")
 	revision := llmAPIRouteRevision(t, h.mustStatus(h.do(http.MethodGet, "/llm/route", ""),
 		http.StatusOK, "read route"))
 	h.mustStatus(h.do(http.MethodPut, "/llm/route", fmt.Sprintf(
@@ -932,6 +948,7 @@ func TestLLMAPIUnknownProviderIs404(t *testing.T) {
 
 func TestLLMAPIRouteConflictReturns409(t *testing.T) {
 	h := newLLMAPIHarness(t)
+	h.seedClaudeModel("haiku")
 	current := h.mustStatus(h.do(http.MethodGet, "/llm/route", ""), http.StatusOK, "read route")
 	revision := llmAPIRouteRevision(t, current)
 
@@ -950,28 +967,6 @@ func TestLLMAPIRouteConflictReturns409(t *testing.T) {
 	}
 	if code := stale.errorCode(t); code != "ROUTE_REVISION_CONFLICT" {
 		t.Errorf("stale route save error code = %q, want ROUTE_REVISION_CONFLICT", code)
-	}
-}
-
-func TestLLMAPIRouteRejectsAChainThatDoesNotEndInClaudeCode(t *testing.T) {
-	h := newLLMAPIHarness(t)
-	id := h.createProvider("openai", "OpenAI", llmAPIKey)
-	h.mustStatus(h.do(http.MethodPost, "/llm/providers/"+id+"/models", `{"model_id":"gpt-4o"}`),
-		http.StatusCreated, "add model")
-	revision := llmAPIRouteRevision(t, h.mustStatus(h.do(http.MethodGet, "/llm/route", ""),
-		http.StatusOK, "read route"))
-
-	got := h.do(http.MethodPut, "/llm/route", fmt.Sprintf(
-		`{"revision":%d,"entries":[{"provider_id":%q,"model_id":"gpt-4o","enabled":true}]}`, revision, id))
-	if got.status != http.StatusUnprocessableEntity {
-		t.Fatalf("route without a Claude Code tail status = %d, want 422; body = %s", got.status, got.raw)
-	}
-	if code := got.errorCode(t); code != "ROUTE_INVALID" {
-		t.Errorf("invalid route error code = %q, want ROUTE_INVALID", code)
-	}
-	after := h.mustStatus(h.do(http.MethodGet, "/llm/route", ""), http.StatusOK, "read route")
-	if got := llmAPIRouteRevision(t, after); got != revision {
-		t.Fatalf("revision after a rejected save = %d, want %d unchanged", got, revision)
 	}
 }
 
