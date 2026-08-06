@@ -159,6 +159,32 @@ test("cleanup failure cannot hide the current route error or run cleanup twice",
   assert.match(reports[1][1].message, /agent cleanup failed/);
 });
 
+test("the providers hash lazy-loads the real Providers module", async () => {
+  const mounts = [];
+  const reports = [];
+  const controller = createPortalController({
+    nav: {},
+    content: { replaceChildren() {} },
+    getHash: () => "#providers",
+    routeHost: {
+      mount: (page, context) => mounts.push({ page, routeId: context.routeId }),
+      dispose() {},
+    },
+    renderNavigation() {},
+    renderError: (error) => error,
+    setTitle() {},
+    focusContent() {},
+    reportError: (...args) => reports.push(args),
+  });
+
+  await controller.navigate();
+
+  assert.deepEqual(reports, []);
+  assert.equal(mounts.length, 1);
+  assert.equal(mounts[0].routeId, "providers");
+  assert.equal(typeof mounts[0].page.mount, "function");
+});
+
 test("dispose invalidates pending navigation and disposes the host once", async () => {
   const models = deferred();
   const agentsPage = page("agents");

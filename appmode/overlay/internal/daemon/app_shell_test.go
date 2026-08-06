@@ -21,6 +21,7 @@ func TestAppPortalShellAssetsAreEmbedded(t *testing.T) {
 		"pages/agents.js",
 		"pages/knowledge.js",
 		"pages/models.js",
+		"pages/providers.js",
 		"pages/roadmap.js",
 	} {
 		if _, err := fs.ReadFile(assetFS, name); err != nil {

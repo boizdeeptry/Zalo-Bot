@@ -35,6 +35,7 @@ test("navigation exposes the legacy menu contract", () => {
           todo: "Nối agent với công cụ ngoài qua MCP: CRM, đơn hàng, tồn kho.",
           href: undefined,
         },
+        { id: "providers", icon: "🔌", label: "Providers", todo: undefined, href: undefined },
         { id: "models", icon: "🧩", label: "Models", todo: undefined, href: undefined },
         {
           id: "memory",

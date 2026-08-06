@@ -29,3 +29,23 @@ test("mobile rail closes after an internal navigation route and disposal detache
   toggle.click();
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
 });
+
+test("mobile rail closes after choosing the Providers route", (t) => {
+  const dom = installDOM();
+  t.after(dom.restore);
+
+  const toggle = document.createElement("button");
+  const rail = document.createElement("aside");
+  const navigation = document.createElement("nav");
+  rail.append(navigation);
+  renderNavigation({ container: navigation, groups: NAVIGATION, activeId: "knowledge" });
+
+  const controller = createRailNavigation({ toggle, rail, navigation });
+  t.after(controller.dispose);
+  toggle.click();
+
+  const providers = find(navigation, (node) => node.dataset?.route === "providers");
+  navigation.dispatchEvent({ type: "click", target: providers.firstElementChild });
+
+  assert.equal(rail.classList.contains("is-open"), false);
+});

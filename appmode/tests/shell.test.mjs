@@ -32,7 +32,8 @@ test("desktop navigation renders every group and roadmap pages stay offline", (t
   assert.deepEqual(headings.map(text), ["BUILD", "OPERATE", "GOVERN", "SYSTEM"]);
 
   const items = findAll(nav, (node) => node.classList?.contains("nav"));
-  assert.equal(items.length, 13);
+  assert.equal(items.length, 14);
+  assert.ok(find(nav, (node) => node.dataset?.route === "providers"));
   const knowledge = find(nav, (node) => node.dataset?.route === "knowledge");
   assert.equal(knowledge.getAttribute("aria-current"), "page");
   const workflows = find(nav, (node) => node.dataset?.route === "workflows");
@@ -75,4 +76,26 @@ test("desktop shell loads isolated Portal CSS with the legacy rail dimensions", 
   assert.match(css, /@media\s*\(max-width:\s*720px\)/);
   assert.match(css, /#rail\.is-open\s*\{/);
   assert.match(css, /#rail-toggle\s*\{/);
+  // Outline hướng vào trong là bản vá cho #main chạm mép; một trang mới không được xoá nó.
+  assert.match(css, /#main:focus-visible\s*\{[^}]*outline-offset:\s*-2px/s);
+});
+
+test("Provider styles stay scoped to their own page and sheet", async () => {
+  const css = await readFile(new URL("portal.css", staticRoot), "utf8");
+
+  assert.match(css, /\.providers-page\s/);
+  assert.match(css, /\.provider-sheet\.sheetback\s*\{/);
+  const providerRules = [...css.matchAll(/^\s*([^@{}\n][^{}\n]*)\{/gm)]
+    .map(([, selector]) => selector.trim())
+    .filter((selector) => selector.includes("provider"));
+  assert.ok(providerRules.length > 0);
+  for (const selector of providerRules) {
+    for (const part of selector.split(",")) {
+      assert.match(
+        part.trim(),
+        /^\.providers-page[\s.:[]|^\.provider-sheet[\s.:[]|^\.providers-page$|^\.provider-sheet$/,
+        `Provider rule "${part.trim()}" must stay scoped`,
+      );
+    }
+  }
 });
