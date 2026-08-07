@@ -94,8 +94,9 @@ func buildCLIArgv(d cliDescriptor, req llmRequest) []string {
 // classifyCLIError ánh xạ output CLI về taxonomy CHUNG. Mặc định rate_limit khi mơ hồ: đoán sai
 // hướng đó chỉ tốn một lượt thử Provider sau; đoán sai thành credential thì chết cả chuỗi.
 //
-// Danh sách chuỗi con cố ý để RỘNG: codex/gemini chưa đăng nhập nên message hết-hạn-mức/xác-thực
-// thật chưa kiểm chứng — Task 8 chạy CLI thật, bắt stderr thật rồi ghim lại. Đừng khớp chính xác.
+// Danh sách chuỗi con cố ý để RỘNG. Chuỗi chưa-đăng-nhập của codex XÁC NHẬN THẬT (2026-08-07):
+// `codex login status` in "Not logged in" (→ credential). Chuỗi HẾT-HẠN-MỨC vẫn CHƯA kiểm chứng
+// (không ép được quota khi còn hạn mức) → giữ default rate_limit (đi tiếp). Đừng khớp chính xác.
 func classifyCLIError(stderr string, notInstalled bool) llmErrorKind {
 	if notInstalled {
 		return llmErrorCredential // cần cài + đăng nhập; thử tiếp vô ích
@@ -365,12 +366,38 @@ func (a *cliAdapter) Discover(_ context.Context, _ []byte) ([]store.LLMModel, er
 	return out, nil
 }
 
-// parseCLIAnswer đọc câu trả lời từ output CLI.
+// parseCLIAnswer trích câu trả lời cuối từ output CLI, chọn cách parse theo vendor.
 //
-// parse TẠM: Task 8 ghim theo output thật đã capture. codex ghi câu trả lời ra một `-o <file>`,
-// gemini phát `-o json`, claude phát stream-json — mỗi vendor một format. Bây giờ trả stdout đã
-// trim làm chỗ dựa; router test tiêm a.run nên format thật chưa bị đụng tới tới Task 8.
-func parseCLIAnswer(_ cliDescriptor, out []byte) string {
+// codex: `codex exec` (KHÔNG --json) ghi ĐÚNG tin nhắn cuối ra stdout, còn toàn bộ event-log/
+// reasoning ra stderr. Capture THẬT trên máy (2026-08-07): stdout khớp byte-for-byte với file
+// `-o/--output-last-message`, cả với câu trả lời nhiều dòng UTF-8. Nên trim stdout là hợp đồng gọn
+// nhất — không phải tạo file tạm mỗi lượt; `-o <file>` là dự phòng có tài liệu nếu một bản codex sau
+// làm bẩn stdout.
+// gemini-cli: `-o json` bọc câu trả lời trong {"response": ...} — trích .response (xem parseGeminiAnswer).
+// claude-code: stream-json, event `result` — Task 11 gộp claude vào đây, hiện chưa đi qua hàm này.
+func parseCLIAnswer(d cliDescriptor, out []byte) string {
+	if d.kind == "gemini-cli" {
+		return parseGeminiAnswer(out)
+	}
+	// codex: stdout đã là câu trả lời sạch (log ở stderr); claude-code: Task 11.
+	return strings.TrimSpace(string(out))
+}
+
+// parseGeminiAnswer trích .response từ output `-o json` của Gemini CLI; fallback về raw đã trim nếu
+// không phải JSON có .response (không nuốt mất câu trả lời).
+//
+// CHƯA kiểm chứng bằng output THẬT: Google khai tử đăng nhập cá nhân của gemini-cli (2026-08, "no
+// longer supported for individuals" → Antigravity), nên không capture live được và Gemini đã bỏ khỏi
+// onboarding (DORMANT). Key .response theo tài liệu `-o json` + quyết định research, KHÔNG phải giá
+// trị đo thật. Khi có CLI Gemini đăng nhập lại được: capture `-o json` thật, xác nhận key, rồi ghim.
+// ponytail: .response theo tài liệu, chưa verify live — Gemini dormant, verify lại khi hồi sinh.
+func parseGeminiAnswer(out []byte) string {
+	var v struct {
+		Response string `json:"response"`
+	}
+	if err := json.Unmarshal(out, &v); err == nil && v.Response != "" {
+		return strings.TrimSpace(v.Response)
+	}
 	return strings.TrimSpace(string(out))
 }
 
@@ -420,8 +447,9 @@ var npmGlobalRoot = sync.OnceValues(func() (string, error) {
 
 // geminiCredPath là đường dò credential của Gemini CLI.
 //
-// Cô lập ở MỘT hàm vì tên file thật còn LOW confidence (Task 8 chốt sau khi đăng nhập). Chỉ nhánh
-// gemini-file trong checkCLIAuth đọc tới; các vendor khác bỏ qua tham số này.
+// Tên file XÁC NHẬN THẬT (2026-08-07): ~/.gemini/oauth_creds.json tồn tại trên máy từng đăng nhập
+// (1822 byte). Cô lập ở MỘT hàm vì đây là chi tiết nội bộ của hãng, có thể vỡ khi Google đổi CLI.
+// Chỉ nhánh gemini-file trong checkCLIAuth đọc tới; các vendor khác bỏ qua tham số này.
 func geminiCredPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {

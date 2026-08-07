@@ -165,6 +165,39 @@ func TestClassifyCLIError(t *testing.T) {
 	}
 }
 
+// TestParseCLIAnswer ghim parse codex theo output THẬT đã capture (testdata/codex-out.txt — chạy
+// `codex exec` trên máy này, 2026-08-07, câu trả lời nhiều dòng UTF-8). KHÔNG bịa: fixture là stdout
+// thật và khớp byte-for-byte với file `-o/--output-last-message`.
+func TestParseCLIAnswer(t *testing.T) {
+	codexOut, err := os.ReadFile(filepath.Join("testdata", "codex-out.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := parseCLIAnswer(cliDescriptors["codex"], codexOut)
+	if !strings.Contains(got, "tiêu hóa") {
+		t.Errorf("parse codex = %q; muốn chứa câu trả lời thật", got)
+	}
+	if got != strings.TrimSpace(got) {
+		t.Errorf("parse codex còn khoảng trắng thừa ở đầu/cuối: %q", got)
+	}
+}
+
+// TestParseGeminiAnswerExtractsResponseField kiểm LOGIC trích .response, KHÔNG phải tính tương thích
+// với gemini THẬT: Google khai tử đăng nhập cá nhân của gemini-cli (2026-08 → Antigravity) nên KHÔNG
+// capture live được, và Gemini đã bỏ khỏi onboarding (dormant). Input dưới đây là SHAPE theo tài liệu
+// `-o json`, CỐ Ý dán nhãn tổng hợp — KHÔNG giả làm output đã đo. Khi Gemini hồi sinh (CLI Antigravity
+// đăng nhập được): capture `-o json` thật, xác nhận key, rồi ghim lại.
+func TestParseGeminiAnswerExtractsResponseField(t *testing.T) {
+	// JSON có .response → trích đúng, đã trim.
+	if got := parseGeminiAnswer([]byte(`{"response":"  4  ","stats":{}}`)); got != "4" {
+		t.Errorf("parseGeminiAnswer(json .response) = %q; want %q", got, "4")
+	}
+	// fallback: không phải JSON → trả raw đã trim, KHÔNG nuốt câu trả lời.
+	if got := parseGeminiAnswer([]byte("  4 khong-json  ")); got != "4 khong-json" {
+		t.Errorf("parseGeminiAnswer(non-json) = %q; want raw đã trim", got)
+	}
+}
+
 // TestGeminiAuthProbe chốt ngữ nghĩa đã hoà giải giữa test và skeleton của plan: thiếu hẳn file →
 // loggedOut (biết chắc chưa đăng nhập, đi login được — hành động đúng và thật); file có mặt nhưng
 // KHÔNG đọc được nội dung (rỗng / khoá) → unknown, KHÔNG dám kết luận "chưa đăng nhập" khi ta chỉ là
@@ -294,7 +327,8 @@ func TestCodexAuthLive(t *testing.T) {
 // --- adapter: run seam tiêm, KHÔNG spawn CLI thật ---
 
 // TestCLIAdapterGenerateBuildsArgvAndReturnsTrimmedText: Generate dựng argv của descriptor, chạy
-// qua seam a.run, và parse TẠM chỉ trim stdout (Task 8 ghim format thật). codex đọc prompt qua argv.
+// qua seam a.run, và trả câu trả lời codex = stdout đã trim (đã ghim theo capture thật, Task 8).
+// codex đọc prompt qua argv.
 func TestCLIAdapterGenerateBuildsArgvAndReturnsTrimmedText(t *testing.T) {
 	var gotArgv []string
 	var gotStdin []byte
