@@ -1,12 +1,16 @@
 package daemon
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +39,7 @@ type connectState struct {
 	Phase    connectPhase `json:"phase"`
 	Message  string       `json:"message,omitempty"`
 	LoginURL string       `json:"loginUrl,omitempty"`
+	Code     string       `json:"code,omitempty"` // device-auth one-time code (NOT a secret credential; expires ~15m)
 	Error    string       `json:"error,omitempty"`
 }
 
@@ -45,7 +50,7 @@ type connectState struct {
 type connectRunner interface {
 	detect(kind string) (installed bool, err error)
 	install(ctx context.Context, kind string, onLine func(string)) error
-	login(ctx context.Context, kind, configDir string) (loginURL string, wait func() error, err error)
+	login(ctx context.Context, kind, configDir string) (loginURL, code string, wait func() error, err error)
 	pollAuth(kind, configDir string) authState
 }
 
@@ -173,13 +178,13 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 		}
 	}
 	job.set(func(s *connectState) { s.Phase = phaseAwaitingLogin; s.Message = "" })
-	loginURL, wait, err := m.runner.login(ctx, kind, job.configDir)
+	loginURL, code, wait, err := m.runner.login(ctx, kind, job.configDir)
 	if err != nil {
 		m.fail(job, kind, "không mở được đăng nhập", err)
 		return
 	}
 	if loginURL != "" {
-		job.set(func(s *connectState) { s.LoginURL = loginURL })
+		job.set(func(s *connectState) { s.LoginURL = loginURL; s.Code = code })
 	}
 	timeout := m.loginTimeout
 	if timeout == 0 {
@@ -249,9 +254,9 @@ func (a *api) newConnectManager() *connectManager {
 // crypto/rand+hex generator; the string is hex+hyphens, safe as a path segment.
 func newAccountID() string { return uuid.NewString() }
 
-// defaultConnectRunner is the real runner. detect is real; install/login/pollAuth are pinned
-// against captured CLI output at the NEEDS-LOGIN checkpoint (Task 5b) — until then they are honest
-// "not yet pinned" stubs so we never ship guessed CLI commands / URL parsing / env-threading.
+// defaultConnectRunner is the real runner, pinned against `codex` CLI output captured live
+// (codex-cli 0.147.0) at the NEEDS-LOGIN checkpoint. install shells npm; login/pollAuth spawn
+// `node <codex.js>` with CODEX_HOME=configDir so each account's session stays isolated.
 type defaultConnectRunner struct{ logger *slog.Logger }
 
 func newDefaultConnectRunner(l *slog.Logger) *defaultConnectRunner {
@@ -271,18 +276,150 @@ func (d *defaultConnectRunner) detect(kind string) (bool, error) {
 	return false, nil
 }
 
+// install runs npm to install the codex CLI globally, streaming progress lines to onLine.
+//
+// ponytail: shells the ambient `npm`. The packaged app bundles node+npm (build task) so this
+// resolves offline on a fresh machine; on a dev box it uses PATH npm.
 func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine func(string)) error {
-	return errors.New("cài tự động chưa được ghim (capture-first, Task 5b)")
+	if kind != "codex" {
+		return fmt.Errorf("connect install: kind lạ %q", kind)
+	}
+	cmd := exec.CommandContext(ctx, "npm", "install", "-g", "@openai/codex")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out // npm writes progress to stderr; fold into the same stream
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("connect install: start npm: %w", err)
+	}
+	err := cmd.Wait()
+	if onLine != nil {
+		sc := bufio.NewScanner(bytes.NewReader(out.Bytes()))
+		for sc.Scan() {
+			onLine(sc.Text())
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("connect install: npm exit: %w", err)
+	}
+	return nil
 }
 
-func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string) (string, func() error, error) {
-	return "", nil, errors.New("đăng nhập trong Portal chưa được ghim (capture-first, Task 5b)")
+// connectURLRe/connectCodeRe parse `node <codex.js> login --device-auth` stdout — captured live
+// (codex-cli 0.147.0): a "https://..." URL line, then later a one-time code like "EQ0J-QKCPZ" on
+// its own line. connectCodeRe is only tried on lines that did NOT match the URL, so it can never
+// grab a fragment out of the URL itself.
+var connectURLRe = regexp.MustCompile(`https://\S+`)
+var connectCodeRe = regexp.MustCompile(`\b[A-Z0-9]{3,6}-[A-Z0-9]{3,6}\b`)
+
+// login runs `node <codex.js> login --device-auth` with CODEX_HOME=configDir, scans stdout for
+// the login URL + one-time code, and returns a wait() that blocks on process exit (success writes
+// auth.json into configDir and the process exits 0). Uses exec.Command (not CommandContext): we
+// kill the whole tree via killPidTree on ctx cancel, because CommandContext only kills the direct
+// node child and would orphan its grandchildren — same hazard runCLIProcess documents.
+func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string) (string, string, func() error, error) {
+	desc, ok := cliDescriptors[kind]
+	if !ok {
+		return "", "", nil, fmt.Errorf("connect login: kind lạ %q", kind)
+	}
+	program, prefixArgs, err := resolveCLIProgram(desc)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("connect login: resolve %s: %w", kind, err)
+	}
+	argv := append(append([]string{}, prefixArgs...), "login", "--device-auth")
+	cmd := exec.Command(program, argv...)
+	cmd.Env = append(os.Environ(), "CODEX_HOME="+configDir)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", "", nil, err
+	}
+	pid := cmd.Process.Pid
+	// Kill the whole tree when ctx is cancelled — covers cancel during the URL-wait below AND
+	// during the post-return polling phase (the connect state machine cancels ctx on every
+	// terminal exit via job.cancel()). Bounded: this goroutine exits as soon as ctx is done.
+	go func() {
+		<-ctx.Done()
+		_ = killPidTree(pid, "connect-login", d.logger)
+	}()
+	type parsed struct{ url, code string }
+	resCh := make(chan parsed, 1)
+	// Bounded: exits when the pipe closes (process exit) or the scan otherwise ends.
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		var url, code string
+		for sc.Scan() {
+			line := sc.Text()
+			if url == "" {
+				if m := connectURLRe.FindString(line); m != "" {
+					url = m
+					continue // don't also code-match the URL line
+				}
+			}
+			if code == "" {
+				if m := connectCodeRe.FindString(line); m != "" {
+					code = m
+				}
+			}
+			if url != "" && code != "" {
+				break
+			}
+		}
+		resCh <- parsed{url, code}
+	}()
+	select {
+	case r := <-resCh:
+		if r.url == "" {
+			_ = killPidTree(pid, "connect-login", d.logger)
+			if d.logger != nil {
+				d.logger.Error("connect login: không đọc được URL", "kind", kind, "stderr", errBuf.String())
+			}
+			return "", "", nil, errors.New("không đọc được URL đăng nhập từ codex")
+		}
+		wait := func() error { return cmd.Wait() }
+		return r.url, r.code, wait, nil
+	case <-time.After(45 * time.Second):
+		_ = killPidTree(pid, "connect-login", d.logger)
+		return "", "", nil, errors.New("codex không in URL đăng nhập trong 45s")
+	case <-ctx.Done():
+		// the kill goroutine above handles the tree kill
+		return "", "", nil, ctx.Err()
+	}
 }
 
+// pollAuth runs `node <codex.js> login status` with CODEX_HOME=configDir — cheap, no subscription
+// turn spent. Captured live (codex-cli 0.147.0): exit 0 + "Logged in using ChatGPT" when signed
+// in, exit 1 + "Not logged in" otherwise. codex prints no email, so the account label stays as the
+// user gave it.
 func (d *defaultConnectRunner) pollAuth(kind, configDir string) authState {
-	// codex-exit auth is not wired in checkCLIAuth yet (returns authUnknown), and threading
-	// CODEX_HOME=configDir into the auth probe is pinned at Task 5b. Honest unknown until then.
-	return authUnknown
+	desc, ok := cliDescriptors[kind]
+	if !ok {
+		return authUnknown
+	}
+	program, prefixArgs, err := resolveCLIProgram(desc)
+	if err != nil {
+		return authUnknown
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	argv := append(append([]string{}, prefixArgs...), "login", "status")
+	cmd := exec.CommandContext(ctx, program, argv...)
+	cmd.Env = append(os.Environ(), "CODEX_HOME="+configDir)
+	err = cmd.Run()
+	if ctx.Err() != nil {
+		return authUnknown // timed out probing → don't conclude logged-out
+	}
+	if err == nil {
+		return codexAuthFromExit(0) // authLoggedIn
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return codexAuthFromExit(exit.ExitCode()) // exit 1 → authLoggedOut
+	}
+	return authUnknown // couldn't even spawn → unknown, not logged-out
 }
 
 // --- HTTP handlers ---

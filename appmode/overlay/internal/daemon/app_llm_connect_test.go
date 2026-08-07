@@ -35,12 +35,12 @@ func (f *fakeRunner) install(ctx context.Context, _ string, onLine func(string))
 	}
 	return f.installErr
 }
-func (f *fakeRunner) login(ctx context.Context, _, configDir string) (string, func() error, error) {
+func (f *fakeRunner) login(ctx context.Context, _, configDir string) (string, string, func() error, error) {
 	f.lastCfgDir = configDir
 	if f.loginErr != nil {
-		return "", nil, f.loginErr
+		return "", "", nil, f.loginErr
 	}
-	return f.loginURL, func() error { <-ctx.Done(); return ctx.Err() }, nil
+	return f.loginURL, "AAAA-BBBBB", func() error { <-ctx.Done(); return ctx.Err() }, nil
 }
 func (f *fakeRunner) pollAuth(_, configDir string) authState { f.lastCfgDir = configDir; return f.auth }
 
@@ -183,6 +183,27 @@ func TestConnectCancelStopsLoginAndPolls(t *testing.T) {
 	if st.Phase != phaseCanceled {
 		t.Errorf("phase = %q; want canceled", st.Phase)
 	}
+}
+
+// TestConnectPollingCarriesLoginURLAndCode proves login's device-auth code (not just the URL)
+// reaches connectState. The happy-path fake flips authLoggedIn immediately, so the state never
+// sits in polling long enough to observe LoginURL/Code — this test holds auth at loggedOut so the
+// machine parks in polling, then asserts both fields, then cancels to end the job cleanly.
+func TestConnectPollingCarriesLoginURLAndCode(t *testing.T) {
+	r := &fakeRunner{installed: true, loginURL: "https://auth.example/login", auth: authLoggedOut}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	m.start("codex", "x")
+	st := waitPhase(t, m, "codex", phasePolling)
+	if st.Phase != phasePolling {
+		t.Fatalf("phase = %q; want polling", st.Phase)
+	}
+	if st.LoginURL != "https://auth.example/login" {
+		t.Errorf("loginUrl = %q; want the fake login URL", st.LoginURL)
+	}
+	if st.Code != "AAAA-BBBBB" {
+		t.Errorf("code = %q; want the fake device code", st.Code)
+	}
+	m.cancel("codex")
 }
 
 func TestConnectSecondKindWhileBusyIsRejected(t *testing.T) {
