@@ -260,7 +260,9 @@ export function createProvidersPage({ request = requestJSON } = {}) {
       async function refresh() {
         const revision = ++listRevision;
         live.textContent = "Đang đọc danh sách Provider…";
-        root.replaceChildren(header(), toolbar());
+        // Chỉ vẽ toolbar gallery khi đang ở gallery — reload lúc đang xem detail không được nháy
+        // ngược về toolbar gallery rồi mới vẽ lại detail ở paint().
+        if (view === "gallery") root.replaceChildren(header(), toolbar());
         try {
           const data = await service.list();
           if (disposed || revision !== listRevision) return;
