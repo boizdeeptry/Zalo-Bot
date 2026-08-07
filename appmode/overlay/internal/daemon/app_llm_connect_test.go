@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,4 +198,65 @@ func TestConnectSecondKindWhileBusyIsRejected(t *testing.T) {
 	if _, err := m.start("other", "y"); !errors.Is(err, errConnectBusy) {
 		t.Errorf("start(other) while busy = %v; want errConnectBusy", err)
 	}
+}
+
+func TestConnectEndpoints(t *testing.T) {
+	a := newAppRouteAPI(t)
+	// inject a fake runner via the package singleton; reset after.
+	connectMgr = &connectManager{
+		runner:        &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedIn},
+		ensure:        a.st.EnsureProviderForKind,
+		createAccount: a.st.CreateLLMAccount,
+		dataDir:       t.TempDir(),
+		newID:         func() string { return "acc1" },
+		logger:        slog.New(slog.DiscardHandler),
+		loginTimeout:  200 * time.Millisecond,
+		pollInterval:  5 * time.Millisecond,
+	}
+	t.Cleanup(func() { connectMgr = nil })
+
+	// POST start (valid kind) → 200
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/llm/providers/codex/connect", strings.NewReader(`{"label":"Tài khoản 1"}`))
+	req.SetPathValue("kind", "codex")
+	a.handleLLMConnectStart(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST connect(codex) = %d; want 200 (body=%s)", rec.Code, rec.Body)
+	}
+
+	// unsupported kind → 400
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("POST", "/llm/providers/openai/connect", nil)
+	req2.SetPathValue("kind", "openai")
+	a.handleLLMConnectStart(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Errorf("POST connect(openai) = %d; want 400", rec2.Code)
+	}
+
+	// GET status → 200 (some phase)
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest("GET", "/llm/providers/codex/connect", nil)
+	req3.SetPathValue("kind", "codex")
+	a.handleLLMConnectStatus(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Errorf("GET connect status = %d; want 200", rec3.Code)
+	}
+
+	// DELETE cancel → 200
+	rec4 := httptest.NewRecorder()
+	req4 := httptest.NewRequest("DELETE", "/llm/providers/codex/connect", nil)
+	req4.SetPathValue("kind", "codex")
+	a.handleLLMConnectCancel(rec4, req4)
+	if rec4.Code != http.StatusOK {
+		t.Errorf("DELETE connect = %d; want 200", rec4.Code)
+	}
+}
+
+// TestConnectRoutesRegisterWithoutConflict proves the {kind} routes don't collide with the
+// existing {id} routes (Go 1.22 ServeMux panics on conflicting patterns at registration).
+func TestConnectRoutesRegisterWithoutConflict(t *testing.T) {
+	a := newAppRouteAPI(t)
+	t.Cleanup(func() { connectMgr = nil })
+	mux := http.NewServeMux()
+	a.registerAppRoutes(mux) // must not panic
 }

@@ -5,11 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"agentdc/internal/store"
+
+	"github.com/google/uuid"
 )
 
 type connectPhase string
@@ -220,4 +224,111 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 		case <-tick.C:
 		}
 	}
+}
+
+// connectMgr is the process-level connect manager (one connect job at a time across the daemon).
+// ponytail: package singleton for the same reason as accountSel — `api` is declared in the base
+// repo (build asserts git-clean, can't add a field) and handlers are methods on *api. Initialized
+// once by registerAppRoutes from the serving api; one daemon = one api instance. Tests assign it
+// directly (and reset to nil via t.Cleanup).
+var connectMgr *connectManager
+
+func (a *api) newConnectManager() *connectManager {
+	return &connectManager{
+		runner:        newDefaultConnectRunner(a.logger),
+		ensure:        a.st.EnsureProviderForKind,
+		createAccount: a.st.CreateLLMAccount,
+		dataDir:       a.cfg.Dir,
+		newID:         newAccountID,
+		logger:        a.logger,
+	}
+}
+
+// newAccountID mints a filesystem-safe unique id for an account config dir. uuid.NewString is
+// already a dependency (registry.go uses it for PTY session ids) — reuse it instead of rolling a
+// crypto/rand+hex generator; the string is hex+hyphens, safe as a path segment.
+func newAccountID() string { return uuid.NewString() }
+
+// defaultConnectRunner is the real runner. detect is real; install/login/pollAuth are pinned
+// against captured CLI output at the NEEDS-LOGIN checkpoint (Task 5b) — until then they are honest
+// "not yet pinned" stubs so we never ship guessed CLI commands / URL parsing / env-threading.
+type defaultConnectRunner struct{ logger *slog.Logger }
+
+func newDefaultConnectRunner(l *slog.Logger) *defaultConnectRunner {
+	return &defaultConnectRunner{logger: l}
+}
+
+func (d *defaultConnectRunner) detect(kind string) (bool, error) {
+	desc, ok := cliDescriptors[kind]
+	if !ok {
+		return false, fmt.Errorf("connect detect: kind lạ %q", kind)
+	}
+	if _, _, err := resolveCLIProgram(desc); err == nil {
+		return true, nil
+	}
+	// resolveCLIProgram fails for both "not installed" and other resolution errors; treat as
+	// not-installed so the install step can try (and report a clear error if it truly can't).
+	return false, nil
+}
+
+func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine func(string)) error {
+	return errors.New("cài tự động chưa được ghim (capture-first, Task 5b)")
+}
+
+func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string) (string, func() error, error) {
+	return "", nil, errors.New("đăng nhập trong Portal chưa được ghim (capture-first, Task 5b)")
+}
+
+func (d *defaultConnectRunner) pollAuth(kind, configDir string) authState {
+	// codex-exit auth is not wired in checkCLIAuth yet (returns authUnknown), and threading
+	// CODEX_HOME=configDir into the auth probe is pinned at Task 5b. Honest unknown until then.
+	return authUnknown
+}
+
+// --- HTTP handlers ---
+
+func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
+	kind := r.PathValue("kind")
+	if !subscriptionKinds[kind] {
+		a.writeLLMErr(w, http.StatusBadRequest, "CONNECT_KIND_UNSUPPORTED",
+			"chỉ OpenAI Codex mới kết nối được ở bản này", map[string]string{"kind": kind})
+		return
+	}
+	var body struct {
+		Label string `json:"label"`
+	}
+	if !a.decodeLLMBody(w, r, &body) {
+		return // decodeLLMBody already wrote the error
+	}
+	label := strings.TrimSpace(body.Label)
+	if label == "" {
+		label = "Tài khoản"
+	}
+	st, err := connectMgr.start(kind, label)
+	if errors.Is(err, errConnectBusy) {
+		// Unreachable while codex is the only subscription kind (a second POST of the same kind
+		// returns the current state, and any other kind is rejected 400 above). Kept for when
+		// claude-code becomes a second connectable kind.
+		a.writeLLMErr(w, http.StatusConflict, "CONNECT_BUSY", "đang có phiên kết nối khác", nil)
+		return
+	}
+	if err != nil {
+		a.writeLLMInternal(w, "không khởi động được kết nối", err)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, st)
+}
+
+func (a *api) handleLLMConnectStatus(w http.ResponseWriter, r *http.Request) {
+	st, ok := connectMgr.status(r.PathValue("kind"))
+	if !ok {
+		a.writeJSON(w, http.StatusOK, map[string]any{"phase": "idle"})
+		return
+	}
+	a.writeJSON(w, http.StatusOK, st)
+}
+
+func (a *api) handleLLMConnectCancel(w http.ResponseWriter, r *http.Request) {
+	connectMgr.cancel(r.PathValue("kind"))
+	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
