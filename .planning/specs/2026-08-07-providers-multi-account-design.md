@@ -92,13 +92,16 @@ CREATE TABLE IF NOT EXISTS llm_accounts (
 
 Runtime: tin nhắn khách → router chọn provider (chuỗi fallback) → `cliAdapter` cho kind đó → `accountSelector.pick` → set env `config_dir` → spawn CLI chính chủ → lỗi rate-limit thì `penalize`. **Không token/khoá nào đi qua daemon** ở bất kỳ bước nào — phiên nằm trong `config_dir`.
 
-## Error handling (fallback 2 tầng)
+## Error handling
 
-- **Provider có ≥1 account enabled** → luôn dùng được: cooldown chỉ **hạ ưu tiên**, không loại cứng khi là lựa chọn duy nhất (một account vừa rate-limit có thể đã hồi; xấu nhất là một lượt phí rồi rơi provider kế theo đường lỗi thường).
-- **Provider 0 account enabled** → `pick` trả `false` → adapter trả **lỗi credential loại TIẾP-TỤC-chuỗi** → chuỗi fallback rơi xuống **provider kế** (hành vi cũ). Bảo đảm "không account" **không** map vào loại DỪNG-chuỗi (khác với "CLI chưa cài" ở `app_llm_cli.go:365-367`).
-- **Rate-limit của một account** → `penalize` + để router xử như lỗi lượt đó (rơi account khác/provider kế).
-- **Xoá account** → `DeleteLLMAccount(id)` + xoá `config_dir` (logout thật, `os.RemoveAll`). Xoá account **cuối** của kind → provider-kind còn "0 kết nối" → card về trạng thái chưa kết nối như fresh (không xoá dòng provider-kind; nó vẫn là mục catalog).
-- Lỗi tạo dir / ghi store lúc connect → phase `error` của connect job (thông báo gọn, không lộ đường dẫn nhạy cảm), không tạo account nửa vời.
+**Taxonomy engine (đã xác minh `app_llm_types.go:57` `isFallbackEligible`)**: chỉ `network/timeout/rate_limit/upstream` ĐƯỢC fallback (đi tiếp provider kế); `credential/model/request/policy/canceled` **DỪNG chuỗi**. Đây là hợp đồng có sẵn — #3 KHÔNG đổi.
+
+- **Rate-limit của account đang dùng** → adapter phân loại `llmErrorRateLimit` (fallback-eligible → router rơi **provider kế** trong lượt đó) **và** `penalize(kind, accountID)` đặt cooldown → các LƯỢT SAU của provider này ưu tiên account khác. `classifyCLIError` đã map "usage limit/rate limit/quota/too many requests" → `llmErrorRateLimit` (`app_llm_cli.go:131`), nên #3 chỉ cần **hook penalize khi kind == rate_limit**, không cần loại lỗi mới.
+- **Nhân quota diễn ra QUA NHIỀU LƯỢT** (round-robin + cooldown chọn account ở ĐẦU mỗi lượt), KHÔNG phải thử nhiều account trong cùng một lượt — một lượt vẫn chỉ chạm một account/một provider, đúng mô hình một-lần-thử-mỗi-provider của engine.
+- **Provider 0 account enabled** → `pick` trả `ok=false` → adapter trả `llmErrorCredential` → **DỪNG chuỗi**, y hệt "chưa đăng nhập" hôm nay (`app_llm_cli.go:130`). KHÔNG phải hành vi mới, KHÔNG "rơi provider kế" (credential không fallback-eligible). *(Sửa lại giả định sai của bản nháp spec trước — xác minh khi viết plan.)*
+- **pick khi có ≥1 account** → cooldown chỉ **hạ ưu tiên**; nếu tất cả cooldown vẫn chọn cái hết-cooldown-sớm-nhất — không bao giờ để một provider CÓ account mà trả `ok=false`.
+- **Xoá account** → `DeleteLLMAccount(id)` + xoá `config_dir` (`os.RemoveAll`, logout thật). Xoá account **cuối** của kind → provider còn "0 kết nối" → card về trạng thái chưa kết nối như fresh (KHÔNG xoá dòng provider-kind; nó vẫn là mục catalog).
+- Lỗi tạo dir / ghi store lúc connect → phase `error` của connect job (thông báo gọn, không lộ đường dẫn), không tạo account nửa vời.
 
 ## Testing
 
@@ -126,6 +129,6 @@ Runtime: tin nhắn khách → router chọn provider (chuỗi fallback) → `cl
 
 - **Login vào dir chỉ định** — cần chắc `codex login` tôn trọng `CODEX_HOME` và `claude` tôn trọng `CLAUDE_CONFIG_DIR` khi spawn nền (không tự rơi về `~/.codex`/`~/.claude`). Rủi ro chính, chốt capture-first. Nếu một CLI **không** cho relocate → account đầu buộc dùng dir mặc định (rơi về phương án bất đối xứng đã loại) — sẽ báo lại làm điểm quyết định.
 - **Phân loại rate-limit** — engine phải phân biệt lỗi rate-limit (→ cooldown) với lỗi khác; xem `classifyCLIError`. Nếu taxonomy chưa tách rate-limit riêng, thêm một loại/nhận diện (không nới hợp đồng che stderr). Chốt capture-first với output lỗi thật.
-- **"Không account" vs "CLI chưa cài"** — hai cái đều là "credential" nhưng một cái phải TIẾP-TỤC-chuỗi, một cái DỪNG. Cần đọc kỹ classify + router trước khi sửa để không đảo hành vi fallback hiện có.
+- **"0 account" = credential = DỪNG chuỗi** — đã xác minh (`isFallbackEligible` chỉ cho network/timeout/rate_limit/upstream đi tiếp). #3 giữ nguyên: 0 account cư xử y như "chưa đăng nhập" hiện tại. Nếu về sau muốn "provider hết account thì rơi provider kế" thì đó là đổi hợp đồng taxonomy — việc riêng, không thuộc #3.
 - **Phụ thuộc #2** — #3 execute được chỉ sau khi #2 (account-aware) đã build. Cùng nhánh, cùng môi trường capture-first — gộp checkpoint đăng nhập của #2 và #3 làm một lần cho gọn.
 - **Cổng credential trên thư mục account** — `Assert-AppPackage` quét khoá; thư mục config account (chứa token phiên) **không** được đóng vào gói (là runtime data trên máy khách, sinh sau cài) — xác nhận nó nằm ngoài cây gói.
