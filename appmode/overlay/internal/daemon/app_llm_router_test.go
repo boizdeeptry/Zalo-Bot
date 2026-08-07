@@ -986,7 +986,9 @@ func TestAttachmentTurnPicksFirstEligibleLocalCLIInOrder(t *testing.T) {
 
 	openai := okAdapter(`{"answer":"api"}`)
 	var geminiSaw, codexSaw []string
-	gemini := fakeCLI("gemini-cli", "gemini-cli-1", `{"answer":"gemini"}`, &geminiSaw)
+	// gemini-cli xuất `-o json` → parseGeminiAnswer trích .response. Dùng ĐÚNG shape đó làm marker
+	// (không phải {"answer":...} tuỳ tiện) để fake khớp với parser thật của vendor.
+	gemini := fakeCLI("gemini-cli", "gemini-cli-1", `{"response":"gemini"}`, &geminiSaw)
 	codex := fakeCLI("codex", "codex-1", `{"answer":"codex"}`, &codexSaw)
 	claude := okClaude(`{"answer":"claude"}`)
 	f := newRouterFixture(newRoute(
@@ -1001,8 +1003,8 @@ func TestAttachmentTurnPicksFirstEligibleLocalCLIInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() = _, %v; want nil", err)
 	}
-	if got != `{"answer":"gemini"}` {
-		t.Errorf("Run() = %q; want %q (local_cli ĐẦU TIÊN, không phải codex sau nó)", got, `{"answer":"gemini"}`)
+	if got != "gemini" {
+		t.Errorf("Run() = %q; want %q (local_cli ĐẦU TIÊN, không phải codex sau nó)", got, "gemini")
 	}
 	if len(geminiSaw) != 1 {
 		t.Errorf("gemini-cli nhận %d lượt; want 1 (nó là local_cli đầu tiên)", len(geminiSaw))
