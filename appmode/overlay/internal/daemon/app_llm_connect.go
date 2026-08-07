@@ -317,13 +317,20 @@ func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine 
 var connectURLRe = regexp.MustCompile(`https://\S+`)
 var connectCodeRe = regexp.MustCompile(`\b[A-Z0-9]{3,6}-[A-Z0-9]{3,6}\b`)
 
+// connectANSIRe strips SGR color escapes. codex wraps its output in ANSI (e.g. the code prints as
+// "\x1b[94mEU2D-4GQCP\x1b[0m"), and it does so even with NO_COLOR set — verified live via the
+// packaged daemon's E2E. Without stripping, connectCodeRe's leading \b never matches (the char
+// before the code is the 'm' ending the escape, a word char → no boundary) and connectURLRe would
+// capture a trailing "\x1b[0m" into the URL. Strip before matching, per line.
+var connectANSIRe = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
 // scanDeviceAuth reads `login --device-auth` stdout and pulls the login URL + one-time code.
 // Pure (no process, no I/O beyond the given reader) so it's testable against the captured
 // codex 0.147.0 sample directly — see TestScanDeviceAuth.
 func scanDeviceAuth(r io.Reader) (url, code string) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
-		line := sc.Text()
+		line := connectANSIRe.ReplaceAllString(sc.Text(), "")
 		if url == "" {
 			if m := connectURLRe.FindString(line); m != "" {
 				url = m

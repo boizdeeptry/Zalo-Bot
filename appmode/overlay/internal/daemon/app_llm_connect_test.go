@@ -22,15 +22,19 @@ import (
 // doesn't false-match the lowercase URL, and the `continue` after a URL match keeps that same line
 // from also being tried as a code line.
 func TestScanDeviceAuth(t *testing.T) {
-	const sample = "Follow these steps to sign in with ChatGPT using device code authorization:\n" +
+	// codex ANSI-colorizes its output (verified live via the packaged daemon): the URL and code
+	// print wrapped in SGR escapes like "\x1b[94m...\x1b[0m". The sample carries those so the test
+	// fails if scanDeviceAuth ever stops stripping them (without stripping, url keeps a trailing
+	// "\x1b[0m" and code's leading \b never matches — the real E2E bug this guards against).
+	const sample = "\x1b[90mFollow these steps to sign in with ChatGPT using device code authorization:\x1b[0m\n" +
 		"\n" +
 		"1. Open this link in your browser and sign in to your account\n" +
-		"   https://auth.openai.com/codex/device\n" +
+		"   \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n" +
 		"\n" +
 		"2. Enter this one-time code (expires in 15 minutes)\n" +
-		"   EQ0J-QKCPZ\n" +
+		"   \x1b[94mEQ0J-QKCPZ\x1b[0m\n" +
 		"\n" +
-		"Continue only if you started this login in Codex.\n"
+		"\x1b[90mContinue only if you started this login in Codex.\x1b[0m\n"
 	url, code := scanDeviceAuth(strings.NewReader(sample))
 	if url != "https://auth.openai.com/codex/device" {
 		t.Errorf("url = %q; want the captured device-auth URL", url)
