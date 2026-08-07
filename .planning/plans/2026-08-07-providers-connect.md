@@ -18,6 +18,19 @@
 
 ---
 
+## AMENDMENT (từ #3, 2026-08-07): connect account-dir-aware
+
+> Thiết kế #3 multi-account chốt: mọi login (kể cả account ĐẦU của #2) sống trong thư mục app tự quản, cô lập — KHÔNG dùng `~/.codex`/`~/.claude`. Nền #3 ĐÃ build & test xanh (commits `5ed2f68`…`df9fa62`): bảng `llm_accounts` + `store.CreateLLMAccount`/`LLMAccounts`/`DeleteLLMAccount`, `accountConfigDir(dataDir,kind,id)`, `envVarFor(kind)`, `accountSelector`, `cliAdapter.accountEnv`. Khi thực thi #2, sửa các task cho khớp:
+
+- **`connectJob`/`connectManager.start`** nhận `{kind, accountId, configDir}` (không chỉ `kind`). `connectRunner.login`/`pollAuth` chạy với env `<envVarFor(kind)>=<configDir>`. `install` giữ mức máy.
+- **`POST /llm/providers/{kind}/connect`** đọc body `{label}`; manager sinh `accountId` + `configDir = accountConfigDir(a.cfg.Dir, kind, accountId)` + `os.MkdirAll(0o700)` trước khi chạy. Một job tại một thời điểm vẫn giữ (tránh 2 trình duyệt login).
+- **Bước `connected`** gọi `EnsureProviderForKind(kind)` **rồi** `store.CreateLLMAccount(...)` (id/providerID/label/configDir/enabled/addedAt) — thay cho "chỉ EnsureProviderForKind". `CreateLLMAccount` đã có (dùng ngay).
+- **Frontend panel Connect** thêm ô **nhãn** (mặc định "Tài khoản 1"); phơi hàm `startConnect(kind)` để #3 Task 8 nối vào nút "Thêm account".
+- **Task 5 (capture-first)** gộp với #3 Task 9: xác nhận `codex`/`claude` login tôn trọng `CODEX_HOME`/`CLAUDE_CONFIG_DIR` (phiên rơi đúng `configDir`), chốt tên biến claude, kiểm CLI có phơi email không.
+- **`EnsureProviderForKind`** (Task của #2) vẫn cần build — nền #3 KHÔNG tạo nó; nó thuộc #2.
+
+---
+
 ## File structure
 
 - **Mới** `appmode/overlay/internal/daemon/app_llm_connect.go` — `connectRunner` (interface), `connectState`/`connectPhase`, `connectJob`, `connectManager`, default runner, 3 handler. Một trách nhiệm: điều phối luồng connect.

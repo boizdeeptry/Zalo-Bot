@@ -6,10 +6,21 @@
 
 Biến nút "Add Connection" (hiện disabled ở trang chi tiết provider từ UI#1) thành luồng đăng nhập THẬT chạy hoàn toàn trong Portal cho **provider subscription** (Claude Code, OpenAI Codex): dò CLI → cài nếu thiếu → login (OAuth) → poll → Connected. **Người mua không bao giờ phải mở terminal.**
 
+## AMENDMENT (từ #3, 2026-08-07): connect account-dir-aware ngay từ đầu
+
+> Chốt khi thiết kế #3 multi-account (user duyệt gộp). #2 KHÔNG còn dùng thư mục config mặc định của máy; mọi login (kể cả account ĐẦU) sống trong thư mục app tự quản, cô lập. Nền #3 (bảng `llm_accounts`, `accountConfigDir`, `envVarFor`, `CreateLLMAccount`) ĐÃ có (commits `5ed2f68`…`df9fa62`). Khi thực thi #2, dựng theo các delta sau:
+
+- **Connect job mang đích account** `{kind, accountId, configDir}` thay vì chỉ `kind`. `install` vẫn ở mức máy (cài CLI một lần); `login`/`pollAuth` chạy với env `<envVarFor(kind)>=<configDir>` (codex→`CODEX_HOME`, claude-code→`CLAUDE_CONFIG_DIR`) → phiên rơi vào đúng thư mục account, KHÔNG đè `~/.codex`/`~/.claude`.
+- **`POST /llm/providers/{kind}/connect` nhận body `{label}`.** `connectManager` sinh `accountId` (short id), `configDir = accountConfigDir(a.cfg.Dir, kind, accountId)`, `os.MkdirAll(configDir, 0o700)` TRƯỚC khi chạy job.
+- **Khi `connected`:** `EnsureProviderForKind(kind)` **rồi** `store.CreateLLMAccount(store.LLMAccount{ID: accountId, ProviderID: <id của kind>, Label: label, ConfigDir: configDir, Enabled: true, AddedAt: now})`. (Email best-effort nếu capture-first Task 9 xác nhận CLI phơi ra.)
+- **`EnsureProviderForKind` vẫn giữ** — đảm bảo dòng provider-kind tồn tại trước khi gắn account.
+- Nút "Connect" của #2 thêm ô **nhãn** (mặc định "Tài khoản 1"); một lần connect = tạo MỘT account. Nhiều account = bấm "Thêm account" nhiều lần (frontend #3 Task 8).
+- Capture-first (#2 Task 5 gộp với #3 Task 9): xác nhận `codex login`/`claude` login **tôn trọng** `CODEX_HOME`/`CLAUDE_CONFIG_DIR` khi spawn nền (phiên rơi đúng dir), chốt tên biến claude, và CLI có phơi email không.
+
 ## Non-goals (để sub-project khác / execute-time)
 
 - **KHÔNG** làm connect cho provider API-key (OpenAI/Anthropic/Gemini/OpenRouter — nút của nhóm đó vẫn disabled "sắp có"); đó là luồng form-dán-khoá khác hẳn, tách riêng.
-- **KHÔNG** multi-account (một tài khoản/provider ở #2) → #3.
+- **KHÔNG** multi-account ở #2 (một lần connect = một account ĐẦU trong dir app-quản; xoay vòng/nhiều account là #3 — xem AMENDMENT).
 - **KHÔNG** Round Robin / Sticky / Combos → #3/#4.
 - **KHÔNG** ghim lệnh install/login CHÍNH XÁC trong spec: chúng là chi tiết execute-time, ghim **capture-first** khi CLI thật có mặt và anh đăng nhập thật (như Task 8 của engine). Spec cam kết KIẾN TRÚC + ranh giới, không phải cú pháp CLI.
 
