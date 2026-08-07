@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"slices"
 	"testing"
 	"time"
@@ -133,5 +136,37 @@ func TestMakeAccountEnvPenalizeOnlyOnRateLimit(t *testing.T) {
 	penalize(true)
 	if _, cooling := sel.cooldown["a1"]; !cooling {
 		t.Fatalf("penalize(true) did not cool down a1")
+	}
+}
+
+// TestSpawnSetsAccountEnvAndPenalizesOnRateLimit ghim seam accountEnv trên đường TEST (a.run):
+// spawn phải wire penalize TRƯỚC nhánh a.run, nên một lỗi rate_limit từ CLI phải gọi penalize(true).
+func TestSpawnSetsAccountEnvAndPenalizesOnRateLimit(t *testing.T) {
+	var penalized bool
+	a := newCLIAdapter(cliDescriptors["codex"], "codex", slog.New(slog.DiscardHandler))
+	a.accountEnv = func() ([]string, func(bool), bool) {
+		return []string{`CODEX_HOME=C:\d\a1`}, func(rl bool) { penalized = rl }, true
+	}
+	// run giả trả lỗi rate_limit (chuỗi "usage limit" → classifyCLIError = rate_limit).
+	a.run = func(ctx context.Context, argv []string, stdin []byte) ([]byte, error) {
+		return nil, &cliExit{err: errors.New("x"), stderr: "usage limit reached"}
+	}
+	_, err := a.Generate(context.Background(), llmRequest{Prompt: "hi", Model: "gpt-5.6-terra"}, nil)
+	if llmErrorKindOf(err) != llmErrorRateLimit {
+		t.Fatalf("kind = %v; want rate_limit", llmErrorKindOf(err))
+	}
+	if !penalized {
+		t.Fatalf("penalize không được gọi khi rate_limit")
+	}
+}
+
+// TestGenerateNoAccountIsCredential: accountEnv trả ok=false (0 account enabled) → Generate trả
+// credential (DỪNG chuỗi), y như CLI chưa cài — chưa đăng nhập thì thử tiếp vô ích.
+func TestGenerateNoAccountIsCredential(t *testing.T) {
+	a := newCLIAdapter(cliDescriptors["codex"], "codex", slog.New(slog.DiscardHandler))
+	a.accountEnv = func() ([]string, func(bool), bool) { return nil, nil, false }
+	_, err := a.Generate(context.Background(), llmRequest{Prompt: "hi", Model: "gpt-5.6-terra"}, nil)
+	if llmErrorKindOf(err) != llmErrorCredential {
+		t.Fatalf("kind = %v; want credential (0 account = chưa đăng nhập)", llmErrorKindOf(err))
 	}
 }

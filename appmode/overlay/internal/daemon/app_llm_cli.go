@@ -317,6 +317,10 @@ type cliAdapter struct {
 	// run cho phép test tiêm một runner giả thay cho spawn thật — router test và adapter test không
 	// được spawn CLI. Mặc định (nil) = spawn thật qua runCLIProcess.
 	run func(ctx context.Context, argv []string, stdin []byte) ([]byte, error)
+	// accountEnv chọn account cho lượt này (round-robin+cooldown) và trả env <VAR>=<configDir>
+	// + penalize. nil = không multi-account (giữ hành vi cũ: env mặc định của máy). ok=false =
+	// 0 account enabled → spawn trả credential (DỪNG chuỗi).
+	accountEnv func() (env []string, penalize func(rateLimited bool), ok bool)
 }
 
 func newCLIAdapter(d cliDescriptor, providerID string, logger *slog.Logger) *cliAdapter {
@@ -339,13 +343,17 @@ func (a *cliAdapter) Generate(ctx context.Context, req llmRequest, credential []
 	if a.d.promptViaStdin {
 		stdin = []byte(req.Prompt)
 	}
-	out, err := a.spawn(ctx, argv, stdin)
+	out, penalize, err := a.spawn(ctx, argv, stdin)
 	if err != nil {
 		var exit *cliExit
 		if errors.As(err, &exit) {
 			// classifyCLIError đọc stderr để PHÂN LOẠI, nhưng thân stderr KHÔNG đi vào thông báo:
 			// chỉ tên CLI + loại lỗi ra ngoài.
 			kind := classifyCLIError(exit.stderr, false)
+			// Chỉ rate_limit mới phạt account (đặt cooldown); các loại khác penalize(false) = no-op.
+			if penalize != nil {
+				penalize(kind == llmErrorRateLimit)
+			}
 			return llmResponse{}, newLLMError(kind, err, "%s: gọi CLI hỏng", a.d.kind)
 		}
 		// Đã là llmError (chưa cài) hoặc lỗi ctx (huỷ/hết giờ) — trả nguyên để router phân loại.
@@ -356,20 +364,38 @@ func (a *cliAdapter) Generate(ctx context.Context, req llmRequest, credential []
 
 // spawn tách runner test khỏi spawn thật. Khi a.run != nil, seam thay TOÀN BỘ việc định vị +
 // chạy tiến trình — adapter test không phụ thuộc CLI có cài trên máy hay không.
-func (a *cliAdapter) spawn(ctx context.Context, argv []string, stdin []byte) ([]byte, error) {
+//
+// Trả về thêm penalize (có thể nil) để Generate phạt account khi lỗi là rate_limit. accountEnv
+// chạy TRƯỚC nhánh a.run: penalize phải có ở CẢ đường test (a.run) lẫn đường thật.
+func (a *cliAdapter) spawn(ctx context.Context, argv []string, stdin []byte) ([]byte, func(bool), error) {
+	var env []string
+	var penalize func(bool)
+	if a.accountEnv != nil {
+		e, p, ok := a.accountEnv()
+		if !ok {
+			// 0 account enabled = chưa đăng nhập → credential (DỪNG chuỗi), y như not-installed.
+			return nil, nil, newLLMError(llmErrorCredential, nil, "%s: chưa có tài khoản nào đăng nhập", a.d.kind)
+		}
+		env, penalize = e, p
+	}
 	if a.run != nil {
-		return a.run(ctx, argv, stdin)
+		out, err := a.run(ctx, argv, stdin)
+		return out, penalize, err
 	}
 	program, prefixArgs, err := resolveCLIProgram(a.d)
 	if err != nil {
 		// Chưa cài → credential (cần cài + đăng nhập), loại DỪNG chuỗi: thử tiếp một CLI chưa cài
 		// chỉ tốn thời gian của khách.
-		return nil, newLLMError(classifyCLIError("", true), nil, "%s: CLI chưa cài", a.d.kind)
+		return nil, penalize, newLLMError(classifyCLIError("", true), nil, "%s: CLI chưa cài", a.d.kind)
 	}
 	// exec.Command chứ không CommandContext: runCLIProcess tự xử lý huỷ ctx bằng killPidTree
 	// (giết cả cây node→cli→cháu), còn CommandContext chỉ giết con trực tiếp và để cháu mồ côi.
 	cmd := exec.Command(program, append(prefixArgs, argv...)...)
-	return runCLIProcess(ctx, cmd, stdin, nil, a.logger)
+	if env != nil {
+		cmd.Env = env
+	}
+	out, err := runCLIProcess(ctx, cmd, stdin, nil, a.logger)
+	return out, penalize, err
 }
 
 // Test dò trạng thái đăng nhập — RẺ, không tốn một lượt subscription. loggedIn → nil; mọi trạng

@@ -538,6 +538,14 @@ func (a *api) appLLMAdapters() (map[string]providerAdapter, map[string]bool, err
 		if !ok {
 			continue
 		}
+		// Multi-account: chỉ kind subscription (envVarFor true) chạy qua cliAdapter mới cần chọn
+		// account + set env config-dir mỗi lượt. Hôm nay chỉ codex khớp (claude-code còn qua
+		// runClaude tới Task 11; gemini-cli là cliAdapter nhưng không subscription → bỏ qua).
+		if ca, isCLI := adapter.(*cliAdapter); isCLI {
+			if _, isSub := envVarFor(p.Kind); isSub {
+				ca.accountEnv = makeAccountEnv(a.st, accountSel, p.ID, p.Kind)
+			}
+		}
 		adapters[p.ID] = adapter
 		// Chỉ Provider GỌI ĐƯỢC mới vào tập tắt. Claude Code không có adapter nên nó không bao giờ
 		// tới đây — đúng như phải thế: nó là lưới an toàn, và một hàng database sửa tay không được
