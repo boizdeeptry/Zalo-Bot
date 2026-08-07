@@ -177,6 +177,30 @@
 }
 .providers-page .pv-mid { font-family:ui-monospace, Menlo, monospace; font-size:12.5px; color:#dcdce0; }
 .providers-page .pv-mname { font-size:10.5px; color:#6a6a72; }
+/* Danh sách tài khoản (multi-account) + nút xoá. */
+.providers-page .pv-account-list { display:flex; flex-direction:column; gap:8px; }
+.providers-page .pv-account {
+  display:flex; align-items:center; gap:10px;
+  background:#17171a; border:1px solid #26262b; border-radius:9px; padding:9px 12px;
+}
+.providers-page .pv-account-label { font-size:13px; font-weight:600; color:var(--ink); }
+.providers-page .pv-account-email { font-size:11.5px; color:var(--dim); }
+.providers-page .pv-account-status { font-size:11px; }
+.providers-page .pv-account-status.on { color:#34d399; }
+.providers-page .pv-account-status.off { color:#74747c; }
+.providers-page .pv-account .pv-btn { margin:0 0 0 auto; padding:5px 10px; }
+.providers-page .pv-btn.danger { border-color:#b4453a; color:#f0a89f; background:transparent; }
+.providers-page .pv-btn.danger:hover:not(:disabled) { border-color:#d05648; color:#fff; background:#b4453a; }
+/* Panel kết nối in-Portal: ô nhập tên, trạng thái từng pha, link đăng nhập. */
+.providers-page .pv-connect { margin-top:14px; border-top:1px solid #24242a; padding-top:14px; }
+.providers-page .pv-connect-prompt { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.providers-page .pv-connect-label {
+  flex:1; min-width:160px; background:#141417; border:1px solid #2a2a30; border-radius:8px;
+  padding:8px 11px; color:var(--ink); font-size:13px;
+}
+.providers-page .pv-connect .pv-btn { margin-top:0; }
+.providers-page .pv-connect-status { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.providers-page .pv-connect-message { font-size:12.5px; color:var(--dim); }
 /* providers:end */
 
 .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
