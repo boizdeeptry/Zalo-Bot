@@ -146,6 +146,9 @@ func TestConnectInstallFailureIsError(t *testing.T) {
 	if st.Phase != phaseError {
 		t.Fatalf("phase = %q; want error", st.Phase)
 	}
+	if !strings.Contains(st.Error, "cài thất bại") {
+		t.Errorf("error = %q; want the install-failure message", st.Error)
+	}
 }
 
 func TestConnectLoginTimeoutIsError(t *testing.T) {
@@ -167,11 +170,14 @@ func TestConnectCancelStopsLoginAndPolls(t *testing.T) {
 	r := &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut}
 	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
 	m.start("codex", "x")
-	waitPhase(t, m, "codex", phasePolling)
+	st := waitPhase(t, m, "codex", phasePolling)
+	if st.Phase != phasePolling {
+		t.Fatalf("phase = %q; want polling before cancel/second-start", st.Phase)
+	}
 	if !m.cancel("codex") {
 		t.Fatal("cancel returned false")
 	}
-	st, _ := m.status("codex")
+	st, _ = m.status("codex")
 	if st.Phase != phaseCanceled {
 		t.Errorf("phase = %q; want canceled", st.Phase)
 	}
@@ -181,7 +187,10 @@ func TestConnectSecondKindWhileBusyIsRejected(t *testing.T) {
 	r := &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut}
 	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
 	m.start("codex", "x")
-	waitPhase(t, m, "codex", phasePolling)
+	st := waitPhase(t, m, "codex", phasePolling)
+	if st.Phase != phasePolling {
+		t.Fatalf("phase = %q; want polling before cancel/second-start", st.Phase)
+	}
 	// start() does not validate kind (that's the HTTP handler's job in Task 4); any second
 	// distinct kind string exercises the one-job-at-a-time guard.
 	if _, err := m.start("other", "y"); !errors.Is(err, errConnectBusy) {
