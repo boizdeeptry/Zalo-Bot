@@ -1,9 +1,9 @@
 # Planning state
 
-step: discuss
+step: execute
 current_topic: providers-connect
-current_spec:
-current_plan:
+current_spec: .planning/specs/2026-08-07-providers-connect-design.md
+current_plan: .planning/plans/2026-08-07-providers-connect.md
 last_updated: 2026-08-07
 
 ## Đang làm: #2 Connect trong Portal (zero-terminal)
