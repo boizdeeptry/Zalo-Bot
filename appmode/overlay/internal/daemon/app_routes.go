@@ -69,9 +69,10 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /llm/providers/{id}/models", a.auth(a.handleLLMModelAdd))
 	mux.Handle("DELETE /llm/providers/{id}/models", a.auth(a.handleLLMModelDelete))
 	mux.Handle("DELETE /llm/providers/{id}/accounts/{accountId}", a.auth(a.handleLLMAccountDelete))
-	if connectMgr == nil {
-		connectMgr = a.newConnectManager()
-	}
+	// connectMgr is refreshed on every registerAppRoutes call (not lazily nil-guarded) so it always
+	// reflects the api that registered the routes. Production registers once; tests each get their
+	// own valid manager and never inherit a prior test's closed store / nil logger.
+	connectMgr = a.newConnectManager()
 	mux.Handle("POST /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectStart))
 	mux.Handle("GET /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectStatus))
 	mux.Handle("DELETE /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectCancel))

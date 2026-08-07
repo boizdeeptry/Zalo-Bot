@@ -224,6 +224,15 @@ func TestConnectEndpoints(t *testing.T) {
 		t.Fatalf("POST connect(codex) = %d; want 200 (body=%s)", rec.Code, rec.Body)
 	}
 
+	// POST with no body → empty label defaults; same kind returns current state → still 200
+	recDup := httptest.NewRecorder()
+	reqDup := httptest.NewRequest("POST", "/llm/providers/codex/connect", nil)
+	reqDup.SetPathValue("kind", "codex")
+	a.handleLLMConnectStart(recDup, reqDup)
+	if recDup.Code != http.StatusOK {
+		t.Errorf("POST connect(codex, no body) = %d; want 200", recDup.Code)
+	}
+
 	// unsupported kind → 400
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest("POST", "/llm/providers/openai/connect", nil)
