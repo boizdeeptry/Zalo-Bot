@@ -9,6 +9,9 @@ export const PROVIDER_CATALOG = [
   { kind: "gemini", name: "Gemini", group: "apikey", prefix: "gm", logoColor: "#3f6ff5" },
   { kind: "openrouter", name: "OpenRouter", group: "apikey", prefix: "or", logoColor: "#5b5ef0" },
 ];
+// CONNECTABLE_KINDS mirrors the backend subscriptionKinds: only these can run the in-Portal login
+// flow today. claude-code joins when its kind is unified and it routes through cliAdapter.
+const CONNECTABLE_KINDS = new Set(["codex"]);
 const normalizeKind = (k) => String(k ?? "").replace(/_/g, "-");
 
 function providerPath(id, suffix = "") {
@@ -56,6 +59,13 @@ export function createProviderService(request = requestJSON) {
       `${providerPath(id, "/models")}?model_id=${encodeURIComponent(modelID)}`,
       { method: "DELETE" },
     ),
+    // Connect flow addresses by KIND, not provider id: codex has no provider row yet the first
+    // time someone connects it, so there is no id to key the path off of.
+    connectStart: (kind, label) => request(`/llm/providers/${encodeURIComponent(kind)}/connect`, {
+      method: "POST", body: { label },
+    }),
+    connectStatus: (kind) => request(`/llm/providers/${encodeURIComponent(kind)}/connect`),
+    connectCancel: (kind) => request(`/llm/providers/${encodeURIComponent(kind)}/connect`, { method: "DELETE" }),
   });
 }
 
@@ -127,19 +137,25 @@ const safeBadge = () => element("div", { className: "pv-safe-badge" },
   element("span", { text: "Đăng nhập chính chủ qua CLI — không giả client, không proxy, không rủi ro khoá tài khoản." }),
 );
 
-function renderConnections(entry, p) {
+function renderConnections(entry, p, ui) {
   const body = p && p.system
     ? element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.name}).` })
     : element("div", { className: "pv-conn-empty", text: "Chưa có kết nối — No connections yet." });
-  // Add Connection deferred to #2: disabled, no handler.
-  const add = element("button", {
-    className: "pv-btn primary",
-    attributes: { type: "button", disabled: true, title: "Có ở bước Connect (#2)" },
-    text: "+ Thêm kết nối",
-  });
+  const add = ui.connectable
+    ? element("button", {
+        className: "pv-btn primary",
+        attributes: { type: "button" },
+        text: "+ Thêm kết nối",
+        on: { click() { ui.onAdd(entry.kind); } },
+      })
+    : element("button", {
+        className: "pv-btn primary",
+        attributes: { type: "button", disabled: true, title: "Sắp có" },
+        text: "+ Thêm kết nối",
+      });
   return element("section", { className: "pv-panel pv-connections" },
     element("div", { className: "pv-panel-head" }, element("h3", { text: "Kết nối" })),
-    body, add,
+    body, add, ui.connecting ? ui.connectSlot : null,
   );
 }
 function renderModels(entry, p) {
@@ -162,18 +178,18 @@ function renderModels(entry, p) {
   );
 }
 
-function renderDetail(entry, byKind, onBack) {
+function renderDetail(entry, byKind, onBack, connUI) {
   const p = byKind.get(entry.kind);
   return element("div", { className: "pv-detail" },
     element("button", { className: "pv-back", attributes: { type: "button" }, text: "Về Providers", on: { click: onBack } }),
     detailHead(entry, byKind),
     entry.group === "subscription" ? safeBadge() : null,
-    renderConnections(entry, p),
+    renderConnections(entry, p, connUI),
     renderModels(entry, p),
   );
 }
 
-export function createProvidersPage({ request = requestJSON } = {}) {
+export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {}) {
   return Object.freeze({
     mount(container) {
       const controller = new AbortController();
@@ -211,6 +227,113 @@ export function createProvidersPage({ request = requestJSON } = {}) {
       // nên gõ vào ô search không làm mất focus hay dựng lại nút "Tải lại".
       const gallerySlot = element("div", {});
 
+      // connect cầm trạng thái luồng đăng nhập in-Portal cho MỘT kind tại một thời điểm — null khi
+      // panel đang đóng. connectSlot là node ổn định giống gallerySlot: paintConnect() chỉ thay nội
+      // dung của nó, không đụng root, nên không làm mất focus ô nhập tên tài khoản.
+      let connect = null; // { kind, phase, label, message?, loginUrl? }
+      const connectSlot = element("div", { className: "pv-connect" });
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const defaultLabel = (p) => `Tài khoản ${(p?.accounts?.length ?? 0) + 1}`;
+
+      // startConnect mở panel ở chế độ "prompt" (nhập tên + bấm Bắt đầu). Đây là hàm mà nút
+      // "Thêm account" ở trang Accounts (việc sau) cũng sẽ gọi lại — nên export ra ngoài paint().
+      function startConnect(kind) {
+        const p = byKindFrom(lastProviders).get(normalizeKind(kind));
+        connect = { kind, phase: "prompt", label: defaultLabel(p) };
+        paint();
+        paintConnect();
+      }
+
+      function closeConnect() {
+        connect = null;
+        paint();
+      }
+
+      async function cancelConnect(kind) {
+        await service.connectCancel(kind);
+        // Nếu vòng lặp poll trong runConnect chưa kịp quan sát "canceled" (ví dụ đang await sleep),
+        // tự vẽ trạng thái đã huỷ ngay — người dùng không phải chờ tick kế tiếp mới thấy phản hồi.
+        if (connect?.kind === kind && connect.phase !== "canceled") {
+          connect = { ...connect, phase: "canceled" };
+          paintConnect();
+        }
+      }
+
+      function phaseLabel(phase, message) {
+        switch (phase) {
+          case "detecting": return "Đang kiểm tra…";
+          case "installing": return message || "Đang cài…";
+          case "awaiting_login": return "Chờ đăng nhập trong trình duyệt…";
+          case "polling": return "Đang xác nhận đăng nhập…";
+          case "connected": return "Đã kết nối.";
+          default: return message || "";
+        }
+      }
+
+      // paintConnect chỉ vẽ lại connectSlot — cùng nguyên tắc với paintGallery().
+      function paintConnect() {
+        if (!connect) { connectSlot.replaceChildren(); return; }
+        if (connect.phase === "prompt") {
+          const input = element("input", { className: "pv-connect-label",
+            attributes: { type: "text", value: connect.label, "aria-label": "Tên tài khoản" } });
+          connectSlot.replaceChildren(element("div", { className: "pv-connect-prompt" },
+            input,
+            element("button", { className: "pv-btn primary", attributes: { type: "button" },
+              text: "Bắt đầu kết nối",
+              on: { click() { void runConnect(connect.kind, input.value); } } }),
+            element("button", { className: "pv-btn", attributes: { type: "button" },
+              text: "Huỷ", on: { click: closeConnect } }),
+          ));
+          return;
+        }
+        if (connect.phase === "error" || connect.phase === "canceled") {
+          connectSlot.replaceChildren(element("div", { className: "pv-connect-status" },
+            element("div", { className: "pv-connect-message",
+              text: connect.message || (connect.phase === "canceled" ? "Đã huỷ kết nối." : "Kết nối thất bại.") }),
+            element("button", { className: "pv-btn", attributes: { type: "button" },
+              text: "Đóng", on: { click: closeConnect } }),
+          ));
+          return;
+        }
+        // Đang chạy: detecting / installing / awaiting_login / polling.
+        const loginLink = connect.phase === "awaiting_login" && connect.loginUrl
+          ? element("a", { className: "pv-btn primary",
+              attributes: { href: connect.loginUrl, target: "_blank", rel: "noopener" },
+              text: "Mở trang đăng nhập" })
+          : null;
+        connectSlot.replaceChildren(element("div", { className: "pv-connect-status" },
+          element("div", { className: "pv-connect-message", text: phaseLabel(connect.phase, connect.message) }),
+          loginLink,
+          element("button", { className: "pv-btn", attributes: { type: "button" },
+            text: "Huỷ", on: { click() { void cancelConnect(connect.kind); } } }),
+        ));
+      }
+
+      // runConnect lái luồng: POST bắt đầu, rồi GET lặp lại tới khi connected/error/canceled.
+      // Mỗi vòng kiểm connect?.kind !== kind để tự dừng khi người dùng đã đóng panel hoặc mở kind
+      // khác — vòng lặp cũ không được ghi đè trạng thái của lượt kết nối mới.
+      async function runConnect(kind, label) {
+        connect = { kind, phase: "detecting", label };
+        paintConnect();
+        try {
+          await service.connectStart(kind, label);
+          for (;;) {
+            if (disposed || connect?.kind !== kind) return;
+            const st = await service.connectStatus(kind);
+            if (disposed || connect?.kind !== kind) return;
+            connect = { ...connect, phase: st.phase, message: st.message, loginUrl: st.loginUrl || connect.loginUrl };
+            paintConnect();
+            if (st.phase === "connected") { connect = null; await refresh(); return; }
+            if (st.phase === "error" || st.phase === "canceled") return;
+            await sleep(pollMs);
+          }
+        } catch (error) {
+          if (disposed || error?.name === "AbortError") return;
+          connect = { ...connect, phase: "error", message: error?.message || "Kết nối thất bại" };
+          paintConnect();
+        }
+      }
+
       // headFor đóng bao service/refresh của mount() — group-head cần gọi testSaved() và refresh()
       // thật, còn renderGallery thì không nên biết tới hai thứ đó để vẫn là hàm thuần trên tham số.
       const headFor = (groupEntries, byKind, isSubscription) => element("span", { className: "pv-head" },
@@ -236,7 +359,15 @@ export function createProvidersPage({ request = requestJSON } = {}) {
         if (view !== "gallery") {
           const entry = PROVIDER_CATALOG.find((e) => e.kind === view);
           if (entry) {
-            root.replaceChildren(header(), renderDetail(entry, byKindFrom(lastProviders), backToGallery));
+            const connUI = {
+              connectable: entry.group === "subscription" && CONNECTABLE_KINDS.has(entry.kind),
+              connecting: connect?.kind === entry.kind,
+              connectSlot,
+              onAdd: startConnect,
+            };
+            root.replaceChildren(header(), renderDetail(entry, byKindFrom(lastProviders), backToGallery, connUI));
+            // Slot node vẽ lại ở paint() mất nội dung cũ — refill nếu panel đang mở cho đúng kind này.
+            if (connect?.kind === entry.kind) paintConnect();
             return;
           }
           view = "gallery";

@@ -16,10 +16,10 @@ const CLAUDE_ADDED = {
   credential_configured: false, credential_unreadable: false, last_check_status: "", last_error: "",
   models: [{ model_id: "sonnet", name: "Claude Sonnet", source: "manual", available: true }],
 };
-function mountPage(t, handler) {
+function mountPage(t, handler, opts = {}) {
   const dom = installDOM();
   const calls = [];
-  const page = createProvidersPage({ request: async (path, options = {}) => {
+  const page = createProvidersPage({ pollMs: 0, ...opts, request: async (path, options = {}) => {
     const { signal, ...recorded } = options; calls.push({ path, options: recorded }); return handler(path, options);
   }});
   const main = document.createElement("main");
@@ -96,15 +96,85 @@ test("detail lists available models with the 9Router-style prefix", async (t) =>
   assert.deepEqual(findAll(detail, (n) => hasClass(n, "pv-mid")).map(text), ["cc/sonnet"]);
 });
 
-test("an unconnected provider shows an empty connections panel with a disabled add button", async (t) => {
+test("codex's add-connection button is enabled; claude-code's is not yet", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
+  await flush();
+
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  let detail = find(main, (n) => hasClass(n, "pv-detail"));
+  assert.match(text(find(detail, (n) => hasClass(n, "pv-connections"))), /No connections yet|Chưa có kết nối/);
+  let add = find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n)));
+  assert.ok(add && !add.disabled, "codex is connectable — add button is enabled");
+
+  find(detail, (n) => hasClass(n, "pv-back")).click();
+  await flush();
+  cards(main).find((c) => cardName(c) === "Claude Code").click();
+  await flush();
+  detail = find(main, (n) => hasClass(n, "pv-detail"));
+  add = find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n)));
+  assert.ok(add && add.disabled, "claude-code is not connectable yet — add button stays disabled");
+  assert.equal(add.getAttribute("title"), "Sắp có");
+});
+
+test("subscription connect: click drives phases, shows login link, finishes connected and refreshes", async (t) => {
+  const phases = ["awaiting_login", "polling", "connected"];
+  let i = 0;
+  let listCalls = 0;
+  const { calls, main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) { listCalls++; return { providers: [], kinds: [] }; }
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
+    if (path === "/llm/providers/codex/connect" && !options.method) {
+      const p = phases[Math.min(i++, phases.length - 1)];
+      return { kind: "codex", phase: p, loginUrl: p === "awaiting_login" ? "https://auth.example/x" : "" };
+    }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
   await flush();
   cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
   await flush();
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
-  assert.match(text(find(detail, (n) => hasClass(n, "pv-connections"))), /No connections yet|Chưa có kết nối/);
-  const add = find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n)));
-  assert.ok(add && add.disabled, "Add Connection is present but disabled in #1");
+  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  await flush();
+
+  const start = find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n)));
+  assert.ok(start, "prompt shows a start button");
+  start.click();
+  // Each phase transition round-trips through the poll loop's sleep(pollMs=0), a setTimeout
+  // macrotask. flush() (setImmediate) never lets that timer fire — repeatedly scheduling
+  // setImmediate from inside a resolved setImmediate callback starves the timers phase — so this
+  // wait uses setTimeout(0) directly to give the loop real event-loop turns.
+  for (let k = 0; k < 50 && listCalls < 2; k++) await new Promise((r) => setTimeout(r, 0));
+
+  const post = calls.find((c) => c.path === "/llm/providers/codex/connect" && c.options.method === "POST");
+  assert.ok(post && typeof post.options.body.label === "string" && post.options.body.label.length > 0, "POST connect carries a label");
+  assert.ok(listCalls >= 2, "connected triggers a provider-list refresh");
+});
+
+test("cancel: clicking Huỷ while polling sends a DELETE to the connect endpoint", async (t) => {
+  const { calls, main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
+    if (path === "/llm/providers/codex/connect" && !options.method) return { kind: "codex", phase: "polling" };
+    if (path === "/llm/providers/codex/connect" && options.method === "DELETE") return { ok: true };
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  await flush();
+  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
+  await flush();
+
+  const cancel = find(main, (n) => n.tagName === "BUTTON" && /Huỷ/.test(text(n)));
+  assert.ok(cancel, "a cancel button is shown while the connect flow runs");
+  cancel.click();
+  await flush();
+
+  assert.ok(calls.some((c) => c.path === "/llm/providers/codex/connect" && c.options.method === "DELETE"),
+    "cancel issues a DELETE to the connect endpoint");
 });
 
 test("Test all runs the saved-provider test and refreshes status", async (t) => {
