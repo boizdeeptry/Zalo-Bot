@@ -283,8 +283,11 @@ func (d *defaultConnectRunner) detect(kind string) (bool, error) {
 // (not a live pipe) because it's race-free as-is: see login()'s cmd.Wait() note for why writing
 // combined output straight into a bytes.Buffer while still reading it would race.
 //
-// ponytail: shells the ambient `npm`. The packaged app bundles node+npm (build task) so this
-// resolves offline on a fresh machine; on a dev box it uses PATH npm.
+// ponytail: shells the ambient `npm` (inherits the daemon env — no cmd.Env set). In the packaged
+// app, run.bat puts bundled node+npm on PATH and sets npm_config_prefix=<data>\cli, so this installs
+// offline into a writable app dir on a zero-Node machine; `npm root -g` (resolveCLIProgram) resolves
+// to the same prefix, so codex.js is found where npm just put it. On a dev box it uses PATH npm and
+// the machine's global prefix, unchanged.
 func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine func(string)) error {
 	pkg := cliDescriptors[kind].npmPackage
 	if pkg == "" {

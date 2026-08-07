@@ -276,9 +276,29 @@ Invoke-AppCommand -Label 'npm prune' -FilePath $npmExe `
   -Arguments @('--prefix', (Join-Path $Out 'app\transport'), 'prune', '--omit=dev', '--silent') `
   -WorkingDirectory $Out
 
-# node.exe di kem: mot tep, chay don le duoc, khong can trinh cai dat Node.
+# node.exe + npm di kem: khong can trinh cai dat Node tren may nguoi mua.
+#
+# Vi sao KEM CA npm (khong chi node.exe): buoc "Ket noi" codex trong Portal chay
+# `npm install -g @openai/codex` ngay tren may nguoi mua -- va may do co the KHONG
+# cai Node. npm.cmd dung `%~dp0` (tro node.exe + node_modules\npm cung thu muc no)
+# nen chi can dat ca ba canh nhau trong app\node la thanh mot ban node+npm doc lap,
+# di chuyen duoc. run.bat chen app\node len dau PATH, va tro npm_config_prefix vao
+# data\cli, nen npm cai duoc offline vao mot thu muc ghi duoc va `npm root -g` tra
+# dung noi do -- daemon tim thay codex.js theo cung duong.
 $node = (Get-Command node).Source
-Copy-Item -LiteralPath $node -Destination (Join-Path $Out 'app\node') -Force
+$nodeSrcDir = Split-Path -Parent $node
+$nodeOut = Join-Path $Out 'app\node'
+Copy-Item -LiteralPath $node -Destination $nodeOut -Force
+foreach ($shim in 'npm', 'npm.cmd', 'npx', 'npx.cmd') {
+  Copy-Item -LiteralPath (Join-Path $nodeSrcDir $shim) -Destination $nodeOut -Force
+}
+$npmModuleSrc = Join-Path $nodeSrcDir 'node_modules\npm'
+if (-not (Test-Path -LiteralPath $npmModuleSrc -PathType Container)) {
+  throw "thieu node_modules\npm o '$npmModuleSrc' -- ban Node nguon phai kem npm"
+}
+$nodeModulesOut = Join-Path $nodeOut 'node_modules'
+[IO.Directory]::CreateDirectory($nodeModulesOut) | Out-Null
+Copy-Item -LiteralPath $npmModuleSrc -Destination $nodeModulesOut -Recurse -Force
 
 # ------------------------------------------------------- 6. persona chung hoa
 Write-Host '[6/7] persona: thay danh tinh bang cho trong'
