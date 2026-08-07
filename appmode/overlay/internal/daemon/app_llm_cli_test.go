@@ -46,8 +46,10 @@ func TestCLIArgvIsReadOnlyAndNeverBypassesSandbox(t *testing.T) {
 		kind, model              string
 		wantContains, wantAbsent []string
 	}{
-		{"codex", "gpt-5.4",
-			[]string{"exec", "-s", "read-only", "-m", "gpt-5.4"},
+		{"codex", "gpt-5.6-terra",
+			[]string{"exec", "-s", "read-only", "--ignore-user-config",
+				"model_reasoning_effort=low", "features.plugins=false", "features.skill_search=false",
+				"-m", "gpt-5.6-terra"},
 			[]string{"--dangerously-bypass-approvals-and-sandbox", "workspace-write", "danger-full-access", "-y", "--yolo"}},
 		{"gemini-cli", "gemini-2.5-pro",
 			[]string{"-p", "--approval-mode", "plan", "-m", "gemini-2.5-pro"},

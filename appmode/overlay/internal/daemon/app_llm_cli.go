@@ -43,10 +43,33 @@ var cliDescriptors = map[string]cliDescriptor{
 		kind: "codex", display: "OpenAI Codex (ChatGPT)",
 		npmPackage: "@openai/codex", binJS: `@openai\codex\bin\codex.js`,
 		subArgs: []string{"exec"}, promptViaStdin: false, modelFlag: "-m",
-		readOnlyArgs: []string{"-s", "read-only", "--skip-git-repo-check", "--ephemeral", "--color", "never"},
-		bannedArgs:   []string{"--dangerously-bypass-approvals-and-sandbox", "workspace-write", "danger-full-access"},
-		authMethod:   "codex-exit",
-		modelSeeds:   []cliModel{{"gpt-5.5", "GPT-5.5"}, {"gpt-5.4", "GPT-5.4"}, {"gpt-5.4-mini", "GPT-5.4 mini"}},
+		// Cô lập lượt tư vấn khỏi config codex của MÁY KHÁCH — verify `codex exec` thật 2026-08-07:
+		//   --ignore-user-config: bỏ ~/.codex/config.toml (model/effort/MCP/provider của khách); auth vẫn
+		//     ở CODEX_HOME nên phiên ChatGPT còn. 24.342→12.392 tok, và hết treo 3 phút do config khách.
+		//   -c model_reasoning_effort=low: ghim effort thấp, không để khách (xhigh, đắt) hay default quyết.
+		//   -c features.{plugins,skill_search}=false: tắt plugin/skill nạp từ ~/.codex/{plugins,skills}
+		//     (superpowers đọc SKILL.md mỗi lượt) — thứ --ignore-user-config KHÔNG tắt vì là feature mặc
+		//     định bật, không nằm trong config.toml. Sau khi tắt: "2+2" còn 700 tok, sạch rò. DÙNG dạng
+		//     `-c features.X=false` CHỨ KHÔNG `--disable X`: `--disable` tên lạ THOÁT 1 ("Unknown feature
+		//     flag") → bản codex sau đổi tên feature là hỏng MỌI lượt; dạng `-c` bỏ qua lặng tên lạ (verify:
+		//     exit 0). KHÔNG cờ nào bỏ sandbox — read-only vẫn nguyên.
+		readOnlyArgs: []string{
+			"-s", "read-only", "--skip-git-repo-check", "--ephemeral", "--color", "never",
+			"--ignore-user-config",
+			"-c", "model_reasoning_effort=low",
+			"-c", "features.plugins=false",
+			"-c", "features.skill_search=false",
+		},
+		bannedArgs: []string{"--dangerously-bypass-approvals-and-sandbox", "workspace-write", "danger-full-access"},
+		authMethod: "codex-exit",
+		// modelSeeds ghim theo /models THẬT (~/.codex/models_cache.json, fetch từ API 2026-08-07). Bỏ
+		// codex-auto-review (model duyệt nội bộ, không phải model chat). gpt-5.4 CŨ đã không còn tồn tại.
+		modelSeeds: []cliModel{
+			{"gpt-5.6-terra", "GPT-5.6-Terra"}, // cân bằng, mặc định của codex
+			{"gpt-5.6-luna", "GPT-5.6-Luna"},   // nhanh & rẻ
+			{"gpt-5.5", "GPT-5.5"},             // frontier
+			{"gpt-5.4-mini", "GPT-5.4-Mini"},   // nhỏ, rẻ nhất
+		},
 	},
 	"gemini-cli": {
 		kind: "gemini-cli", display: "Gemini CLI (Google AI)",
