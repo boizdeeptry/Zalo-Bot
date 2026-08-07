@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -100,9 +101,11 @@ func (m *connectManager) start(kind, label string) (connectState, error) {
 	}
 	id := m.newID()
 	dir := accountConfigDir(m.dataDir, kind, id)
+	// ponytail: MkdirAll runs under the lock; start() is user-driven and rare, so the brief
+	// I/O under lock is fine. Keeping it here avoids creating a stray dir on a busy rejection.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		m.mu.Unlock()
-		return connectState{}, err
+		return connectState{}, fmt.Errorf("create account config dir %s: %w", dir, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &connectJob{
@@ -142,14 +145,16 @@ func (m *connectManager) cancel(kind string) bool {
 	return true
 }
 
-func (m *connectManager) fail(job *connectJob, msg string) {
-	job.set(func(s *connectState) { s.Phase = phaseError; s.Error = msg })
+func (m *connectManager) fail(job *connectJob, kind, userMsg string, cause error) {
+	m.logger.Error("connect failed", "kind", kind, "phase", job.snapshot().Phase, "err", cause)
+	job.set(func(s *connectState) { s.Phase = phaseError; s.Error = userMsg })
 }
 
 func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) {
+	defer job.cancel() // cancel ctx on EVERY return path — unblocks the wait() goroutine below
 	installed, err := m.runner.detect(kind)
 	if err != nil {
-		m.fail(job, "không kiểm được CLI: "+err.Error())
+		m.fail(job, kind, "không kiểm được CLI: "+err.Error(), err)
 		return
 	}
 	if !installed {
@@ -157,14 +162,14 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 		if err := m.runner.install(ctx, kind, func(line string) {
 			job.set(func(s *connectState) { s.Message = line })
 		}); err != nil {
-			m.fail(job, "cài thất bại")
+			m.fail(job, kind, "cài thất bại", err)
 			return
 		}
 	}
 	job.set(func(s *connectState) { s.Phase = phaseAwaitingLogin; s.Message = "" })
 	loginURL, wait, err := m.runner.login(ctx, kind, job.configDir)
 	if err != nil {
-		m.fail(job, "không mở được đăng nhập")
+		m.fail(job, kind, "không mở được đăng nhập", err)
 		return
 	}
 	if loginURL != "" {
@@ -179,7 +184,7 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	for {
 		if m.runner.pollAuth(kind, job.configDir) == authLoggedIn {
 			if err := m.ensure(kind); err != nil {
-				m.fail(job, "lưu provider lỗi: "+err.Error())
+				m.fail(job, kind, "lưu provider lỗi: "+err.Error(), err)
 				return
 			}
 			now := time.Now()
@@ -188,7 +193,7 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 				ConfigDir: job.configDir, Enabled: true, AddedAt: &now,
 			}
 			if err := m.createAccount(acct); err != nil {
-				m.fail(job, "lưu account lỗi: "+err.Error())
+				m.fail(job, kind, "lưu account lỗi: "+err.Error(), err)
 				return
 			}
 			job.set(func(s *connectState) { s.Phase = phaseConnected; s.Message = "" })
@@ -200,7 +205,7 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 				job.set(func(s *connectState) { s.Phase = phaseCanceled })
 				return
 			}
-			m.fail(job, "hết giờ đăng nhập")
+			m.fail(job, kind, "hết giờ đăng nhập", nil)
 			return
 		case <-tick.C:
 		}
