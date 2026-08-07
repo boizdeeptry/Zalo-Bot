@@ -201,12 +201,12 @@ test("subscription connect: click drives phases through to connected and refresh
 
 // Auto-advancing phases (previous test) makes catching the transient awaiting_login render racy —
 // a mock stuck on awaiting_login forever is the robust way to assert the login link itself.
-test("awaiting_login renders a login link to the backend-provided URL", async (t) => {
+test("awaiting_login renders a login link plus the device-auth code", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
     if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
     if (path === "/llm/providers/codex/connect" && !options.method) {
-      return { kind: "codex", phase: "awaiting_login", loginUrl: "https://auth.example/x" };
+      return { kind: "codex", phase: "awaiting_login", loginUrl: "https://auth.example/x", code: "EQ0J-QKCPZ" };
     }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
@@ -222,6 +222,9 @@ test("awaiting_login renders a login link to the backend-provided URL", async (t
   const link = find(main, (n) => n.tagName === "A" && /Mở trang đăng nhập/.test(text(n)));
   assert.ok(link, "a login link renders while awaiting_login");
   assert.equal(link.getAttribute("href"), "https://auth.example/x");
+  const codeEl = find(main, (n) => hasClass(n, "pv-connect-code-value"));
+  assert.ok(codeEl, "the device-auth code renders while awaiting_login");
+  assert.equal(text(codeEl), "EQ0J-QKCPZ");
 });
 
 test("navigating back to the gallery stops the connect poll loop", async (t) => {

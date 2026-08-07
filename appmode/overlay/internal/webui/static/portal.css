@@ -201,6 +201,13 @@
 .providers-page .pv-connect .pv-btn { margin-top:0; }
 .providers-page .pv-connect-status { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
 .providers-page .pv-connect-message { font-size:12.5px; color:var(--dim); }
+.providers-page .pv-connect-code { display:flex; align-items:center; gap:8px; }
+.providers-page .pv-connect-code-label { font-size:12px; color:var(--dim); }
+.providers-page .pv-connect-code-value {
+  font-family:ui-monospace, Menlo, monospace; font-size:15px; font-weight:600; letter-spacing:1px;
+  color:var(--ink); background:#141417; border:1px solid #2a2a30; border-radius:7px; padding:4px 10px;
+  user-select:all;
+}
 /* providers:end */
 
 .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }

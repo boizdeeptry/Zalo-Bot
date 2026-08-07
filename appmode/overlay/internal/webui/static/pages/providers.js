@@ -311,7 +311,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
         switch (phase) {
           case "detecting": return "Đang kiểm tra…";
           case "installing": return message || "Đang cài…";
-          case "awaiting_login": return "Chờ đăng nhập trong trình duyệt…";
+          case "awaiting_login": return "Mở trang đăng nhập, nhập mã bên dưới, rồi chờ xác nhận…";
           case "polling": return "Đang xác nhận đăng nhập…";
           case "connected": return "Đã kết nối.";
           default: return message || "";
@@ -351,9 +351,17 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
               attributes: { href: connect.loginUrl, target: "_blank", rel: "noopener" },
               text: "Mở trang đăng nhập" })
           : null;
+        // device-auth: người dùng phải nhập mã một lần này vào trang đăng nhập. Hiện rõ + đọc được
+        // để copy; KHÔNG phải credential (mã hết hạn ~15 phút, chỉ dùng để ghép phiên login).
+        const codeBlock = connect.phase === "awaiting_login" && connect.code
+          ? element("div", { className: "pv-connect-code" },
+              element("span", { className: "pv-connect-code-label", text: "Mã đăng nhập:" }),
+              element("code", { className: "pv-connect-code-value", text: connect.code }))
+          : null;
         connectSlot.replaceChildren(element("div", { className: "pv-connect-status" },
           element("div", { className: "pv-connect-message", text: phaseLabel(connect.phase, connect.message) }),
           loginLink,
+          codeBlock,
           element("button", { className: "pv-btn", attributes: { type: "button" },
             text: "Huỷ", on: { click() { void cancelConnect(connect.kind); } } }),
         ));
@@ -373,7 +381,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
             if (disposed || connectRun !== myRun) return;
             const st = await service.connectStatus(kind);
             if (disposed || connectRun !== myRun) return;
-            connect = { ...connect, phase: st.phase, message: st.message, loginUrl: st.loginUrl || connect.loginUrl };
+            connect = { ...connect, phase: st.phase, message: st.message, loginUrl: st.loginUrl || connect.loginUrl, code: st.code || connect.code };
             paintConnect();
             if (st.phase === "connected") { connect = null; await refresh(); return; }
             if (st.phase === "error" || st.phase === "canceled") return;
