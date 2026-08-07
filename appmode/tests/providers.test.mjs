@@ -107,6 +107,27 @@ test("an unconnected provider shows an empty connections panel with a disabled a
   assert.ok(add && add.disabled, "Add Connection is present but disabled in #1");
 });
 
+test("Test all runs the saved-provider test and refreshes status", async (t) => {
+  let checked = false;
+  const { calls, main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method)
+      return { providers: [{ ...CLAUDE_ADDED, last_check_status: checked ? "ok" : "" }], kinds: [] };
+    if (path === "/llm/providers/claude-code/test" && options.method === "POST") { checked = true; return { ok: true }; }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  const testAll = find(main, (n) => n.tagName === "BUTTON" && /Kiểm tra tất cả/.test(text(n)));
+  testAll.click();
+  await flush();
+  assert.ok(calls.some((c) => c.path === "/llm/providers/claude-code/test"));
+});
+
+test("a failed provider list renders the shared error panel, never a blank page", async (t) => {
+  const { main } = mountPage(t, () => { throw new Error("không đọc được danh sách Provider"); });
+  await flush();
+  assert.match(text(find(main, (n) => hasClass(n, "banner"))), /không đọc được danh sách Provider/);
+});
+
 // Khoá thử nghiệm của tầng Portal, cùng một chuỗi với llmPackageCanary bên Go. Cửa chặn gói
 // (tests/build-app.Tests.ps1) quét đúng chuỗi con này trong gói đã dựng và đòi 0 lần khớp; quét
 // một chuỗi không tệp nào trong repo mang thì luôn xanh, nên mọi khoá gõ vào test phải là nó.

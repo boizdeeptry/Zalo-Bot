@@ -87,12 +87,31 @@ const safeTag = () => element("span", { className: "pv-safe-tag" },
   element("span", { className: "pv-dot" }),
   element("span", { text: "Chính chủ · không rủi ro khoá" }),
 );
-function renderGallery(entries, byKind, onOpen) {
+// testAllButton nhận service/refresh làm tham số thay vì đóng bao (closure) — group()/renderGallery
+// giữ nguyên là hàm thuần trên tham số đầu vào, không đụng trạng thái của mount(). Promise.allSettled
+// vì một Provider lỗi (mất mạng, khoá hết hạn) không được chặn phần còn lại của lượt kiểm tra chung.
+function testAllButton(entries, byKind, service, refresh) {
+  const btn = element("button", { className: "pv-btn", attributes: { type: "button" }, text: "Kiểm tra tất cả" });
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      await Promise.allSettled(entries.map((e) => {
+        const p = byKind.get(e.kind);
+        return p ? service.testSaved(p.id) : Promise.resolve();
+      }));
+      await refresh();
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  return btn;
+}
+function renderGallery(entries, byKind, onOpen, headFor) {
   const sub = entries.filter((e) => e.group === "subscription");
   const api = entries.filter((e) => e.group === "apikey");
   return element("div", { className: "pv-gallery" },
-    group("Gói thuê bao — CLI chính chủ", sub, byKind, onOpen, safeTag()),
-    group("API Key", api, byKind, onOpen));
+    group("Gói thuê bao — CLI chính chủ", sub, byKind, onOpen, headFor(sub, byKind, true)),
+    group("API Key", api, byKind, onOpen, headFor(api, byKind, false)));
 }
 
 function detailHead(entry, byKind) {
@@ -192,11 +211,17 @@ export function createProvidersPage({ request = requestJSON } = {}) {
       // nên gõ vào ô search không làm mất focus hay dựng lại nút "Tải lại".
       const gallerySlot = element("div", {});
 
+      // headFor đóng bao service/refresh của mount() — group-head cần gọi testSaved() và refresh()
+      // thật, còn renderGallery thì không nên biết tới hai thứ đó để vẫn là hàm thuần trên tham số.
+      const headFor = (groupEntries, byKind, isSubscription) => element("span", { className: "pv-head" },
+        isSubscription ? safeTag() : null,
+        testAllButton(groupEntries, byKind, service, refresh));
+
       function galleryNode() {
         const filtered = query
           ? PROVIDER_CATALOG.filter((e) => e.name.toLowerCase().includes(query))
           : PROVIDER_CATALOG;
-        return renderGallery(filtered, byKindFrom(lastProviders), openDetail);
+        return renderGallery(filtered, byKindFrom(lastProviders), openDetail, headFor);
       }
 
       // paintGallery chỉ vẽ lại gallerySlot — KHÔNG đụng header/toolbar, KHÔNG refetch.
