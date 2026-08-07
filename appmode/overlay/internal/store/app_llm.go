@@ -190,8 +190,10 @@ var subscriptionDisplayName = map[string]string{
 func (s *Store) EnsureProviderForKind(kind string) error {
 	name, ok := subscriptionDisplayName[kind]
 	if !ok {
-		return fmt.Errorf("ensure provider: kind is not a subscription: %q", kind)
+		return fmt.Errorf("ensure provider %s: không phải kind subscription", kind)
 	}
+	// ponytail: check-then-insert is not atomic; safe because connect runs one job at a time
+	// from a single goroutine. Wrap in inLLMTx if this is ever called concurrently.
 	providers, err := s.LLMProviders()
 	if err != nil {
 		return err

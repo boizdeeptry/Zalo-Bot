@@ -622,6 +622,9 @@ func TestEnsureProviderForKind(t *testing.T) {
 			if p.System {
 				t.Errorf("codex provider must not be system")
 			}
+			if p.CredentialConfigured {
+				t.Errorf("codex provider must not carry a credential")
+			}
 		}
 	}
 	if got != 1 {
@@ -650,6 +653,10 @@ func TestEnsureProviderForKind(t *testing.T) {
 	}
 	if claudeCode != 1 {
 		t.Errorf("claude-code providers = %d; want 1 (untouched)", claudeCode)
+	}
+
+	if err := st.EnsureProviderForKind("openai"); err == nil {
+		t.Error("EnsureProviderForKind(openai) = nil; want error (not a subscription kind)")
 	}
 }
 
