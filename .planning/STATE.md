@@ -63,9 +63,17 @@ CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4
     Node cần: bundle cây npm + `install()` gọi npm BUNDLED + node-resolution nhất quán (generate & install cùng
     dùng node bundled, tìm codex đúng nơi npm cài). Là thiết kế riêng (đụng `resolveCLIProgram`/#1), KHÔNG bolt-on.
     Hiện `install()` giả định máy khách có `npm` trên PATH; connect vẫn chạy full khi codex ĐÃ cài + login.
-  - **E2E connect THẬT (chưa chạy)**: cần chạy app ĐÃ ĐÓNG GÓI — việc đó KHỞI ĐỘNG bot Zalo thật (side-effect
-    hướng-ngoại) nên chỉ chạy khi user đồng ý — + user hoàn tất device-auth trong trình duyệt. Mọi tầng đã
-    test/capture; E2E là xác nhận cuối trước ship.
+  - **E2E ĐÃ CHẠY (gói cn-36df907f, daemon v0.10.0 trên :8770, data cô lập không Zalo-cred):** BẮT ĐƯỢC LỖI
+    ship-blocking mà unit-test + capture thủ công KHÔNG thấy. Xác nhận chạy end-to-end: gallery/detail/CSS,
+    gating (claude-code "Sắp có" disabled, codex enabled), bấm "+ Thêm kết nối"→prompt→"Bắt đầu"→POST connect
+    → state machine tạo `accountId=uuid` + `MkdirAll` configDir cô lập (`data\accounts\codex\d5c54cb9-…\`),
+    daemon spawn `codex login --device-auth` với `CODEX_HOME`=dir đó (codex ghi `log/` vào ĐÚNG dir → cô lập
+    THẬT trong daemon). **LỖI:** daemon log `connect failed kind=codex phase=awaiting_login err="codex không
+    in URL đăng nhập trong 45s"`. Chẩn: `codex login --device-auth` KHÔNG in URL qua PIPE của Go exec
+    (`StandardOutput.ReadLine` chặn 30s, 0 dòng) — codex gate output theo TTY / block-buffer khi stdout không
+    phải terminal. Capture thủ công thấy URL vì redirect ra FILE (khác pipe live-read). **FIX = spawn login
+    dưới PTY** (engine có `internal/pty`), hoặc thử env ép non-TTY (`CI=1`/`TERM=dumb`) rẻ hơn trước khi PTY.
+    Đây là BLOCKER connect device-auth → task kế tiếp NGAY.
   - **#4 Combos** (+ Task 11: gộp Claude vào `cliAdapter`, hợp nhất kind `claude_code`→`claude-code`). Khi làm
     PHẢI sync `envVarFor` + `subscriptionDisplayName` + `CONNECTABLE_KINDS` để bật Claude connect.
 - **Ship CẢ NHÁNH một lần sau #4.**
