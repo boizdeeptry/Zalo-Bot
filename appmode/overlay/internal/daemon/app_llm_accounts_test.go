@@ -64,3 +64,51 @@ func TestSelectorNoEnabled(t *testing.T) {
 		t.Fatalf("pick on disabled-only: ok=true; want false")
 	}
 }
+
+func TestEnvVarFor(t *testing.T) {
+	for _, tc := range []struct {
+		kind, want string
+		ok         bool
+	}{
+		{"codex", "CODEX_HOME", true},
+		{"claude_code", "CLAUDE_CONFIG_DIR", true},
+		{"openai", "", false},
+	} {
+		got, ok := envVarFor(tc.kind)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("envVarFor(%q) = %q,%v; want %q,%v", tc.kind, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestMakeAccountEnvPicksAndFormats(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf(`store.Open(":memory:") = %v; want nil`, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.CreateLLMProvider(store.LLMProvider{ID: "codex", Name: "Codex", Kind: "codex", Enabled: true})
+	_ = st.CreateLLMAccount(store.LLMAccount{ID: "a1", ProviderID: "codex", Label: "x",
+		ConfigDir: `C:\home\accounts\codex\a1`, Enabled: true})
+	sel := newAccountSelector()
+	envFn := makeAccountEnv(st, sel, "codex", "codex")
+	env, penalize, ok := envFn()
+	if !ok || penalize == nil {
+		t.Fatalf("envFn ok=%v penalize==nil=%v; want true, non-nil", ok, penalize == nil)
+	}
+	if !slices.Contains(env, `CODEX_HOME=C:\home\accounts\codex\a1`) {
+		t.Fatalf("env = %v; want CODEX_HOME=...a1", env)
+	}
+}
+
+func TestMakeAccountEnvNoAccount(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf(`store.Open(":memory:") = %v; want nil`, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	envFn := makeAccountEnv(st, newAccountSelector(), "codex", "codex")
+	if _, _, ok := envFn(); ok {
+		t.Fatalf("envFn ok=true with 0 accounts; want false")
+	}
+}

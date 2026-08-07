@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -70,3 +72,47 @@ func (s *accountSelector) penalize(accountID string) {
 // thêm field), và `cliAdapter` dựng mới mỗi lượt nên state không ở đó được. Guard bằng mutex.
 // Nâng cấp: nếu base cho thêm field vào api thì chuyển sang DI qua constructor.
 var accountSel = newAccountSelector()
+
+// envVarFor trả tên biến môi trường trỏ thư mục config cho một kind subscription.
+// CODEX_HOME xác nhận (app_llm_cli.go:48). CLAUDE_CONFIG_DIR chốt capture-first (Task 9).
+func envVarFor(kind string) (string, bool) {
+	switch kind {
+	case "codex":
+		return "CODEX_HOME", true
+	case "claude_code":
+		return "CLAUDE_CONFIG_DIR", true
+	}
+	return "", false
+}
+
+// accountConfigDir dựng thư mục config của một account, cạnh DB Portal (dataDir = cfg.Dir).
+func accountConfigDir(dataDir, kind, id string) string {
+	return filepath.Join(dataDir, "accounts", kind, id)
+}
+
+// makeAccountEnv trả một closure cho cliAdapter: đọc account của kind, chọn qua selector, và
+// trả env <VAR>=<configDir> + hàm penalize account đó. ok=false khi kind không subscription
+// hoặc 0 account enabled — adapter khi đó trả credential (DỪNG chuỗi, xem spec Error handling).
+func makeAccountEnv(st *store.Store, sel *accountSelector, providerID, kind string) func() ([]string, func(rateLimited bool), bool) {
+	return func() ([]string, func(bool), bool) {
+		varName, isSub := envVarFor(kind)
+		if !isSub {
+			return nil, nil, false
+		}
+		accounts, err := st.LLMAccounts(providerID)
+		if err != nil {
+			return nil, nil, false
+		}
+		acc, ok := sel.pick(kind, accounts)
+		if !ok {
+			return nil, nil, false
+		}
+		env := append(os.Environ(), varName+"="+acc.ConfigDir)
+		penalize := func(rateLimited bool) {
+			if rateLimited {
+				sel.penalize(acc.ID)
+			}
+		}
+		return env, penalize, true
+	}
+}
