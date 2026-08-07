@@ -1,20 +1,36 @@
 # Planning state
 
-step: plan
+step: execute
 current_topic: providers-multi-account
 current_spec: .planning/specs/2026-08-07-providers-multi-account-design.md
 current_plan: .planning/plans/2026-08-07-providers-multi-account.md
 last_updated: 2026-08-07
 
-## Đang làm: #3 Multi-account (đang /plan)
+## Đang làm: #3 Multi-account (spec+plan XONG, TẠM DỪNG chờ /execute phiên mới)
 
 Sub-project #3/4. Mỗi provider subscription (Claude Code/OpenAI Codex) cho NHIỀU account, mỗi account
-một phiên CLI độc lập (thư mục config app tự quản, cô lập khỏi CLI người mua tự dùng). Runtime
-round-robin theo lượt + cooldown (KHÔNG sticky-thread, KHÔNG quota thật — CLI không phơi quota).
-Style-diversity giữa 2 CLI (trục provider) để #4. Spec `.planning/specs/2026-08-07-providers-multi-account-design.md`
-(commit `b52cb93`, đã duyệt). Duyệt spec = cho phép sửa spec+plan #2 thành account-dir-aware.
+một phiên CLI độc lập (thư mục config app tự quản dưới `cfg.Dir/accounts/<kind>/<id>`, cô lập khỏi CLI
+người mua tự dùng). Runtime round-robin theo lượt + cooldown (KHÔNG sticky-thread, KHÔNG quota thật —
+CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4.
+- Spec `.planning/specs/2026-08-07-providers-multi-account-design.md` (đã duyệt; đã sửa taxonomy:
+  0 account = credential = DỪNG chuỗi, KHÔNG rơi provider kế — `isFallbackEligible` chỉ cho
+  network/timeout/rate_limit/upstream đi tiếp).
+- Plan `.planning/plans/2026-08-07-providers-multi-account.md` (commit `6bc9632`), 10 task TDD.
 
-**Thứ tự execute trên nhánh: #2 TRƯỚC (dependency, đang tạm dừng — xem dưới) → rồi #3.** Ship cả nhánh một lần.
+### TRẠNG THÁI: TẠM DỪNG — cả #2 và #3 đã plan xong, chờ `/execute` phiên mới (môi trường ổn định)
+
+- **Đọc mục "Execution ordering" trong plan #3** — thực thi ĐAN XEN: #3 T1–T4 (store/selector/helpers/
+  adapter-env, Go thuần, KHÔNG cần CLI) → T5 amend #2 (doc) → **thực thi #2 đã amend** (cần login) →
+  #3 T6–T8 (bề mặt) → #3 T9 capture-first → T10 cổng. #2 gọi `CreateLLMAccount` (#3 T1) nên T1 chạy trước #2.
+- **Checkpoint NEEDS-LOGIN gộp #2 Task 5 + #3 Task 9**: cần môi trường ổn định (node v22, codex+claude
+  cài lại & đăng nhập THẬT) để ghim env var (`CODEX_HOME` xác nhận, `CLAUDE_CONFIG_DIR` chờ verify),
+  login-vào-dir-chỉ-định, và CLI có phơi email không. KHÔNG bịa output.
+- Kiến trúc chốt: selector là **singleton cấp package** (base `api` git-clean cấm thêm field; adapter
+  dựng mỗi lượt) + seam `cliAdapter.accountEnv`; wire trong `appLLMAdapters` (có `a.cfg.Dir`+`a.st`).
+  `spawn` ĐỔI chữ ký (thêm `penalize`) → grep `.spawn(` trước khi build.
+- Pre-flight ổn định môi trường: xem mục #2 bên dưới (giống hệt).
+
+**Thứ tự execute trên nhánh: #3 T1–4 → #2 (đã amend) → #3 T6–10.** Ship cả nhánh một lần sau #4.
 
 ## Dependency tạm dừng: #2 Connect trong Portal (zero-terminal)
 
