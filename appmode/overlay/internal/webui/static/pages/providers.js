@@ -346,14 +346,18 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
         // Đang chạy: detecting / installing / awaiting_login / polling. Chỉ dựng <a href> khi URL
         // thật là https:// — một backend hỏng hay giả mạo trả về javascript:/data: không được phép
         // trở thành một liên kết bấm được trong trang.
-        const loginLink = connect.phase === "awaiting_login" && connect.loginUrl?.startsWith("https://")
+        // Hiện link + mã bất cứ khi nào chúng có (awaiting_login VÀ polling): state machine set
+        // loginUrl/code NGAY lúc chuyển sang polling, nên nếu chỉ hiện ở awaiting_login thì người
+        // dùng không bao giờ kịp thấy mã cần nhập. Chúng tự biến mất ở connected/error/canceled
+        // (các phase đó có nhánh render riêng, không tới đây).
+        const loginLink = connect.loginUrl?.startsWith("https://")
           ? element("a", { className: "pv-btn primary",
               attributes: { href: connect.loginUrl, target: "_blank", rel: "noopener" },
               text: "Mở trang đăng nhập" })
           : null;
         // device-auth: người dùng phải nhập mã một lần này vào trang đăng nhập. Hiện rõ + đọc được
         // để copy; KHÔNG phải credential (mã hết hạn ~15 phút, chỉ dùng để ghép phiên login).
-        const codeBlock = connect.phase === "awaiting_login" && connect.code
+        const codeBlock = connect.code
           ? element("div", { className: "pv-connect-code" },
               element("span", { className: "pv-connect-code-label", text: "Mã đăng nhập:" }),
               element("code", { className: "pv-connect-code-value", text: connect.code }))

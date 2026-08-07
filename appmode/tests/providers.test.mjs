@@ -199,14 +199,16 @@ test("subscription connect: click drives phases through to connected and refresh
   assert.ok(listCalls >= 2, "connected triggers a provider-list refresh");
 });
 
-// Auto-advancing phases (previous test) makes catching the transient awaiting_login render racy —
-// a mock stuck on awaiting_login forever is the robust way to assert the login link itself.
-test("awaiting_login renders a login link plus the device-auth code", async (t) => {
+// The backend sets loginUrl/code exactly as it flips awaiting_login -> polling, so the URL+code
+// must render during POLLING, not only awaiting_login (a real E2E bug: gating the display on
+// phase==="awaiting_login" meant the user never saw the code they must type). Mock stuck on
+// polling-with-url is the robust guard.
+test("running connect (polling) renders the login link + device-auth code", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
     if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
     if (path === "/llm/providers/codex/connect" && !options.method) {
-      return { kind: "codex", phase: "awaiting_login", loginUrl: "https://auth.example/x", code: "EQ0J-QKCPZ" };
+      return { kind: "codex", phase: "polling", loginUrl: "https://auth.example/x", code: "EQ0J-QKCPZ" };
     }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
@@ -220,10 +222,10 @@ test("awaiting_login renders a login link plus the device-auth code", async (t) 
   for (let k = 0; k < 20; k++) await new Promise((r) => setTimeout(r, 0));
 
   const link = find(main, (n) => n.tagName === "A" && /Mở trang đăng nhập/.test(text(n)));
-  assert.ok(link, "a login link renders while awaiting_login");
+  assert.ok(link, "the login link must render while the connect is polling");
   assert.equal(link.getAttribute("href"), "https://auth.example/x");
   const codeEl = find(main, (n) => hasClass(n, "pv-connect-code-value"));
-  assert.ok(codeEl, "the device-auth code renders while awaiting_login");
+  assert.ok(codeEl, "the device-auth code must render while the connect is polling");
   assert.equal(text(codeEl), "EQ0J-QKCPZ");
 });
 
