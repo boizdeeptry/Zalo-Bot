@@ -177,8 +177,10 @@ func TestParseCLIAnswer(t *testing.T) {
 	if !strings.Contains(got, "tiêu hóa") {
 		t.Errorf("parse codex = %q; muốn chứa câu trả lời thật", got)
 	}
-	if got != strings.TrimSpace(got) {
-		t.Errorf("parse codex còn khoảng trắng thừa ở đầu/cuối: %q", got)
+	// "chỉ trim, không đổi nội dung": kết quả đúng bằng fixture đã trim — bắt được nếu parser thêm/bớt
+	// hay cắt xén gì (khác hẳn `got == TrimSpace(got)`, luôn đúng vì parser vốn đã trim → vô nghĩa).
+	if want := strings.TrimSpace(string(codexOut)); got != want {
+		t.Errorf("parse codex = %q; want %q (chỉ trim)", got, want)
 	}
 }
 
@@ -195,6 +197,11 @@ func TestParseGeminiAnswerExtractsResponseField(t *testing.T) {
 	// fallback: không phải JSON → trả raw đã trim, KHÔNG nuốt câu trả lời.
 	if got := parseGeminiAnswer([]byte("  4 khong-json  ")); got != "4 khong-json" {
 		t.Errorf("parseGeminiAnswer(non-json) = %q; want raw đã trim", got)
+	}
+	// JSON hợp lệ nhưng .response rỗng ({}) → trả rỗng (để textOrUpstream báo upstream-empty), KHÔNG
+	// phun khối JSON ra làm "câu trả lời".
+	if got := parseGeminiAnswer([]byte("{}")); got != "" {
+		t.Errorf("parseGeminiAnswer({}) = %q; want rỗng", got)
 	}
 }
 

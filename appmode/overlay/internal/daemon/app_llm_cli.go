@@ -374,7 +374,9 @@ func (a *cliAdapter) Discover(_ context.Context, _ []byte) ([]store.LLMModel, er
 // nhất — không phải tạo file tạm mỗi lượt; `-o <file>` là dự phòng có tài liệu nếu một bản codex sau
 // làm bẩn stdout.
 // gemini-cli: `-o json` bọc câu trả lời trong {"response": ...} — trích .response (xem parseGeminiAnswer).
-// claude-code: stream-json, event `result` — Task 11 gộp claude vào đây, hiện chưa đi qua hàm này.
+// claude-code: stream-json, event `result` — Task 11 gộp claude vào cliAdapter; CHƯA nối vào ở
+// production nên chưa đi qua hàm này (Generate gọi parseCLIAnswer cho MỌI descriptor, nên khi nối sẽ
+// phải thêm nhánh riêng cho stream-json, KHÔNG để rơi vào trim).
 func parseCLIAnswer(d cliDescriptor, out []byte) string {
 	if d.kind == "gemini-cli" {
 		return parseGeminiAnswer(out)
@@ -383,8 +385,8 @@ func parseCLIAnswer(d cliDescriptor, out []byte) string {
 	return strings.TrimSpace(string(out))
 }
 
-// parseGeminiAnswer trích .response từ output `-o json` của Gemini CLI; fallback về raw đã trim nếu
-// không phải JSON có .response (không nuốt mất câu trả lời).
+// parseGeminiAnswer trích .response từ output `-o json` của Gemini CLI; CHỈ fallback về raw đã trim
+// khi output KHÔNG phải JSON (ví dụ output vendor khác lỡ đi nhầm vào đây).
 //
 // CHƯA kiểm chứng bằng output THẬT: Google khai tử đăng nhập cá nhân của gemini-cli (2026-08, "no
 // longer supported for individuals" → Antigravity), nên không capture live được và Gemini đã bỏ khỏi
@@ -395,7 +397,9 @@ func parseGeminiAnswer(out []byte) string {
 	var v struct {
 		Response string `json:"response"`
 	}
-	if err := json.Unmarshal(out, &v); err == nil && v.Response != "" {
+	// Parse THÀNH CÔNG thì tin nó: .response rỗng ({} hay {"response":""}) → trả rỗng để textOrUpstream
+	// báo "không có nội dung" (kích hoạt fallback), KHÔNG phun cả khối JSON ra làm "câu trả lời".
+	if err := json.Unmarshal(out, &v); err == nil {
 		return strings.TrimSpace(v.Response)
 	}
 	return strings.TrimSpace(string(out))
