@@ -594,6 +594,8 @@ var subscriptionKinds = map[string]bool{"claude-code": true, "codex": true}
 
   `renderConnectPhase`: `awaiting_login` → text + nút "Mở trang đăng nhập" (`openLink(st.loginUrl)` / `<a href>`), nút "Huỷ" (`service.connectCancel(kind)` + dừng vòng). Poll bọc trong `AbortController` của trang (dispose huỷ). `sleep`/`pollMs` tiêm được để test không chờ thật.
 
+  > **Ghi chú (thực hiện T6):** thực tế bật hẹp hơn câu trên — không phải MỌI provider `group === "subscription"`, mà chỉ những `kind` nằm trong `CONNECTABLE_KINDS` (module-level set, hiện `{"codex"}"`), khớp `subscriptionKinds` phía backend. `claude-code` vẫn disabled ("Sắp có") cho tới khi kind của nó được hợp nhất và đi qua `cliAdapter` — không phải một sai lệch âm thầm, chỉ là phạm vi đã thu hẹp so với mô tả plan ban đầu.
+
 - [ ] **Step 4: Chạy xanh** (`npm --prefix appmode test`).
 - [ ] **Step 5: Refactor** — poll dừng sạch khi rời trang (dispose) và khi terminal phase.
 - [ ] **Step 6: Commit**

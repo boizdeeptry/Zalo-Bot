@@ -144,7 +144,9 @@ function renderConnections(entry, p, ui) {
   const add = ui.connectable
     ? element("button", {
         className: "pv-btn primary",
-        attributes: { type: "button" },
+        // Disabled while a connect flow for this entry is already open — a second click can't
+        // fire a second runConnect (belt, alongside the connectRun guard in runConnect itself).
+        attributes: { type: "button", disabled: ui.connecting, title: ui.connecting ? "Đang kết nối…" : undefined },
         text: "+ Thêm kết nối",
         on: { click() { ui.onAdd(entry.kind); } },
       })
@@ -211,8 +213,11 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
       // view cầm trạng thái điều hướng: "gallery" hoặc kind của Provider đang xem chi tiết.
       // paint() là điểm vẽ DUY NHẤT đọc view này để quyết định vẽ gì vào root.
       let view = "gallery";
-      const openDetail = (kind) => { view = kind; paint(); };
-      const backToGallery = () => { view = "gallery"; paint(); };
+      // Rời khỏi detail (mở kind khác, hoặc quay lại gallery) phải chấm dứt một luồng connect đang
+      // chạy — bump connectRun ở đây để vòng lặp poll của runConnect tự thấy mình lỗi thời ở lượt
+      // kiểm kế tiếp và dừng lại, không tiếp tục refresh() nền sau khi người dùng đã rời trang.
+      const openDetail = (kind) => { connectRun++; connect = null; view = kind; paint(); };
+      const backToGallery = () => { connectRun++; connect = null; view = "gallery"; paint(); };
 
       const byKindFrom = (providers) => new Map(providers.map((p) => [normalizeKind(p.kind), p]));
       let lastProviders = [];
@@ -231,6 +236,12 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
       // panel đang đóng. connectSlot là node ổn định giống gallerySlot: paintConnect() chỉ thay nội
       // dung của nó, không đụng root, nên không làm mất focus ô nhập tên tài khoản.
       let connect = null; // { kind, phase, label, message?, loginUrl? }
+      // connectRun là token đơn điệu: MỖI lượt mở panel (startConnect) hoặc rời detail (openDetail/
+      // backToGallery) tăng nó lên một. runConnect chụp giá trị của mình vào myRun lúc bắt đầu; mọi
+      // điểm kiểm "đây còn phải là lượt của tôi không" so connectRun !== myRun thay vì so connect?.kind
+      // !== kind — kind không đổi khi bấm lại nút hay điều hướng, nên phép so sánh cũ không bắt được
+      // vòng lặp cũ vẫn đang chạy nền.
+      let connectRun = 0;
       const connectSlot = element("div", { className: "pv-connect" });
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const defaultLabel = (p) => `Tài khoản ${(p?.accounts?.length ?? 0) + 1}`;
@@ -239,6 +250,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
       // "Thêm account" ở trang Accounts (việc sau) cũng sẽ gọi lại — nên export ra ngoài paint().
       function startConnect(kind) {
         const p = byKindFrom(lastProviders).get(normalizeKind(kind));
+        connectRun++; // invalidate any prior run before opening a fresh prompt
         connect = { kind, phase: "prompt", label: defaultLabel(p) };
         paint();
         paintConnect();
@@ -295,8 +307,10 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
           ));
           return;
         }
-        // Đang chạy: detecting / installing / awaiting_login / polling.
-        const loginLink = connect.phase === "awaiting_login" && connect.loginUrl
+        // Đang chạy: detecting / installing / awaiting_login / polling. Chỉ dựng <a href> khi URL
+        // thật là https:// — một backend hỏng hay giả mạo trả về javascript:/data: không được phép
+        // trở thành một liên kết bấm được trong trang.
+        const loginLink = connect.phase === "awaiting_login" && connect.loginUrl?.startsWith("https://")
           ? element("a", { className: "pv-btn primary",
               attributes: { href: connect.loginUrl, target: "_blank", rel: "noopener" },
               text: "Mở trang đăng nhập" })
@@ -309,18 +323,20 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
         ));
       }
 
-      // runConnect lái luồng: POST bắt đầu, rồi GET lặp lại tới khi connected/error/canceled.
-      // Mỗi vòng kiểm connect?.kind !== kind để tự dừng khi người dùng đã đóng panel hoặc mở kind
-      // khác — vòng lặp cũ không được ghi đè trạng thái của lượt kết nối mới.
+      // runConnect lái luồng: POST bắt đầu, rồi GET lặp lại tới khi connected/error/canceled. Mỗi
+      // vòng kiểm connectRun !== myRun để tự dừng — KHÔNG connect?.kind !== kind: kind không đổi
+      // khi bấm lại nút hay điều hướng sang detail khác rồi quay lại cùng kind, nên phép so sánh
+      // theo kind bỏ lọt đúng ca gây lỗi (vòng lặp cũ chạy nền, đè trạng thái của lượt mới).
       async function runConnect(kind, label) {
+        const myRun = ++connectRun;
         connect = { kind, phase: "detecting", label };
         paintConnect();
         try {
           await service.connectStart(kind, label);
           for (;;) {
-            if (disposed || connect?.kind !== kind) return;
+            if (disposed || connectRun !== myRun) return;
             const st = await service.connectStatus(kind);
-            if (disposed || connect?.kind !== kind) return;
+            if (disposed || connectRun !== myRun) return;
             connect = { ...connect, phase: st.phase, message: st.message, loginUrl: st.loginUrl || connect.loginUrl };
             paintConnect();
             if (st.phase === "connected") { connect = null; await refresh(); return; }
@@ -328,7 +344,9 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
             await sleep(pollMs);
           }
         } catch (error) {
-          if (disposed || error?.name === "AbortError") return;
+          // Lượt cũ/lỗi muộn không được đè connect: {...null, phase:"error"} sinh ra một đối tượng
+          // thiếu kind là đúng thứ lỗi cần chặn.
+          if (disposed || connectRun !== myRun || error?.name === "AbortError") return;
           connect = { ...connect, phase: "error", message: error?.message || "Kết nối thất bại" };
           paintConnect();
         }

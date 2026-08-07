@@ -117,7 +117,7 @@ test("codex's add-connection button is enabled; claude-code's is not yet", async
   assert.equal(add.getAttribute("title"), "Sắp có");
 });
 
-test("subscription connect: click drives phases, shows login link, finishes connected and refreshes", async (t) => {
+test("subscription connect: click drives phases through to connected and refreshes the list", async (t) => {
   const phases = ["awaiting_login", "polling", "connected"];
   let i = 0;
   let listCalls = 0;
@@ -149,6 +149,58 @@ test("subscription connect: click drives phases, shows login link, finishes conn
   const post = calls.find((c) => c.path === "/llm/providers/codex/connect" && c.options.method === "POST");
   assert.ok(post && typeof post.options.body.label === "string" && post.options.body.label.length > 0, "POST connect carries a label");
   assert.ok(listCalls >= 2, "connected triggers a provider-list refresh");
+});
+
+// Auto-advancing phases (previous test) makes catching the transient awaiting_login render racy —
+// a mock stuck on awaiting_login forever is the robust way to assert the login link itself.
+test("awaiting_login renders a login link to the backend-provided URL", async (t) => {
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
+    if (path === "/llm/providers/codex/connect" && !options.method) {
+      return { kind: "codex", phase: "awaiting_login", loginUrl: "https://auth.example/x" };
+    }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  await flush();
+  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
+  for (let k = 0; k < 20; k++) await new Promise((r) => setTimeout(r, 0));
+
+  const link = find(main, (n) => n.tagName === "A" && /Mở trang đăng nhập/.test(text(n)));
+  assert.ok(link, "a login link renders while awaiting_login");
+  assert.equal(link.getAttribute("href"), "https://auth.example/x");
+});
+
+test("navigating back to the gallery stops the connect poll loop", async (t) => {
+  let connectGets = 0;
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
+    if (path === "/llm/providers/codex/connect" && !options.method) { connectGets++; return { kind: "codex", phase: "polling" }; }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  await flush();
+  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
+  for (let k = 0; k < 20; k++) await new Promise((r) => setTimeout(r, 0));
+
+  const seenBeforeNav = connectGets;
+  assert.ok(seenBeforeNav > 0, "the poll loop made at least one status GET before navigating away");
+
+  find(main, (n) => hasClass(n, "pv-back")).click();
+  await flush();
+  for (let k = 0; k < 20; k++) await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(connectGets, seenBeforeNav, "no further connect-status GETs after leaving the detail page");
 });
 
 test("cancel: clicking Huỷ while polling sends a DELETE to the connect endpoint", async (t) => {
