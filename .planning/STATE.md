@@ -1,6 +1,6 @@
 # Planning state
 
-step: execute
+step: ship
 current_topic: providers-gallery-ui
 current_spec: .planning/specs/2026-08-07-providers-gallery-ui-design.md
 current_plan: .planning/plans/2026-08-07-providers-gallery-ui.md
@@ -25,9 +25,17 @@ Quyết định 2026-08-07: KHÔNG ship engine riêng; hoàn thiện luôn UI ki
 - **Providers UI kiểu 9Router** — 4 sub-project, cùng nhánh, mỗi cái spec→plan→execute riêng.
   9Router tách **Providers** (gallery + connections/models) và **Combos** (Fallback/RR/Fusion/
   Capacity). Điểm bán hơn 9Router: badge XANH "chính chủ, không rủi ro khoá" thay Risk Notice đỏ.
-  - **#1 gallery + trang chi tiết** — spec DUYỆT, plan `2026-08-07-providers-gallery-ui.md` (7 task TDD).
-    Thuần frontend restyle `providers.js` (bỏ facts-list+sheet → gallery+detail), đọc `/llm/*` sẵn có;
-    thao tác ghi deferred #2/#4; giữ test canary bảo mật. **ĐANG: `/execute`.**
+  - **#1 gallery + trang chi tiết — XONG** (7 task TDD, mỗi task 2 vòng review; final whole-branch review
+    SHIP). `providers.js` 531→295, gallery+detail kiểu 9Router, badge xanh, search, Test-all thật, thao
+    tác ghi inert (deferred #2/#4), canary bảo mật nguyên. Commits 791c203…f96cdb1.
+    - Kèm 2 sửa hạ tầng do Node v20→v22: `appmode/package.json` + `AgentDC/tuvan-zalo/package.json`
+      (`node --test <dir>` → glob/no-arg); 1 sửa engine `ecf8bf9` (probeClaudeAuth đọc JSON exit≠0 →
+      phát hiện claude logged-out đúng thay vì unknown).
+    - Build gate GREEN: go tests, Portal 100/100, tuvan-zalo 3/3, gói 1209 tệp/110MB, cổng credential pass.
+    - Follow-up nhỏ (không chặn): unit-test seam cho probeClaudeAuth exit≠0+body; copy "0 kết nối"→"0 model";
+      note logoColor nếu catalog thành backend-driven.
+    - Nhánh hiện = **engine + UI#1** (đều shippable). CÒN #2 Connect, #3 Multi-account, #4 Combos theo
+      ý "hoàn thiện cả nhánh". Quyết định: tiếp #2 (`/discuss`) hay `/ship` sớm engine+UI#1. **CHỜ user.**
   - #2 Connect trong Portal (zero-terminal: install-on-demand + device-auth login, 1 tài khoản).
   - #3 Multi-account (nhiều tài khoản/provider, tách `CODEX_HOME`/`CLAUDE_CONFIG_DIR`, Round Robin + Sticky).
   - #4 Combos (Fallback = chuỗi fallback hiện tại; + Round Robin/Fusion/Capacity) — THAY trang Models;
