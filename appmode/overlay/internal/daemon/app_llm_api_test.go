@@ -944,6 +944,47 @@ func TestLLMAPIUnknownProviderIs404(t *testing.T) {
 	}
 }
 
+// TestLLMAPIProviderBodyIncludesAccounts canh chỗ Portal đọc danh sách account của một Provider
+// subscription: llmProviderBody phải mang chúng ra, còn ConfigDir (đường dẫn nội bộ) thì không.
+func TestLLMAPIProviderBodyIncludesAccounts(t *testing.T) {
+	h := newLLMAPIHarness(t)
+	if err := h.st.CreateLLMProvider(store.LLMProvider{
+		ID: "codex", Name: "Codex", Kind: "codex", Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMProvider(codex) = %v; want nil", err)
+	}
+	if err := h.st.CreateLLMAccount(store.LLMAccount{
+		ID: "a1", ProviderID: "codex", Label: "TK chính", Enabled: true, ConfigDir: "d",
+	}); err != nil {
+		t.Fatalf("CreateLLMAccount(a1) = %v; want nil", err)
+	}
+
+	body, err := h.api.llmProviderBody(store.LLMProvider{ID: "codex", Name: "Codex", Kind: "codex", Enabled: true})
+	if err != nil {
+		t.Fatalf("llmProviderBody(codex) = %v; want nil", err)
+	}
+	if len(body.Accounts) != 1 || body.Accounts[0].ID != "a1" || body.Accounts[0].Label != "TK chính" {
+		t.Fatalf("body.Accounts = %+v; want 1 account a1/TK chính", body.Accounts)
+	}
+
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("Marshal(body) = %v; want nil", err)
+	}
+	if strings.Contains(string(raw), "config_dir") || strings.Contains(string(raw), "\"d\"") {
+		t.Errorf("provider body leaks config_dir: %s", raw)
+	}
+
+	// Provider API-key (claude-code hệ thống, không có account) mang accounts rỗng/vắng mặt.
+	apiBody, err := h.api.llmProviderBody(store.LLMProvider{ID: "claude-code", Name: "Claude Code", Kind: "claude_code"})
+	if err != nil {
+		t.Fatalf("llmProviderBody(claude-code) = %v; want nil", err)
+	}
+	if len(apiBody.Accounts) != 0 {
+		t.Errorf("apiBody.Accounts = %+v; want none for an API-key provider", apiBody.Accounts)
+	}
+}
+
 // --- route ---
 
 func TestLLMAPIRouteConflictReturns409(t *testing.T) {

@@ -76,18 +76,19 @@ func llmEndpointFor(kind string) (string, bool) {
 // thứ duy nhất được marshal ra ngoài, nên "không khai báo" là bảo đảm mạnh hơn "nhớ đừng gán".
 // Hai cờ dưới đây thay cho khoá: đã nhập chưa, và nhập rồi mà máy này còn mở ra được không.
 type llmProviderBody struct {
-	ID                   string         `json:"id"`
-	Name                 string         `json:"name"`
-	Kind                 string         `json:"kind"`
-	Endpoint             string         `json:"endpoint"`
-	Enabled              bool           `json:"enabled"`
-	System               bool           `json:"system"`
-	CredentialConfigured bool           `json:"credential_configured"`
-	CredentialUnreadable bool           `json:"credential_unreadable"`
-	LastCheckStatus      string         `json:"last_check_status"`
-	LastError            string         `json:"last_error"`
-	LastCheckedAt        string         `json:"last_checked_at"`
-	Models               []llmModelBody `json:"models"`
+	ID                   string           `json:"id"`
+	Name                 string           `json:"name"`
+	Kind                 string           `json:"kind"`
+	Endpoint             string           `json:"endpoint"`
+	Enabled              bool             `json:"enabled"`
+	System               bool             `json:"system"`
+	CredentialConfigured bool             `json:"credential_configured"`
+	CredentialUnreadable bool             `json:"credential_unreadable"`
+	LastCheckStatus      string           `json:"last_check_status"`
+	LastError            string           `json:"last_error"`
+	LastCheckedAt        string           `json:"last_checked_at"`
+	Models               []llmModelBody   `json:"models"`
+	Accounts             []llmAccountBody `json:"accounts,omitempty"`
 }
 
 type llmModelBody struct {
@@ -95,6 +96,17 @@ type llmModelBody struct {
 	Name      string `json:"name"`
 	Source    string `json:"source"`
 	Available bool   `json:"available"`
+}
+
+// llmAccountBody là một account subscription như Portal nhìn thấy.
+//
+// KHÔNG có ConfigDir: đó là đường dẫn filesystem nội bộ máy chạy daemon, không phải thứ Portal
+// cần biết — cùng lý do llmProviderBody không mang credential.
+type llmAccountBody struct {
+	ID      string `json:"id"`
+	Label   string `json:"label"`
+	Email   string `json:"email,omitempty"`
+	Enabled bool   `json:"enabled"`
 }
 
 // llmRouteEntryBody phục vụ cả đọc lẫn ghi.
@@ -356,6 +368,15 @@ func (a *api) llmProviderBody(p store.LLMProvider) (llmProviderBody, error) {
 	}
 	if p.LastCheckedAt != nil {
 		body.LastCheckedAt = p.LastCheckedAt.Format(time.RFC3339)
+	}
+	accounts, err := a.st.LLMAccounts(p.ID)
+	if err != nil {
+		return llmProviderBody{}, fmt.Errorf("đọc account của %s: %w", p.ID, err)
+	}
+	for _, ac := range accounts {
+		body.Accounts = append(body.Accounts, llmAccountBody{
+			ID: ac.ID, Label: ac.Label, Email: ac.Email, Enabled: ac.Enabled,
+		})
 	}
 	return body, nil
 }
