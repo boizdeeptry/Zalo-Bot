@@ -29,6 +29,7 @@ var appPortalRoutePatterns = []string{
 	"POST /llm/providers/{id}/discover",
 	"POST /llm/providers/{id}/models",
 	"DELETE /llm/providers/{id}/models",
+	"DELETE /llm/providers/{id}/accounts/{accountId}",
 	"GET /llm/route",
 	"PUT /llm/route",
 	"GET /llm/status",
@@ -64,6 +65,7 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /llm/providers/{id}/discover", a.auth(a.handleLLMProviderDiscover))
 	mux.Handle("POST /llm/providers/{id}/models", a.auth(a.handleLLMModelAdd))
 	mux.Handle("DELETE /llm/providers/{id}/models", a.auth(a.handleLLMModelDelete))
+	mux.Handle("DELETE /llm/providers/{id}/accounts/{accountId}", a.auth(a.handleLLMAccountDelete))
 	mux.Handle("GET /llm/route", a.auth(a.handleLLMRouteGet))
 	mux.Handle("PUT /llm/route", a.auth(a.handleLLMRoutePut))
 	mux.Handle("GET /llm/status", a.auth(a.handleLLMStatus))

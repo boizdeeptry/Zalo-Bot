@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -425,6 +426,45 @@ func (a *api) handleLLMModelDelete(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// --- account ---
+
+func (a *api) handleLLMAccountDelete(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	accountID := r.PathValue("accountId")
+	// Đọc config_dir TRƯỚC khi xoá hàng: DeleteLLMAccount chỉ nhận id, nên sau khi hàng biến mất
+	// không còn cách nào tìm lại đường dẫn cần dọn.
+	accounts, err := a.st.LLMAccounts(providerID)
+	if err != nil {
+		a.writeLLMInternal(w, "không đọc được danh sách account", err)
+		return
+	}
+	dir, ok := findLLMAccountDir(accounts, accountID)
+	if !ok {
+		a.writeLLMErr(w, http.StatusNotFound, "ACCOUNT_NOT_FOUND",
+			fmt.Sprintf("Không tìm thấy account %q", accountID), nil)
+		return
+	}
+	if err := a.st.DeleteLLMAccount(accountID); err != nil {
+		a.writeLLMInternal(w, "không xoá được account", err)
+		return
+	}
+	// RemoveAll hỏng KHÔNG làm hỏng cả yêu cầu: hàng đã xoá là nguồn sự thật, một thư mục mồ côi
+	// còn cứu được (dọn tay), còn quay lại tạo một hàng ma vì dọn đĩa không xong thì không.
+	if err := os.RemoveAll(dir); err != nil {
+		a.logger.Warn("llm api: không xoá được thư mục config account", "account", accountID, "err", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func findLLMAccountDir(accounts []store.LLMAccount, id string) (string, bool) {
+	for _, ac := range accounts {
+		if ac.ID == id {
+			return ac.ConfigDir, true
+		}
+	}
+	return "", false
 }
 
 // --- route ---

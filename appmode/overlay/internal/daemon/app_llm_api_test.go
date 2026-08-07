@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -982,6 +983,52 @@ func TestLLMAPIProviderBodyIncludesAccounts(t *testing.T) {
 	}
 	if len(apiBody.Accounts) != 0 {
 		t.Errorf("apiBody.Accounts = %+v; want none for an API-key provider", apiBody.Accounts)
+	}
+}
+
+// --- account ---
+
+// TestLLMAPIDeleteAccountRemovesRowAndConfigDir canh đường xoá THÀNH CÔNG: hàng và thư mục phiên
+// (đăng xuất thật) phải biến mất cùng nhau.
+func TestLLMAPIDeleteAccountRemovesRowAndConfigDir(t *testing.T) {
+	h := newLLMAPIHarness(t)
+	if err := h.st.CreateLLMProvider(store.LLMProvider{
+		ID: "codex", Name: "Codex", Kind: "codex", Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMProvider(codex) = %v; want nil", err)
+	}
+	dir := t.TempDir()
+	if err := h.st.CreateLLMAccount(store.LLMAccount{
+		ID: "a1", ProviderID: "codex", Label: "TK chính", ConfigDir: dir, Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMAccount(a1) = %v; want nil", err)
+	}
+
+	h.mustStatus(h.do(http.MethodDelete, "/llm/providers/codex/accounts/a1", ""),
+		http.StatusNoContent, "delete account")
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("config_dir %q still exists after delete: %v", dir, err)
+	}
+	if got, err := h.st.LLMAccounts("codex"); err != nil || len(got) != 0 {
+		t.Fatalf("LLMAccounts(codex) after delete = %+v, %v; want none", got, err)
+	}
+}
+
+func TestLLMAPIDeleteAccountMissingIs404(t *testing.T) {
+	h := newLLMAPIHarness(t)
+	if err := h.st.CreateLLMProvider(store.LLMProvider{
+		ID: "codex", Name: "Codex", Kind: "codex", Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMProvider(codex) = %v; want nil", err)
+	}
+
+	got := h.do(http.MethodDelete, "/llm/providers/codex/accounts/nope", "")
+	if got.status != http.StatusNotFound {
+		t.Fatalf("delete unknown account status = %d, want 404; body = %s", got.status, got.raw)
+	}
+	if code := got.errorCode(t); code != "ACCOUNT_NOT_FOUND" {
+		t.Errorf("delete unknown account error code = %q, want ACCOUNT_NOT_FOUND", code)
 	}
 }
 
