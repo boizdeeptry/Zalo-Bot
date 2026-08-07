@@ -1710,3 +1710,95 @@ func TestAppLLMRunnerFallsBackOverRealHTTP(t *testing.T) {
 			status.LastErrorKind, status.LastErrorProviderID)
 	}
 }
+
+// TestChainFallsFromHTTPToCLI nghiệm thu XUYÊN họ Provider: một Provider HTTP trả 429 → mắt xích
+// local_cli (codex) phục vụ. Telemetry ghi ĐÚNG một lần chuyển (Attempts=2, Fallbacks=1), Provider
+// đang phục vụ là codex, lỗi 429 → rate_limit ghim vào openai-1, và lượt CLI chạy read-only (argv
+// Task 2) KHÔNG mang cờ bỏ sandbox. Đây là mắt xích test đơn vị từng vendor bỏ sót: HTTP→CLI đi qua
+// cùng một chuỗi fallback với ánh xạ lỗi thật, trên một store thật (không phải fakeRouteStore).
+func TestChainFallsFromHTTPToCLI(t *testing.T) {
+	// answerZalo hợp lệ ngắn nhất (nhánh clarify ra ngoài không cần trích dẫn) — test này nghiệm thu
+	// đường đi HTTP→CLI, không nghiệm thu phần soát trích dẫn của upstream.
+	const answer = `{"clarify":"Dạ mình cần tư vấn phần nào ạ?"}`
+
+	rateLimited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":{"message":"rate limit"}}`, http.StatusTooManyRequests)
+	}))
+	t.Cleanup(rateLimited.Close)
+
+	a := newAppRouteAPI(t)
+	for _, p := range []struct{ id, kind string }{{"openai-1", "openai"}, {"codex-1", "codex"}} {
+		if err := a.st.CreateLLMProvider(store.LLMProvider{
+			ID: p.id, Name: p.id, Kind: p.kind, Enabled: true,
+		}); err != nil {
+			t.Fatalf("CreateLLMProvider(%q) = %v; want nil", p.id, err)
+		}
+	}
+	for _, m := range []struct{ pid, model string }{{"openai-1", "gpt-5-mini"}, {"codex-1", "gpt-5.6-terra"}} {
+		if err := a.st.AddLLMModel(store.LLMModel{
+			ProviderID: m.pid, ModelID: m.model, Name: m.model,
+			Source: store.LLMModelManual, Available: true,
+		}); err != nil {
+			t.Fatalf("AddLLMModel(%s/%s) = %v; want nil", m.pid, m.model, err)
+		}
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	openai := newOpenAIAdapter("openai-1", client)
+	openai.base = rateLimited.URL // endpoint là hằng của Provider; test trỏ nó vào máy chủ giả 429.
+	var codexSaw []string
+	codex := fakeCLI("codex", "codex-1", answer, &codexSaw)
+	adapters := map[string]providerAdapter{"openai-1": openai, "codex-1": codex}
+
+	saveRoute(t, a,
+		store.LLMRouteEntry{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true},
+		store.LLMRouteEntry{ProviderID: "codex-1", ModelID: "gpt-5.6-terra", Enabled: true},
+	)
+
+	claude := okClaude(`{"clarify":"Claude Code không được gọi trong lượt này"}`)
+	runner := newAppLLMRunner(appLLMRunnerConfig{
+		Store:      a.st,
+		Adapters:   adapters,
+		Claude:     func(string) zaloRunner { return claude },
+		Credential: func(string) ([]byte, error) { return []byte(llmPackageCanary), nil },
+		Logger:     slog.New(slog.DiscardHandler),
+	})
+
+	got, err := runner.Run(t.Context(), "khách hỏi giá combo", func(string) {})
+	if err != nil {
+		t.Fatalf("Run() HTTP→CLI = _, %v; want nil", err)
+	}
+	if got != answer {
+		t.Errorf("Run() = %q; want %q (codex phục vụ sau 429)", got, answer)
+	}
+	if len(codexSaw) != 1 {
+		t.Fatalf("codex nhận %d lượt; want 1 (phục vụ sau khi openai 429)", len(codexSaw))
+	}
+	// Lượt CLI phải read-only (argv Task 2), KHÔNG cờ bỏ sandbox.
+	if !strings.Contains(codexSaw[0], "read-only") {
+		t.Errorf("argv codex = %q; muốn có 'read-only'", codexSaw[0])
+	}
+	if strings.Contains(codexSaw[0], "--dangerously-bypass-approvals-and-sandbox") {
+		t.Errorf("argv codex = %q; KHÔNG được mang cờ bỏ sandbox", codexSaw[0])
+	}
+	if len(claude.seen()) != 0 {
+		t.Errorf("claude được gọi %d lần; want 0 (codex đã trả lời)", len(claude.seen()))
+	}
+
+	status, err := a.st.LLMStatus()
+	if err != nil {
+		t.Fatalf("LLMStatus() = _, %v; want nil", err)
+	}
+	if status.ActiveProviderID != "codex-1" || status.ActiveModelID != "gpt-5.6-terra" {
+		t.Errorf("LLMStatus() provider/model = %s/%s; want codex-1/gpt-5.6-terra",
+			status.ActiveProviderID, status.ActiveModelID)
+	}
+	if status.Attempts != 2 || status.Fallbacks != 1 {
+		t.Errorf("LLMStatus() attempts/fallbacks = %d/%d; want 2/1 (429 rồi codex)",
+			status.Attempts, status.Fallbacks)
+	}
+	if status.LastErrorKind != string(llmErrorRateLimit) || status.LastErrorProviderID != "openai-1" {
+		t.Errorf("LLMStatus() lastError = %q/%q; want rate_limit/openai-1",
+			status.LastErrorKind, status.LastErrorProviderID)
+	}
+}
