@@ -16,6 +16,12 @@ const CLAUDE_ADDED = {
   credential_configured: false, credential_unreadable: false, last_check_status: "", last_error: "",
   models: [{ model_id: "sonnet", name: "Claude Sonnet", source: "manual", available: true }],
 };
+const CODEX_CONNECTED = {
+  id: "codex", name: "OpenAI Codex", kind: "codex", system: false, enabled: true,
+  credential_configured: false, credential_unreadable: false, last_check_status: "", last_error: "",
+  models: [],
+  accounts: [{ id: "a1", label: "Tài khoản 1", email: "", enabled: true }],
+};
 function mountPage(t, handler, opts = {}) {
   const dom = installDOM();
   const calls = [];
@@ -115,6 +121,48 @@ test("codex's add-connection button is enabled; claude-code's is not yet", async
   add = find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n)));
   assert.ok(add && add.disabled, "claude-code is not connectable yet — add button stays disabled");
   assert.equal(add.getAttribute("title"), "Sắp có");
+});
+
+test("subscription detail lists connected accounts with a delete button and a '+ Thêm account' button", async (t) => {
+  const { main } = mountPage(t, listWith([CODEX_CONNECTED]));
+  await flush();
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  const labels = findAll(detail, (n) => hasClass(n, "pv-account-label")).map(text);
+  assert.deepEqual(labels, ["Tài khoản 1"]);
+  assert.ok(find(detail, (n) => n.tagName === "BUTTON" && /Xoá/.test(text(n))), "each account has a delete button");
+  assert.ok(find(detail, (n) => n.tagName === "BUTTON" && /Thêm account/.test(text(n))), "add button reads '+ Thêm account' when accounts exist");
+});
+
+test("deleting an account issues DELETE .../accounts/{id} and refreshes", async (t) => {
+  let listCalls = 0, deleted = false;
+  const { calls, main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) {
+      listCalls++;
+      return { providers: [deleted ? { ...CODEX_CONNECTED, accounts: [] } : CODEX_CONNECTED], kinds: [] };
+    }
+    if (path === "/llm/providers/codex/accounts/a1" && options.method === "DELETE") { deleted = true; return null; }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  find(detail, (n) => n.tagName === "BUTTON" && /Xoá/.test(text(n))).click();
+  await flush();
+  assert.ok(calls.some((c) => c.path === "/llm/providers/codex/accounts/a1" && c.options.method === "DELETE"), "DELETE issued");
+  assert.ok(listCalls >= 2, "delete triggers a provider-list refresh");
+});
+
+test("'+ Thêm account' reuses the connect flow (opens the label prompt)", async (t) => {
+  const { main } = mountPage(t, listWith([CODEX_CONNECTED]));
+  await flush();
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  find(main, (n) => n.tagName === "BUTTON" && /Thêm account/.test(text(n))).click();
+  await flush();
+  assert.ok(find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))), "add-account opens the connect prompt");
 });
 
 test("subscription connect: click drives phases through to connected and refreshes the list", async (t) => {

@@ -66,6 +66,10 @@ export function createProviderService(request = requestJSON) {
     }),
     connectStatus: (kind) => request(`/llm/providers/${encodeURIComponent(kind)}/connect`),
     connectCancel: (kind) => request(`/llm/providers/${encodeURIComponent(kind)}/connect`, { method: "DELETE" }),
+    removeAccount: (providerId, accountId) => request(
+      `${providerPath(providerId, "/accounts")}/${encodeURIComponent(accountId)}`,
+      { method: "DELETE" },
+    ),
   });
 }
 
@@ -138,22 +142,43 @@ const safeBadge = () => element("div", { className: "pv-safe-badge" },
 );
 
 function renderConnections(entry, p, ui) {
-  const body = p && p.system
-    ? element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.name}).` })
-    : element("div", { className: "pv-conn-empty", text: "Chưa có kết nối — No connections yet." });
+  const accounts = Array.isArray(p?.accounts) ? p.accounts : [];
+  let body;
+  if (accounts.length) {
+    // Multi-account provider (e.g. codex): list each connected account with a delete button,
+    // instead of the single-row "system" or "empty" states below.
+    body = element("div", { className: "pv-account-list" }, accounts.map((a) => element("div", { className: "pv-account" },
+      element("span", { className: "pv-account-label", text: a.label }),
+      a.email ? element("span", { className: "pv-account-email", text: a.email }) : null,
+      element("span", { className: `pv-account-status ${a.enabled ? "on" : "off"}`, text: a.enabled ? "Bật" : "Tắt" }),
+      element("button", {
+        className: "pv-btn danger",
+        attributes: { type: "button", "aria-label": `Xoá ${a.label}` },
+        text: "Xoá",
+        on: { click() { void ui.onRemoveAccount(p.id, a.id); } },
+      }),
+    )));
+  } else if (p && p.system) {
+    body = element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.name}).` });
+  } else {
+    body = element("div", { className: "pv-conn-empty", text: "Chưa có kết nối — No connections yet." });
+  }
+  // Label switches to "+ Thêm account" once at least one account is connected — same startConnect
+  // flow underneath (ui.onAdd), just numbered for the next account via defaultLabel().
+  const addText = accounts.length ? "+ Thêm account" : "+ Thêm kết nối";
   const add = ui.connectable
     ? element("button", {
         className: "pv-btn primary",
         // Disabled while a connect flow for this entry is already open — a second click can't
         // fire a second runConnect (belt, alongside the connectRun guard in runConnect itself).
         attributes: { type: "button", disabled: ui.connecting, title: ui.connecting ? "Đang kết nối…" : undefined },
-        text: "+ Thêm kết nối",
+        text: addText,
         on: { click() { ui.onAdd(entry.kind); } },
       })
     : element("button", {
         className: "pv-btn primary",
         attributes: { type: "button", disabled: true, title: "Sắp có" },
-        text: "+ Thêm kết nối",
+        text: addText,
       });
   return element("section", { className: "pv-panel pv-connections" },
     element("div", { className: "pv-panel-head" }, element("h3", { text: "Kết nối" })),
@@ -259,6 +284,13 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
       function closeConnect() {
         connect = null;
         paint();
+      }
+
+      // removeAccount deletes one account off a provider then refreshes — same shape as the
+      // model-removal path, no local optimistic state to keep in sync.
+      async function removeAccount(providerId, accountId) {
+        await service.removeAccount(providerId, accountId);
+        await refresh();
       }
 
       async function cancelConnect(kind) {
@@ -382,6 +414,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
               connecting: connect?.kind === entry.kind,
               connectSlot,
               onAdd: startConnect,
+              onRemoveAccount: removeAccount,
             };
             root.replaceChildren(header(), renderDetail(entry, byKindFrom(lastProviders), backToGallery, connUI));
             // Slot node vẽ lại ở paint() mất nội dung cũ — refill nếu panel đang mở cho đúng kind này.
