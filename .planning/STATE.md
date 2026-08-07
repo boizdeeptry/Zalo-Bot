@@ -63,22 +63,27 @@ CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4
     Node cần: bundle cây npm + `install()` gọi npm BUNDLED + node-resolution nhất quán (generate & install cùng
     dùng node bundled, tìm codex đúng nơi npm cài). Là thiết kế riêng (đụng `resolveCLIProgram`/#1), KHÔNG bolt-on.
     Hiện `install()` giả định máy khách có `npm` trên PATH; connect vẫn chạy full khi codex ĐÃ cài + login.
-  - **E2E ĐÃ CHẠY (gói cn-36df907f, daemon v0.10.0 trên :8770, data cô lập không Zalo-cred):** BẮT ĐƯỢC LỖI
-    ship-blocking mà unit-test + capture thủ công KHÔNG thấy. Xác nhận chạy end-to-end: gallery/detail/CSS,
-    gating (claude-code "Sắp có" disabled, codex enabled), bấm "+ Thêm kết nối"→prompt→"Bắt đầu"→POST connect
-    → state machine tạo `accountId=uuid` + `MkdirAll` configDir cô lập (`data\accounts\codex\d5c54cb9-…\`),
-    daemon spawn `codex login --device-auth` với `CODEX_HOME`=dir đó (codex ghi `log/` vào ĐÚNG dir → cô lập
-    THẬT trong daemon). **LỖI:** daemon log `connect failed kind=codex phase=awaiting_login err="codex không
-    in URL đăng nhập trong 45s"`. Chẩn: `codex login --device-auth` KHÔNG in URL qua PIPE của Go exec
-    (`StandardOutput.ReadLine` chặn 30s, 0 dòng) — codex gate output theo TTY / block-buffer khi stdout không
-    phải terminal. Capture thủ công thấy URL vì redirect ra FILE (khác pipe live-read). **FIX = spawn login
-    dưới PTY** (engine có `internal/pty`), hoặc thử env ép non-TTY (`CI=1`/`TERM=dumb`) rẻ hơn trước khi PTY.
-    Đây là BLOCKER connect device-auth → task kế tiếp NGAY.
+- **E2E ĐÃ CHẠY + SỬA XONG 2 lỗi ship-blocker** (gói cn-36df907f, daemon v0.10.0 :8770, data cô lập không
+  Zalo-cred). Chạy end-to-end: gallery/detail/CSS, gating (claude-code "Sắp có" disabled, codex enabled),
+  "+ Thêm kết nối"→prompt→"Bắt đầu"→POST connect → `accountId=uuid` + `MkdirAll` configDir cô lập
+  (`data\accounts\codex\<uuid>\`) → daemon spawn `codex login --device-auth` với `CODEX_HOME`=dir đó (codex
+  ghi `log/` vào ĐÚNG dir → **cô lập THẬT trong daemon, không chỉ trong test**).
+  - **Lỗi 1 (backend):** codex ANSI-màu output (`\x1b[94m<code>\x1b[0m`, KỂ CẢ khi `NO_COLOR=1`) → `\b` đầu
+    `connectCodeRe` không khớp (ký tự trước code là `m`) → `scanDeviceAuth` kẹt chờ code → timeout 45s. **KHÔNG
+    phải PTY** — URL/ code ra pipe bình thường sau ~0.7s. Fix: strip SGR escape trong `scanDeviceAuth` (`2bed4e0`).
+  - **Lỗi 2 (frontend):** panel chỉ hiện URL/code khi `awaiting_login`, nhưng state machine set chúng lúc
+    chuyển sang `polling` → người dùng không bao giờ thấy mã. Fix: hiện khi có url/code bất kể phase (`82a8c76`).
+  - **Sau fix — backend E2E XÁC NHẬN**: `GET .../connect` = `{phase:polling, loginUrl:"https://auth.openai.com/
+    codex/device", code:"EUF8-2N6RT"}` (SẠCH, không còn ANSI). Bước cuối (user mở URL + nhập mã + authorize →
+    connected → account row) là hành động OAuth của user; mọi tầng khác đã chạy thật.
+  - CÒN: rebuild+embed frontend fix vào bản cuối (fix đã có test node `82a8c76`); một lần bấm-thật để thấy
+    "connected" (tùy chọn, user tự làm qua Start.vbs).
   - **#4 Combos** (+ Task 11: gộp Claude vào `cliAdapter`, hợp nhất kind `claude_code`→`claude-code`). Khi làm
     PHẢI sync `envVarFor` + `subscriptionDisplayName` + `CONNECTABLE_KINDS` để bật Claude connect.
 - **Ship CẢ NHÁNH một lần sau #4.**
 
-**Thứ tự còn lại: [phiên login] T5b+T9 (runner thật) → T7/T10 (bundle+gate) → ship cả nhánh (sau #4).**
+**Thứ tự còn lại: #45 npm-bundle (zero-Node) → #4 Combos → ship cả nhánh. Connect codex đã chạy end-to-end
+(còn mỗi bước OAuth của user).**
 
 ## #2 Connect trong Portal (zero-terminal) — code XONG, chỉ còn runner thật (T5b)
 
