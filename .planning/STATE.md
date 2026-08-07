@@ -6,7 +6,7 @@ current_spec: .planning/specs/2026-08-07-providers-multi-account-design.md
 current_plan: .planning/plans/2026-08-07-providers-multi-account.md
 last_updated: 2026-08-07
 
-## Đang làm: #3 Multi-account (spec+plan XONG, TẠM DỪNG chờ /execute phiên mới)
+## Đang làm: #3 Multi-account + #2 Connect — code login-free XONG, DỪNG ở checkpoint login
 
 Sub-project #3/4. Mỗi provider subscription (Claude Code/OpenAI Codex) cho NHIỀU account, mỗi account
 một phiên CLI độc lập (thư mục config app tự quản dưới `cfg.Dir/accounts/<kind>/<id>`, cô lập khỏi CLI
@@ -17,54 +17,64 @@ CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4
   network/timeout/rate_limit/upstream đi tiếp).
 - Plan `.planning/plans/2026-08-07-providers-multi-account.md` (commit `6bc9632`), 10 task TDD.
 
-### TRẠNG THÁI: T1–T7 + T5 XONG (backend #3 + amend #2); TẠM DỪNG trước T8 — chờ #2 build + đăng nhập
+### TRẠNG THÁI: backend #3 (T1–T7) + #2 connect (T1–T4,T6) + #3 T8 + CSS XONG. CHỈ CÒN checkpoint login + build gate.
 
-- **ĐÃ THỰC THI + review sạch** (subagent-driven, mỗi code task implementer + code-reviewer ✅; go-check full xanh sau mỗi task):
-  - T1 store `llm_accounts` (schema v3) `5ed2f68`; T2 `accountSelector` `f068ba1` (+guard `0b4c796`);
-    T3 env helpers `f039f52`; T4 `cliAdapter.accountEnv`+`spawn`(3-value)+`appLLMAdapters` `156f02f`
-    (plan spawn-order fix `cd5ed0d`); T6 provider body `Accounts` `a40cac4`; T7 DELETE account endpoint
-    `df9fa62` (+cross-provider guard `12268e9`); T5 amend #2 spec+plan account-dir-aware `c063d2c`.
-  - `spawn` ĐÃ đổi chữ ký (thêm penalize) — caller duy nhất `Generate`. Canary/security giữ nguyên
-    (config_dir KHÔNG lọt ra body; DELETE có auth + allowlist; không credential qua daemon).
-  - **Cảnh báo Task 11 (#4)**: `envVarFor` khớp kind `claude_code` (gạch DƯỚI) — đúng hiện tại; nếu
-    Task 11 đưa claude-code vào cliAdapter & đổi kind sang gạch NỐI phải sync `envVarFor` kẻo wiring no-op.
-- **CÒN LẠI (đều cần môi trường ổn định + đăng nhập):**
-  - **#2 connect** (đã amend account-dir-aware) — build state machine + endpoints (fakeRunner, login-free)
-    rồi Task 5 capture-first login THẬT. #2 gọi `CreateLLMAccount` (#3 đã có) khi `connected`.
-  - **#3 T8** frontend panel Kết nối — list account (từ T6 body) + Xoá (T7 endpoint) đã sẵn dữ liệu; nút
-    "Thêm account" nối vào `startConnect(kind)` của #2 → nên build CÙNG lúc #2 frontend, tránh nửa vời.
-  - **#3 T9** capture-first (env var claude, login-vào-dir, email) + **T10** full `build-app` gate.
-- Pre-flight ổn định môi trường: xem mục #2 dependency bên dưới.
-- **Checkpoint NEEDS-LOGIN gộp #2 Task 5 + #3 Task 9**: cần môi trường ổn định (node v22, codex+claude
-  cài lại & đăng nhập THẬT) để ghim env var (`CODEX_HOME` xác nhận, `CLAUDE_CONFIG_DIR` chờ verify),
-  login-vào-dir-chỉ-định, và CLI có phơi email không. KHÔNG bịa output.
-- Kiến trúc chốt: selector là **singleton cấp package** (base `api` git-clean cấm thêm field; adapter
-  dựng mỗi lượt) + seam `cliAdapter.accountEnv`; wire trong `appLLMAdapters` (có `a.cfg.Dir`+`a.st`).
-  `spawn` ĐỔI chữ ký (thêm `penalize`) → grep `.spawn(` trước khi build.
-- Pre-flight ổn định môi trường: xem mục #2 bên dưới (giống hệt).
+- **Backend #3 (T1–T7) + T5-amend** đã xong phiên trước: T1 `llm_accounts` `5ed2f68`; T2 `accountSelector`
+  `f068ba1` (+guard `0b4c796`); T3 env helpers `f039f52`; T4 `cliAdapter.accountEnv`+`spawn`(3-value)
+  `156f02f`; T6 provider body `Accounts` `a40cac4`; T7 DELETE account endpoint `df9fa62` (+guard `12268e9`);
+  T5 amend #2 `c063d2c`.
+- **#2 connect + #3 T8 + CSS — XONG phiên NÀY** (subagent-driven, mỗi code task implementer + code-reviewer ✅;
+  go-check full xanh / Portal 107/107 sau mỗi task):
+  - #2 T1 `EnsureProviderForKind` `14db56e`(+`cbadbce`); T2 state machine (account-dir-aware, happy)
+    `7637da4`(+fix ctx-cancel/log/mkdir `78e58b7`); T3 branches install/error/timeout/cancel/one-job
+    `9fd2e87`(+`8cbdddf`); T4 endpoints POST/GET/DELETE + routes + **minimal default runner** (detect thật;
+    install/login/pollAuth = honest stub "chưa ghim") `fc2e7a6`(+singleton-refresh fix `8713b7e`).
+  - #2 T6 frontend connect panel (poll + login link + Huỷ, `pollMs` injectable, `startConnect(kind)` tái dùng)
+    `3f8d571`(+run-token fix `a23109d`).
+  - #3 T8 frontend accounts list + Xoá + "Thêm account"→startConnect `5786d6d`(+`f9e118a`).
+  - CSS connect panel + account rows (scoped `.providers-page`) `7af1443`.
+- **QUYẾT ĐỊNH quan trọng phiên này — connect CODEX-ONLY.** Nút thắt tên kind Claude: seed `id=claude-code`
+  **kind=`claude_code`** (gạch DƯỚI, app_schema.go:93); `cliDescriptors["claude-code"].kind="claude-code"`
+  (gạch NỐI, cố ý, Task 11 mới hợp nhất); `envVarFor` khớp `claude_code`; `EnsureProviderForKind` map dùng
+  `claude-code`. Ba nơi lệch cho Claude + Claude chưa qua `cliAdapter` → per-account chưa có tác dụng.
+  Nên `subscriptionKinds`/`CONNECTABLE_KINDS` = **{codex}**; claude-code nút "Sắp có". Claude connect
+  hoãn tới Task 11 (#4) hợp nhất kind. Codex nhất quán tuyệt đối trên chuỗi "codex".
+- **Bất biến bảo mật giữ nguyên**: `connectState`/`llmProviderBody` KHÔNG mang `config_dir`/credential (test
+  ghim); 3 route connect + DELETE account đều `a.auth`+allowlist; không credential qua daemon; canary sạch.
+- **Kiến trúc mới phiên này**: `connectMgr` **singleton cấp package** (base `api` git-clean cấm thêm field —
+  giống `accountSel`), **refresh MỖI `registerAppRoutes`** (không nil-guard) nên không rò singleton cũ giữa
+  test. `connectRunner` seam: fake trong test, `defaultConnectRunner` thật (install/login/pollAuth chờ T5b).
+  `accountId` = `uuid.NewString()` (dep có sẵn). Poll loop dùng **run-token** (không so kind) chống re-click/điều hướng.
 
-**Thứ tự execute trên nhánh: #3 T1–4 → #2 (đã amend) → #3 T6–10.** Ship cả nhánh một lần sau #4.
+- **CÒN LẠI — đều CẦN đăng nhập / môi trường (đây là bức tường):**
+  - **#2 T5b + #3 T9 = CHECKPOINT NEEDS-LOGIN** (gộp): người dùng đăng nhập codex THẬT → ghim: lệnh install
+    (`npm i -g @openai/codex` qua node bundle), lệnh login + parse `loginUrl`, xác nhận `CODEX_HOME=configDir`
+    ĐƯỢC tôn trọng (phiên rơi đúng dir), `checkCLIAuth` codex-exit wire (hiện trả `authUnknown`), CLI có phơi
+    email không. Rồi thay 3 stub trong `defaultConnectRunner` bằng impl thật. KHÔNG bịa output. `claude`
+    connect vẫn hoãn (Task 11). `CLAUDE_CONFIG_DIR` chờ verify khi Claude vào cuộc.
+  - **#2 T7 / #3 T10 = npm bundle + full build gate**: bundle node+npm vào `app\node` (BuildApp.psm1) để cài
+    codex on-demand offline; `Assert-AppPackage` chấp nhận cây npm + canary sạch; full `build-app.ps1`
+    (cần `ZALOBOT_PERSONA`); xác nhận thư mục `accounts/` KHÔNG bị đóng gói. Chạy CÙNG T5b để gate cả runner thật.
+- **Cảnh báo Task 11 (#4)**: `envVarFor` + `subscriptionDisplayName` + `CONNECTABLE_KINDS` phải sync khi
+  Task 11 hợp nhất kind Claude (`claude_code`→`claude-code`) & đưa Claude qua `cliAdapter`.
 
-## Dependency tạm dừng: #2 Connect trong Portal (zero-terminal)
+**Thứ tự còn lại: [phiên login] T5b+T9 (runner thật) → T7/T10 (bundle+gate) → ship cả nhánh (sau #4).**
 
-Sub-project #2/4. Fresh install chưa provider nào → bấm Connect mở luồng đăng nhập NGAY trong Portal
-(không bắt khách mở terminal): dò CLI → cài nếu thiếu → login CLI → poll → Connected. UI#1 XONG @ b44a010;
-engine XONG. #3 dựng trên cơ chế connect này.
+## #2 Connect trong Portal (zero-terminal) — code XONG, chỉ còn runner thật (T5b)
 
-### TRẠNG THÁI: TẠM DỪNG — plan #2 đã commit (`84babf9`), chờ `/execute` phiên mới
+Sub-project #2/4. Fresh install → bấm Connect mở luồng đăng nhập NGAY trong Portal: dò CLI → cài nếu thiếu
+→ login CLI → poll → Connected. UI#1 XONG @ b44a010; engine XONG; plan `84babf9`. Code T1–T4+T6 + amend
+account-dir-aware ĐÃ XONG phiên này (xem block trên). Còn T5b (runner thật, NEEDS-LOGIN) + T7 (bundle+gate).
 
-Pre-flight trước khi `/execute` (môi trường đang trôi — lý do tạm dừng):
-- **Ổn định môi trường trước.** Node đã nâng v20→v22 (test scripts đã sửa; xác nhận `node -v`=v22).
-  Cài lại + ĐĂNG NHẬP THẬT: `codex` (codex.js dịch chỗ sau nâng node → engine resolve qua `npm root -g`,
-  KHÔNG hardcode) và `claude` (đang logged-out; `claude auth status --json` thoát 1 + JSON). Không xác thực,
-  Task 5 sẽ kẹt.
-- **Tasks 1–4 + 6 KHÔNG cần CLI thật** (fakeRunner + mock request) — chạy được ngay. **Task 5** (connectRunner
-  thật: install/login) + **Task 7** (bundle npm + full `build-app.ps1`) cần môi trường ổn định.
-- **Task 5 = checkpoint NEEDS-LOGIN** (capture-first như engine Task 8): ghim lệnh install/login + `loginUrl`
-  parse khi anh đăng nhập THẬT. KHÔNG bịa output CLI.
-- Baseline xanh trước khi bắt đầu: `pwsh -NoProfile -File .\scripts\go-check.ps1 -Repo $env:ZALOBOT_REPO`
-  + `npm --prefix appmode test`. (env vars không truyền xuống shell con — nạp ở đầu mỗi shell qua
-  `[Environment]::GetEnvironmentVariable('ZALOBOT_REPO','User')`.)
+### Pre-flight cho phiên login (T5b+T9, rồi T7/T10)
+- **Ổn định môi trường + ĐĂNG NHẬP THẬT.** `node -v` = v22 (đã xác nhận). Cài lại + login `codex`
+  (`npm i -g @openai/codex; codex login` — engine resolve codex.js qua `npm root -g`, KHÔNG hardcode).
+  `claude` để sau (Task 11). Không đăng nhập → T5b kẹt.
+- **Baseline xanh trước khi bắt đầu:** `$env:ZALOBOT_REPO=[Environment]::GetEnvironmentVariable('ZALOBOT_REPO','User'); pwsh -NoProfile -File .\scripts\go-check.ps1 -Repo $env:ZALOBOT_REPO`
+  + `npm --prefix appmode test` (hiện: go full xanh, Portal 107/107). Env vars KHÔNG truyền xuống shell con.
+- **T5b = NEEDS-LOGIN** (capture-first như engine Task 8): thay 3 stub trong `defaultConnectRunner`
+  (`app_llm_connect.go`) — `install`/`login`/`pollAuth` — bằng impl ghim theo output THẬT. Xác nhận
+  `CODEX_HOME=configDir` được tôn trọng + `checkCLIAuth` codex-exit wire. KHÔNG bịa output.
 
 ## Đã ship
 
