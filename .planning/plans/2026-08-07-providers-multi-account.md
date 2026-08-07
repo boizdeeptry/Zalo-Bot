@@ -521,13 +521,12 @@ Fast Go loop: `$env:ZALOBOT_REPO=[Environment]::GetEnvironmentVariable('ZALOBOT_
       return textOrUpstream(a.d.kind+" generate", parseCLIAnswer(a.d, out))
   }
   ```
-  Sửa `spawn` để dựng env qua seam và trả penalize:
+  Sửa `spawn` để dựng env qua seam và trả penalize. QUAN TRỌNG: khối `accountEnv` phải chạy TRƯỚC
+  nhánh `a.run` — nếu không, khi test tiêm cả `a.run` lẫn `a.accountEnv` thì `penalize` không được
+  nối và không bao giờ gọi:
   ```go
   func (a *cliAdapter) spawn(ctx context.Context, argv []string, stdin []byte) ([]byte, func(bool), error) {
-      if a.run != nil {
-          out, err := a.run(ctx, argv, stdin)
-          return out, nil, err
-      }
+      // accountEnv TRƯỚC nhánh a.run: penalize phải có ở CẢ đường test (a.run) lẫn đường thật.
       var env []string
       var penalize func(bool)
       if a.accountEnv != nil {
@@ -537,6 +536,10 @@ Fast Go loop: `$env:ZALOBOT_REPO=[Environment]::GetEnvironmentVariable('ZALOBOT_
               return nil, nil, newLLMError(llmErrorCredential, nil, "%s: chưa có tài khoản nào đăng nhập", a.d.kind)
           }
           env, penalize = e, p
+      }
+      if a.run != nil {
+          out, err := a.run(ctx, argv, stdin)
+          return out, penalize, err
       }
       program, prefixArgs, err := resolveCLIProgram(a.d)
       if err != nil {
@@ -550,7 +553,7 @@ Fast Go loop: `$env:ZALOBOT_REPO=[Environment]::GetEnvironmentVariable('ZALOBOT_
       return out, penalize, err
   }
   ```
-  (Chú ý: khi `a.run != nil` — test router hiện có — `spawn` trả `penalize=nil`, `Generate` bỏ qua; các test cũ không đổi hành vi. Nếu có caller khác của `spawn` trong repo, cập nhật chữ ký; grep `\.spawn(` trước khi build.)
+  (Các test router/attachment hiện có set `a.run` nhưng KHÔNG set `a.accountEnv` → khối accountEnv bị bỏ qua, `penalize=nil`, `Generate` bỏ qua — hành vi cũ không đổi. Nếu có caller khác của `spawn`, cập nhật chữ ký; grep `\.spawn(` trước khi build.)
 
   Trong `app_llm_router.go`, tại `appLLMAdapters` (method trên `*api`): sau khi dựng adapter cho codex/claude-code, wire `accountEnv`. Đọc thân hàm hiện có; với mỗi adapter CLI subscription:
   ```go
