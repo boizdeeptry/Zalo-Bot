@@ -14,6 +14,21 @@ terminal): dò CLI đã cài chưa → cài-theo-yêu-cầu nếu thiếu → ch
 poll auth status → lật sang Connected. Biến nút "Có ở bước Connect (#2)" (đang disabled ở UI#1) thành
 luồng thật. UI#1 (gallery) XONG @ b44a010; engine XONG. Ship cả nhánh một lần sau khi đủ #2–#4.
 
+### TRẠNG THÁI: TẠM DỪNG — plan #2 đã commit (`84babf9`), chờ `/execute` phiên mới
+
+Pre-flight trước khi `/execute` (môi trường đang trôi — lý do tạm dừng):
+- **Ổn định môi trường trước.** Node đã nâng v20→v22 (test scripts đã sửa; xác nhận `node -v`=v22).
+  Cài lại + ĐĂNG NHẬP THẬT: `codex` (codex.js dịch chỗ sau nâng node → engine resolve qua `npm root -g`,
+  KHÔNG hardcode) và `claude` (đang logged-out; `claude auth status --json` thoát 1 + JSON). Không xác thực,
+  Task 5 sẽ kẹt.
+- **Tasks 1–4 + 6 KHÔNG cần CLI thật** (fakeRunner + mock request) — chạy được ngay. **Task 5** (connectRunner
+  thật: install/login) + **Task 7** (bundle npm + full `build-app.ps1`) cần môi trường ổn định.
+- **Task 5 = checkpoint NEEDS-LOGIN** (capture-first như engine Task 8): ghim lệnh install/login + `loginUrl`
+  parse khi anh đăng nhập THẬT. KHÔNG bịa output CLI.
+- Baseline xanh trước khi bắt đầu: `pwsh -NoProfile -File .\scripts\go-check.ps1 -Repo $env:ZALOBOT_REPO`
+  + `npm --prefix appmode test`. (env vars không truyền xuống shell con — nạp ở đầu mỗi shell qua
+  `[Environment]::GetEnvironmentVariable('ZALOBOT_REPO','User')`.)
+
 ## Đã ship
 
 - **Provider routing** — merge vào `main` ở `40cd198`. Bốn API Provider với chuỗi
