@@ -87,6 +87,26 @@ test("clicking a card opens its detail; back returns to the gallery", async (t) 
   assert.equal(find(main, (n) => hasClass(n, "pv-detail")), null);
 });
 
+test("detail lists available models with the 9Router-style prefix", async (t) => {
+  const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
+  await flush();
+  cards(main).find((c) => cardName(c) === "Claude Code").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  assert.deepEqual(findAll(detail, (n) => hasClass(n, "pv-mid")).map(text), ["cc/sonnet"]);
+});
+
+test("an unconnected provider shows an empty connections panel with a disabled add button", async (t) => {
+  const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
+  await flush();
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  assert.match(text(find(detail, (n) => hasClass(n, "pv-connections"))), /No connections yet|Chưa có kết nối/);
+  const add = find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n)));
+  assert.ok(add && add.disabled, "Add Connection is present but disabled in #1");
+});
+
 // Khoá thử nghiệm của tầng Portal, cùng một chuỗi với llmPackageCanary bên Go. Cửa chặn gói
 // (tests/build-app.Tests.ps1) quét đúng chuỗi con này trong gói đã dựng và đòi 0 lần khớp; quét
 // một chuỗi không tệp nào trong repo mang thì luôn xanh, nên mọi khoá gõ vào test phải là nó.

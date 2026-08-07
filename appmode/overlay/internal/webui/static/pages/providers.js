@@ -107,12 +107,50 @@ function detailHead(entry, byKind) {
 const safeBadge = () => element("div", { className: "pv-safe-badge" },
   element("span", { text: "Đăng nhập chính chủ qua CLI — không giả client, không proxy, không rủi ro khoá tài khoản." }),
 );
+
+function renderConnections(entry, p) {
+  const body = p && p.system
+    ? element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.name}).` })
+    : element("div", { className: "pv-conn-empty", text: "Chưa có kết nối — No connections yet." });
+  // Add Connection deferred to #2: disabled, no handler.
+  const add = element("button", {
+    className: "pv-btn primary",
+    attributes: { type: "button", disabled: true, title: "Có ở bước Connect (#2)" },
+    text: "+ Thêm kết nối",
+  });
+  return element("section", { className: "pv-panel pv-connections" },
+    element("div", { className: "pv-panel-head" }, element("h3", { text: "Kết nối" })),
+    body, add,
+  );
+}
+function renderModels(entry, p) {
+  const models = p && Array.isArray(p.models) ? p.models : [];
+  const grid = models.length
+    ? element("div", { className: "pv-model-grid" }, models.map((m) => element("div", { className: "pv-model" },
+        element("span", { className: "pv-mid", text: `${entry.prefix}/${m.model_id}` }),
+        element("span", { className: "pv-mname", text: m.name || m.model_id }),
+      )))
+    : element("div", { className: "pv-conn-empty", text: "Chưa có model." });
+  // Add model deferred to #4 (Combos): disabled, no handler.
+  const addModel = element("button", {
+    className: "pv-btn",
+    attributes: { type: "button", disabled: true, title: "Có ở Combos (#4)" },
+    text: "+ Thêm model",
+  });
+  return element("section", { className: "pv-panel pv-models" },
+    element("div", { className: "pv-panel-head" }, element("h3", { text: "Model khả dụng" })),
+    grid, addModel,
+  );
+}
+
 function renderDetail(entry, byKind, onBack) {
+  const p = byKind.get(entry.kind);
   return element("div", { className: "pv-detail" },
     element("button", { className: "pv-back", attributes: { type: "button" }, text: "Về Providers", on: { click: onBack } }),
     detailHead(entry, byKind),
     entry.group === "subscription" ? safeBadge() : null,
-    // Connections + Models panels: Task 5
+    renderConnections(entry, p),
+    renderModels(entry, p),
   );
 }
 
