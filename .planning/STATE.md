@@ -17,11 +17,19 @@ CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4
   network/timeout/rate_limit/upstream đi tiếp).
 - Plan `.planning/plans/2026-08-07-providers-multi-account.md` (commit `6bc9632`), 10 task TDD.
 
-### TRẠNG THÁI: TẠM DỪNG — cả #2 và #3 đã plan xong, chờ `/execute` phiên mới (môi trường ổn định)
+### TRẠNG THÁI: T1–T4 XONG (nền, không cần CLI); TẠM DỪNG trước T5 — chờ `/execute` phiên mới (môi trường ổn định)
 
-- **Đọc mục "Execution ordering" trong plan #3** — thực thi ĐAN XEN: #3 T1–T4 (store/selector/helpers/
-  adapter-env, Go thuần, KHÔNG cần CLI) → T5 amend #2 (doc) → **thực thi #2 đã amend** (cần login) →
-  #3 T6–T8 (bề mặt) → #3 T9 capture-first → T10 cổng. #2 gọi `CreateLLMAccount` (#3 T1) nên T1 chạy trước #2.
+- **T1–T4 ĐÃ THỰC THI + review sạch** (subagent-driven, mỗi task implementer + code-reviewer ✅):
+  - T1 store `llm_accounts` (schema v3) `5ed2f68`; T2 `accountSelector` `f068ba1`; guard test `0b4c796`;
+    T3 env helpers `f039f52`; T4 `cliAdapter.accountEnv` seam + `spawn`(3-value) + `appLLMAdapters` wiring `156f02f`.
+  - go-check full xanh sau mỗi task. `spawn` ĐÃ đổi chữ ký (thêm penalize) — caller duy nhất là `Generate`.
+  - **Cảnh báo cho Task 11 (#4)**: `envVarFor` (app_llm_accounts.go) khớp kind `claude_code` (gạch DƯỚI) —
+    đúng với kind hiện tại; nếu Task 11 đưa claude-code vào cliAdapter và đổi kind sang gạch NỐI thì phải
+    sync `envVarFor` kẻo wiring accountEnv âm thầm no-op.
+- **CÒN LẠI T5–T10** — cần môi trường ổn định + đăng nhập:
+- **Đọc mục "Execution ordering" trong plan #3** — thực thi ĐAN XEN: (T1–T4 xong) → T5 amend #2 (doc) →
+  **thực thi #2 đã amend** (cần login) → #3 T6–T8 (bề mặt) → #3 T9 capture-first → T10 cổng.
+  #2 gọi `CreateLLMAccount` (#3 T1, đã có) khi `connected`.
 - **Checkpoint NEEDS-LOGIN gộp #2 Task 5 + #3 Task 9**: cần môi trường ổn định (node v22, codex+claude
   cài lại & đăng nhập THẬT) để ghim env var (`CODEX_HOME` xác nhận, `CLAUDE_CONFIG_DIR` chờ verify),
   login-vào-dir-chỉ-định, và CLI có phơi email không. KHÔNG bịa output.
