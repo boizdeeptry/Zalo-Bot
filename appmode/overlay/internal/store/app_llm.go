@@ -61,6 +61,15 @@ type LLMModel struct {
 	Available                         bool
 }
 
+// LLMAccount là một phiên đăng nhập CLI độc lập của một provider subscription.
+//
+// KHÔNG mang credential — phiên nằm trong ConfigDir, không đi qua daemon.
+type LLMAccount struct {
+	ID, ProviderID, Label, Email, ConfigDir string
+	Enabled                                 bool
+	AddedAt                                 *time.Time
+}
+
 // LLMRouteEntry là một mắt xích trong chuỗi fallback toàn cục.
 type LLMRouteEntry struct {
 	Position            int
@@ -209,9 +218,12 @@ func (s *Store) DeleteLLMProvider(id string) error {
 		if changed == 0 {
 			return ErrNotFound
 		}
-		// ON DELETE CASCADE không chạy vì SQLite mặc định tắt khoá ngoại, nên model mồ côi
-		// phải xoá tay — nếu không, tạo lại Provider cùng id sẽ thấy model của bản trước.
-		_, err = tx.Exec(`DELETE FROM llm_models WHERE provider_id = ?`, id)
+		// ON DELETE CASCADE không chạy vì SQLite mặc định tắt khoá ngoại, nên model và account mồ
+		// côi phải xoá tay — nếu không, tạo lại Provider cùng id sẽ thấy dữ liệu của bản trước.
+		if _, err := tx.Exec(`DELETE FROM llm_models WHERE provider_id = ?`, id); err != nil {
+			return err
+		}
+		_, err = tx.Exec(`DELETE FROM llm_accounts WHERE provider_id = ?`, id)
 		return err
 	})
 }
@@ -349,6 +361,57 @@ const llmModelUpsert = `
 INSERT INTO llm_models(provider_id, model_id, name, source, available) VALUES(?,?,?,?,?)
 ON CONFLICT(provider_id, model_id) DO UPDATE SET
   name = excluded.name, source = excluded.source, available = excluded.available`
+
+// --- accounts ---
+
+func (s *Store) LLMAccounts(providerID string) ([]LLMAccount, error) {
+	rows, err := s.db.Query(`
+SELECT id, provider_id, label, email, config_dir, enabled, added_at
+FROM llm_accounts WHERE provider_id = ? ORDER BY added_at, id`, providerID)
+	if err != nil {
+		return nil, fmt.Errorf("list llm accounts of %s: %w", providerID, err)
+	}
+	defer rows.Close()
+	var out []LLMAccount
+	for rows.Next() {
+		var a LLMAccount
+		var enabled int
+		var addedAt string
+		if err := rows.Scan(&a.ID, &a.ProviderID, &a.Label, &a.Email, &a.ConfigDir, &enabled, &addedAt); err != nil {
+			return nil, fmt.Errorf("scan llm account of %s: %w", providerID, err)
+		}
+		a.Enabled = enabled == 1
+		if a.AddedAt, err = parseNullableTS(addedAt); err != nil {
+			return nil, fmt.Errorf("parse llm account %s added_at: %w", a.ID, err)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate llm accounts of %s: %w", providerID, err)
+	}
+	return out, nil
+}
+
+func (s *Store) CreateLLMAccount(a LLMAccount) error {
+	if a.ID == "" || a.ProviderID == "" || a.Label == "" || a.ConfigDir == "" {
+		return fmt.Errorf("create llm account: cần id, provider, nhãn và config_dir")
+	}
+	if _, err := s.db.Exec(`
+INSERT INTO llm_accounts(id, provider_id, label, email, config_dir, enabled, added_at)
+VALUES(?,?,?,?,?,?,?)`, a.ID, a.ProviderID, a.Label, a.Email, a.ConfigDir,
+		boolInt(a.Enabled), formatNullableTS(a.AddedAt)); err != nil {
+		return fmt.Errorf("create llm account %s: %w", a.ID, err)
+	}
+	return nil
+}
+
+func (s *Store) DeleteLLMAccount(id string) error {
+	res, err := s.db.Exec(`DELETE FROM llm_accounts WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete llm account %s: %w", id, err)
+	}
+	return assertOneRow(res, fmt.Sprintf("delete llm account %s", id))
+}
 
 // --- route ---
 

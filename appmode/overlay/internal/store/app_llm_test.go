@@ -575,6 +575,37 @@ func TestLLMAttemptsTableHasNoContentColumns(t *testing.T) {
 	}
 }
 
+func TestLLMAccountsCRUD(t *testing.T) {
+	st := newLLMStore(t)
+	if err := st.CreateLLMAccount(LLMAccount{
+		ID: "acc1", ProviderID: "codex", Label: "TK chính", ConfigDir: `C:\d\accounts\codex\acc1`, Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMAccount = %v; want nil", err)
+	}
+	got, err := st.LLMAccounts("codex")
+	if err != nil || len(got) != 1 || got[0].ID != "acc1" || got[0].Label != "TK chính" {
+		t.Fatalf("LLMAccounts = %+v, %v; want 1 account acc1", got, err)
+	}
+	if err := st.DeleteLLMAccount("acc1"); err != nil {
+		t.Fatalf("DeleteLLMAccount = %v; want nil", err)
+	}
+	if got, _ := st.LLMAccounts("codex"); len(got) != 0 {
+		t.Fatalf("after delete LLMAccounts = %+v; want empty", got)
+	}
+}
+
+func TestDeleteProviderCascadesAccounts(t *testing.T) {
+	st := newLLMStore(t)
+	_ = st.CreateLLMProvider(LLMProvider{ID: "codex", Name: "OpenAI Codex", Kind: "codex", Enabled: true})
+	_ = st.CreateLLMAccount(LLMAccount{ID: "a", ProviderID: "codex", Label: "x", ConfigDir: "d", Enabled: true})
+	if err := st.DeleteLLMProvider("codex"); err != nil {
+		t.Fatalf("DeleteLLMProvider = %v", err)
+	}
+	if got, _ := st.LLMAccounts("codex"); len(got) != 0 {
+		t.Fatalf("accounts survived provider delete: %+v", got)
+	}
+}
+
 func findProvider(t *testing.T, st *Store, id string) LLMProvider {
 	t.Helper()
 	providers, err := st.LLMProviders()

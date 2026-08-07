@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS app_meta (
 INSERT OR IGNORE INTO app_meta(key, value) VALUES ('schema_version', '1');
 `
 
-// appLLMSchema là schema phiên bản 2: cấu hình Provider, model, chuỗi fallback và telemetry.
+// appLLMSchema là schema phiên bản 3: cấu hình Provider, model, account đăng nhập CLI, chuỗi
+// fallback và telemetry.
 //
 // Boolean đi kèm CHECK vì SQLite không có kiểu bool — không có ràng buộc thì một bản ghi
 // enabled = 2 vẫn vào được, và mọi chỗ đọc sau đó phải tự đoán nó nghĩa là gì.
@@ -74,12 +75,24 @@ CREATE TABLE IF NOT EXISTS llm_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_attempts_started ON llm_attempts(started_at);
 
+-- Khoá logic là id sinh ở tầng ứng dụng: một Provider subscription có thể có nhiều phiên đăng
+-- nhập CLI độc lập, và mỗi phiên nằm trong ConfigDir riêng, không đi qua daemon.
+CREATE TABLE IF NOT EXISTS llm_accounts (
+  id          TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
+  label       TEXT NOT NULL,
+  email       TEXT NOT NULL DEFAULT '',
+  config_dir  TEXT NOT NULL,
+  enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  added_at    TEXT NOT NULL DEFAULT ''
+);
+
 -- OR IGNORE ở cả hai dòng vì migration chạy MỖI lần mở database: gieo đè sẽ trả tên Provider
 -- và revision route về mặc định mỗi lần khởi động, xoá đúng thứ người dùng vừa sửa.
 INSERT OR IGNORE INTO llm_providers(id, name, kind, enabled, system_provider)
 VALUES ('claude-code', 'Claude Code', 'claude_code', 1, 1);
 INSERT OR IGNORE INTO app_meta(key, value) VALUES ('llm_route_revision', '1');
-UPDATE app_meta SET value = '2' WHERE key = 'schema_version';
+UPDATE app_meta SET value = '3' WHERE key = 'schema_version';
 `
 
 func migrateApp(db *sql.DB) error {

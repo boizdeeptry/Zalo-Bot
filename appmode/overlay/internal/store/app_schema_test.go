@@ -23,8 +23,8 @@ func TestMigrateAppIsIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != "2" {
-		t.Fatalf("schema_version = %q; want 2", version)
+	if version != "3" {
+		t.Fatalf("schema_version = %q; want 3", version)
 	}
 
 	// Provider hệ thống được gieo trong migration chứ không phải lúc chạy: sau §6 route không
