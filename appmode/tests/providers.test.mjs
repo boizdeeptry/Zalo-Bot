@@ -41,6 +41,17 @@ test("gallery renders the 6-provider catalogue in two groups", async (t) => {
   assert.equal(groups.length, 2);
 });
 
+test("the subscription group carries the green official-CLI safety badge, never a ban warning", async (t) => {
+  const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
+  await flush();
+  const tag = find(main, (n) => hasClass(n, "pv-safe-tag"));
+  assert.ok(tag, "subscription group must show the safety badge");
+  assert.match(text(tag), /chính chủ/i);
+  for (const bad of ["Risk Notice", "banned", "restricted", "proxy/router"]) {
+    assert.ok(!text(main).includes(bad), `gallery must not contain "${bad}"`);
+  }
+});
+
 test("an added provider shows connected-ish status, an unlisted one shows not connected", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();

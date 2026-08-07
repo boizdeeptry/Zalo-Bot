@@ -65,7 +65,7 @@ function galleryStatus(entry, byKind) {
   if (p.credential_unreadable) return { cls: "off", label: "Cần đăng nhập lại" };
   if (p.last_check_status === "ok") return { cls: "on", label: "Đã kết nối" };
   if (p.system) return { cls: "on", label: "Sẵn sàng" };
-  if (!p.system && !p.credential_configured) return { cls: "off", label: "Chưa kết nối" };
+  if (!p.credential_configured) return { cls: "off", label: "Chưa kết nối" };
   return { cls: "on", label: "Đã thêm" };
 }
 function card(entry, byKind, onOpen) {
@@ -83,12 +83,16 @@ function group(title, entries, byKind, onOpen, extraHead = null) {
     element("div", { className: "pv-group-head" }, element("h2", { text: title }), extraHead),
     element("div", { className: "pv-grid" }, entries.map((e) => card(e, byKind, onOpen))));
 }
+const safeTag = () => element("span", { className: "pv-safe-tag" },
+  element("span", { className: "pv-dot" }),
+  element("span", { text: "Chính chủ · không rủi ro khoá" }),
+);
 function renderGallery(providers, onOpen) {
   const byKind = new Map(providers.map((p) => [normalizeKind(p.kind), p]));
   const sub = PROVIDER_CATALOG.filter((e) => e.group === "subscription");
   const api = PROVIDER_CATALOG.filter((e) => e.group === "apikey");
   return element("div", { className: "pv-gallery" },
-    group("Gói thuê bao — CLI chính chủ", sub, byKind, onOpen),
+    group("Gói thuê bao — CLI chính chủ", sub, byKind, onOpen, safeTag()),
     group("API Key", api, byKind, onOpen));
 }
 
