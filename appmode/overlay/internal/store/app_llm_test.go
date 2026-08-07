@@ -606,6 +606,53 @@ func TestDeleteProviderCascadesAccounts(t *testing.T) {
 	}
 }
 
+func TestEnsureProviderForKind(t *testing.T) {
+	st := newLLMStore(t)
+	if err := st.EnsureProviderForKind("codex"); err != nil {
+		t.Fatalf("EnsureProviderForKind(codex) = %v; want nil", err)
+	}
+	providers, err := st.LLMProviders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := 0
+	for _, p := range providers {
+		if p.Kind == "codex" {
+			got++
+			if p.System {
+				t.Errorf("codex provider must not be system")
+			}
+		}
+	}
+	if got != 1 {
+		t.Fatalf("have %d providers kind=codex; want 1", got)
+	}
+
+	if err := st.EnsureProviderForKind("codex"); err != nil {
+		t.Fatal(err)
+	}
+	providers, err = st.LLMProviders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	again := 0
+	claudeCode := 0
+	for _, p := range providers {
+		if p.Kind == "codex" {
+			again++
+		}
+		if p.ID == "claude-code" {
+			claudeCode++
+		}
+	}
+	if again != 1 {
+		t.Errorf("after second call have %d codex; want 1 (idempotent)", again)
+	}
+	if claudeCode != 1 {
+		t.Errorf("claude-code providers = %d; want 1 (untouched)", claudeCode)
+	}
+}
+
 func findProvider(t *testing.T, st *Store, id string) LLMProvider {
 	t.Helper()
 	providers, err := st.LLMProviders()

@@ -175,6 +175,35 @@ VALUES(?,?,?,?,0,x'')`, p.ID, p.Name, p.Kind, boolInt(p.Enabled)); err != nil {
 	return nil
 }
 
+// subscriptionDisplayName ánh xạ kind sang tên hiển thị cho các Provider subscription
+// (CLI tự giữ phiên đăng nhập, không qua credential_cipher).
+var subscriptionDisplayName = map[string]string{
+	"claude-code": "Claude Code",
+	"codex":       "OpenAI Codex",
+}
+
+// EnsureProviderForKind đảm bảo có ĐÚNG một hàng Provider cho một kind subscription.
+//
+// Idempotent: đã có thì không làm gì. Provider subscription không mang credential (CLI tự giữ
+// phiên riêng), nên hàng này chỉ tồn tại để lên danh sách / route trỏ tới. id = kind vì #2 mới
+// chỉ có một tài khoản; #3 (multi-account) dùng riêng bảng llm_accounts cho danh tính từng tài khoản.
+func (s *Store) EnsureProviderForKind(kind string) error {
+	name, ok := subscriptionDisplayName[kind]
+	if !ok {
+		return fmt.Errorf("ensure provider: kind is not a subscription: %q", kind)
+	}
+	providers, err := s.LLMProviders()
+	if err != nil {
+		return err
+	}
+	for _, p := range providers {
+		if p.Kind == kind {
+			return nil
+		}
+	}
+	return s.CreateLLMProvider(LLMProvider{ID: kind, Name: name, Kind: kind, Enabled: true})
+}
+
 // UpdateLLMProvider sửa phần hiển thị và trạng thái kiểm tra.
 //
 // KHÔNG đụng tới kind và credential. Kind chọn adapter, nên đổi nó biến một key OpenAI đang
