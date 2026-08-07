@@ -1032,6 +1032,30 @@ func TestLLMAPIDeleteAccountMissingIs404(t *testing.T) {
 	}
 }
 
+// Xoá một account QUA provider id sai (account thuộc provider khác) phải 404 và KHÔNG xoá nhầm:
+// handler dò account theo provider_id scoped, nên a1 của codex vô hình với /providers/openai.
+func TestLLMAPIDeleteAccountWrongProviderIs404(t *testing.T) {
+	h := newLLMAPIHarness(t)
+	if err := h.st.CreateLLMProvider(store.LLMProvider{
+		ID: "codex", Name: "Codex", Kind: "codex", Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMProvider(codex) = %v; want nil", err)
+	}
+	if err := h.st.CreateLLMAccount(store.LLMAccount{
+		ID: "a1", ProviderID: "codex", Label: "x", ConfigDir: "d", Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMAccount(a1) = %v; want nil", err)
+	}
+
+	got := h.do(http.MethodDelete, "/llm/providers/openai/accounts/a1", "")
+	if got.status != http.StatusNotFound {
+		t.Fatalf("delete via wrong provider status = %d, want 404; body = %s", got.status, got.raw)
+	}
+	if accs, err := h.st.LLMAccounts("codex"); err != nil || len(accs) != 1 {
+		t.Fatalf("LLMAccounts(codex) after wrong-provider delete = %+v, %v; want a1 still present", accs, err)
+	}
+}
+
 // --- route ---
 
 func TestLLMAPIRouteConflictReturns409(t *testing.T) {
