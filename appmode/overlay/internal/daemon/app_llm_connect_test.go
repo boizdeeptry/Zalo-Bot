@@ -17,6 +17,29 @@ import (
 	"agentdc/internal/store"
 )
 
+// TestScanDeviceAuth pins scanDeviceAuth against the REAL captured `codex login --device-auth`
+// output (codex-cli 0.147.0, see the T5b task's ground truth). Proves: the uppercase code regex
+// doesn't false-match the lowercase URL, and the `continue` after a URL match keeps that same line
+// from also being tried as a code line.
+func TestScanDeviceAuth(t *testing.T) {
+	const sample = "Follow these steps to sign in with ChatGPT using device code authorization:\n" +
+		"\n" +
+		"1. Open this link in your browser and sign in to your account\n" +
+		"   https://auth.openai.com/codex/device\n" +
+		"\n" +
+		"2. Enter this one-time code (expires in 15 minutes)\n" +
+		"   EQ0J-QKCPZ\n" +
+		"\n" +
+		"Continue only if you started this login in Codex.\n"
+	url, code := scanDeviceAuth(strings.NewReader(sample))
+	if url != "https://auth.openai.com/codex/device" {
+		t.Errorf("url = %q; want the captured device-auth URL", url)
+	}
+	if code != "EQ0J-QKCPZ" {
+		t.Errorf("code = %q; want the captured one-time code", code)
+	}
+}
+
 type fakeRunner struct {
 	installed  bool
 	loginURL   string
