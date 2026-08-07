@@ -1,18 +1,26 @@
 # Planning state
 
-step: execute
-current_topic: providers-connect
-current_spec: .planning/specs/2026-08-07-providers-connect-design.md
-current_plan: .planning/plans/2026-08-07-providers-connect.md
+step: plan
+current_topic: providers-multi-account
+current_spec: .planning/specs/2026-08-07-providers-multi-account-design.md
+current_plan: .planning/plans/2026-08-07-providers-multi-account.md
 last_updated: 2026-08-07
 
-## Đang làm: #2 Connect trong Portal (zero-terminal)
+## Đang làm: #3 Multi-account (đang /plan)
 
-Sub-project #2/4 của Providers UI. Fresh install chưa provider nào → bấm Connect trên một provider
-subscription (Claude Code/OpenAI Codex) mở luồng đăng nhập NGAY trong Portal (không bắt khách mở
-terminal): dò CLI đã cài chưa → cài-theo-yêu-cầu nếu thiếu → chạy login CLI (device-auth/OAuth) →
-poll auth status → lật sang Connected. Biến nút "Có ở bước Connect (#2)" (đang disabled ở UI#1) thành
-luồng thật. UI#1 (gallery) XONG @ b44a010; engine XONG. Ship cả nhánh một lần sau khi đủ #2–#4.
+Sub-project #3/4. Mỗi provider subscription (Claude Code/OpenAI Codex) cho NHIỀU account, mỗi account
+một phiên CLI độc lập (thư mục config app tự quản, cô lập khỏi CLI người mua tự dùng). Runtime
+round-robin theo lượt + cooldown (KHÔNG sticky-thread, KHÔNG quota thật — CLI không phơi quota).
+Style-diversity giữa 2 CLI (trục provider) để #4. Spec `.planning/specs/2026-08-07-providers-multi-account-design.md`
+(commit `b52cb93`, đã duyệt). Duyệt spec = cho phép sửa spec+plan #2 thành account-dir-aware.
+
+**Thứ tự execute trên nhánh: #2 TRƯỚC (dependency, đang tạm dừng — xem dưới) → rồi #3.** Ship cả nhánh một lần.
+
+## Dependency tạm dừng: #2 Connect trong Portal (zero-terminal)
+
+Sub-project #2/4. Fresh install chưa provider nào → bấm Connect mở luồng đăng nhập NGAY trong Portal
+(không bắt khách mở terminal): dò CLI → cài nếu thiếu → login CLI → poll → Connected. UI#1 XONG @ b44a010;
+engine XONG. #3 dựng trên cơ chế connect này.
 
 ### TRẠNG THÁI: TẠM DỪNG — plan #2 đã commit (`84babf9`), chờ `/execute` phiên mới
 
