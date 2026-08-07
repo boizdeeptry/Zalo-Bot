@@ -160,6 +160,10 @@ function renderConnections(entry, p, ui) {
     )));
   } else if (p && p.system) {
     body = element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.name}).` });
+  } else if (ui.connectable) {
+    // Connectable subscription with zero accounts (codex, first visit): point at the add button
+    // instead of the generic empty copy below.
+    body = element("div", { className: "pv-conn-empty", text: "Chưa có tài khoản — bấm + Thêm kết nối để đăng nhập." });
   } else {
     body = element("div", { className: "pv-conn-empty", text: "Chưa có kết nối — No connections yet." });
   }

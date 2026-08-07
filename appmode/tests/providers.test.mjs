@@ -109,7 +109,7 @@ test("codex's add-connection button is enabled; claude-code's is not yet", async
   cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
   await flush();
   let detail = find(main, (n) => hasClass(n, "pv-detail"));
-  assert.match(text(find(detail, (n) => hasClass(n, "pv-connections"))), /No connections yet|Chưa có kết nối/);
+  assert.match(text(find(detail, (n) => hasClass(n, "pv-connections"))), /Chưa có tài khoản/);
   let add = find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n)));
   assert.ok(add && !add.disabled, "codex is connectable — add button is enabled");
 
@@ -325,6 +325,7 @@ test("provider service issues the documented paths and methods", async () => {
   await service.discover("openai-1");
   await service.addModel("openai-1", "gpt-5");
   await service.removeModel("openai-1", "gpt 5/preview");
+  await service.removeAccount("codex", "a1");
 
   assert.deepEqual(calls, [
     { path: "/llm/providers", options: {} },
@@ -359,6 +360,7 @@ test("provider service issues the documented paths and methods", async () => {
       path: "/llm/providers/openai-1/models?model_id=gpt%205%2Fpreview",
       options: { method: "DELETE" },
     },
+    { path: "/llm/providers/codex/accounts/a1", options: { method: "DELETE" } },
   ]);
 });
 
