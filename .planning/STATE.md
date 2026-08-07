@@ -57,12 +57,13 @@ CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4
   `TestStreamThroughTheConfiguredServer` (server_timeouts_test.go) FLAKY do timing (pass khi chạy riêng +
   mọi lượt go-check phiên này) — KHÔNG phải regression từ thay đổi connect.
 
-- **CÒN LẠI:**
-  - **npm-bundle (FOLLOW-UP có scope riêng, chưa làm)**: `build-app.ps1:281` chỉ bundle `node.exe`, KHÔNG npm;
-    codex cũng KHÔNG bundle (resolve qua `npm root -g` của máy khách). Để bước `install` chạy trên máy KHÔNG có
-    Node cần: bundle cây npm + `install()` gọi npm BUNDLED + node-resolution nhất quán (generate & install cùng
-    dùng node bundled, tìm codex đúng nơi npm cài). Là thiết kế riêng (đụng `resolveCLIProgram`/#1), KHÔNG bolt-on.
-    Hiện `install()` giả định máy khách có `npm` trên PATH; connect vẫn chạy full khi codex ĐÃ cài + login.
+- **#45 npm-bundle (zero-Node) — XONG (2026-08-08, `b7a8ec5`)**: gói giờ bundle CẢ npm (npm/npm.cmd/npx/
+  npx.cmd + `node_modules\npm`) vào `app\node` cạnh node.exe; run.bat set `npm_config_prefix=%ROOT%\data\cli`
+  (npm i -g cài vào đó + `npm root -g` trả đúng đó → daemon tìm ra codex.js) + `npm_config_cache=%ROOT%\
+  data\npm-cache` (npm không ghi ra ngoài goi → chạy được cả từ USB). **KHÔNG đổi logic Go** — `install()`/
+  `resolveCLIProgram` thừa kế env launcher. Xác minh trên PATH=CHỈ `app\node` (chặt hơn run.bat prepend):
+  npm bundled cài `@openai/codex` vào prefix mới, codex.js ở đúng binJS, node chạy codex-cli 0.147.0, cache
+  nằm trong goi. Full build gate XANH, goi 3177 tệp/120.8MB (từ 1209/110.1 — +npm). Còn bước OAuth của user.
 - **E2E ĐÃ CHẠY + SỬA XONG 2 lỗi ship-blocker** (gói cn-36df907f, daemon v0.10.0 :8770, data cô lập không
   Zalo-cred). Chạy end-to-end: gallery/detail/CSS, gating (claude-code "Sắp có" disabled, codex enabled),
   "+ Thêm kết nối"→prompt→"Bắt đầu"→POST connect → `accountId=uuid` + `MkdirAll` configDir cô lập
@@ -84,8 +85,8 @@ CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4
     PHẢI sync `envVarFor` + `subscriptionDisplayName` + `CONNECTABLE_KINDS` để bật Claude connect.
 - **Ship CẢ NHÁNH một lần sau #4.**
 
-**Thứ tự còn lại: #45 npm-bundle (zero-Node) → #4 Combos → ship cả nhánh. Connect codex đã chạy end-to-end
-(còn mỗi bước OAuth của user).**
+**Thứ tự còn lại: #4 Combos (+ Task 11 gộp Claude) → ship cả nhánh. #45 npm-bundle XONG. Connect codex chạy
+end-to-end kể cả trên máy zero-Node (còn mỗi bước OAuth của user).**
 
 ## #2 Connect trong Portal (zero-terminal) — code XONG, chỉ còn runner thật (T5b)
 
