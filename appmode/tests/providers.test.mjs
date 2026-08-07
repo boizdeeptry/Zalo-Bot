@@ -62,6 +62,16 @@ test("an added provider shows connected-ish status, an unlisted one shows not co
   assert.match(text(codex), /Chưa kết nối/);
 });
 
+test("typing in the search box filters cards by name", async (t) => {
+  const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
+  await flush();
+  const box = find(main, (n) => n.tagName === "INPUT" && n.getAttribute?.("type") === "search");
+  assert.ok(box);
+  box.value = "codex";
+  box.dispatchEvent({ type: "input" });
+  assert.deepEqual(cards(main).map(cardName), ["OpenAI Codex"]);
+});
+
 // Khoá thử nghiệm của tầng Portal, cùng một chuỗi với llmPackageCanary bên Go. Cửa chặn gói
 // (tests/build-app.Tests.ps1) quét đúng chuỗi con này trong gói đã dựng và đòi 0 lần khớp; quét
 // một chuỗi không tệp nào trong repo mang thì luôn xanh, nên mọi khoá gõ vào test phải là nó.

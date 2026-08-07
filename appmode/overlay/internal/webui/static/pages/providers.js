@@ -87,10 +87,9 @@ const safeTag = () => element("span", { className: "pv-safe-tag" },
   element("span", { className: "pv-dot" }),
   element("span", { text: "Chính chủ · không rủi ro khoá" }),
 );
-function renderGallery(providers, onOpen) {
-  const byKind = new Map(providers.map((p) => [normalizeKind(p.kind), p]));
-  const sub = PROVIDER_CATALOG.filter((e) => e.group === "subscription");
-  const api = PROVIDER_CATALOG.filter((e) => e.group === "apikey");
+function renderGallery(entries, byKind, onOpen) {
+  const sub = entries.filter((e) => e.group === "subscription");
+  const api = entries.filter((e) => e.group === "apikey");
   return element("div", { className: "pv-gallery" },
     group("Gói thuê bao — CLI chính chủ", sub, byKind, onOpen, safeTag()),
     group("API Key", api, byKind, onOpen));
@@ -118,6 +117,31 @@ export function createProvidersPage({ request = requestJSON } = {}) {
       // openDetail nối gallery vào trang chi tiết Provider — no-op ở task này, Task 4 nối.
       const openDetail = (kind) => {};
 
+      const byKindFrom = (providers) => new Map(providers.map((p) => [normalizeKind(p.kind), p]));
+      let lastProviders = [];
+      let query = "";
+      const searchBox = element("input", { className: "pv-search-input",
+        attributes: { type: "search", placeholder: "Tìm provider…", "aria-label": "Tìm provider" },
+        on: { input(e) { query = e.currentTarget.value.trim().toLowerCase(); paintGallery(); } },
+      });
+      const searchBar = () => element("div", { className: "pv-search" }, searchBox);
+      // gallerySlot là một node ổn định giữ nguyên vị trí trong root; paintGallery chỉ thay NỘI
+      // DUNG của nó (replaceChildren), không đụng tới root hay các anh em header/toolbar/searchBar —
+      // nên gõ vào ô search không làm mất focus hay dựng lại nút "Tải lại".
+      const gallerySlot = element("div", {});
+
+      function galleryNode() {
+        const filtered = query
+          ? PROVIDER_CATALOG.filter((e) => e.name.toLowerCase().includes(query))
+          : PROVIDER_CATALOG;
+        return renderGallery(filtered, byKindFrom(lastProviders), openDetail);
+      }
+
+      // paintGallery chỉ vẽ lại gallerySlot — KHÔNG đụng header/toolbar, KHÔNG refetch.
+      function paintGallery() {
+        gallerySlot.replaceChildren(galleryNode());
+      }
+
       const toolbar = () => element("div", { className: "row" },
         element("button", {
           className: "btn",
@@ -139,7 +163,9 @@ export function createProvidersPage({ request = requestJSON } = {}) {
           if (disposed || revision !== listRevision) return;
           const providers = Array.isArray(data?.providers) ? data.providers : [];
           live.textContent = "";
-          root.replaceChildren(header(), toolbar(), renderGallery(providers, openDetail));
+          lastProviders = providers;
+          paintGallery();
+          root.replaceChildren(header(), toolbar(), searchBar(), gallerySlot);
         } catch (error) {
           if (disposed || revision !== listRevision || error?.name === "AbortError") return;
           live.textContent = "";
