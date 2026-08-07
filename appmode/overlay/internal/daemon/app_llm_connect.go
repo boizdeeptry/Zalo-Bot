@@ -83,6 +83,8 @@ type connectManager struct {
 	logger        *slog.Logger
 	job           *connectJob
 	jobKind       string
+	loginTimeout  time.Duration // 0 → connectLoginTimeout (5m default); test seam
+	pollInterval  time.Duration // 0 → connectPollInterval (2s default); test seam
 }
 
 func (m *connectManager) start(kind, label string) (connectState, error) {
@@ -175,11 +177,19 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	if loginURL != "" {
 		job.set(func(s *connectState) { s.LoginURL = loginURL })
 	}
-	loginCtx, stop := context.WithTimeout(ctx, connectLoginTimeout)
+	timeout := m.loginTimeout
+	if timeout == 0 {
+		timeout = connectLoginTimeout
+	}
+	poll := m.pollInterval
+	if poll == 0 {
+		poll = connectPollInterval
+	}
+	loginCtx, stop := context.WithTimeout(ctx, timeout)
 	defer stop()
 	go func() { _ = wait() }() // exits when loginCtx/ctx done (default runner kills the tree via ctx)
 	job.set(func(s *connectState) { s.Phase = phasePolling })
-	tick := time.NewTicker(connectPollInterval)
+	tick := time.NewTicker(poll)
 	defer tick.Stop()
 	for {
 		if m.runner.pollAuth(kind, job.configDir) == authLoggedIn {

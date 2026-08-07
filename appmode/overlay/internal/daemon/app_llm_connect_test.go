@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -46,7 +47,9 @@ func newTestManager(t *testing.T, r connectRunner, ensure func(string) error, cr
 	return &connectManager{
 		runner: r, ensure: ensure, createAccount: create,
 		dataDir: t.TempDir(), newID: func() string { return "acc1" },
-		logger: slog.New(slog.DiscardHandler),
+		logger:       slog.New(slog.DiscardHandler),
+		loginTimeout: 200 * time.Millisecond,
+		pollInterval: 5 * time.Millisecond,
 	}
 }
 
@@ -117,5 +120,71 @@ func TestConnectHappyPathAlreadyInstalled(t *testing.T) {
 	b, _ := json.Marshal(st)
 	if strings.Contains(string(b), "acc1") || strings.Contains(string(b), "accounts") {
 		t.Errorf("connectState JSON leaks the internal config dir: %s", b)
+	}
+}
+
+func TestConnectInstallsWhenMissing(t *testing.T) {
+	r := &fakeRunner{installed: false, loginURL: "https://x", auth: authLoggedIn}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	if _, err := m.start("codex", "Tài khoản 1"); err != nil {
+		t.Fatalf("start = %v; want nil", err)
+	}
+	st := waitPhase(t, m, "codex", phaseConnected)
+	if st.Phase != phaseConnected {
+		t.Fatalf("phase = %q; want connected (err=%q)", st.Phase, st.Error)
+	}
+	if r.installCnt != 1 {
+		t.Errorf("install called %d times; want 1 (was missing)", r.installCnt)
+	}
+}
+
+func TestConnectInstallFailureIsError(t *testing.T) {
+	r := &fakeRunner{installed: false, installErr: errors.New("mạng hỏng")}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	m.start("codex", "x")
+	st := waitPhase(t, m, "codex", phaseError)
+	if st.Phase != phaseError {
+		t.Fatalf("phase = %q; want error", st.Phase)
+	}
+}
+
+func TestConnectLoginTimeoutIsError(t *testing.T) {
+	// installed, login returns a URL but auth never flips to loggedIn → poll loop must time out.
+	r := &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	m.start("codex", "x")
+	st := waitPhase(t, m, "codex", phaseError)
+	if st.Phase != phaseError {
+		t.Fatalf("phase = %q; want error (timeout)", st.Phase)
+	}
+	if !strings.Contains(st.Error, "giờ") {
+		t.Errorf("error = %q; want the login-timeout message", st.Error)
+	}
+}
+
+func TestConnectCancelStopsLoginAndPolls(t *testing.T) {
+	// auth never loggedIn → machine sits in polling until cancel.
+	r := &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	m.start("codex", "x")
+	waitPhase(t, m, "codex", phasePolling)
+	if !m.cancel("codex") {
+		t.Fatal("cancel returned false")
+	}
+	st, _ := m.status("codex")
+	if st.Phase != phaseCanceled {
+		t.Errorf("phase = %q; want canceled", st.Phase)
+	}
+}
+
+func TestConnectSecondKindWhileBusyIsRejected(t *testing.T) {
+	r := &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	m.start("codex", "x")
+	waitPhase(t, m, "codex", phasePolling)
+	// start() does not validate kind (that's the HTTP handler's job in Task 4); any second
+	// distinct kind string exercises the one-job-at-a-time guard.
+	if _, err := m.start("other", "y"); !errors.Is(err, errConnectBusy) {
+		t.Errorf("start(other) while busy = %v; want errConnectBusy", err)
 	}
 }
