@@ -76,8 +76,10 @@ CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4
   - **Sau fix — backend E2E XÁC NHẬN**: `GET .../connect` = `{phase:polling, loginUrl:"https://auth.openai.com/
     codex/device", code:"EUF8-2N6RT"}` (SẠCH, không còn ANSI). Bước cuối (user mở URL + nhập mã + authorize →
     connected → account row) là hành động OAuth của user; mọi tầng khác đã chạy thật.
-  - CÒN: rebuild+embed frontend fix vào bản cuối (fix đã có test node `82a8c76`); một lần bấm-thật để thấy
-    "connected" (tùy chọn, user tự làm qua Start.vbs).
+  - **REBUILD+EMBED XONG (2026-08-08)**: `build-app.ps1` → `F:\dist\_verify-20260808` (7/7 phase, canary sạch,
+    1209 tệp/110.1MB). Binary mới `app\agentdc.exe` (01:42, 20.4MB) đã `go:embed` `providers.js` bản fix —
+    xác nhận bằng grep binary: `loginUrl?.startsWith`×1 + `pv-connect-code-value`×2. Chạy qua `Start.vbs`.
+  - CÒN (tùy chọn): một lần bấm-thật để thấy "connected" — hành động OAuth của user qua Start.vbs.
   - **#4 Combos** (+ Task 11: gộp Claude vào `cliAdapter`, hợp nhất kind `claude_code`→`claude-code`). Khi làm
     PHẢI sync `envVarFor` + `subscriptionDisplayName` + `CONNECTABLE_KINDS` để bật Claude connect.
 - **Ship CẢ NHÁNH một lần sau #4.**
