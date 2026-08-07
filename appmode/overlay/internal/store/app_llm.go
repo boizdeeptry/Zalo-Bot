@@ -411,13 +411,6 @@ func (s *Store) ReplaceLLMRoute(expectedRevision int64, entries []LLMRouteEntry)
 	return s.LLMRoute()
 }
 
-// BootstrapClaudeRoute từng seed một route claude-code trên máy mới. Không còn: §6 cho phép chuỗi
-// RỖNG, và máy mới đi qua màn onboarding (người vận hành chọn Provider) chứ không bị ép một mặc
-// định. Giữ hàm (và lời gọi ở app_routes.go, gỡ ở task sau) để lịch sử rõ; nó là no-op có chủ đích.
-func (s *Store) BootstrapClaudeRoute(model string) error {
-	return nil
-}
-
 // validateLLMRoute từ chối mọi chuỗi mà router không đi hết được.
 //
 // Kiểm ở đây chứ không ở tầng HTTP vì router đọc thẳng từ database: một chuỗi sai lọt vào chỉ

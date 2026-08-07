@@ -315,26 +315,6 @@ func TestLLMRouteSnapshotIsIndependentCopy(t *testing.T) {
 	}
 }
 
-// BootstrapClaudeRoute không còn gieo route: §6 cho phép chuỗi RỖNG và máy mới đi qua onboarding
-// (người vận hành chọn Provider) chứ không bị ép một mặc định claude-code.
-func TestLLMBootstrapClaudeRouteDoesNotSeed(t *testing.T) {
-	st := newLLMStore(t)
-
-	if err := st.BootstrapClaudeRoute("sonnet"); err != nil {
-		t.Fatalf("BootstrapClaudeRoute(%q) = %v; want nil", "sonnet", err)
-	}
-	snap, err := st.LLMRoute()
-	if err != nil {
-		t.Fatalf("LLMRoute() = %v; want nil", err)
-	}
-	if len(snap.Entries) != 0 {
-		t.Errorf("LLMRoute().Entries after bootstrap = %v; want empty (bootstrap không còn gieo)", snap.Entries)
-	}
-	if snap.Revision != 1 {
-		t.Errorf("LLMRoute().Revision after bootstrap = %d; want 1 (không ghi route nào)", snap.Revision)
-	}
-}
-
 func TestLLMCredentialCipherIsStoredAndCleared(t *testing.T) {
 	st := newLLMStore(t)
 	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
