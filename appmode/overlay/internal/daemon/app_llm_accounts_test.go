@@ -112,3 +112,26 @@ func TestMakeAccountEnvNoAccount(t *testing.T) {
 		t.Fatalf("envFn ok=true with 0 accounts; want false")
 	}
 }
+
+// TestMakeAccountEnvPenalizeOnlyOnRateLimit ghim nhánh gating: penalize(false) KHÔNG được cooldown
+// (mọi lượt thành công đều gọi penalize(false)); chỉ penalize(true) mới cooldown. Nhánh này lật là
+// âm thầm bào mòn mọi account, mà các test khác vẫn xanh — nên cần guard riêng.
+func TestMakeAccountEnvPenalizeOnlyOnRateLimit(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf(`store.Open(":memory:") = %v; want nil`, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.CreateLLMProvider(store.LLMProvider{ID: "codex", Name: "Codex", Kind: "codex", Enabled: true})
+	_ = st.CreateLLMAccount(store.LLMAccount{ID: "a1", ProviderID: "codex", Label: "x", ConfigDir: "d", Enabled: true})
+	sel := newAccountSelector()
+	_, penalize, _ := makeAccountEnv(st, sel, "codex", "codex")()
+	penalize(false)
+	if _, cooling := sel.cooldown["a1"]; cooling {
+		t.Fatalf("penalize(false) cooled down a1; want no-op")
+	}
+	penalize(true)
+	if _, cooling := sel.cooldown["a1"]; !cooling {
+		t.Fatalf("penalize(true) did not cool down a1")
+	}
+}
