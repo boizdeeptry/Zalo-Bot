@@ -72,6 +72,21 @@ test("typing in the search box filters cards by name", async (t) => {
   assert.deepEqual(cards(main).map(cardName), ["OpenAI Codex"]);
 });
 
+test("clicking a card opens its detail; back returns to the gallery", async (t) => {
+  const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
+  await flush();
+  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  assert.ok(detail);
+  assert.equal(text(find(detail, (n) => hasClass(n, "pv-name"))), "OpenAI Codex");
+  assert.ok(find(detail, (n) => hasClass(n, "pv-safe-badge")));
+  find(detail, (n) => hasClass(n, "pv-back")).click();
+  await flush();
+  assert.ok(find(main, (n) => hasClass(n, "pv-gallery")));
+  assert.equal(find(main, (n) => hasClass(n, "pv-detail")), null);
+});
+
 // Khoá thử nghiệm của tầng Portal, cùng một chuỗi với llmPackageCanary bên Go. Cửa chặn gói
 // (tests/build-app.Tests.ps1) quét đúng chuỗi con này trong gói đã dựng và đòi 0 lần khớp; quét
 // một chuỗi không tệp nào trong repo mang thì luôn xanh, nên mọi khoá gõ vào test phải là nó.

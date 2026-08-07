@@ -95,6 +95,27 @@ function renderGallery(entries, byKind, onOpen) {
     group("API Key", api, byKind, onOpen));
 }
 
+function detailHead(entry, byKind) {
+  const p = byKind.get(entry.kind);
+  const count = p && Array.isArray(p.models) ? `${p.models.length} model` : "0 kết nối";
+  return element("div", { className: "pv-detail-head" },
+    element("span", { className: "pv-logo lg", attributes: { style: `background:${entry.logoColor}` }, text: entry.prefix.toUpperCase() }),
+    element("div", {}, element("div", { className: "pv-name", text: entry.name }),
+      element("div", { className: "pv-sub", text: count })),
+  );
+}
+const safeBadge = () => element("div", { className: "pv-safe-badge" },
+  element("span", { text: "Đăng nhập chính chủ qua CLI — không giả client, không proxy, không rủi ro khoá tài khoản." }),
+);
+function renderDetail(entry, byKind, onBack) {
+  return element("div", { className: "pv-detail" },
+    element("button", { className: "pv-back", attributes: { type: "button" }, text: "Về Providers", on: { click: onBack } }),
+    detailHead(entry, byKind),
+    entry.group === "subscription" ? safeBadge() : null,
+    // Connections + Models panels: Task 5
+  );
+}
+
 export function createProvidersPage({ request = requestJSON } = {}) {
   return Object.freeze({
     mount(container) {
@@ -114,8 +135,11 @@ export function createProvidersPage({ request = requestJSON } = {}) {
       );
       const live = element("span", { className: "note", attributes: { "aria-live": "polite" } });
 
-      // openDetail nối gallery vào trang chi tiết Provider — no-op ở task này, Task 4 nối.
-      const openDetail = (kind) => {};
+      // view cầm trạng thái điều hướng: "gallery" hoặc kind của Provider đang xem chi tiết.
+      // paint() là điểm vẽ DUY NHẤT đọc view này để quyết định vẽ gì vào root.
+      let view = "gallery";
+      const openDetail = (kind) => { view = kind; paint(); };
+      const backToGallery = () => { view = "gallery"; paint(); };
 
       const byKindFrom = (providers) => new Map(providers.map((p) => [normalizeKind(p.kind), p]));
       let lastProviders = [];
@@ -142,6 +166,22 @@ export function createProvidersPage({ request = requestJSON } = {}) {
         gallerySlot.replaceChildren(galleryNode());
       }
 
+      // paint là điểm vẽ toàn cục duy nhất, rẽ theo view. Gallery giữ nguyên cấu trúc
+      // header+toolbar+searchBar+gallerySlot của Task 3 (search vẫn hoạt động, không mất focus);
+      // detail thay root bằng header + renderDetail. kind lạ (đã bị xoá khỏi catalogue) rơi về gallery.
+      function paint() {
+        if (view !== "gallery") {
+          const entry = PROVIDER_CATALOG.find((e) => e.kind === view);
+          if (entry) {
+            root.replaceChildren(header(), renderDetail(entry, byKindFrom(lastProviders), backToGallery));
+            return;
+          }
+          view = "gallery";
+        }
+        paintGallery();
+        root.replaceChildren(header(), toolbar(), searchBar(), gallerySlot);
+      }
+
       const toolbar = () => element("div", { className: "row" },
         element("button", {
           className: "btn",
@@ -164,8 +204,7 @@ export function createProvidersPage({ request = requestJSON } = {}) {
           const providers = Array.isArray(data?.providers) ? data.providers : [];
           live.textContent = "";
           lastProviders = providers;
-          paintGallery();
-          root.replaceChildren(header(), toolbar(), searchBar(), gallerySlot);
+          paint();
         } catch (error) {
           if (disposed || revision !== listRevision || error?.name === "AbortError") return;
           live.textContent = "";
