@@ -6,7 +6,7 @@ current_spec: .planning/specs/2026-08-07-providers-multi-account-design.md
 current_plan: .planning/plans/2026-08-07-providers-multi-account.md
 last_updated: 2026-08-07
 
-## Đang làm: #3 Multi-account + #2 Connect — code login-free XONG, DỪNG ở checkpoint login
+## Đang làm: #2 Connect + #3 Multi-account — CODE XONG + build gate XANH; còn npm-bundle follow-up + E2E + #4
 
 Sub-project #3/4. Mỗi provider subscription (Claude Code/OpenAI Codex) cho NHIỀU account, mỗi account
 một phiên CLI độc lập (thư mục config app tự quản dưới `cfg.Dir/accounts/<kind>/<id>`, cô lập khỏi CLI
@@ -43,20 +43,32 @@ CLI không phơi quota). Style-diversity giữa 2 CLI (trục provider) để #4
   ghim); 3 route connect + DELETE account đều `a.auth`+allowlist; không credential qua daemon; canary sạch.
 - **Kiến trúc mới phiên này**: `connectMgr` **singleton cấp package** (base `api` git-clean cấm thêm field —
   giống `accountSel`), **refresh MỖI `registerAppRoutes`** (không nil-guard) nên không rò singleton cũ giữa
-  test. `connectRunner` seam: fake trong test, `defaultConnectRunner` thật (install/login/pollAuth chờ T5b).
+  test. `connectRunner` seam: fake trong test, `defaultConnectRunner` thật (install/login/pollAuth ghim ở T5b).
   `accountId` = `uuid.NewString()` (dep có sẵn). Poll loop dùng **run-token** (không so kind) chống re-click/điều hướng.
 
-- **CÒN LẠI — đều CẦN đăng nhập / môi trường (đây là bức tường):**
-  - **#2 T5b + #3 T9 = CHECKPOINT NEEDS-LOGIN** (gộp): người dùng đăng nhập codex THẬT → ghim: lệnh install
-    (`npm i -g @openai/codex` qua node bundle), lệnh login + parse `loginUrl`, xác nhận `CODEX_HOME=configDir`
-    ĐƯỢC tôn trọng (phiên rơi đúng dir), `checkCLIAuth` codex-exit wire (hiện trả `authUnknown`), CLI có phơi
-    email không. Rồi thay 3 stub trong `defaultConnectRunner` bằng impl thật. KHÔNG bịa output. `claude`
-    connect vẫn hoãn (Task 11). `CLAUDE_CONFIG_DIR` chờ verify khi Claude vào cuộc.
-  - **#2 T7 / #3 T10 = npm bundle + full build gate**: bundle node+npm vào `app\node` (BuildApp.psm1) để cài
-    codex on-demand offline; `Assert-AppPackage` chấp nhận cây npm + canary sạch; full `build-app.ps1`
-    (cần `ZALOBOT_PERSONA`); xác nhận thư mục `accounts/` KHÔNG bị đóng gói. Chạy CÙNG T5b để gate cả runner thật.
-- **Cảnh báo Task 11 (#4)**: `envVarFor` + `subscriptionDisplayName` + `CONNECTABLE_KINDS` phải sync khi
-  Task 11 hợp nhất kind Claude (`claude_code`→`claude-code`) & đưa Claude qua `cliAdapter`.
+- **T5b runner THẬT XONG (capture-first từ codex-cli 0.147.0)**: `pollAuth`=`login status` exit-code (env
+  `CODEX_HOME=configDir`); `login`=`login --device-auth` stream-parse URL `https://auth.openai.com/codex/device`
+  + code một-lần (`scanDeviceAuth`, có test ghim); `install`=`npm i -g <descriptor.npmPackage>`. **`CODEX_HOME`
+  cô lập XÁC NHẬN** (dir mặc định=logged-in, dir mới=logged-out). Email KHÔNG phơi qua status → account để trống.
+  Commits `16aef56`+`9931835` (reap process/ dùng `envVarFor(kind)`/ test parser); `connectState`+`Code`;
+  frontend hiện URL+code + CSS `bde8300`.
+- **Full build gate XANH** (`build-app.ps1` + `ZALOBOT_PERSONA`): 7/7 phase, canary "sach: khong con dau
+  khach hang nao", 1209 tệp/110.1MB (bằng baseline UI#1 — không phình). Lưu ý: base test
+  `TestStreamThroughTheConfiguredServer` (server_timeouts_test.go) FLAKY do timing (pass khi chạy riêng +
+  mọi lượt go-check phiên này) — KHÔNG phải regression từ thay đổi connect.
+
+- **CÒN LẠI:**
+  - **npm-bundle (FOLLOW-UP có scope riêng, chưa làm)**: `build-app.ps1:281` chỉ bundle `node.exe`, KHÔNG npm;
+    codex cũng KHÔNG bundle (resolve qua `npm root -g` của máy khách). Để bước `install` chạy trên máy KHÔNG có
+    Node cần: bundle cây npm + `install()` gọi npm BUNDLED + node-resolution nhất quán (generate & install cùng
+    dùng node bundled, tìm codex đúng nơi npm cài). Là thiết kế riêng (đụng `resolveCLIProgram`/#1), KHÔNG bolt-on.
+    Hiện `install()` giả định máy khách có `npm` trên PATH; connect vẫn chạy full khi codex ĐÃ cài + login.
+  - **E2E connect THẬT (chưa chạy)**: cần chạy app ĐÃ ĐÓNG GÓI — việc đó KHỞI ĐỘNG bot Zalo thật (side-effect
+    hướng-ngoại) nên chỉ chạy khi user đồng ý — + user hoàn tất device-auth trong trình duyệt. Mọi tầng đã
+    test/capture; E2E là xác nhận cuối trước ship.
+  - **#4 Combos** (+ Task 11: gộp Claude vào `cliAdapter`, hợp nhất kind `claude_code`→`claude-code`). Khi làm
+    PHẢI sync `envVarFor` + `subscriptionDisplayName` + `CONNECTABLE_KINDS` để bật Claude connect.
+- **Ship CẢ NHÁNH một lần sau #4.**
 
 **Thứ tự còn lại: [phiên login] T5b+T9 (runner thật) → T7/T10 (bundle+gate) → ship cả nhánh (sau #4).**
 
