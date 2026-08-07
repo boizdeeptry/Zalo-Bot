@@ -217,6 +217,13 @@ func probeClaudeAuth(ctx context.Context, d cliDescriptor, logger *slog.Logger) 
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "auth", "status", "--json").Output()
 	if err != nil {
+		// `claude auth status --json` THOÁT khác 0 khi CHƯA đăng nhập, nhưng vẫn in JSON
+		// {"loggedIn": false} hợp lệ (verify claude 2.1.223). Đọc thân TRƯỚC khi bỏ cuộc: một
+		// exit≠0 KÈM JSON dứt khoát vẫn là câu trả lời (loggedOut), không phải "không dò được".
+		// .Output() vẫn trả stdout đã bắt được dù lệnh thoát lỗi.
+		if st := claudeAuthFromJSON(out); st != authUnknown {
+			return st
+		}
 		if logger != nil {
 			logger.Debug("claude auth status thất bại", "err", err)
 		}
