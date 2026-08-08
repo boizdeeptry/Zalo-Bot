@@ -12,7 +12,7 @@ const cards = (main) => findAll(main, (n) => hasClass(n, "pv-card"));
 const cardName = (card) => text(find(card, (n) => hasClass(n, "pv-name")));
 
 const CLAUDE_ADDED = {
-  id: "claude-code", name: "Claude Code", kind: "claude_code", system: true, enabled: true,
+  id: "claude-code", name: "Claude Code", kind: "claude-code", system: true, enabled: true,
   credential_configured: false, credential_unreadable: false, last_check_status: "", last_error: "",
   models: [{ model_id: "sonnet", name: "Claude Sonnet", source: "manual", available: true }],
 };
@@ -102,7 +102,7 @@ test("detail lists available models with the 9Router-style prefix", async (t) =>
   assert.deepEqual(findAll(detail, (n) => hasClass(n, "pv-mid")).map(text), ["cc/sonnet"]);
 });
 
-test("codex's add-connection button is enabled; claude-code's is not yet", async (t) => {
+test("both subscription CLIs (codex, claude-code) have an enabled add-connection button", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();
 
@@ -112,6 +112,7 @@ test("codex's add-connection button is enabled; claude-code's is not yet", async
   assert.match(text(find(detail, (n) => hasClass(n, "pv-connections"))), /Chưa có tài khoản/);
   let add = find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n)));
   assert.ok(add && !add.disabled, "codex is connectable — add button is enabled");
+  assert.notEqual(add.getAttribute("title"), "Sắp có");
 
   find(detail, (n) => hasClass(n, "pv-back")).click();
   await flush();
@@ -119,8 +120,8 @@ test("codex's add-connection button is enabled; claude-code's is not yet", async
   await flush();
   detail = find(main, (n) => hasClass(n, "pv-detail"));
   add = find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n)));
-  assert.ok(add && add.disabled, "claude-code is not connectable yet — add button stays disabled");
-  assert.equal(add.getAttribute("title"), "Sắp có");
+  assert.ok(add && !add.disabled, "claude-code is now connectable — add button is enabled");
+  assert.notEqual(add.getAttribute("title"), "Sắp có");
 });
 
 test("subscription detail lists connected accounts with a delete button and a '+ Thêm account' button", async (t) => {
@@ -227,6 +228,58 @@ test("running connect (polling) renders the login link + device-auth code", asyn
   const codeEl = find(main, (n) => hasClass(n, "pv-connect-code-value"));
   assert.ok(codeEl, "the device-auth code must render while the connect is polling");
   assert.equal(text(codeEl), "EQ0J-QKCPZ");
+});
+
+// Claude's login is a plain URL link — no device-auth code. The panel must render the clickable
+// link and NO code block (paintConnect's `code ? … : null` guard holds when code is absent).
+// Mirrors the codex polling test above, minus the code.
+test("claude connect (polling) renders the login link but no device-code block", async (t) => {
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers/claude-code/connect" && options.method === "POST") return { kind: "claude-code", phase: "detecting" };
+    if (path === "/llm/providers/claude-code/connect" && !options.method) {
+      return { kind: "claude-code", phase: "polling", loginUrl: "https://claude.ai/login/x" };
+    }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((c) => cardName(c) === "Claude Code").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  await flush();
+  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
+  for (let k = 0; k < 20; k++) await new Promise((r) => setTimeout(r, 0));
+
+  const link = find(main, (n) => n.tagName === "A" && /Mở trang đăng nhập/.test(text(n)));
+  assert.ok(link, "the login link must render for claude");
+  assert.equal(link.getAttribute("href"), "https://claude.ai/login/x");
+  assert.equal(find(main, (n) => hasClass(n, "pv-connect-code-value")), null, "claude has no device-auth code block");
+});
+
+// Claude can't be auto-installed (native install, not npm), so an install-step failure surfaces a
+// generic error. The claude connect error panel must point the user at claude.com/claude-code.
+test("claude connect failure points the user at claude.com/claude-code", async (t) => {
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers/claude-code/connect" && options.method === "POST") return { kind: "claude-code", phase: "detecting" };
+    if (path === "/llm/providers/claude-code/connect" && !options.method) {
+      return { kind: "claude-code", phase: "error", message: "Không cài được Claude" };
+    }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((c) => cardName(c) === "Claude Code").click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  await flush();
+  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
+  for (let k = 0; k < 20; k++) await new Promise((r) => setTimeout(r, 0));
+
+  const link = find(main, (n) => n.tagName === "A" && /claude\.com\/claude-code/.test(text(n)));
+  assert.ok(link, "claude connect failure must link to the install page");
+  assert.equal(link.getAttribute("href"), "https://claude.com/claude-code");
 });
 
 test("navigating back to the gallery stops the connect poll loop", async (t) => {

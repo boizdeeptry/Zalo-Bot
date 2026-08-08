@@ -10,8 +10,9 @@ export const PROVIDER_CATALOG = [
   { kind: "openrouter", name: "OpenRouter", group: "apikey", prefix: "or", logoColor: "#5b5ef0" },
 ];
 // CONNECTABLE_KINDS mirrors the backend subscriptionKinds: only these can run the in-Portal login
-// flow today. claude-code joins when its kind is unified and it routes through cliAdapter.
-const CONNECTABLE_KINDS = new Set(["codex"]);
+// flow. Both route login through cliAdapter — codex via device-auth code, claude-code via a plain
+// browser URL (no code).
+const CONNECTABLE_KINDS = new Set(["codex", "claude-code"]);
 const normalizeKind = (k) => String(k ?? "").replace(/_/g, "-");
 
 function providerPath(id, suffix = "") {
@@ -307,11 +308,14 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
         }
       }
 
-      function phaseLabel(phase, message) {
+      function phaseLabel(phase, message, kind) {
         switch (phase) {
           case "detecting": return "Đang kiểm tra…";
           case "installing": return message || "Đang cài…";
-          case "awaiting_login": return "Mở trang đăng nhập, nhập mã bên dưới, rồi chờ xác nhận…";
+          // Claude has no device-auth code — just a browser URL to click. Codex needs the code typed in.
+          case "awaiting_login": return kind === "claude-code"
+            ? "Bấm link để đăng nhập Claude ở trình duyệt vừa mở, rồi chờ xác nhận…"
+            : "Mở trang đăng nhập, nhập mã bên dưới, rồi chờ xác nhận…";
           case "polling": return "Đang xác nhận đăng nhập…";
           case "connected": return "Đã kết nối.";
           default: return message || "";
@@ -335,9 +339,20 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
           return;
         }
         if (connect.phase === "error" || connect.phase === "canceled") {
+          // Claude installs natively (not via npm), so the backend can't auto-install it and an
+          // install-step failure comes back as a generic error. Point the user at the download page
+          // on any claude-code connect error — install-missing is the likeliest early failure and
+          // the hint is harmless otherwise.
+          const installHint = connect.kind === "claude-code" && connect.phase === "error"
+            ? element("div", { className: "pv-connect-hint" },
+                element("span", { text: "Chưa cài Claude Code? Tải tại " }),
+                element("a", { attributes: { href: "https://claude.com/claude-code", target: "_blank", rel: "noopener" },
+                  text: "claude.com/claude-code" }))
+            : null;
           connectSlot.replaceChildren(element("div", { className: "pv-connect-status" },
             element("div", { className: "pv-connect-message",
               text: connect.message || (connect.phase === "canceled" ? "Đã huỷ kết nối." : "Kết nối thất bại.") }),
+            installHint,
             element("button", { className: "pv-btn", attributes: { type: "button" },
               text: "Đóng", on: { click: closeConnect } }),
           ));
@@ -363,7 +378,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
               element("code", { className: "pv-connect-code-value", text: connect.code }))
           : null;
         connectSlot.replaceChildren(element("div", { className: "pv-connect-status" },
-          element("div", { className: "pv-connect-message", text: phaseLabel(connect.phase, connect.message) }),
+          element("div", { className: "pv-connect-message", text: phaseLabel(connect.phase, connect.message, connect.kind) }),
           loginLink,
           codeBlock,
           element("button", { className: "pv-btn", attributes: { type: "button" },

@@ -54,7 +54,7 @@ const PROVIDERS = {
       models: [{ model_id: "gemini-2", name: "Gemini 2", source: "discovered", available: true }],
     },
     {
-      id: "claude-code", name: "Claude Code", kind: "claude_code", enabled: true, system: true,
+      id: "claude-code", name: "Claude Code", kind: "claude-code", enabled: true, system: true,
       credential_configured: false, credential_unreadable: false,
       models: [{ model_id: "haiku", name: "Haiku", source: "manual", available: true }],
     },
