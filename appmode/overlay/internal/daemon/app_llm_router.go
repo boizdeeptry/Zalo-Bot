@@ -567,19 +567,34 @@ func (a *api) threadHasAttachments(threadID string) bool {
 	})
 }
 
-// appClaudeRunner là mắt xích cuối chạy đúng model mà route nêu tên.
+// appClaudeRunner là mắt xích cuối chạy đúng model mà route nêu tên, dưới đăng nhập của một account.
 //
-// zc là BẢN SAO (tham số theo giá trị), nên đổi Model ở đây không chạm tới cấu hình của vòng trực
-// — hai lượt song song trên hai model khác nhau vẫn đúng.
+// zc là BẢN SAO (tham số theo giá trị), nên đổi Model/ConfigDir ở đây không chạm tới cấu hình của
+// vòng trực — hai lượt song song trên hai model/account khác nhau vẫn đúng.
 //
-// Trùng model thì giữ nguyên base đã tiêm vào. Không phải để tiết kiệm: base là chỗ duy nhất
-// duty_test.go tiêm được một runner giả, và dựng mới ở đây biến mọi test đó thành lượt gọi tiến
-// trình claude thật.
+// CÓ account claude-code: chọn một cái theo round-robin (accountSel, cùng selector với codex) và
+// chạy lượt dưới CLAUDE_CONFIG_DIR của nó (zc.ConfigDir → claudeEnv). Luôn dựng execZaloRunner mới,
+// vì đường đăng nhập phải đổi theo account — base là runner cố định một login, không mang được nó.
 //
-// Model rỗng cũng giữ base. validateLLMRoute không cho lưu một mắt xích như thế, nên đây là hàng
-// bị sửa tay trong database — và `claude --model ""` là một dòng lệnh hỏng, còn cấu hình đang chạy
-// thì vẫn trả lời được.
+// 0 account: giữ NGUYÊN đường cũ. Trùng model (hoặc model rỗng) thì trả base đã tiêm vào — base là
+// chỗ duy nhất duty_test.go tiêm được một runner giả, dựng mới ở đây biến mọi test đó thành lượt gọi
+// tiến trình claude thật. Model rỗng cũng vào nhánh này: validateLLMRoute không cho lưu mắt xích như
+// thế nên đây là hàng sửa tay trong database, và `claude --model ""` là dòng lệnh hỏng — cấu hình
+// đang chạy vẫn trả lời được. Model khác thì dựng execZaloRunner với config mặc định (ConfigDir rỗng).
+//
+// ponytail: penalize-on-rate-limit CHƯA nối cho Claude — runClaude không có bộ phân loại rate-limit
+// (khác cliAdapter của codex), nên đây chỉ round-robin. Cooldown là follow-up khi runClaude phân
+// loại được lỗi 429 của Claude.
 func (a *api) appClaudeRunner(zc zaloConfig, base zaloRunner, model string) zaloRunner {
+	if accounts, err := a.st.LLMAccounts(claudeCodeProviderID); err == nil && len(accounts) > 0 {
+		if acc, ok := accountSel.pick("claude-code", accounts); ok {
+			zc.ConfigDir = acc.ConfigDir
+			if model != "" && model != zc.Model {
+				zc.Model = model
+			}
+			return execZaloRunner{cfg: zc, logger: a.logger}
+		}
+	}
 	if model == "" || model == zc.Model {
 		return base
 	}

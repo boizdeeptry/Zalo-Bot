@@ -1492,6 +1492,65 @@ func TestAppClaudeRunnerCarriesTheRouteModel(t *testing.T) {
 	}
 }
 
+// TestAppClaudeRunnerSelectsAClaudeAccount: khi CÓ account claude-code, mỗi lượt Claude chạy dưới
+// CLAUDE_CONFIG_DIR của một account chọn theo round-robin (accountSel). 0 account thì giữ NGUYÊN
+// đường cũ — base seam của duty_test.go còn tiêm được, và model khác dựng execZaloRunner ConfigDir
+// rỗng (config mặc định).
+func TestAppClaudeRunnerSelectsAClaudeAccount(t *testing.T) {
+	// accountSel là singleton cấp package; reset để thứ tự round-robin bắt đầu từ 0 (A→B→A),
+	// độc lập với các test khác trong gói.
+	accountSel = newAccountSelector()
+	t.Cleanup(func() { accountSel = newAccountSelector() })
+
+	a := newAppRouteAPI(t) // provider "claude-code" đã được migration gieo sẵn.
+	for _, acc := range []store.LLMAccount{
+		{ID: "acc-a", ProviderID: "claude-code", Label: "A", ConfigDir: "A", Enabled: true},
+		{ID: "acc-b", ProviderID: "claude-code", Label: "B", ConfigDir: "B", Enabled: true},
+	} {
+		if err := a.st.CreateLLMAccount(acc); err != nil {
+			t.Fatalf("CreateLLMAccount(%s) = %v; want nil", acc.ID, err)
+		}
+	}
+
+	base := okClaude("base")
+	zc := zaloConfig{Model: "haiku"}
+	// Ba lượt liên tiếp: mỗi lượt phải là execZaloRunner MỚI (không phải base), ConfigDir xoay
+	// A→B→A. Model trùng cấu hình đang chạy nên nhánh account VẪN dựng runner mới — account chọn
+	// đường đăng nhập, không phụ thuộc model.
+	var dirs []string
+	for i := 0; i < 3; i++ {
+		got := a.appClaudeRunner(zc, base, "haiku")
+		r, ok := got.(execZaloRunner)
+		if !ok {
+			t.Fatalf("lượt %d: appClaudeRunner = %T; want execZaloRunner (có account claude-code)", i, got)
+		}
+		dirs = append(dirs, r.cfg.ConfigDir)
+	}
+	if want := []string{"A", "B", "A"}; !slices.Equal(dirs, want) {
+		t.Errorf("ConfigDir qua 3 lượt = %v; want %v (round-robin)", dirs, want)
+	}
+
+	// 0 account: đường mặc định giữ nguyên. Store riêng để không dính hai account ở trên.
+	zero := newAppRouteAPI(t)
+	if got := zero.appClaudeRunner(zc, base, "haiku"); got != zaloRunner(base) {
+		t.Errorf("0 account, model trùng: appClaudeRunner = %T; want base đã tiêm vào", got)
+	}
+	if got := zero.appClaudeRunner(zc, base, ""); got != zaloRunner(base) {
+		t.Errorf("0 account, model rỗng: appClaudeRunner = %T; want base đã tiêm vào", got)
+	}
+	got := zero.appClaudeRunner(zc, base, "opus")
+	r, ok := got.(execZaloRunner)
+	if !ok {
+		t.Fatalf("0 account, model khác: appClaudeRunner = %T; want execZaloRunner", got)
+	}
+	if r.cfg.ConfigDir != "" {
+		t.Errorf("0 account: ConfigDir = %q; want \"\" (config mặc định)", r.cfg.ConfigDir)
+	}
+	if r.cfg.Model != "opus" {
+		t.Errorf("0 account, model khác: cfg.Model = %q; want opus", r.cfg.Model)
+	}
+}
+
 func TestAppLLMAdaptersComeFromTheStoredProviderKind(t *testing.T) {
 	a := newAppRouteAPI(t)
 	for id, kind := range map[string]string{
