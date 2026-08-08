@@ -1,12 +1,30 @@
 # Planning state
 
-step: plan
+step: ship
 current_topic: providers-combos
 current_spec: .planning/specs/2026-08-08-providers-combos-design.md
 current_plan: .planning/plans/2026-08-08-providers-combos.md
 last_updated: 2026-08-08
 
-## Đang làm: #4 Combos — CB1–CB7 XONG + SHIPPABLE (build gate XANH); CB8 (Task 11, hedged) đang thử
+## #4 Combos — XONG HẾT, final review CLEAN, gate XANH → SẴN SÀNG /ship (Task 11 hoãn)
+
+**#4 execute XONG (subagent-driven, mỗi task implementer + spec review + code review + fix cycles):**
+CB1 `1f1ca16` · CB2 `f513cd0` · CB3 `e45c12b` · CB4 `30233d4` · CB5 `922bcad` · CB6 `82c582d` ·
+CB7 `96c6aa0`+`bf61491` · **RR-eligible-only fix `953a098`** (thay Task 11: RR xoay CHỈ member đủ điều
+kiện — enabled + non-claude — nên claude-code luôn là lưới cuối, không route ~1/N lượt thẳng vào Claude).
+- **Final whole-#4 integration review: SHIP IT** (0 Critical). Important #1 (migration v3→v4 không copy
+  `llm_route_entries` cũ) = **greenfield, đã đóng**: nhánh chưa ship, mọi buyer nhận data dir mới ở v4;
+  combo mặc định rỗng route Claude-direct y như route rỗng cũ. 4 Minor không chặn (dead `/llm/route`
+  back-compat; `.models-page` class còn tên cũ; RR cursor không dọn khi xoá combo; check-then-insert đã ghi chú).
+- **Final full build gate XANH**: 7/7, canary "sach", 3177 tệp/120.8MB, F:\dist\_verify-20260808.
+- **Task 11 (CB8) HOÃN** sang phiên riêng (task #55): refactor seam tinh vi (budget bypass + stream-json +
+  step rehome + kind claude_code→claude-code) + NEEDS-LOGIN (verify CLAUDE_CONFIG_DIR với Claude login thật)
+  để bật Claude connect. Combos KHÔNG cần nó.
+
+**→ Nhánh `feat/cli-subscription-providers` giờ = engine + UI#1 + #2 connect + #3 multi-account + #4 combos,
+tất cả shippable. `/ship` MỘT LẦN. Sau ship: Task 11 phiên riêng.**
+
+## (cũ) #4 Combos — CB1–CB7 XONG + SHIPPABLE (build gate XANH); CB8 (Task 11, hedged) đang thử
 
 **#4 Combos execute (subagent-driven, mỗi task implementer + spec review + code review):**
 - CB1 schema v4 `1f1ca16` · CB2 combo CRUD `f513cd0` · CB3 active-combo CAS + LLMRoute `e45c12b` ·
