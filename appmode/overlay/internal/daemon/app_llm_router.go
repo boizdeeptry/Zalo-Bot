@@ -134,11 +134,12 @@ func (r *appLLMRunner) Run(ctx context.Context, prompt string, step func(string)
 		return r.runCLIAttachment(ctx, r.cfg.Adapters[e.ProviderID], e, prompt)
 	}
 
-	// Round-robin: xoay chuỗi để lượt này bắt đầu ở mắt xích kế con trỏ combo, rồi vẫn fallthrough
-	// hết phần còn lại. CHỈ vòng fallback API bị xoay — nhánh HasAttachments ở trên đã trả về, nên
-	// định tuyến tệp giữ NGUYÊN thứ tự (firstEligibleCLIEntry là ranh giới ổn định, không round-robin).
+	// Round-robin: xoay để lượt này bắt đầu ở mắt xích đủ điều kiện kế con trỏ combo, rồi vẫn
+	// fallthrough hết phần còn lại. CHỈ phần đủ điều kiện xoay — claude-code là lưới cuối, không phải
+	// một primary định kỳ (xem rrRotate). Nhánh HasAttachments ở trên đã trả về, nên định tuyến tệp
+	// giữ NGUYÊN thứ tự (firstEligibleCLIEntry là ranh giới ổn định, không round-robin).
 	if snapshot.Type == "round_robin" {
-		entries = rotate(entries, comboRR.next(snapshot.ComboID, len(entries)))
+		entries = rrRotate(entries, snapshot.ComboID)
 	}
 
 	apiCtx, cancel := context.WithTimeout(ctx, r.cfg.APIChainTimeout)
@@ -412,6 +413,37 @@ func rotate(entries []store.LLMRouteEntry, k int) []store.LLMRouteEntry {
 	out = append(out, entries[k:]...)
 	out = append(out, entries[:k]...)
 	return out
+}
+
+// rrRotate xoay một combo round_robin cho ĐÚNG một lượt: chỉ những mắt xích ĐỦ ĐIỀU KIỆN (đang bật,
+// KHÔNG phải claude-code) xoay vòng với nhau để mỗi lượt một cái khác dẫn đầu, còn mắt xích tắt và
+// lưới an toàn claude-code giữ NGUYÊN thứ tự tương đối của chúng phía SAU.
+//
+// Vì sao chỉ xoay phần đủ điều kiện: claude-code là mắt xích ĐẦU CUỐI — nó trả lời ngay bằng ngân
+// sách lượt dài rồi trả về. Xoay CẢ chuỗi thì cứ 1-trên-N lượt claude-code lại lọt lên đầu và lượt
+// đó đi thẳng đường Claude đắt/chậm, bỏ qua các Provider API — đúng thứ round-robin sinh ra để
+// tránh. Nó phải là chốt chặn CUỐI, chỉ chạm tới sau khi các mắt xích đủ điều kiện đã hỏng.
+//
+// Con trỏ đẩy theo SỐ mắt xích đủ điều kiện (len(lead)), không theo cả chuỗi, nên mỗi lượt đúng
+// một mắt xích API khác nhau dẫn đầu. Không mắt xích đủ điều kiện nào (toàn tắt hoặc chỉ có
+// claude-code) → không xoay, giữ nguyên chuỗi. Một mắt xích đủ điều kiện → rotate về identity.
+func rrRotate(entries []store.LLMRouteEntry, comboID string) []store.LLMRouteEntry {
+	// lead cấp sẵn đủ chỗ cho CẢ chuỗi: ở nhánh identity (rotate trả lại chính lead khi k%n==0),
+	// append(lead, tail...) ghi tail vào phần đuôi backing array của lead — an toàn vì lead là mảng
+	// mới toanh ở đây, không dùng lại sau lời gọi này, và cap đủ nên không cấp phát lại đè ai.
+	lead := make([]store.LLMRouteEntry, 0, len(entries))
+	tail := make([]store.LLMRouteEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.Enabled && e.ProviderID != claudeCodeProviderID {
+			lead = append(lead, e)
+		} else {
+			tail = append(tail, e)
+		}
+	}
+	if len(lead) == 0 {
+		return entries
+	}
+	return append(rotate(lead, comboRR.next(comboID, len(lead))), tail...)
 }
 
 // comboRRCursor là con trỏ round-robin in-memory theo combo id — đối xứng accountSel (app_llm_accounts.go):

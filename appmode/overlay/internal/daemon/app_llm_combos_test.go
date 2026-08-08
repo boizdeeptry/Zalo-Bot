@@ -87,3 +87,60 @@ func TestRunRoundRobinStartsRotatedThenFallsThrough(t *testing.T) {
 			attempts[1].ProviderID, attempts[1].Outcome)
 	}
 }
+
+// TestRunRoundRobinRotatesOnlyEligibleKeepingClaudeAsNet: một combo round_robin [apiA, apiB, claude-code]
+// (tất cả bật) CHỈ xoay hai mắt xích API. claude-code là lưới an toàn ĐẦU CUỐI — nó không bao giờ được
+// làm mắt xích ĐẦU của một lượt (nếu xoay cả chuỗi thì cứ 1-trên-3 lượt nó lọt lên đầu và lượt đó đi
+// thẳng đường Claude, bỏ qua các API). Qua 3 lượt liên tiếp, mắt xích thử ĐẦU TIÊN xoay
+// apiA→apiB→apiA và KHÔNG bao giờ là claude-code; claude-code chỉ tới được sau khi cả hai API hỏng.
+func TestRunRoundRobinRotatesOnlyEligibleKeepingClaudeAsNet(t *testing.T) {
+	// comboRR là singleton cấp package: id riêng để con trỏ bắt đầu sạch ở 0, không lẫn lượt test khác.
+	const comboID = "rr-eligible-only"
+
+	// Con trỏ xoay trên HAI mắt xích đủ điều kiện (không phải trên cả ba): lượt 1 apiA dẫn, lượt 2 apiB
+	// dẫn, lượt 3 apiA lại dẫn. Nếu nó xoay trên cả chuỗi thì lượt 3 mới là apiA — thứ tự này đủ để
+	// phân biệt "xoay 2" với "xoay 3".
+	wantLead := []string{"prov-a", "prov-b", "prov-a"}
+	for turn, lead := range wantLead {
+		// Cả hai API hỏng fallback-eligible, claude trả lời được: mỗi lượt chạm CẢ ba mắt xích, nên
+		// attempt[0] chính là mắt xích ĐẦU của lượt và attempt cuối phải là claude — đọc trực tiếp được
+		// con trỏ đã xoay ai lên đầu, và claude chỉ tới sau khi cả hai API hỏng.
+		apiA := failAdapter(llmErrorUpstream)
+		apiB := failAdapter(llmErrorUpstream)
+		claude := okClaude(`{"answer":"claude"}`)
+		snap := newRoute(
+			entry("prov-a", "model-a", true),
+			entry("prov-b", "model-b", true),
+			entry("claude-code", "haiku", true),
+		)
+		snap.Type = "round_robin"
+		snap.ComboID = comboID
+		f := newRouterFixture(snap, claude).with("prov-a", "sk-a", apiA).with("prov-b", "sk-b", apiB)
+
+		got, err := f.runner(appLLMRunnerConfig{}).Run(t.Context(), "câu hỏi", f.step)
+		if err != nil {
+			t.Fatalf("lượt %d: Run() = _, %v; want nil", turn, err)
+		}
+		if got != `{"answer":"claude"}` {
+			t.Errorf("lượt %d: Run() = %q; want %q (cả hai API hỏng → claude là lưới cuối)",
+				turn, got, `{"answer":"claude"}`)
+		}
+		attempts := f.store.recorded()
+		if len(attempts) != 3 {
+			t.Fatalf("lượt %d: RecordLLMAttempt gọi %d lần; want 3 (apiA, apiB, claude) — claude không được là mắt xích giữa",
+				turn, len(attempts))
+		}
+		if attempts[0].ProviderID != lead {
+			t.Errorf("lượt %d: mắt xích ĐẦU = %s; want %s (chỉ xoay apiA↔apiB)",
+				turn, attempts[0].ProviderID, lead)
+		}
+		if attempts[0].ProviderID == claudeCodeProviderID {
+			t.Errorf("lượt %d: claude-code là mắt xích ĐẦU của lượt; want không bao giờ (nó là lưới cuối)", turn)
+		}
+		// claude-code chỉ chạm tới sau khi CẢ HAI API hỏng: nó phải là attempt CUỐI, không sớm hơn.
+		if attempts[2].ProviderID != claudeCodeProviderID {
+			t.Errorf("lượt %d: attempt cuối = %s; want claude-code (chỉ tới sau khi cả hai API hỏng)",
+				turn, attempts[2].ProviderID)
+		}
+	}
+}
