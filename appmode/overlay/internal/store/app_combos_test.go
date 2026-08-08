@@ -104,6 +104,27 @@ func TestLLMRouteResolvesActiveCombo(t *testing.T) {
 	}
 }
 
+// Một combo ĐANG TẮT vẫn giữ Provider "đang dùng": nó có thể được bật lại sau, và xoá Provider
+// nó trỏ tới để lại chuỗi cụt. Chốt điều này để một hồi quy `WHERE active = 1` không lọt qua.
+func TestDeleteProviderBlockedByInactiveComboMember(t *testing.T) {
+	st := newLLMStore(t)
+	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
+	c, err := st.CreateLLMCombo("Dự phòng", "fallback")
+	if err != nil {
+		t.Fatalf("CreateLLMCombo = %v", err)
+	}
+	if c.Active {
+		t.Fatal("combo mới phải inactive (điều kiện của test)")
+	}
+	if _, err := st.ReplaceLLMComboMembers(c.ID, 1, "fallback",
+		[]LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}); err != nil {
+		t.Fatalf("ReplaceLLMComboMembers(inactive combo) = %v", err)
+	}
+	if err := st.DeleteLLMProvider("openai-1"); !errors.Is(err, ErrLLMProviderInUse) {
+		t.Fatalf("DeleteLLMProvider referenced by INACTIVE combo = %v; want ErrLLMProviderInUse", err)
+	}
+}
+
 // Khoá ngoại TẮT trên connection này (DSN không bật foreign_keys), nên ON DELETE CASCADE
 // không chạy — members phải bị xoá tay trong cùng transaction, nếu không sẽ để lại member mồ côi.
 func TestDeleteComboRemovesMembers(t *testing.T) {

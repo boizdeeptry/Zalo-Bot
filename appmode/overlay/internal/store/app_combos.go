@@ -85,10 +85,13 @@ func (s *Store) comboMembers(comboID string) ([]LLMRouteEntry, error) {
 func (s *Store) activeCombo() (id, typ string, revision int64, err error) {
 	err = s.db.QueryRow(
 		`SELECT id, type, revision FROM llm_combos WHERE active = 1 LIMIT 1`).Scan(&id, &typ, &revision)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", 0, fmt.Errorf("active combo: không có combo nào đang active")
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", 0, fmt.Errorf("active combo: không có combo nào đang active")
+		}
+		return "", "", 0, fmt.Errorf("active combo: %w", err)
 	}
-	return id, typ, revision, err
+	return id, typ, revision, nil
 }
 
 // ReplaceLLMComboMembers ghi đè members + type của một combo nếu revision người gọi cầm vẫn mới
@@ -134,11 +137,19 @@ func (s *Store) ReplaceLLMComboMembers(comboID string, expectedRevision int64, t
 	if err != nil {
 		return LLMCombo{}, err
 	}
-	members, err := s.comboMembers(comboID)
-	if err != nil {
+	// Đọc lại name+active để struct trả về đầy đủ: handler HTTP (CB5) serialize thẳng giá trị này,
+	// không đọc lại DB, nên thiếu hai trường đó là báo một combo vô danh, không-active.
+	c := LLMCombo{ID: comboID, Type: typ, Revision: next}
+	var active int
+	if err := s.db.QueryRow(
+		`SELECT name, active FROM llm_combos WHERE id = ?`, comboID).Scan(&c.Name, &active); err != nil {
+		return LLMCombo{}, fmt.Errorf("read combo %s after write: %w", comboID, err)
+	}
+	c.Active = active == 1
+	if c.Members, err = s.comboMembers(comboID); err != nil {
 		return LLMCombo{}, err
 	}
-	return LLMCombo{ID: comboID, Type: typ, Revision: next, Members: members}, nil
+	return c, nil
 }
 
 // CreateLLMCombo thêm một combo INACTIVE: chỉ đổi combo đang phục vụ qua SetActiveLLMCombo,
