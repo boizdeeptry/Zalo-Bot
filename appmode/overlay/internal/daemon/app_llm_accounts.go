@@ -79,7 +79,7 @@ func envVarFor(kind string) (string, bool) {
 	switch kind {
 	case "codex":
 		return "CODEX_HOME", true
-	case "claude_code":
+	case "claude-code":
 		return "CLAUDE_CONFIG_DIR", true
 	}
 	return "", false

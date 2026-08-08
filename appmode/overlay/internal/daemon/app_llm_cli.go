@@ -19,7 +19,7 @@ import (
 // cliDescriptor là DỮ LIỆU cho một vendor CLI, không phải code. Adapter thân duy nhất đọc nó.
 // Học từ 9Router: provider là descriptor, không phải một nhánh switch.
 type cliDescriptor struct {
-	kind           string // kind của họ provider local_cli MỚI. claude-code CỐ Ý dùng gạch nối, khác hàng seeded cũ kind=claude_code (gạch dưới) — Task 11 đổi tên claude_code → claude-code.
+	kind           string // kind của họ provider local_cli. claude-code dùng gạch nối, thống nhất với hàng seeded (migration đã hợp nhất kind cũ claude_code → claude-code).
 	display        string
 	npmPackage     string   // gói cài; rỗng nếu là native exe (claude)
 	binJS          string   // đường dẫn tương đối tới entry .js trong node_modules; rỗng nếu native

@@ -36,8 +36,8 @@ func TestMigrateAppIsIdempotent(t *testing.T) {
 		`SELECT kind, system_provider FROM llm_providers WHERE id = 'claude-code'`).Scan(&kind, &system); err != nil {
 		t.Fatalf("read seeded claude-code provider: %v", err)
 	}
-	if kind != "claude_code" || system != 1 {
-		t.Fatalf("seeded claude-code kind/system_provider = %q/%d; want claude_code/1", kind, system)
+	if kind != "claude-code" || system != 1 {
+		t.Fatalf("seeded claude-code kind/system_provider = %q/%d; want claude-code/1", kind, system)
 	}
 
 	var revision string
@@ -85,6 +85,38 @@ func TestMigrateAppKeepsEditedSystemProvider(t *testing.T) {
 	}
 	if revision != "7" {
 		t.Errorf("llm_route_revision after re-migration = %q; want 7", revision)
+	}
+}
+
+// Đường nâng cấp: một máy đã cài từ trước có hàng claude-code với kind='claude_code' (gạch
+// dưới). migrateApp phải sửa nó thành 'claude-code' (gạch nối) — INSERT OR IGNORE không đụng
+// tới hàng đã có, nên cần UPDATE riêng. Không sửa thì kind lệch descriptor/envVarFor vĩnh viễn.
+func TestMigrateAppUnifiesClaudeKind(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := migrateApp(db); err != nil {
+		t.Fatal(err)
+	}
+	// Ép về kind cũ (gạch dưới) như một máy đã cài trước khi hợp nhất.
+	if _, err := db.Exec(
+		`UPDATE llm_providers SET kind = 'claude_code' WHERE id = 'claude-code'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateApp(db); err != nil {
+		t.Fatalf("re-migrate: %v", err)
+	}
+
+	var kind string
+	if err := db.QueryRow(
+		`SELECT kind FROM llm_providers WHERE id = 'claude-code'`).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "claude-code" {
+		t.Errorf("claude-code kind after re-migration = %q; want claude-code (hyphen)", kind)
 	}
 }
 

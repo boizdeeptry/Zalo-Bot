@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS llm_accounts (
 -- OR IGNORE ở cả hai dòng vì migration chạy MỖI lần mở database: gieo đè sẽ trả tên Provider
 -- và revision route về mặc định mỗi lần khởi động, xoá đúng thứ người dùng vừa sửa.
 INSERT OR IGNORE INTO llm_providers(id, name, kind, enabled, system_provider)
-VALUES ('claude-code', 'Claude Code', 'claude_code', 1, 1);
+VALUES ('claude-code', 'Claude Code', 'claude-code', 1, 1);
 INSERT OR IGNORE INTO app_meta(key, value) VALUES ('llm_route_revision', '1');
 
 -- Combos: chiến lược định tuyến có tên. ĐÚNG một hàng active = 1 (bất biến giữ ở tầng app
@@ -117,6 +117,11 @@ CREATE TABLE IF NOT EXISTS llm_combo_members (
 
 -- OR IGNORE: migration chạy mỗi lần mở database; gieo đè sẽ trả tên combo về mặc định.
 INSERT OR IGNORE INTO llm_combos(id, name, type, active) VALUES ('default', 'Mặc định', 'fallback', 1);
+
+-- Đường nâng cấp: máy đã cài trước khi hợp nhất có hàng claude-code với kind='claude_code'
+-- (gạch dưới). INSERT OR IGNORE ở trên không đụng hàng đã có, nên sửa riêng ở đây. WHERE
+-- kèm kind='claude_code' làm nó bất biến — chạy lại migration không đè gì thêm.
+UPDATE llm_providers SET kind = 'claude-code' WHERE id = 'claude-code' AND kind = 'claude_code';
 UPDATE app_meta SET value = '4' WHERE key = 'schema_version';
 `
 

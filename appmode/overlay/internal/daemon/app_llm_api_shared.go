@@ -49,7 +49,7 @@ type llmProviderKind struct {
 
 // llmProviderKinds là danh sách CHO PHÉP của kind.
 //
-// claude_code cố ý vắng mặt: Provider hệ thống có đúng một bản do migration gieo, và một bản
+// claude-code cố ý vắng mặt: Provider hệ thống có đúng một bản do migration gieo, và một bản
 // thứ hai do người dùng dựng sẽ trông y hệt lưới an toàn mà không phải — nó không chạy được
 // Claude Code, nhưng chuỗi fallback lại nhận nó làm mắt xích cuối hợp lệ.
 var llmProviderKinds = []llmProviderKind{
@@ -354,7 +354,7 @@ func (a *api) llmProviderBody(p store.LLMProvider) (llmProviderBody, error) {
 	if err != nil {
 		return llmProviderBody{}, err
 	}
-	// Endpoint rỗng cho claude_code là đúng: nó chạy một tiến trình cục bộ, không gọi HTTP đi đâu.
+	// Endpoint rỗng cho claude-code là đúng: nó chạy một tiến trình cục bộ, không gọi HTTP đi đâu.
 	endpoint, _ := llmEndpointFor(p.Kind)
 	body := llmProviderBody{
 		ID: p.ID, Name: p.Name, Kind: p.Kind, Endpoint: endpoint,

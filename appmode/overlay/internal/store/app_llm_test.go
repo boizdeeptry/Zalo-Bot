@@ -51,8 +51,8 @@ func TestLLMSeedsProtectedClaudeProvider(t *testing.T) {
 		t.Fatalf("LLMProviders() returned %d providers; want 1", len(got))
 	}
 	p := got[0]
-	if p.ID != "claude-code" || p.Kind != "claude_code" {
-		t.Errorf("LLMProviders()[0] id/kind = %q/%q; want claude-code/claude_code", p.ID, p.Kind)
+	if p.ID != "claude-code" || p.Kind != "claude-code" {
+		t.Errorf("LLMProviders()[0] id/kind = %q/%q; want claude-code/claude-code", p.ID, p.Kind)
 	}
 	if !p.System || !p.Enabled {
 		t.Errorf("LLMProviders()[0] system/enabled = %v/%v; want true/true", p.System, p.Enabled)

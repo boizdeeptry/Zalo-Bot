@@ -74,7 +74,8 @@ func TestEnvVarFor(t *testing.T) {
 		ok         bool
 	}{
 		{"codex", "CODEX_HOME", true},
-		{"claude_code", "CLAUDE_CONFIG_DIR", true},
+		{"claude-code", "CLAUDE_CONFIG_DIR", true},
+		{"claude_code", "", false}, // kind cũ (gạch dưới) không còn khớp sau khi hợp nhất
 		{"openai", "", false},
 	} {
 		got, ok := envVarFor(tc.kind)

@@ -393,11 +393,11 @@ func TestLLMAPIRejectsProviderKindOutsideAllowlist(t *testing.T) {
 	if code := got.errorCode(t); code != "PROVIDER_KIND_UNSUPPORTED" {
 		t.Errorf("create with kind=evil error code = %q, want PROVIDER_KIND_UNSUPPORTED", code)
 	}
-	// claude_code là kind của Provider hệ thống: nó tồn tại nhưng không được tạo thêm bản thứ hai,
+	// claude-code là kind của Provider hệ thống: nó tồn tại nhưng không được tạo thêm bản thứ hai,
 	// nếu không thì một chuỗi fallback có thể kết thúc bằng một "Claude Code" do người dùng dựng.
-	got = h.do(http.MethodPost, "/llm/providers", `{"kind":"claude_code","name":"Bản sao"}`)
+	got = h.do(http.MethodPost, "/llm/providers", `{"kind":"claude-code","name":"Bản sao"}`)
 	if got.status != http.StatusUnprocessableEntity {
-		t.Fatalf("create with kind=claude_code status = %d, want 422; body = %s", got.status, got.raw)
+		t.Fatalf("create with kind=claude-code status = %d, want 422; body = %s", got.status, got.raw)
 	}
 }
 
@@ -977,7 +977,7 @@ func TestLLMAPIProviderBodyIncludesAccounts(t *testing.T) {
 	}
 
 	// Provider API-key (claude-code hệ thống, không có account) mang accounts rỗng/vắng mặt.
-	apiBody, err := h.api.llmProviderBody(store.LLMProvider{ID: "claude-code", Name: "Claude Code", Kind: "claude_code"})
+	apiBody, err := h.api.llmProviderBody(store.LLMProvider{ID: "claude-code", Name: "Claude Code", Kind: "claude-code"})
 	if err != nil {
 		t.Fatalf("llmProviderBody(claude-code) = %v; want nil", err)
 	}
