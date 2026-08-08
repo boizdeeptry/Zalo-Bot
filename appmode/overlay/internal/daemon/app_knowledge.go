@@ -151,10 +151,14 @@ func kbCount(root string) (int, []string) {
 
 // modelChoices là những mô hình cho chọn. Bí danh, KHÔNG id đầy đủ.
 //
-// `claude --model` nhận cả bí danh (`opus`, `sonnet`, `haiku`) và id đầy đủ. Bí danh luôn trỏ về
-// bản mới nhất của dòng đó, nên một tệp cấu hình ghi "sonnet" không hết hạn khi Anthropic ra bản
-// tiếp theo — còn ghi một id đầy đủ thì có, và nó sẽ hỏng lặng lẽ trên máy người mua.
-var modelChoices = []string{"haiku", "sonnet", "opus"}
+// `claude --model` nhận cả bí danh (`opus`, `sonnet`, `haiku`, `fable`) và id đầy đủ. Bí danh luôn
+// trỏ về bản mới nhất của dòng đó, nên một tệp cấu hình ghi "sonnet" không hết hạn khi Anthropic ra
+// bản tiếp theo — còn ghi một id đầy đủ thì có, và nó sẽ hỏng lặng lẽ trên máy người mua.
+//
+// Cùng TẬP với cliDescriptors["claude-code"].modelSeeds (app_llm_cli.go): combo picker gieo từ seeds
+// còn selector /kb đọc từ đây, và cả hai giá trị đều đi vào cùng `claude --model` — lệch nhau là một
+// đường mở ra thứ đường kia từ chối.
+var modelChoices = []string{"haiku", "sonnet", "opus", "fable"}
 
 // modelFile là nơi lựa chọn được ghi: MỘT dòng, trong data\.
 //

@@ -87,7 +87,10 @@ var cliDescriptors = map[string]cliDescriptor{
 		readOnlyArgs: []string{"--allowed-tools", "Read", "Grep", "Glob", "WebFetch"},
 		bannedArgs:   []string{"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "bypassPermissions", "--permission-mode"},
 		authMethod:   "claude-json", claudeBudget: true,
-		modelSeeds: []cliModel{{"sonnet", "Claude Sonnet"}, {"opus", "Claude Opus"}, {"fable", "Claude Fable"}},
+		// Cùng TẬP với modelChoices (app_knowledge.go): mỗi seed đi vào combo picker rồi thành tham
+		// số --model của một tiến trình claude thật, nên hai danh sách phải khớp — kể cả haiku (model
+		// Zalo mặc định) để combo dựng được trên nó. Bí danh, không id đầy đủ (xem modelChoices).
+		modelSeeds: []cliModel{{"haiku", "Claude Haiku"}, {"sonnet", "Claude Sonnet"}, {"opus", "Claude Opus"}, {"fable", "Claude Fable"}},
 	},
 }
 
@@ -440,14 +443,19 @@ func descriptorModels(kind, providerID string) []store.LLMModel {
 // ReplaceLLMModels thay trọn nguồn discovered trong MỘT transaction, nên gọi lại không nhân đôi.
 // No-op nếu kind không có seed.
 //
-// ponytail: nuốt lỗi ReplaceLLMModels — gieo best-effort, hỏng chỉ khiến model chưa hiện (không mất
-// dữ liệu khách), và hai nơi gọi (startup, connect goroutine) đều không có đường trả lỗi hợp lý.
-func ensureCLIProviderModels(st *store.Store, providerID, kind string) {
+// ponytail: best-effort — gieo hỏng chỉ khiến combo picker trống model (không mất dữ liệu khách), và
+// hai nơi gọi (startup, connect goroutine) đều không có đường trả lỗi hợp lý. Vẫn LOG để một hỏng
+// lúc khởi động không lặng lẽ (guard nil logger cho test route dùng api không logger).
+func ensureCLIProviderModels(st *store.Store, logger *slog.Logger, providerID, kind string) {
 	if st == nil {
 		return // không có store để gieo (registerAppRoutes gọi từ test route bằng api không DB)
 	}
-	if m := descriptorModels(kind, providerID); len(m) > 0 {
-		_ = st.ReplaceLLMModels(providerID, store.LLMModelDiscovered, m)
+	m := descriptorModels(kind, providerID)
+	if len(m) == 0 {
+		return
+	}
+	if err := st.ReplaceLLMModels(providerID, store.LLMModelDiscovered, m); err != nil && logger != nil {
+		logger.Warn("gieo model CLI provider hỏng", "provider", providerID, "err", err)
 	}
 }
 

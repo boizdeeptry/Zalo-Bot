@@ -744,8 +744,8 @@ func TestLLMAPIDiscoverClaudeCodeReturnsDescriptorModels(t *testing.T) {
 	got := h.mustStatus(h.do(http.MethodPost, "/llm/providers/claude-code/discover", ""),
 		http.StatusOK, "discover claude-code")
 
-	// store trả model ORDER BY model_id, nên seed sonnet/opus/fable ra theo thứ tự chữ cái.
-	if want := []string{"fable", "opus", "sonnet"}; !equalStrings(llmAPIModelIDs(t, got), want) {
+	// store trả model ORDER BY model_id, nên seed haiku/sonnet/opus/fable ra theo thứ tự chữ cái.
+	if want := []string{"fable", "haiku", "opus", "sonnet"}; !equalStrings(llmAPIModelIDs(t, got), want) {
 		t.Fatalf("discover claude-code trả model %v; want %v", llmAPIModelIDs(t, got), want)
 	}
 }

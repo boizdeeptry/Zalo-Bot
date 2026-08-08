@@ -454,12 +454,12 @@ func TestCLIAdapterDiscoverReturnsDescriptorSeeds(t *testing.T) {
 }
 
 // TestDescriptorModelsClaudeCode: helper gieo model TĨNH cho claude-code (không adapter) trả đúng
-// 3 seed sonnet/opus/fable, gắn providerID, nguồn discovered/available.
+// 4 seed haiku/sonnet/opus/fable, gắn providerID, nguồn discovered/available.
 func TestDescriptorModelsClaudeCode(t *testing.T) {
 	models := descriptorModels("claude-code", "claude-code")
 	seeds := cliDescriptors["claude-code"].modelSeeds
-	if len(models) != len(seeds) || len(models) != 3 {
-		t.Fatalf("descriptorModels(claude-code) trả %d model; want 3 (= modelSeeds)", len(models))
+	if len(models) != len(seeds) || len(models) != 4 {
+		t.Fatalf("descriptorModels(claude-code) trả %d model; want 4 (= modelSeeds)", len(models))
 	}
 	for i, m := range models {
 		if m.ProviderID != "claude-code" {
@@ -490,14 +490,14 @@ func TestEnsureCLIProviderModelsPopulatesClaudeCode(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	ensureCLIProviderModels(st, "claude-code", "claude-code")
+	ensureCLIProviderModels(st, slog.New(slog.DiscardHandler), "claude-code", "claude-code")
 
 	models, err := st.LLMModels("claude-code")
 	if err != nil {
 		t.Fatalf("LLMModels(claude-code) = %v; want nil", err)
 	}
-	if len(models) != 3 {
-		t.Fatalf("LLMModels(claude-code) trả %d model; want 3", len(models))
+	if len(models) != 4 {
+		t.Fatalf("LLMModels(claude-code) trả %d model; want 4", len(models))
 	}
 }
 

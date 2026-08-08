@@ -262,7 +262,7 @@ func (a *api) newConnectManager() *connectManager {
 	return &connectManager{
 		runner:        newDefaultConnectRunner(a.logger),
 		ensure:        a.st.EnsureProviderForKind,
-		ensureModels:  func(k string) { ensureCLIProviderModels(a.st, k, k) },
+		ensureModels:  func(k string) { ensureCLIProviderModels(a.st, a.logger, k, k) },
 		createAccount: a.st.CreateLLMAccount,
 		dataDir:       a.cfg.Dir,
 		newID:         newAccountID,
