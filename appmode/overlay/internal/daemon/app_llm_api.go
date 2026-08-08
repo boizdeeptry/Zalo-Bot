@@ -306,8 +306,26 @@ func (a *api) handleLLMProviderDiscover(w http.ResponseWriter, r *http.Request) 
 	if !a.decodeLLMBody(w, r, &req) {
 		return
 	}
-	p, adapter, ok := a.llmProviderAdapter(w, r.PathValue("id"))
+	p, ok := a.llmProvider(w, r.PathValue("id"))
 	if !ok {
+		return
+	}
+	adapter, hasAdapter := llmAdapterFor(p.Kind, p.ID, a.llmAPIClient(), a.logger)
+	if !hasAdapter {
+		// claude-code KHÔNG có adapter (newLLMAdapter vắng case — định tuyến qua runClaude), nhưng
+		// model của nó là TĨNH ở descriptor. Gieo thẳng từ descriptorModels, không cần credential/
+		// adapter. Kind lạ THẬT (không adapter, không seed) vẫn báo 422 như llmProviderAdapter cũ.
+		models := descriptorModels(p.Kind, p.ID)
+		if len(models) == 0 {
+			a.writeLLMErr(w, http.StatusUnprocessableEntity, "PROVIDER_KIND_UNSUPPORTED",
+				p.Name+" không gọi được qua API", nil)
+			return
+		}
+		if err := a.st.ReplaceLLMModels(p.ID, store.LLMModelDiscovered, models); err != nil {
+			a.writeLLMInternal(w, "không lưu được danh sách model", err)
+			return
+		}
+		a.writeLLMModels(w, http.StatusOK, p.ID)
 		return
 	}
 	credential, ok := a.loadLLMCredential(w, p)

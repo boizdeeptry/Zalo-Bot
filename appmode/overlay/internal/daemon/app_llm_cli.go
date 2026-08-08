@@ -412,14 +412,43 @@ func (a *cliAdapter) Test(ctx context.Context, _ string, _ []byte) error {
 // Discover trả danh sách model TĨNH từ descriptor. Không I/O: vendor CLI không có endpoint liệt kê
 // model, nên danh sách được ghim ở modelSeeds và Portal hiện đúng nó.
 func (a *cliAdapter) Discover(_ context.Context, _ []byte) ([]store.LLMModel, error) {
-	out := make([]store.LLMModel, 0, len(a.d.modelSeeds))
-	for _, m := range a.d.modelSeeds {
+	return descriptorModels(a.d.kind, a.providerID), nil
+}
+
+// descriptorModels dựng danh sách model TĨNH của một họ CLI, gắn providerID. Rỗng (nil) nếu kind
+// không có descriptor hoặc descriptor không mang modelSeeds.
+//
+// Nguồn sự thật DUY NHẤT của phép ánh xạ modelSeeds → store.LLMModel: cliAdapter.Discover gọi nó cho
+// codex/gemini-cli, còn claude-code — KHÔNG có adapter (định tuyến qua runClaude) — thì discover +
+// gieo-lúc-khởi-động gọi thẳng hàm này. Mọi model đều nguồn discovered + available.
+func descriptorModels(kind, providerID string) []store.LLMModel {
+	d, ok := cliDescriptors[kind]
+	if !ok || len(d.modelSeeds) == 0 {
+		return nil
+	}
+	out := make([]store.LLMModel, 0, len(d.modelSeeds))
+	for _, m := range d.modelSeeds {
 		out = append(out, store.LLMModel{
-			ProviderID: a.providerID, ModelID: m.id, Name: m.name,
+			ProviderID: providerID, ModelID: m.id, Name: m.name,
 			Source: store.LLMModelDiscovered, Available: true,
 		})
 	}
-	return out, nil
+	return out
+}
+
+// ensureCLIProviderModels gieo model TĨNH của một CLI provider vào store. Idempotent:
+// ReplaceLLMModels thay trọn nguồn discovered trong MỘT transaction, nên gọi lại không nhân đôi.
+// No-op nếu kind không có seed.
+//
+// ponytail: nuốt lỗi ReplaceLLMModels — gieo best-effort, hỏng chỉ khiến model chưa hiện (không mất
+// dữ liệu khách), và hai nơi gọi (startup, connect goroutine) đều không có đường trả lỗi hợp lý.
+func ensureCLIProviderModels(st *store.Store, providerID, kind string) {
+	if st == nil {
+		return // không có store để gieo (registerAppRoutes gọi từ test route bằng api không DB)
+	}
+	if m := descriptorModels(kind, providerID); len(m) > 0 {
+		_ = st.ReplaceLLMModels(providerID, store.LLMModelDiscovered, m)
+	}
 }
 
 // parseCLIAnswer trích câu trả lời cuối từ output CLI, chọn cách parse theo vendor.

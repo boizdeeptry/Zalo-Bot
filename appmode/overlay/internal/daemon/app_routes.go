@@ -80,6 +80,10 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	// reflects the api that registered the routes. Production registers once; tests each get their
 	// own valid manager and never inherit a prior test's closed store / nil logger.
 	connectMgr = a.newConnectManager()
+	// Gieo model tĩnh của claude-code ngay khi khởi động: nó là provider luôn có sẵn (seeded), chạy
+	// qua runClaude nên KHÔNG có adapter để discover — không gieo ở đây thì detail + combo picker
+	// trống model dù chưa ai connect. Idempotent (ReplaceLLMModels thay trọn nguồn discovered).
+	ensureCLIProviderModels(a.st, "claude-code", "claude-code")
 	mux.Handle("POST /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectStart))
 	mux.Handle("GET /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectStatus))
 	mux.Handle("DELETE /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectCancel))

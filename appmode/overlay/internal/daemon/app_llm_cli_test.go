@@ -453,6 +453,54 @@ func TestCLIAdapterDiscoverReturnsDescriptorSeeds(t *testing.T) {
 	}
 }
 
+// TestDescriptorModelsClaudeCode: helper gieo model TĨNH cho claude-code (không adapter) trả đúng
+// 3 seed sonnet/opus/fable, gắn providerID, nguồn discovered/available.
+func TestDescriptorModelsClaudeCode(t *testing.T) {
+	models := descriptorModels("claude-code", "claude-code")
+	seeds := cliDescriptors["claude-code"].modelSeeds
+	if len(models) != len(seeds) || len(models) != 3 {
+		t.Fatalf("descriptorModels(claude-code) trả %d model; want 3 (= modelSeeds)", len(models))
+	}
+	for i, m := range models {
+		if m.ProviderID != "claude-code" {
+			t.Errorf("model[%d].ProviderID = %q; want claude-code", i, m.ProviderID)
+		}
+		if m.ModelID != seeds[i].id || m.Name != seeds[i].name {
+			t.Errorf("model[%d] = %s/%s; want %s/%s", i, m.ModelID, m.Name, seeds[i].id, seeds[i].name)
+		}
+		if m.Source != store.LLMModelDiscovered || !m.Available {
+			t.Errorf("model[%d] source/available = %s/%v; want discovered/true", i, m.Source, m.Available)
+		}
+	}
+}
+
+// TestDescriptorModelsUnknownKind: kind không có descriptor → nil (không có model để gieo).
+func TestDescriptorModelsUnknownKind(t *testing.T) {
+	if m := descriptorModels("openai", "x"); m != nil {
+		t.Errorf("descriptorModels(openai) = %v; want nil (không có descriptor)", m)
+	}
+}
+
+// TestEnsureCLIProviderModelsPopulatesClaudeCode: sau ensureCLIProviderModels, store có đủ model
+// tĩnh của claude-code (đường mà connect + startup gọi để detail/combo hiện model).
+func TestEnsureCLIProviderModelsPopulatesClaudeCode(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf(`store.Open(":memory:") = %v; want nil`, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ensureCLIProviderModels(st, "claude-code", "claude-code")
+
+	models, err := st.LLMModels("claude-code")
+	if err != nil {
+		t.Fatalf("LLMModels(claude-code) = %v; want nil", err)
+	}
+	if len(models) != 3 {
+		t.Fatalf("LLMModels(claude-code) trả %d model; want 3", len(models))
+	}
+}
+
 // readGrandchildPID poll file cho tới khi node ghi xong pid cháu rồi parse. Poll ngắn có giới hạn:
 // đang chờ một tiến trình NGOẠI khởi động, không có channel để đợi.
 func readGrandchildPID(t *testing.T, pidFile string) int {

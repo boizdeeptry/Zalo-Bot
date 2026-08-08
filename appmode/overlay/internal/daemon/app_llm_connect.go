@@ -94,6 +94,7 @@ type connectManager struct {
 	mu            sync.Mutex
 	runner        connectRunner
 	ensure        func(kind string) error
+	ensureModels  func(kind string) // gieo model tĩnh của provider vừa kết nối; nil (test không set) = bỏ qua
 	createAccount func(store.LLMAccount) error
 	dataDir       string
 	newID         func() string
@@ -214,6 +215,11 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 				m.fail(job, kind, "lưu provider lỗi: "+err.Error(), err)
 				return
 			}
+			// Provider vừa có hàng — gieo model tĩnh của nó ngay để detail + combo picker hiện model.
+			// Provider CLI subscription: providerID == kind. Guard vì test không set hook này.
+			if m.ensureModels != nil {
+				m.ensureModels(kind)
+			}
 			now := time.Now()
 			// Prefer the vendor's own label (claude → signed-in email); fall back to the user-given
 			// one (codex prints no email → accountLabel returns "").
@@ -256,6 +262,7 @@ func (a *api) newConnectManager() *connectManager {
 	return &connectManager{
 		runner:        newDefaultConnectRunner(a.logger),
 		ensure:        a.st.EnsureProviderForKind,
+		ensureModels:  func(k string) { ensureCLIProviderModels(a.st, k, k) },
 		createAccount: a.st.CreateLLMAccount,
 		dataDir:       a.cfg.Dir,
 		newID:         newAccountID,

@@ -730,6 +730,26 @@ func TestLLMAPIDiscoveryReplacesDiscoveredAndKeepsManual(t *testing.T) {
 	h.assertNoSecret("discover", "response", got.raw, "list", list.raw)
 }
 
+// TestLLMAPIDiscoverClaudeCodeReturnsDescriptorModels: claude-code KHÔNG có adapter (newLLMAdapter
+// vắng case; định tuyến qua runClaude), nên đường adapter cũ trả 422. Discover phải rẽ nhánh sang
+// model TĨNH của descriptor và trả 200 kèm 3 model, KHÔNG PROVIDER_DISCOVER_FAILED/kind-unsupported.
+func TestLLMAPIDiscoverClaudeCodeReturnsDescriptorModels(t *testing.T) {
+	h := newLLMAPIHarness(t)
+	// Xoá model đã gieo lúc khởi động để bài kiểm CHỨNG MINH chính endpoint discover gieo lại,
+	// không dựa vào lần gieo startup.
+	if err := h.st.ReplaceLLMModels("claude-code", store.LLMModelDiscovered, nil); err != nil {
+		t.Fatalf("clear claude-code discovered models = %v; want nil", err)
+	}
+
+	got := h.mustStatus(h.do(http.MethodPost, "/llm/providers/claude-code/discover", ""),
+		http.StatusOK, "discover claude-code")
+
+	// store trả model ORDER BY model_id, nên seed sonnet/opus/fable ra theo thứ tự chữ cái.
+	if want := []string{"fable", "opus", "sonnet"}; !equalStrings(llmAPIModelIDs(t, got), want) {
+		t.Fatalf("discover claude-code trả model %v; want %v", llmAPIModelIDs(t, got), want)
+	}
+}
+
 func TestLLMAPIFailedDiscoveryKeepsCachedModels(t *testing.T) {
 	h := newLLMAPIHarness(t)
 	id := h.createProvider("openai", "OpenAI", llmAPIKey)
