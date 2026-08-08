@@ -443,6 +443,44 @@ export function createComboEditor({
   });
 }
 
+// openComboModal đắp một modal (tạo/sửa combo) lên document.body — dùng data-combos-modal để tách
+// khỏi modal chọn model (data-combos-overlay) lồng bên trong editor. Đóng bằng nút, nền, hoặc Esc.
+function openComboModal({ title, body, onClose = () => {}, initialFocus } = {}) {
+  const back = element("div", { className: "sheetback", attributes: { "data-combos-modal": "" } });
+  const closeBtn = element("button", {
+    className: "btn", attributes: { type: "button", "aria-label": "Đóng" }, text: "Đóng",
+  });
+  let closed = false;
+  const onKey = (event) => { if (event.key === "Escape") close(); };
+  function close() {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener?.("keydown", onKey);
+    back.remove();
+    onClose();
+  }
+  const sheet = element("div", {
+    className: "sheet",
+    attributes: { role: "dialog", "aria-modal": "true", "aria-label": title },
+  },
+    element("div", { className: "sheethead" },
+      element("span", { className: "st", text: title }),
+      closeBtn,
+    ),
+    body,
+  );
+  closeBtn.addEventListener("click", close);
+  back.addEventListener("click", (event) => { if (event.target === back) close(); });
+  document.addEventListener?.("keydown", onKey);
+  back.append(sheet);
+  document.body.append(back);
+  (initialFocus ?? closeBtn).focus?.();
+  return { close };
+}
+
+// createCombosPage vẽ trang Combos kiểu 9Router: một cột THẺ (mỗi combo = tên + chip model + ô chọn
+// kiểu + Nhân bản/Sửa model/Xoá + chấm "Đang dùng"), nút "Tạo combo" mở MODAL, và "Sửa model" mở
+// modal bọc editor (thêm/bớt/sắp model, tự lưu). Backend combos KHÔNG đổi — chỉ khác cách bày.
 export function createCombosPage({
   request = requestJSON,
   setInterval: schedule = globalThis.setInterval,
@@ -460,96 +498,112 @@ export function createCombosPage({
       let disposed = false;
       let providers = [];
       let combos = [];
-      let selectedId = "";
       let status = null;
       let statusError = "";
-      let editor = null;
+      let editEditor = null; // editor instance của modal Sửa model đang mở (null = không mở)
+      let editModal = null; // { close } của modal Sửa model
+      let editComboId = ""; // id combo đang mở modal — để xoá đúng combo thì đóng modal
       container.append(root);
+
+      const nameOf = (providerID) => providers
+        .find((provider) => provider.id === providerID)?.name || providerID;
+      const modelLabelOf = (providerID, modelID) => providers
+        .find((provider) => provider.id === providerID)?.models
+        ?.find((model) => model.model_id === modelID)?.name || modelID;
 
       const header = () => pageHeader(
         "Combos",
         "Bộ chuỗi Provider/model mà bot chọn giữa. Combo đang dùng là bộ bot chạy khi trả lời khách.",
       );
-      const rowsBox = element("div", { className: "clist" });
-      const editorSlot = element("div", { className: "ceditor" });
+      const cardsBox = element("div", { className: "ccards" });
       const note = element("span", { className: "note", attributes: { "aria-live": "polite" } });
       const say = (message) => { note.textContent = message; };
-
-      const nameInput = element("input", {
-        className: "cname-input",
-        attributes: { type: "text", placeholder: "Tên combo mới", "aria-label": "Tên combo mới" },
-      });
-      const newTypeSelect = element("select", {
-        attributes: { "aria-label": "Kiểu combo mới" },
-      }, TYPE_ORDER.map((id) => element("option", { attributes: { value: id }, text: typeLabel(id) })));
       const createBtn = element("button", {
-        className: "btn go",
-        attributes: { type: "button" },
-        text: "Tạo combo",
+        className: "btn go", attributes: { type: "button" }, text: "Tạo combo",
       });
-      createBtn.addEventListener("click", () => { void create(); });
-      const creator = element("div", { className: "cnew" },
-        element("div", { className: "cnew-head", text: "Combo mới" },),
-        element("div", { className: "row" }, nameInput, newTypeSelect, createBtn),
-      );
+      createBtn.addEventListener("click", () => openCreateModal());
 
-      // drawList chỉ vẽ lại các HÀNG combo — nameInput/creator/note giữ nguyên qua mỗi lượt vẽ để một
-      // lượt activate/xoá không thổi bay tên combo đang gõ dở hay câu thông báo vừa hiện.
-      function drawList() {
-        if (!combos.length) {
-          rowsBox.replaceChildren(element("div", { className: "none", text: "Chưa có combo nào." }));
-          return;
-        }
-        rowsBox.replaceChildren(...combos.map(comboRow));
+      // syncCombo cập nhật một combo trong state từ thân máy chủ trả về (revision/kiểu/entries/đang-dùng)
+      // rồi vẽ lại thẻ — nguồn chung cho cả editor (onSaved) lẫn ô chọn kiểu trên thẻ.
+      function syncCombo(id, saved) {
+        combos = combos.map((combo) => (combo.id === id
+          ? {
+              ...combo,
+              revision: revisionOf(saved, combo.revision),
+              type: saved?.type ?? combo.type,
+              entries: Array.isArray(saved?.entries) ? saved.entries : combo.entries,
+              active: typeof saved?.active === "boolean" ? saved.active : combo.active,
+            }
+          : combo));
+        drawCards();
       }
 
-      function comboRow(combo) {
-        const chosen = combo.id === selectedId;
+      // --- danh sách thẻ ---
+
+      function drawCards() {
+        if (!combos.length) {
+          cardsBox.replaceChildren(element("div", { className: "none", text: "Chưa có combo nào. Bấm “Tạo combo”." }));
+          return;
+        }
+        cardsBox.replaceChildren(...combos.map(comboCard));
+      }
+
+      function comboCard(combo) {
         const radio = element("input", {
           attributes: { type: "radio", name: "combo-active", "aria-label": `Dùng combo ${combo.name || combo.id}` },
         });
         radio.checked = Boolean(combo.active);
         radio.addEventListener("change", () => { void activate(combo.id); });
 
-        const name = element("button", {
-          className: "cname",
-          attributes: { type: "button" },
-          text: combo.name || combo.id,
-        });
-        name.addEventListener("click", () => {
-          if (selectedId === combo.id) return;
-          selectedId = combo.id;
-          drawList();
-          drawEditor();
+        const entries = Array.isArray(combo.entries) ? combo.entries : [];
+        const chips = entries.length
+          ? entries.map((entry) => element("span", {
+              className: entry.enabled ? "cchip" : "cchip off",
+              text: `${nameOf(entry.provider_id)} · ${modelLabelOf(entry.provider_id, entry.model_id)}`,
+            }))
+          : [element("span", { className: "none", text: "Chưa có model — bấm “Sửa model”." })];
+
+        const typeSel = element("select", {
+          className: "ctype-sel",
+          attributes: { "aria-label": `Kiểu combo ${combo.name || combo.id}` },
+        }, TYPE_ORDER.map((id) => element("option", { attributes: { value: id }, text: typeLabel(id) })));
+        typeSel.value = TYPE_ORDER.includes(combo.type) ? combo.type : "fallback";
+        typeSel.addEventListener("change", () => {
+          void saveComboType(combo, TYPE_ORDER.includes(typeSel.value) ? typeSel.value : "fallback");
         });
 
-        const badge = element("span", { className: `ctype ctype-${combo.type}`, text: typeLabel(combo.type) });
+        const editBtn = element("button", { className: "btn", attributes: { type: "button" }, text: "Sửa model" });
+        editBtn.addEventListener("click", () => openEditModal(combo));
+        const copyBtn = element("button", { className: "btn", attributes: { type: "button" }, text: "Nhân bản" });
+        copyBtn.addEventListener("click", () => { void copy(combo); });
         const del = element("button", {
-          className: "btn",
-          attributes: { type: "button", "aria-label": `Xoá combo ${combo.name || combo.id}` },
-          text: "Xoá",
+          className: "btn", attributes: { type: "button", "aria-label": `Xoá combo ${combo.name || combo.id}` }, text: "Xoá",
         });
         del.addEventListener("click", () => { void remove(combo.id); });
 
-        return element("div", { className: chosen ? "crow on" : "crow" },
-          element("label", { className: "cactive" }, radio, element("span", { text: "Đang dùng" })),
-          name,
-          badge,
-          del,
+        return element("div", { className: combo.active ? "ccard on" : "ccard" },
+          element("div", { className: "ccard-head" },
+            element("span", { className: "cname", text: combo.name || combo.id }),
+            element("label", { className: "cactive" }, radio, element("span", { text: "Đang dùng" })),
+          ),
+          element("div", { className: "cchips" }, ...chips),
+          element("div", { className: "ccard-foot" },
+            element("label", { className: "cfk" }, element("span", { text: "Kiểu" }), typeSel),
+            element("div", { className: "cacts" }, editBtn, copyBtn, del),
+          ),
         );
       }
 
-      function drawEditor() {
-        if (editor) { editor.dispose(); editor = null; }
-        const combo = combos.find((entry) => entry.id === selectedId);
-        if (!combo) {
-          editorSlot.replaceChildren(element("div", {
-            className: "none",
-            text: "Chọn một combo để sửa mắt xích.",
-          }));
-          return;
-        }
-        editor = createComboEditor({
+      // --- modal Sửa model: bọc editor (thêm/bớt/sắp model + tự lưu), một modal một lúc ---
+
+      function closeEdit() {
+        editModal?.close(); // onClose dispose editor + null hoá handle
+      }
+
+      function openEditModal(combo) {
+        closeEdit();
+        editComboId = combo.id;
+        const editor = createComboEditor({
           providers,
           snapshot: snapshotOf(combo),
           type: combo.type,
@@ -558,49 +612,118 @@ export function createCombosPage({
           reload: async () => {
             const fresh = await service.list();
             combos = Array.isArray(fresh?.combos) ? fresh.combos : [];
+            drawCards();
             const found = combos.find((entry) => entry.id === combo.id);
-            // Danh sách vừa đổi (revision, kiểu, combo đang dùng) — vẽ lại rows để radio/huy hiệu/tên
-            // khớp lại thay vì đứng cũ tới lượt bấm không liên quan kế tiếp.
-            drawList();
             if (!found) {
-              // Combo bị xoá ở nơi khác trong lúc đang sửa: nhặt lại combo đang dùng/đầu tiên rồi dựng
-              // lại editor theo lựa chọn mới. drawEditor dispose editor hiện tại, nên lượt throw dưới
-              // đây chỉ để thoát handler reload cũ — nó tự bail qua cờ disposed, không hiện câu lỗi.
-              selectedId = (combos.find((entry) => entry.active) ?? combos[0])?.id ?? "";
-              drawEditor();
-              say("Combo này đã bị xoá ở nơi khác — đã chuyển sang combo hiện có.");
+              // Combo bị xoá ở nơi khác trong lúc đang sửa: đóng modal, báo cấp trang. Throw để thoát
+              // handler reload của editor (nó tự bail qua cờ disposed, không hiện câu lỗi thừa).
+              closeEdit();
+              say("Combo này đã bị xoá ở nơi khác — đã đóng cửa sổ sửa.");
               throw new Error("combo không còn tồn tại");
             }
             return { revision: found.revision, entries: snapshotOf(found).entries, type: found.type };
           },
-          onSaved: (saved) => {
-            // Đồng bộ revision + entries + kiểu vào state danh sách để lần dựng lại editor kế tiếp không
-            // lưu đè một revision cũ, rồi vẽ lại rows để huy hiệu kiểu bắt kịp lượt đổi kiểu vừa tự lưu.
-            combos = combos.map((entry) => (entry.id === combo.id
-              ? {
-                  ...entry,
-                  revision: revisionOf(saved, entry.revision),
-                  type: saved?.type ?? entry.type,
-                  entries: Array.isArray(saved?.entries) ? saved.entries : entry.entries,
-                }
-              : entry));
-            drawList();
-          },
+          onSaved: (saved) => syncCombo(combo.id, saved),
           conflictCode: "COMBO_REVISION_CONFLICT",
         });
-        editorSlot.replaceChildren(editor.node);
+        editEditor = editor;
+        editModal = openComboModal({
+          title: `Sửa model · ${combo.name || combo.id}`,
+          body: editor.node,
+          onClose: () => { editor.dispose(); editEditor = null; editModal = null; editComboId = ""; },
+        });
         editor.setStatus(status, statusError);
       }
 
-      async function refreshList() {
-        const list = await service.list();
-        if (disposed) return;
-        combos = Array.isArray(list?.combos) ? list.combos : [];
-        if (!combos.some((combo) => combo.id === selectedId)) {
-          selectedId = (combos.find((combo) => combo.active) ?? combos[0])?.id ?? "";
+      // --- modal Tạo combo ---
+
+      function openCreateModal() {
+        const nameInput = element("input", {
+          className: "cname-input",
+          attributes: { type: "text", placeholder: "Tên combo mới", "aria-label": "Tên combo mới" },
+        });
+        const typeSel = element("select", { attributes: { "aria-label": "Kiểu combo mới" } },
+          TYPE_ORDER.map((id) => element("option", { attributes: { value: id }, text: typeLabel(id) })));
+        const mnote = element("span", { className: "note", attributes: { "aria-live": "polite" } });
+        const submit = element("button", { className: "btn go", attributes: { type: "button" }, text: "Tạo" });
+        const body = element("div", { className: "cnew" },
+          element("label", { className: "cfk" }, element("span", { text: "Tên" }), nameInput),
+          element("label", { className: "cfk" }, element("span", { text: "Kiểu" }), typeSel),
+          element("div", { className: "row" }, submit),
+          mnote,
+        );
+        const modal = openComboModal({ title: "Tạo combo mới", body, initialFocus: nameInput });
+        submit.addEventListener("click", async () => {
+          const name = nameInput.value.trim();
+          if (!name) { mnote.textContent = "Đặt tên cho combo mới trước khi tạo."; return; }
+          const type = TYPE_ORDER.includes(typeSel.value) ? typeSel.value : "fallback";
+          submit.disabled = true;
+          mnote.textContent = "Đang tạo combo mới…";
+          try {
+            const created = await service.create({ name, type });
+            if (disposed) return;
+            modal.close();
+            await refreshList();
+            if (disposed) return;
+            say("Đã tạo combo mới. Bấm “Sửa model” để thêm model, gạt “Đang dùng” để bot dùng.");
+            const fresh = combos.find((combo) => combo.id === created?.id);
+            if (fresh) openEditModal(fresh); // mở luôn để thêm model — combo mới trống
+          } catch (error) {
+            if (disposed || error?.name === "AbortError") return;
+            mnote.textContent = `không tạo được combo: ${messageOf(error)}`;
+            submit.disabled = false;
+          }
+        });
+      }
+
+      // --- hành động cấp trang ---
+
+      // copy nhân bản một combo: tạo combo mới cùng kiểu rồi (nếu có model) lưu lại đúng bộ thành viên.
+      // Hai lượt gọi API bằng đúng endpoint sẵn có — backend không cần biết về "nhân bản".
+      async function copy(combo) {
+        say("Đang nhân bản combo…");
+        try {
+          const created = await service.create({ name: `${combo.name || combo.id} (bản sao)`, type: combo.type });
+          if (disposed) return;
+          const entries = (Array.isArray(combo.entries) ? combo.entries : []).map((entry) => ({
+            provider_id: entry.provider_id, model_id: entry.model_id, enabled: Boolean(entry.enabled),
+          }));
+          if (entries.length && created?.id) {
+            await service.save(created.id, { revision: revisionOf(created), type: combo.type, entries });
+          }
+          if (disposed) return;
+          await refreshList();
+          if (!disposed) say("Đã nhân bản combo. Gạt “Đang dùng” nếu muốn bot dùng bản mới.");
+        } catch (error) {
+          if (disposed || error?.name === "AbortError") return;
+          say(`không nhân bản được: ${messageOf(error)}`);
         }
-        drawList();
-        drawEditor();
+      }
+
+      // saveComboType lưu lượt đổi kiểu ngay trên thẻ: gửi kèm revision + thành viên hiện tại. Xung đột
+      // revision (ai đó vừa đổi ở nơi khác) → tải lại rồi mời thử lại; lỗi khác → báo và vẽ lại (ô select
+      // trở về giá trị đang lưu).
+      async function saveComboType(combo, nextType) {
+        const current = combos.find((entry) => entry.id === combo.id) ?? combo;
+        try {
+          const saved = await service.save(combo.id, {
+            revision: current.revision,
+            type: nextType,
+            entries: Array.isArray(current.entries) ? current.entries : [],
+          });
+          if (disposed) return;
+          syncCombo(combo.id, saved);
+          say(`Đã đổi kiểu combo${current.active ? " — bot dùng ngay" : ""}.`);
+        } catch (error) {
+          if (disposed || error?.name === "AbortError") return;
+          if (error?.code === "COMBO_REVISION_CONFLICT") {
+            await refreshList().catch(() => {});
+            if (!disposed) say("Combo vừa đổi ở nơi khác — đã tải lại, thử đổi kiểu lại.");
+            return;
+          }
+          say(`không đổi được kiểu: ${messageOf(error)}`);
+          drawCards();
+        }
       }
 
       async function activate(id) {
@@ -622,7 +745,7 @@ export function createCombosPage({
         try {
           await service.remove(id);
           if (disposed) return;
-          if (selectedId === id) selectedId = "";
+          if (editComboId === id) closeEdit();
           await refreshList();
           if (!disposed) say("Đã xoá combo.");
         } catch (error) {
@@ -636,28 +759,11 @@ export function createCombosPage({
         }
       }
 
-      async function create() {
-        const name = nameInput.value.trim();
-        if (!name) {
-          say("Đặt tên cho combo mới trước khi tạo.");
-          return;
-        }
-        const type = TYPE_ORDER.includes(newTypeSelect.value) ? newTypeSelect.value : "fallback";
-        createBtn.disabled = true;
-        say("Đang tạo combo mới…");
-        try {
-          const combo = await service.create({ name, type });
-          if (disposed) return;
-          nameInput.value = "";
-          selectedId = combo?.id ?? selectedId;
-          await refreshList();
-          if (!disposed) say("Đã tạo combo mới. Gạt radio để cho bot dùng.");
-        } catch (error) {
-          if (disposed || error?.name === "AbortError") return;
-          say(`không tạo được combo: ${messageOf(error)}`);
-        } finally {
-          if (!disposed) createBtn.disabled = false;
-        }
+      async function refreshList() {
+        const list = await service.list();
+        if (disposed) return;
+        combos = Array.isArray(list?.combos) ? list.combos : [];
+        drawCards();
       }
 
       async function refreshStatus() {
@@ -666,11 +772,11 @@ export function createCombosPage({
           if (disposed) return;
           status = next;
           statusError = "";
-          editor?.setStatus(status, statusError);
+          editEditor?.setStatus(status, statusError);
         } catch (error) {
           if (disposed || error?.name === "AbortError") return;
           statusError = `không đọc được trạng thái: ${messageOf(error)}`;
-          editor?.setStatus(status, statusError);
+          editEditor?.setStatus(status, statusError);
         }
       }
 
@@ -688,16 +794,12 @@ export function createCombosPage({
           combos = Array.isArray(list?.combos) ? list.combos : [];
           providers = Array.isArray(providerList?.providers) ? providerList.providers : [];
           status = statusResp;
-          selectedId = (combos.find((combo) => combo.active) ?? combos[0])?.id ?? "";
           root.replaceChildren(
             header(),
-            element("div", { className: "cols" },
-              element("div", { className: "combos-list" }, rowsBox, creator, note),
-              editorSlot,
-            ),
+            element("div", { className: "ctop" }, createBtn, note),
+            cardsBox,
           );
-          drawList();
-          drawEditor();
+          drawCards();
           const timer = schedule(() => {
             if (disposed) return;
             void refreshStatus();
@@ -713,7 +815,7 @@ export function createCombosPage({
       return {
         dispose() {
           disposed = true;
-          if (editor) { editor.dispose(); editor = null; }
+          closeEdit();
           controller.abort();
         },
       };

@@ -115,6 +115,20 @@
 [data-combos-overlay] .pick-mid { margin-left:auto; padding-left:10px; font-family:ui-monospace, Menlo, monospace; font-size:11.5px; color:#6a6a72; }
 [data-combos-overlay] .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
 
+/* combo Tạo/Sửa — modal đắp lên body (data-combos-modal), tách khỏi picker (data-combos-overlay) để
+   hai lớp lồng nhau không đè z-index/attr của nhau. Sheet dùng lại khung overlay; nội dung modal Sửa
+   là editor .models-page (đã có style ở khối models), modal Tạo là form .cnew bên dưới. */
+[data-combos-modal].sheetback { position:fixed; z-index:40; inset:0; display:flex; align-items:center; justify-content:center; padding:22px; background:rgba(9, 12, 16, .58); }
+[data-combos-modal] .sheet { box-sizing:border-box; width:min(560px, 100%); max-height:calc(100vh - 44px); overflow:auto; border:1px solid var(--line); border-radius:10px; padding:16px; background:var(--panel); box-shadow:0 16px 55px rgba(0, 0, 0, .35); }
+[data-combos-modal] .sheethead { display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:12px; }
+[data-combos-modal] .sheethead .st { font-size:15px; font-weight:600; }
+[data-combos-modal] .cnew { display:flex; flex-direction:column; gap:12px; }
+[data-combos-modal] .cfk { display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--dim); }
+[data-combos-modal] .cfk > span { font-weight:600; }
+[data-combos-modal] .cname-input, [data-combos-modal] .cnew select { box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:9px; padding:8px 12px; color:var(--ink); background:var(--sunk); font:inherit; font-size:13px; }
+[data-combos-modal] .cnew .row { margin:0; }
+[data-combos-modal] .note { font-size:12px; color:var(--dim); }
+
 /* providers:begin — Providers gallery + detail (Task 1–6). Nền tối kiểu 9Router: card #161618,
    viền #26262b, accent xanh #34d399 thay cho banner đỏ "may be banned" của bản gốc.
 
@@ -279,72 +293,50 @@
 .models-page .reslot:empty { display:none; }
 /* models:end */
 
-/* combos:begin — Trang Combos: cột trái liệt kê combo (radio "đang dùng" + tên + huy hiệu kiểu +
-   nút xoá) và ô tạo combo mới; cột phải là member-editor dùng lại khối .models-page ở trên.
-   Mọi luật từ đây tới combos:end bắt đầu bằng .combos-page để không rò ra trang khác. */
-.combos-page .combos-list { flex:1 1 240px; }
-.combos-page .ceditor { flex:2 1 420px; }
+/* combos:begin — Trang Combos kiểu 9Router: một lưới THẺ, mỗi combo là một .ccard (tên + chip model
+   + ô chọn kiểu + Nhân bản/Sửa model/Xoá + chấm "đang dùng"). Modal Tạo/Sửa render NGOÀI .combos-page
+   (trên body, xem [data-combos-modal]). Mọi luật từ đây tới combos:end bắt đầu bằng .combos-page. */
+.combos-page .ctop { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin:0 0 16px; }
+.combos-page .ctop > .note { font-size:12px; color:var(--dim); }
 
-.combos-page .clist {
-  border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--panel);
+.combos-page .ccards {
+  display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:12px;
 }
-.combos-page .crow {
-  display:flex; align-items:center; gap:10px; padding:9px 11px;
-  border-bottom:1px solid var(--line); font-size:12.5px;
+.combos-page .ccard {
+  display:flex; flex-direction:column; gap:11px; padding:14px;
+  border:1px solid #26262b; border-radius:11px; background:#161618;
 }
-.combos-page .crow:last-child { border-bottom:0; }
-/* Combo đang mở trong editor: nền chìm + sọc accent bên trái, giống mục điều hướng đang chọn. */
-.combos-page .crow.on { background:var(--sunk); box-shadow:inset 2px 0 0 var(--live); }
+/* Combo đang dùng: viền + quầng accent, tách khỏi các combo nghỉ. */
+.combos-page .ccard.on { border-color:rgba(52,211,153,.45); box-shadow:inset 0 0 0 1px rgba(52,211,153,.18); }
+.combos-page .ccard-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+.combos-page .cname { font-size:14.5px; font-weight:600; overflow-wrap:anywhere; }
 
 .combos-page .cactive {
   display:inline-flex; align-items:center; gap:6px; flex:none;
-  color:var(--dim); font-size:11.5px; white-space:nowrap;
+  color:var(--dim); font-size:11.5px; white-space:nowrap; cursor:pointer;
 }
-/* Radio "đang dùng" đã chọn = combo bot đang chạy: tô accent để tách khỏi các combo nghỉ. */
 .combos-page .cactive:has(input:checked) { color:var(--live); font-weight:600; }
 
-.combos-page .cname {
-  flex:1; min-width:0; border:0; background:none; padding:0; text-align:left;
-  color:var(--ink); font:inherit; font-size:13px; font-weight:600; cursor:pointer;
-  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+/* Chip model: viên bo tròn provider·model; mắt xích tắt thì mờ + gạch ngang. */
+.combos-page .cchips { display:flex; flex-wrap:wrap; gap:6px; min-height:24px; }
+.combos-page .cchip {
+  display:inline-flex; align-items:center; border:1px solid #2f2f36; border-radius:999px;
+  padding:3px 10px; font-size:11.5px; background:#1c1c20; color:var(--ink);
 }
-.combos-page .cname:hover { color:var(--live); }
+.combos-page .cchip.off { opacity:.5; text-decoration:line-through; }
 
-/* Huy hiệu kiểu: nền mờ theo accent (giống .pv-safe-tag), mỗi kiểu một màu để phân biệt nhanh. */
-.combos-page .ctype {
-  display:inline-flex; align-items:center; flex:none; border-radius:20px; padding:3px 9px;
-  font-size:11px; font-weight:500; white-space:nowrap;
-  border:1px solid var(--line); color:var(--dim); background:var(--sunk);
+.combos-page .ccard-foot {
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  flex-wrap:wrap; margin-top:auto;
 }
-.combos-page .ctype-fallback {
-  color:#34d399; border-color:rgba(52,211,153,.30); background:rgba(52,211,153,.10);
+.combos-page .cfk { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; color:var(--dim); }
+.combos-page .ctype-sel {
+  border:1px solid var(--line); border-radius:8px; padding:5px 8px;
+  color:var(--ink); background:var(--sunk); font:inherit; font-size:12px;
 }
-.combos-page .ctype-round_robin {
-  color:#a78bfa; border-color:rgba(167,139,250,.32); background:rgba(167,139,250,.12);
-}
+.combos-page .cacts { display:flex; gap:6px; flex-wrap:wrap; }
 
 .combos-page .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
-
-/* Ô tạo combo mới: ngồi dưới danh sách, cùng ngôn ngữ khung với .clist. */
-.combos-page .cnew {
-  border:1px solid var(--line); border-radius:8px; padding:11px 12px; margin:14px 0 0;
-  background:var(--panel);
-}
-.combos-page .cnew-head {
-  font-size:12px; font-weight:600; color:var(--dim); text-transform:uppercase;
-  letter-spacing:.06em; margin:0 0 8px;
-}
-.combos-page .cnew .row { margin:0; }
-.combos-page .cname-input {
-  flex:1; min-width:140px; box-sizing:border-box; border:1px solid var(--line);
-  border-radius:7px; padding:7px 9px; color:var(--ink); background:var(--sunk); font-size:13px;
-}
-.combos-page .cnew select {
-  border:1px solid var(--line); border-radius:7px; padding:7px 9px;
-  color:var(--ink); background:var(--sunk); font:inherit; font-size:13px;
-}
-
-.combos-page .combos-list > .note { display:block; margin-top:10px; }
 /* combos:end */
 
 .cols { display:flex; gap:16px; flex-wrap:wrap; }
@@ -383,10 +375,13 @@
   #main { padding:18px 16px 40px; overflow:visible; }
   .cards,
   .cols { display:grid; grid-template-columns:1fr; }
+  .combos-page .ccards { grid-template-columns:1fr; }
   [data-agents-overlay].sheetback,
-  [data-combos-overlay].sheetback { padding:12px; }
+  [data-combos-overlay].sheetback,
+  [data-combos-modal].sheetback { padding:12px; }
   [data-agents-overlay] .sheet,
-  [data-combos-overlay] .sheet {
+  [data-combos-overlay] .sheet,
+  [data-combos-modal] .sheet {
     width:100%; height:auto; max-height:calc(100vh - 24px); border-radius:8px;
   }
   /* providers:begin — cùng luật phạm vi như khối trên.

@@ -13,16 +13,24 @@ function button(root, label) {
   return find(root, (node) => node.tagName === "BUTTON" && text(node) === label);
 }
 
-const comboRows = (main) => findAll(main, (node) => hasClass(node, "crow"));
-const memberRows = (main) => findAll(main, (node) => hasClass(node, "fact"));
-const memberLabel = (row) => text(find(row, (node) => hasClass(node, "mv")));
-const memberLabels = (main) => memberRows(main).map(memberLabel);
-const liveBadge = (row) => text(find(row, (node) => hasClass(node, "live")));
-const radioOf = (row) => find(row, (node) => node.getAttribute?.("type") === "radio");
-const typeBadge = (row) => text(find(row, (node) => hasClass(node, "ctype")));
+// Danh sách thẻ: mỗi combo là một .ccard (tên + chip model + ô chọn kiểu + Nhân bản/Sửa model/Xoá).
+const cards = (main) => findAll(main, (node) => hasClass(node, "ccard"));
+const cardName = (card) => text(find(card, (node) => hasClass(node, "cname")));
+const cardChips = (card) => findAll(card, (node) => hasClass(node, "cchip")).map(text);
+const cardTypeSel = (card) => find(card, (node) => hasClass(node, "ctype-sel"));
+const radioOf = (card) => find(card, (node) => node.getAttribute?.("type") === "radio");
 
-// Model picker modal: đắp lên document.body (như overlay của Agents), tra qua data-combos-overlay.
+// Modal tạo/sửa (data-combos-modal) vs modal chọn model lồng bên trong (data-combos-overlay).
+const comboModal = () => find(document.body, (node) => node.getAttribute?.("data-combos-modal") != null);
 const overlay = () => find(document.body, (node) => node.getAttribute?.("data-combos-overlay") != null);
+
+// Danh sách mắt xích sống TRONG modal Sửa model; các helper nhận root là modal đó.
+const memberRows = (root) => findAll(root, (node) => hasClass(node, "fact"));
+const memberLabel = (row) => text(find(row, (node) => hasClass(node, "mv")));
+const memberLabels = (root) => memberRows(root).map(memberLabel);
+const liveBadge = (row) => text(find(row, (node) => hasClass(node, "live")));
+const editorType = (root) => find(root, (node) => node.getAttribute?.("id") === "combo-type");
+
 const pickRows = (root) => findAll(root, (node) => hasClass(node, "pick-model"));
 const pickGroups = (root) => findAll(root, (node) => hasClass(node, "pick-group-head"));
 const pickSearch = (root) => find(root, (node) => node.tagName === "INPUT");
@@ -33,17 +41,22 @@ const putCalls = (calls) => calls
   .filter((call) => /^\/llm\/combos\/[^/]+$/.test(call.path) && call.options.method === "PUT")
   .map((call) => ({ path: call.path, body: call.options.body }));
 
-// pageNotice: câu thông báo cấp trang (tạo/đổi/xoá) sống trong cột danh sách, tách khỏi note của
-// editor để một lượt vẽ lại danh sách không thổi bay nó.
+// pageNotice: câu thông báo cấp trang (tạo/đổi/xoá) sống trong thanh trên (.ctop).
 function pageNotice(main) {
-  const column = find(main, (node) => hasClass(node, "combos-list"));
-  return find(column, (node) => node.getAttribute?.("aria-live") === "polite");
+  const top = find(main, (node) => hasClass(node, "ctop"));
+  return find(top, (node) => node.getAttribute?.("aria-live") === "polite");
 }
 
-// editorNotice: câu save/tải-lại nằm trên note của EDITOR (trong .ceditor), tách khỏi note cấp trang.
-function editorNotice(main) {
-  const slot = find(main, (node) => hasClass(node, "ceditor"));
-  return find(slot, (node) => hasClass(node, "note"));
+// editorNotice: câu save/tải-lại nằm trên note của EDITOR, giờ ở trong modal Sửa model.
+function editorNotice() {
+  return find(comboModal(), (node) => hasClass(node, "note")
+    && node.getAttribute?.("aria-live") === "polite");
+}
+
+// openEdit mở modal Sửa model của một thẻ rồi trả về modal đó.
+function openEdit(main, index) {
+  button(cards(main)[index], "Sửa model").click();
+  return comboModal();
 }
 
 const PROVIDERS = {
@@ -76,7 +89,7 @@ const PROVIDERS = {
 };
 
 // Một combo fallback đang chạy và một combo round_robin nghỉ — đủ để kiểm huy hiệu kiểu, chấm radio,
-// và editor đổi theo combo đang chọn.
+// và modal Sửa model đổi theo combo được mở.
 const COMBOS = {
   combos: [
     {
@@ -228,22 +241,26 @@ test("combo service rejects a missing request function", () => {
   assert.throws(() => createComboService(null), TypeError);
 });
 
-// --- trang Combos: cột danh sách trái ---
+// --- trang Combos: danh sách thẻ ---
 
-test("Combos renders one row per combo with an active radio and a type badge", async (t) => {
+test("Combos renders one card per combo with an active radio, chips, and a type selector", async (t) => {
   const { main } = await mounted(t);
 
   assert.equal(text(find(main, (node) => node.tagName === "H1")), "Combos");
-  const rows = comboRows(main);
-  assert.equal(rows.length, 2);
-  assert.equal(radioOf(rows[0]).checked, true);
-  assert.equal(radioOf(rows[1]).checked, false);
-  assert.deepEqual(rows.map(typeBadge), ["Fallback", "Round Robin"]);
+  const list = cards(main);
+  assert.equal(list.length, 2);
+  assert.deepEqual(list.map(cardName), ["Chính", "Luân phiên"]);
+  assert.equal(radioOf(list[0]).checked, true);
+  assert.equal(radioOf(list[1]).checked, false);
+  assert.deepEqual(list.map((card) => cardTypeSel(card).value), ["fallback", "round_robin"]);
+  // Chip model hiện provider·model, không cần mở modal.
+  assert.deepEqual(cardChips(list[0]), ["OpenAI chính · GPT-5", "Claude Code · Haiku"]);
+  assert.deepEqual(cardChips(list[1]), ["Gemini · Gemini 2"]);
 });
 
 test("activating a combo posts to its activate endpoint", async (t) => {
   const { calls, main } = await mounted(t);
-  radioOf(comboRows(main)[1]).dispatchEvent({ type: "change" });
+  radioOf(cards(main)[1]).dispatchEvent({ type: "change" });
   await flush();
 
   assert.ok(
@@ -252,13 +269,32 @@ test("activating a combo posts to its activate endpoint", async (t) => {
   );
 });
 
-test("creating a combo posts name and type to /llm/combos", async (t) => {
+test("changing a card's type selector saves the new type", async (t) => {
   const { calls, main } = await mounted(t);
-  const nameInput = find(main, (node) => node.tagName === "INPUT" && node.getAttribute?.("type") === "text");
-  nameInput.value = "Thử nghiệm";
-  const newType = find(main, (node) => node.getAttribute?.("aria-label") === "Kiểu combo mới");
-  newType.value = "round_robin";
+  const sel = cardTypeSel(cards(main)[0]);
+  sel.value = "round_robin";
+  sel.dispatchEvent({ type: "change" });
+  await settle();
+
+  const put = putCalls(calls).at(-1);
+  assert.equal(put.path, "/llm/combos/c1");
+  assert.equal(put.body.type, "round_robin");
+  assert.equal(put.body.revision, 4, "the card save carries the combo's current revision");
+});
+
+// --- modal Tạo combo ---
+
+test("creating a combo posts name and type from the create modal", async (t) => {
+  const { calls, main } = await mounted(t);
   button(main, "Tạo combo").click();
+  const modal = comboModal();
+  assert.ok(modal, "the Tạo combo button must open the create modal");
+
+  const nameInput = find(modal, (node) => node.tagName === "INPUT" && node.getAttribute?.("type") === "text");
+  nameInput.value = "Thử nghiệm";
+  const newType = find(modal, (node) => node.getAttribute?.("aria-label") === "Kiểu combo mới");
+  newType.value = "round_robin";
+  button(modal, "Tạo").click();
   await flush();
 
   const post = calls.find((call) => call.path === "/llm/combos" && call.options.method === "POST");
@@ -269,10 +305,12 @@ test("creating a combo posts name and type to /llm/combos", async (t) => {
 test("creating a combo with no name is refused before it reaches the API", async (t) => {
   const { calls, main } = await mounted(t);
   button(main, "Tạo combo").click();
+  const modal = comboModal();
+  button(modal, "Tạo").click();
   await flush();
 
   assert.equal(calls.some((call) => call.path === "/llm/combos" && call.options.method === "POST"), false);
-  assert.match(text(pageNotice(main)), /Đặt tên cho combo mới/);
+  assert.match(text(find(modal, (node) => hasClass(node, "note"))), /Đặt tên cho combo mới/);
 });
 
 test("a protected delete shows the reason instead of crashing", async (t) => {
@@ -285,55 +323,74 @@ test("a protected delete shows the reason instead of crashing", async (t) => {
       });
     },
   }));
-  button(comboRows(main)[0], "Xoá").click();
+  button(cards(main)[0], "Xoá").click();
   await flush();
 
   assert.match(text(pageNotice(main)), /Không xoá được combo đang dùng/);
-  assert.equal(comboRows(main).length, 2);
+  assert.equal(cards(main).length, 2);
 });
 
-// --- danh sách mắt xích chỉ-đọc (thay ô chọn kép cũ) ---
+// --- nhân bản ---
 
-test("the active combo's member list shows provider·model labels and a running badge", async (t) => {
+test("copying a combo creates a duplicate then saves its members", async (t) => {
+  const { calls, main } = await mounted(t);
+  button(cards(main)[0], "Nhân bản").click();
+  await settle();
+
+  const post = calls.find((call) => call.path === "/llm/combos" && call.options.method === "POST");
+  assert.deepEqual(post.options.body, { name: "Chính (bản sao)", type: "fallback" });
+  const put = putCalls(calls).find((call) => call.path === "/llm/combos/c-new");
+  assert.ok(put, "the copy must save the source combo's members onto the new combo");
+  assert.deepEqual(put.body.entries, [
+    { provider_id: "openai-1", model_id: "gpt-5", enabled: true },
+    { provider_id: "claude-code", model_id: "haiku", enabled: true },
+  ]);
+});
+
+// --- modal Sửa model: danh sách mắt xích ---
+
+test("the active combo's edit modal shows provider·model labels and a running badge", async (t) => {
   const { main } = await mounted(t);
+  const modal = openEdit(main, 0);
 
-  assert.deepEqual(memberLabels(main), ["OpenAI chính · GPT-5", "Claude Code · Haiku"]);
-  assert.equal(liveBadge(memberRows(main)[0]), "đang chạy");
-  assert.equal(liveBadge(memberRows(main)[1]), "");
+  assert.deepEqual(memberLabels(modal), ["OpenAI chính · GPT-5", "Claude Code · Haiku"]);
+  assert.equal(liveBadge(memberRows(modal)[0]), "đang chạy");
+  assert.equal(liveBadge(memberRows(modal)[1]), "");
 });
 
-test("selecting a combo swaps the member list without a running badge", async (t) => {
+test("opening a non-active combo's edit modal shows its members without a running badge", async (t) => {
   const { main } = await mounted(t);
-  find(comboRows(main)[1], (node) => hasClass(node, "cname")).click();
+  const modal = openEdit(main, 1);
 
-  assert.deepEqual(memberLabels(main), ["Gemini · Gemini 2"]);
-  // c2 không phải combo đang chạy, nên không mắt xích nào của nó đeo huy hiệu.
-  assert.equal(liveBadge(memberRows(main)[0]), "");
+  assert.deepEqual(memberLabels(modal), ["Gemini · Gemini 2"]);
+  assert.equal(liveBadge(memberRows(modal)[0]), "");
 });
 
-// --- model picker modal ---
+// --- model picker modal (lồng trong modal Sửa model) ---
 
 test("opening the picker lists every connected provider's models grouped by provider", async (t) => {
   const { main } = await mounted(t);
-  button(main, "Thêm model").click();
+  const modal = openEdit(main, 0);
+  button(modal, "Thêm model").click();
 
-  const modal = overlay();
-  assert.ok(modal, "the Thêm model button must open the picker overlay");
+  const picker = overlay();
+  assert.ok(picker, "the Thêm model button must open the picker overlay");
   // Chỉ Provider đang bật + có model: OpenAI chính, Gemini, Claude Code. Anthropic nghỉ bị loại.
-  assert.deepEqual(pickGroups(modal).map(text), ["OpenAI chính", "Gemini", "Claude Code"]);
-  assert.equal(pickRows(modal).length, 4);
+  assert.deepEqual(pickGroups(picker).map(text), ["OpenAI chính", "Gemini", "Claude Code"]);
+  assert.equal(pickRows(picker).length, 4);
 });
 
 test("typing in the picker search filters the visible models", async (t) => {
   const { main } = await mounted(t);
-  button(main, "Thêm model").click();
-  const modal = overlay();
-  const search = pickSearch(modal);
+  const modal = openEdit(main, 0);
+  button(modal, "Thêm model").click();
+  const picker = overlay();
+  const search = pickSearch(picker);
   search.value = "gpt";
   search.dispatchEvent({ type: "input" });
 
-  assert.equal(pickRows(modal).length, 2);
-  assert.deepEqual(pickGroups(modal).map(text), ["OpenAI chính"]);
+  assert.equal(pickRows(picker).length, 2);
+  assert.deepEqual(pickGroups(picker).map(text), ["OpenAI chính"]);
 });
 
 test("clicking a non-member model adds it and auto-saves carrying the combo revision; the next toggle uses the returned revision", async (t) => {
@@ -345,11 +402,12 @@ test("clicking a non-member model adds it and auto-saves carrying the combo revi
       entries: body.entries.map((entry, position) => ({ position, ...entry })),
     }),
   }));
-  button(main, "Thêm model").click();
+  const modal = openEdit(main, 0);
+  button(modal, "Thêm model").click();
   pickRow(overlay(), "Gemini 2").click();
   await settle();
 
-  assert.ok(memberLabels(main).includes("Gemini · Gemini 2"), "the clicked model becomes a member");
+  assert.ok(memberLabels(modal).includes("Gemini · Gemini 2"), "the clicked model becomes a member");
   const first = putCalls(calls).at(-1);
   assert.equal(first.body.revision, 4);
   assert.ok(
@@ -363,7 +421,7 @@ test("clicking a non-member model adds it and auto-saves carrying the combo revi
 
   const second = putCalls(calls).at(-1);
   assert.equal(second.body.revision, 104, "the second save must carry the revision the first save returned");
-  assert.equal(memberLabels(main).includes("Gemini · Gemini 2"), false, "clicking a member again removes it");
+  assert.equal(memberLabels(modal).includes("Gemini · Gemini 2"), false, "clicking a member again removes it");
 });
 
 test("a change enqueued while the first save is in flight carries the revision the first save returned", async (t) => {
@@ -385,13 +443,14 @@ test("a change enqueued while the first save is in flight carries the revision t
       return reply;
     },
   }));
+  const modal = openEdit(main, 0);
   // Đổi #1: xoá mắt xích claude/haiku → PUT #1 bay (revision 4) rồi treo.
-  button(memberRows(main)[1], "Xoá").click();
+  button(memberRows(modal)[1], "Xoá").click();
   await flush();
   assert.equal(putCalls(calls).length, 1, "the first change fires its save immediately");
 
   // Đổi #2 trong lúc PUT #1 CÒN treo: tắt mắt xích còn lại. saveChain phải giữ PUT #2 lại.
-  const box = find(memberRows(main)[0], (node) => node.getAttribute?.("type") === "checkbox");
+  const box = find(memberRows(modal)[0], (node) => node.getAttribute?.("type") === "checkbox");
   box.checked = false;
   box.dispatchEvent({ type: "change" });
   await flush();
@@ -410,38 +469,42 @@ test("a change enqueued while the first save is in flight carries the revision t
 
 test("clicking a model already in the combo removes it and auto-saves", async (t) => {
   const { calls, main } = await mounted(t);
-  button(main, "Thêm model").click();
+  const modal = openEdit(main, 0);
+  button(modal, "Thêm model").click();
   pickRow(overlay(), "GPT-5").click();
   await settle();
 
-  assert.deepEqual(memberLabels(main), ["Claude Code · Haiku"]);
+  assert.deepEqual(memberLabels(modal), ["Claude Code · Haiku"]);
   const put = putCalls(calls).at(-1);
   assert.equal(put.body.entries.some((entry) => entry.model_id === "gpt-5"), false);
 });
 
 test("removing a member from the list auto-saves", async (t) => {
   const { calls, main } = await mounted(t);
-  button(memberRows(main)[1], "Xoá").click();
+  const modal = openEdit(main, 0);
+  button(memberRows(modal)[1], "Xoá").click();
   await settle();
 
-  assert.deepEqual(memberLabels(main), ["OpenAI chính · GPT-5"]);
+  assert.deepEqual(memberLabels(modal), ["OpenAI chính · GPT-5"]);
   const put = putCalls(calls).at(-1);
   assert.deepEqual(put.body.entries, [{ provider_id: "openai-1", model_id: "gpt-5", enabled: true }]);
 });
 
 test("reordering a member from the list auto-saves the new order", async (t) => {
   const { calls, main } = await mounted(t);
-  button(memberRows(main)[0], "Xuống").click();
+  const modal = openEdit(main, 0);
+  button(memberRows(modal)[0], "Xuống").click();
   await settle();
 
-  assert.deepEqual(memberLabels(main), ["Claude Code · Haiku", "OpenAI chính · GPT-5"]);
+  assert.deepEqual(memberLabels(modal), ["Claude Code · Haiku", "OpenAI chính · GPT-5"]);
   const put = putCalls(calls).at(-1);
   assert.deepEqual(put.body.entries.map((entry) => entry.model_id), ["haiku", "gpt-5"]);
 });
 
 test("toggling a member's enable checkbox auto-saves", async (t) => {
   const { calls, main } = await mounted(t);
-  const box = find(memberRows(main)[0], (node) => node.getAttribute?.("type") === "checkbox");
+  const modal = openEdit(main, 0);
+  const box = find(memberRows(modal)[0], (node) => node.getAttribute?.("type") === "checkbox");
   box.checked = false;
   box.dispatchEvent({ type: "change" });
   await settle();
@@ -450,9 +513,10 @@ test("toggling a member's enable checkbox auto-saves", async (t) => {
   assert.equal(put.body.entries[0].enabled, false);
 });
 
-test("the per-combo type selector auto-saves on change", async (t) => {
+test("the editor's type selector inside the modal auto-saves on change", async (t) => {
   const { calls, main } = await mounted(t);
-  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  const modal = openEdit(main, 0);
+  const typeSelect = editorType(modal);
   typeSelect.value = "round_robin";
   typeSelect.dispatchEvent({ type: "change" });
   await settle();
@@ -484,7 +548,8 @@ test("a save conflict re-reads the fresh revision and retries the save once", as
       };
     },
   }));
-  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  const modal = openEdit(main, 0);
+  const typeSelect = editorType(modal);
   typeSelect.value = "round_robin";
   typeSelect.dispatchEvent({ type: "change" });
   await settle();
@@ -493,7 +558,7 @@ test("a save conflict re-reads the fresh revision and retries the save once", as
   assert.equal(puts.length, 2, "a conflict must trigger exactly one retry");
   assert.equal(puts[0].body.revision, 4, "the first save uses the stale revision");
   assert.equal(puts[1].body.revision, 9, "the retry uses the revision from the re-read");
-  assert.equal(button(main, "Tải lại combo"), null, "a self-healed save must not offer the reload control");
+  assert.equal(button(comboModal(), "Tải lại combo"), null, "a self-healed save must not offer the reload control");
 });
 
 test("a persistent conflict keeps the members and offers a reload", async (t) => {
@@ -506,18 +571,19 @@ test("a persistent conflict keeps the members and offers a reload", async (t) =>
       });
     },
   }));
-  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  const modal = openEdit(main, 0);
+  const typeSelect = editorType(modal);
   typeSelect.value = "round_robin";
   typeSelect.dispatchEvent({ type: "change" });
   await settle();
 
-  assert.match(text(editorNotice(main)), /lưu ở nơi khác/);
-  assert.ok(button(main, "Tải lại combo"), "a persistent conflict offers the reload control");
+  assert.match(text(editorNotice()), /lưu ở nơi khác/);
+  assert.ok(button(comboModal(), "Tải lại combo"), "a persistent conflict offers the reload control");
   // Danh sách mắt xích còn nguyên: không bị vẽ lại thành trống.
-  assert.deepEqual(memberLabels(main), ["OpenAI chính · GPT-5", "Claude Code · Haiku"]);
+  assert.deepEqual(memberLabels(comboModal()), ["OpenAI chính · GPT-5", "Claude Code · Haiku"]);
 });
 
-test("reloading a combo re-syncs the list rows to the fresh fetch", async (t) => {
+test("reloading a combo re-syncs the card list to the fresh fetch", async (t) => {
   let reads = 0;
   const { main } = await mounted(t, comboAPI({
     save: () => {
@@ -526,18 +592,19 @@ test("reloading a combo re-syncs the list rows to the fresh fetch", async (t) =>
     combos: () => {
       reads += 1;
       if (reads <= 1) return COMBOS;
-      // Ai đó đổi kiểu c1 fallback → round_robin ở nơi khác; lượt tải lại phải cập nhật huy hiệu.
+      // Ai đó đổi kiểu c1 fallback → round_robin ở nơi khác; lượt tải lại phải cập nhật thẻ.
       return { combos: [{ ...COMBOS.combos[0], type: "round_robin", revision: 9 }, COMBOS.combos[1]] };
     },
   }));
-  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  const modal = openEdit(main, 0);
+  const typeSelect = editorType(modal);
   typeSelect.value = "round_robin";
   typeSelect.dispatchEvent({ type: "change" });
   await settle();
-  button(main, "Tải lại combo").click();
+  button(comboModal(), "Tải lại combo").click();
   await settle();
 
-  assert.deepEqual(comboRows(main).map(typeBadge), ["Round Robin", "Round Robin"]);
+  assert.deepEqual(cards(main).map((card) => cardTypeSel(card).value), ["round_robin", "round_robin"]);
 });
 
 test("clicking reload closes an open model picker", async (t) => {
@@ -546,15 +613,16 @@ test("clicking reload closes an open model picker", async (t) => {
       throw new AppAPIError({ code: "COMBO_REVISION_CONFLICT", message: "xung đột", status: 409 });
     },
   }));
+  const modal = openEdit(main, 0);
   // Xung đột dai → hiện nút "Tải lại combo".
-  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  const typeSelect = editorType(modal);
   typeSelect.value = "round_robin";
   typeSelect.dispatchEvent({ type: "change" });
   await settle();
-  // Mở modal rồi tải lại: tải lại vứt bản nháp nên checkmark của modal đã lỗi thời — modal phải đóng.
-  button(main, "Thêm model").click();
+  // Mở picker rồi tải lại: tải lại vứt bản nháp nên checkmark của picker đã lỗi thời — picker phải đóng.
+  button(comboModal(), "Thêm model").click();
   assert.ok(overlay(), "the picker is open before reload");
-  button(main, "Tải lại combo").click();
+  button(comboModal(), "Tải lại combo").click();
   await settle();
 
   assert.equal(overlay(), null, "reload must close the open picker");
@@ -569,16 +637,18 @@ test("a combo deleted elsewhere self-corrects during an auto-save conflict", asy
     combos: () => {
       reads += 1;
       if (reads <= 1) return COMBOS;
-      return { combos: [COMBOS.combos[1]] }; // c1 (đang chọn) đã bị xoá ở nơi khác
+      return { combos: [COMBOS.combos[1]] }; // c1 (đang sửa) đã bị xoá ở nơi khác
     },
   }));
-  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  const modal = openEdit(main, 0);
+  const typeSelect = editorType(modal);
   typeSelect.value = "round_robin";
   typeSelect.dispatchEvent({ type: "change" });
   await settle();
 
-  assert.equal(comboRows(main).length, 1);
-  assert.deepEqual(memberLabels(main), ["Gemini · Gemini 2"]);
+  assert.equal(cards(main).length, 1, "the deleted combo drops out of the card list");
+  assert.equal(cardName(cards(main)[0]), "Luân phiên");
+  assert.equal(comboModal(), null, "the edit modal closes when its combo is deleted elsewhere");
   assert.match(text(pageNotice(main)), /đã bị xoá ở nơi khác/);
 });
 
