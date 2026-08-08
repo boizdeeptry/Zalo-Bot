@@ -10,17 +10,31 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // codexBackendURL là endpoint responses của codex ở chế độ ChatGPT-subscription (capture từ codex.exe).
 const codexBackendURL = "https://chatgpt.com/backend-api/codex/responses"
+
+// codexTokenURL + codexClientID: refresh token OAuth. client_id là ĐỊNH DANH CÔNG KHAI của codex CLI
+// (public/native client, không phải bí mật) — ghim từ codex.exe. Refresh dùng grant_type=refresh_token.
+const (
+	codexTokenURL  = "https://auth.openai.com/oauth/token"
+	codexClientID  = "app_EMoamEEZ73f0CkXaXp7hrann"
+	codexUserAgent = "codex_cli_rs/0.0.0"
+	codexScope     = "openid profile email"
+)
 
 // --- PX2: token store — đọc token OAuth từ <CODEX_HOME>/auth.json của một account ---
 
@@ -148,4 +162,170 @@ func parseCodexSSE(r io.Reader) (string, error) {
 		return "", errors.New("codex responses không có nội dung")
 	}
 	return text, nil
+}
+
+// --- PX3 (phần mạng): gọi endpoint responses ---
+
+// newCodexSessionID sinh một session_id kiểu UUIDv4 cho header. crypto/rand (không math/rand) — id
+// gửi lên backend, không để trùng/đoán được.
+func newCodexSessionID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// codexDoResponses gửi MỘT lượt hỏi tới backend responses với đúng bộ header tối thiểu mà probe đã
+// xác nhận nhận (200). Trả (text, statusCode, err). status != 200 KHÔNG phải err — caller phân loại
+// (401 → refresh, 429 → rate limit…). Thân lỗi của backend KHÔNG đi vào err (có thể chép token/khoá).
+func codexDoResponses(ctx context.Context, client *http.Client, tok codexTokens, model, prompt string) (string, int, error) {
+	body, err := codexResponsesBody(model, prompt)
+	if err != nil {
+		return "", 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexBackendURL, bytes.NewReader(body))
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	req.Header.Set("chatgpt-account-id", tok.AccountID)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("OpenAI-Beta", "responses=experimental")
+	req.Header.Set("originator", "codex_cli_rs")
+	req.Header.Set("User-Agent", codexUserAgent)
+	req.Header.Set("session_id", newCodexSessionID())
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16)) // drain để tái dùng kết nối; KHÔNG đưa vào lỗi
+		return "", resp.StatusCode, nil
+	}
+	text, perr := parseCodexSSE(resp.Body)
+	return text, resp.StatusCode, perr
+}
+
+// --- PX4: refresh token ---
+
+// refreshCodexToken đổi refresh_token lấy access_token mới qua oauth/token. Trả token mới (access +
+// có thể refresh/id mới). Không log secret. Lỗi khi refresh_token vắng, mạng, hoặc backend != 200.
+func refreshCodexToken(ctx context.Context, client *http.Client, refreshToken string) (codexTokens, error) {
+	if refreshToken == "" {
+		return codexTokens{}, errors.New("thiếu refresh_token")
+	}
+	body, err := json.Marshal(map[string]string{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+		"client_id":     codexClientID,
+		"scope":         codexScope,
+	})
+	if err != nil {
+		return codexTokens{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexTokenURL, bytes.NewReader(body))
+	if err != nil {
+		return codexTokens{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", codexUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return codexTokens{}, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return codexTokens{}, fmt.Errorf("oauth/token trả %d", resp.StatusCode)
+	}
+	var r struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return codexTokens{}, fmt.Errorf("parse oauth/token: %w", err)
+	}
+	if r.AccessToken == "" {
+		return codexTokens{}, errors.New("oauth/token không có access_token")
+	}
+	return codexTokens{AccessToken: r.AccessToken, RefreshToken: r.RefreshToken, IDToken: r.IDToken}, nil
+}
+
+// writeCodexTokens ghi token mới (sau refresh) vào auth.json, GIỮ NGUYÊN mọi trường khác của file (codex
+// tự thêm field mới) — đọc vào map, chỉ thay access/refresh/id + last_refresh. Ghi qua .tmp rồi rename
+// cho nguyên tử. refresh/id rỗng thì giữ giá trị cũ (một số refresh không trả refresh_token mới).
+func writeCodexTokens(configDir string, tok codexTokens, lastRefresh string) error {
+	path := codexAuthPath(configDir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("đọc auth.json: %w", err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse auth.json: %w", err)
+	}
+	tokObj := map[string]json.RawMessage{}
+	if raw, ok := root["tokens"]; ok {
+		_ = json.Unmarshal(raw, &tokObj)
+	}
+	set := func(m map[string]json.RawMessage, k, v string) {
+		if v == "" {
+			return
+		}
+		b, _ := json.Marshal(v)
+		m[k] = b
+	}
+	set(tokObj, "access_token", tok.AccessToken)
+	set(tokObj, "refresh_token", tok.RefreshToken)
+	set(tokObj, "id_token", tok.IDToken)
+	set(tokObj, "account_id", tok.AccountID)
+	tb, err := json.Marshal(tokObj)
+	if err != nil {
+		return err
+	}
+	root["tokens"] = tb
+	set(root, "last_refresh", lastRefresh)
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return fmt.Errorf("ghi auth.json.tmp: %w", err)
+	}
+	return os.Rename(tmp, path)
+}
+
+// codexProxyGenerate là một lượt hỏi HOÀN CHỈNH qua proxy: đọc token của account → gọi responses →
+// nếu 401 thì refresh MỘT lần, ghi lại auth.json, rồi thử lại → parse SSE. Trả text hoặc lỗi kèm
+// statusCode để router phân loại (429 rate limit, 401/403 credential…).
+func codexProxyGenerate(ctx context.Context, client *http.Client, configDir, model, prompt string) (string, int, error) {
+	tok, err := readCodexTokens(configDir)
+	if err != nil {
+		return "", 0, err
+	}
+	text, status, err := codexDoResponses(ctx, client, tok, model, prompt)
+	if status == http.StatusUnauthorized {
+		newTok, rerr := refreshCodexToken(ctx, client, tok.RefreshToken)
+		if rerr != nil {
+			return "", status, fmt.Errorf("refresh token: %w", rerr)
+		}
+		if newTok.RefreshToken == "" {
+			newTok.RefreshToken = tok.RefreshToken // refresh không trả cái mới → giữ cái cũ
+		}
+		newTok.AccountID = tok.AccountID
+		_ = writeCodexTokens(configDir, newTok, time.Now().UTC().Format(time.RFC3339)) // best-effort: lỗi ghi không chặn lượt
+		text, status, err = codexDoResponses(ctx, client, newTok, model, prompt)
+	}
+	if err != nil {
+		return "", status, err
+	}
+	if status != http.StatusOK {
+		return "", status, fmt.Errorf("codex backend trả %d", status)
+	}
+	return text, status, nil
 }
