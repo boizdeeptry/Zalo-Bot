@@ -1,10 +1,19 @@
 # Planning state
 
-step: done
-current_topic:
+step: execute
+current_topic: cli-models-combo-modal
 current_spec:
-current_plan:
+current_plan: .planning/plans/2026-08-08-cli-models-combo-modal.md
 last_updated: 2026-08-08
+
+## Đang làm: CLI models hiện ra + combo model-picker modal (9Router-style) — follow-up sau test
+
+Nhánh `feat/cli-models-combo-modal` off main `4f48d94`. User test bản mới thấy 2 lỗ hổng:
+- **A**: Claude Code = 0 model. GỐC: claude-code KHÔNG có adapter (chạy runClaude), mà `handleLLMProviderDiscover`
+  cần adapter → không lấy được model tĩnh (modelSeeds sonnet/opus/fable trong descriptor). Sửa: descriptor-discover
+  cho claude-code + auto-populate model lúc startup (claude-code) + lúc connect (kind). Codex vốn discover được.
+- **B**: combo cần **modal chọn model** như 9Router (search + click add/bớt, auto-save) thay vì dropdown từng dòng.
+- Plan `.planning/plans/2026-08-08-cli-models-combo-modal.md` — 3 task (CM1 backend models, CM2 modal, CM3 CSS+gate).
 
 ## SHIPPED 2026-08-08 → main (`78d1980`) — Claude connect-in-Portal + multi-account
 
