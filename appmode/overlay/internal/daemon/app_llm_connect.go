@@ -60,8 +60,10 @@ type connectRunner interface {
 	accountLabel(kind, configDir string) string
 }
 
-// subscriptionKinds: only these kinds may connect. Both route through cliAdapter with their own
-// isolated config dir. claude-code's kind is unified (migration seeded claude_code → claude-code).
+// subscriptionKinds: only these kinds may connect. Codex routes through cliAdapter; claude-code
+// runs via runClaude/execZaloRunner (agentic KB --add-dir access — NOT a cliAdapter). Both hold
+// their own isolated config dir (CODEX_HOME / CLAUDE_CONFIG_DIR). claude-code's kind is unified
+// (migration seeded claude_code → claude-code).
 var subscriptionKinds = map[string]bool{"codex": true, "claude-code": true}
 
 var errConnectBusy = errors.New("connect: đang có phiên kết nối khác")

@@ -57,6 +57,17 @@ func TestScanClaudeLoginURL(t *testing.T) {
 	}
 }
 
+// TestClaudeEmailFromJSON pins the parser that sets the account label: the real `claude auth status
+// --json` shape yields the email, and malformed JSON yields "" (account falls back to job.label).
+func TestClaudeEmailFromJSON(t *testing.T) {
+	if got := claudeEmailFromJSON([]byte(`{"email":"a@b.com","loggedIn":true}`)); got != "a@b.com" {
+		t.Errorf("claudeEmailFromJSON(valid) = %q; want a@b.com", got)
+	}
+	if got := claudeEmailFromJSON([]byte("garbage")); got != "" {
+		t.Errorf("claudeEmailFromJSON(garbage) = %q; want empty", got)
+	}
+}
+
 // TestConnectClaudeLabelsAccountWithEmail proves the claude-code branch: the account is labeled
 // with the email accountLabel reads from `claude auth status --json` (overriding the user-given
 // label), and the Portal snapshot still leaks no config dir.
