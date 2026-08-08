@@ -1,10 +1,27 @@
 # Planning state
 
-step: done
-current_topic:
-current_spec:
+step: plan
+current_topic: claude-connect
+current_spec: .planning/specs/2026-08-08-claude-connect-design.md
 current_plan:
 last_updated: 2026-08-08
+
+## Đang làm: Claude connect-in-Portal + multi-account — SPEC XONG, CHẶN ở checkpoint LOGIN
+
+Nhánh `feat/claude-cliadapter` (off main `8b92c57`). **Reframe từ "Task 11 gộp Claude vào cliAdapter"** —
+Explore chứng minh gộp sẽ HỎNG KB/tool của Claude (adapter chung cho CLI stateless; Claude agentic đọc KB
+qua `--add-dir` trong `execZaloRunner`). BỎ merge, giữ `runClaude`. Thay bằng:
+- **Part 1 (overlay)**: Claude connect-in-Portal — `claude auth login` là browser-OAuth IM LẶNG (không device-auth,
+  không URL/code ra pipe; mở browser + block tới khi exit 0). `CLAUDE_CONFIG_DIR` cô lập (đã xác nhận). Connect
+  runner nhánh claude (no code UI, chờ exit-0), kind unify `claude_code`→`claude-code`.
+- **Part 2 (BASE AgentDC repo)**: multi-account — `execZaloRunner` (duty.go) nhận per-turn `CLAUDE_CONFIG_DIR`;
+  `appClaudeRunner` chọn account claude-code qua `accountSel`. Đây là thay đổi ĐẦU TIÊN vào base repo.
+- Spec: `.planning/specs/2026-08-08-claude-connect-design.md`.
+- **CHẶN — NEEDS-LOGIN checkpoint**: Claude đang LOGGED OUT trên máy. Phải `claude auth login` thật (hành động
+  OAuth của user) để verify: daemon ẩn có mở được browser? login exit 0 khi xong? `auth status` flip trong dir?
+  consult turn với `CLAUDE_CONFIG_DIR=<dir>` dùng đúng account? → rồi mới `/plan` → execute.
+- **Lỗi cần nhớ**: ĐỪNG `Get-Process claude | Kill` — agent runtime LÀ claude, quét trúng cả session mình +
+  các claude khác. Chỉ kill đúng PID mình spawn.
 
 ## SHIPPED 2026-08-08 → main (`5551c4b`)
 
