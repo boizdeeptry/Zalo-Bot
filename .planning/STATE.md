@@ -1,9 +1,9 @@
 # Planning state
 
-step: plan
+step: execute
 current_topic: claude-connect
 current_spec: .planning/specs/2026-08-08-claude-connect-design.md
-current_plan:
+current_plan: .planning/plans/2026-08-08-claude-connect.md
 last_updated: 2026-08-08
 
 ## Đang làm: Claude connect-in-Portal + multi-account — SPEC XONG, checkpoint LOGIN ĐÃ QUA → sẵn sàng /plan
