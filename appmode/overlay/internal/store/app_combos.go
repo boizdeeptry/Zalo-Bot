@@ -70,12 +70,18 @@ func (s *Store) comboMembers(comboID string) ([]LLMRouteEntry, error) {
 		e.Enabled = enabled == 1
 		entries = append(entries, e)
 	}
-	return entries, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate combo members %s: %w", comboID, err)
+	}
+	return entries, nil
 }
 
 // CreateLLMCombo thêm một combo INACTIVE: chỉ đổi combo đang phục vụ qua SetActiveLLMCombo,
 // nên combo mới không được tự cướp lượt định tuyến khỏi combo đang chạy.
 func (s *Store) CreateLLMCombo(name, typ string) (LLMCombo, error) {
+	if name == "" {
+		return LLMCombo{}, fmt.Errorf("create combo: cần tên")
+	}
 	if typ != "fallback" && typ != "round_robin" {
 		return LLMCombo{}, fmt.Errorf("create combo: type lạ %q", typ)
 	}

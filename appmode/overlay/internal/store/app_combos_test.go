@@ -17,9 +17,26 @@ func TestCreateComboIsInactiveByDefault(t *testing.T) {
 	if c.Active {
 		t.Error("new combo is active; want inactive (default stays active)")
 	}
+	// Handler HTTP echo lại struct này KHÔNG đọc lại DB, nên các trường phải đúng ngay tại đây.
+	if c.ID == "" {
+		t.Error("CreateLLMCombo returned empty ID")
+	}
+	if c.Name != "Xoay vòng" || c.Type != "round_robin" || c.Revision != 1 {
+		t.Errorf("returned combo = (%q,%q,rev %d); want (Xoay vòng,round_robin,1)", c.Name, c.Type, c.Revision)
+	}
 	combos, err := st.LLMCombos()
 	if err != nil || len(combos) != 2 {
 		t.Fatalf("LLMCombos() = %d combos, %v; want 2", len(combos), err)
+	}
+}
+
+func TestCreateComboRejectsBadInput(t *testing.T) {
+	st := newLLMStore(t)
+	if _, err := st.CreateLLMCombo("", "fallback"); err == nil {
+		t.Error("CreateLLMCombo empty name = nil; want error")
+	}
+	if _, err := st.CreateLLMCombo("x", "bogus"); err == nil {
+		t.Error(`CreateLLMCombo type "bogus" = nil; want error`)
 	}
 }
 
