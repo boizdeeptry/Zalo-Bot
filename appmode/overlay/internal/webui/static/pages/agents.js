@@ -84,7 +84,7 @@ function agentFacts(agent, openDocument) {
     on: { click(event) { openDocument(name, event.currentTarget); } },
   });
   return element("div", { className: "facts" },
-    fact("Mô hình", agent.model || "(mặc định)", "đổi ở mục Models"),
+    fact("Mô hình", agent.model || "(mặc định)", "đổi ở mục Combos"),
     fact("Phạm vi quyền", Array.isArray(agent.tools) ? agent.tools.join(", ") : "", "CHỈ ĐỌC, không đổi được từ đây"),
     fact("Tệp văn phong", agent.persona_name, `${Math.round((agent.persona_size || 0) / 1024)} KB`, pencil("persona")),
     fact("Sổ tay thành viên", shortPath(agent.roster_path), null, pencil("roster")),

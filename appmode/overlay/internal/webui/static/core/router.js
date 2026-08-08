@@ -21,7 +21,7 @@ export const NAVIGATION = Object.freeze([
         todo: "Nối agent với công cụ ngoài qua MCP: CRM, đơn hàng, tồn kho.",
       },
       { id: "providers", icon: "🔌", label: "Providers" },
-      { id: "models", icon: "🧩", label: "Models" },
+      { id: "combos", icon: "🧩", label: "Combos" },
       {
         id: "memory",
         icon: "🗃",

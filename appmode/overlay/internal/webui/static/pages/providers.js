@@ -235,7 +235,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
 
       const header = () => pageHeader(
         "Providers",
-        "Các nhà cung cấp mô hình mà bot được phép gọi. Thứ tự thử nằm ở mục Models.",
+        "Các nhà cung cấp mô hình mà bot được phép gọi. Thứ tự thử nằm ở mục Combos.",
       );
       const live = element("span", { className: "note", attributes: { "aria-live": "polite" } });
 

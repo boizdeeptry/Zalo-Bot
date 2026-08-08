@@ -8,7 +8,7 @@ import {
 
 test("known and unknown hashes resolve predictably", () => {
   assert.equal(routeFromHash("#providers"), "providers");
-  assert.equal(routeFromHash("#models"), "models");
+  assert.equal(routeFromHash("#combos"), "combos");
   assert.equal(routeFromHash("#workflows"), "workflows");
   assert.equal(routeFromHash("#not-a-page"), "knowledge");
   assert.equal(routeFromHash(""), "knowledge");

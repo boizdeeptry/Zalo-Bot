@@ -36,7 +36,7 @@ test("navigation exposes the legacy menu contract", () => {
           href: undefined,
         },
         { id: "providers", icon: "🔌", label: "Providers", todo: undefined, href: undefined },
-        { id: "models", icon: "🧩", label: "Models", todo: undefined, href: undefined },
+        { id: "combos", icon: "🧩", label: "Combos", todo: undefined, href: undefined },
         {
           id: "memory",
           icon: "🗃",

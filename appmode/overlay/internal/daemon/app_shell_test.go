@@ -19,7 +19,8 @@ func TestAppPortalShellAssetsAreEmbedded(t *testing.T) {
 		"core/shell.js",
 		"pages/agents.js",
 		"pages/knowledge.js",
-		"pages/models.js",
+		"pages/combos.js",
+		"pages/route-editor.js",
 		"pages/providers.js",
 		"pages/roadmap.js",
 	} {

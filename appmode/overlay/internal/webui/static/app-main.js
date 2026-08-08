@@ -11,8 +11,8 @@ const implementedPages = Object.freeze({
     const page = await import("./pages/knowledge.js");
     return { mount: page.mount };
   },
-  models: async () => {
-    const page = await import("./pages/models.js");
+  combos: async () => {
+    const page = await import("./pages/combos.js");
     return { mount: page.mount };
   },
   providers: async () => {
