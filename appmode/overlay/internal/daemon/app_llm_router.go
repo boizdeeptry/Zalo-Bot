@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"sync"
 	"time"
 
 	"agentdc/internal/ipc"
@@ -55,8 +56,8 @@ type appLLMRunnerConfig struct {
 	// model nào, và giữa hai lần đọc đó route đổi được — khi ấy lượt chạy một model trong khi
 	// telemetry ghi model kia.
 	//
-	// Luôn có mặt: validateLLMRoute không cho lưu chuỗi kết thúc bằng thứ khác Claude Code, nên
-	// router không cần một nhánh "nếu không còn gì".
+	// Luôn có mặt: appZaloRunner luôn tiêm nó (validateLLMRoute chỉ đòi mắt xích cuối đang bật —
+	// chuỗi không kết thúc bằng Claude Code vẫn hợp lệ), nên router không cần nhánh "nếu không còn gì".
 	Claude func(model string) zaloRunner
 	// Disabled là id của những Provider API đang TẮT, và nó là công tắc ngắt SỐNG.
 	//
@@ -131,6 +132,13 @@ func (r *appLLMRunner) Run(ctx context.Context, prompt string, step func(string)
 			return r.runClaude(ctx, e, prompt, step)
 		}
 		return r.runCLIAttachment(ctx, r.cfg.Adapters[e.ProviderID], e, prompt)
+	}
+
+	// Round-robin: xoay chuỗi để lượt này bắt đầu ở mắt xích kế con trỏ combo, rồi vẫn fallthrough
+	// hết phần còn lại. CHỈ vòng fallback API bị xoay — nhánh HasAttachments ở trên đã trả về, nên
+	// định tuyến tệp giữ NGUYÊN thứ tự (firstEligibleCLIEntry là ranh giới ổn định, không round-robin).
+	if snapshot.Type == "round_robin" {
+		entries = rotate(entries, comboRR.next(snapshot.ComboID, len(entries)))
 	}
 
 	apiCtx, cancel := context.WithTimeout(ctx, r.cfg.APIChainTimeout)
@@ -391,6 +399,44 @@ func (r *appLLMRunner) nextProvider(entries []store.LLMRouteEntry, from int) str
 	}
 	return ""
 }
+
+// rotate trả một lát cắt bắt đầu ở offset k rồi vòng về đầu: entries[k:] + entries[:k]. Thuần,
+// không sửa đầu vào (Run đã Clone snapshot.Entries). k phải trong [0,len).
+func rotate(entries []store.LLMRouteEntry, k int) []store.LLMRouteEntry {
+	n := len(entries)
+	if n == 0 || k%n == 0 {
+		return entries
+	}
+	k %= n
+	out := make([]store.LLMRouteEntry, 0, n)
+	out = append(out, entries[k:]...)
+	out = append(out, entries[:k]...)
+	return out
+}
+
+// comboRRCursor là con trỏ round-robin in-memory theo combo id — đối xứng accountSel (app_llm_accounts.go):
+// `api` khai ở base repo không thêm field được, và runner dựng mới mỗi lượt nên cursor không ở đó
+// được. Guard mutex; restart reset (vô hại: cùng lắm lệch một lượt phân bổ).
+type comboRRCursor struct {
+	mu     sync.Mutex
+	cursor map[string]int
+}
+
+func newComboRR() *comboRRCursor { return &comboRRCursor{cursor: map[string]int{}} }
+
+// next trả offset hiện tại cho combo rồi tăng con trỏ (mod n). n<=0 → 0.
+func (c *comboRRCursor) next(comboID string, n int) int {
+	if n <= 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := c.cursor[comboID] % n
+	c.cursor[comboID] = (k + 1) % n
+	return k
+}
+
+var comboRR = newComboRR()
 
 // --- dây nối bản chạy ---
 
