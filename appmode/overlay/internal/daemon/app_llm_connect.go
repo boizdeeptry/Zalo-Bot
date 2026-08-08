@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -53,11 +54,15 @@ type connectRunner interface {
 	install(ctx context.Context, kind string, onLine func(string)) error
 	login(ctx context.Context, kind, configDir string) (loginURL, code string, wait func() error, err error)
 	pollAuth(kind, configDir string) authState
+	// accountLabel returns a vendor-supplied display label for the connected account, or "" to
+	// keep the user-given label. codex prints no email → ""; claude-code returns the signed-in
+	// email from `claude auth status --json`.
+	accountLabel(kind, configDir string) string
 }
 
-// subscriptionKinds: only these kinds may connect. claude-code joins when its kind is unified
-// (seeded claude_code → claude-code) and it routes through cliAdapter.
-var subscriptionKinds = map[string]bool{"codex": true}
+// subscriptionKinds: only these kinds may connect. Both route through cliAdapter with their own
+// isolated config dir. claude-code's kind is unified (migration seeded claude_code → claude-code).
+var subscriptionKinds = map[string]bool{"codex": true, "claude-code": true}
 
 var errConnectBusy = errors.New("connect: đang có phiên kết nối khác")
 
@@ -208,8 +213,14 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 				return
 			}
 			now := time.Now()
+			// Prefer the vendor's own label (claude → signed-in email); fall back to the user-given
+			// one (codex prints no email → accountLabel returns "").
+			label := m.runner.accountLabel(kind, job.configDir)
+			if label == "" {
+				label = job.label
+			}
 			acct := store.LLMAccount{
-				ID: job.accountID, ProviderID: kind, Label: job.label,
+				ID: job.accountID, ProviderID: kind, Label: label,
 				ConfigDir: job.configDir, Enabled: true, AddedAt: &now,
 			}
 			if err := m.createAccount(acct); err != nil {
@@ -289,6 +300,11 @@ func (d *defaultConnectRunner) detect(kind string) (bool, error) {
 // to the same prefix, so codex.js is found where npm just put it. On a dev box it uses PATH npm and
 // the machine's global prefix, unchanged.
 func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine func(string)) error {
+	// Claude Code is a native binary, not an npm package — we can't install it. Tell the user where
+	// to get it; the state machine surfaces this as install-failed.
+	if kind == "claude-code" {
+		return fmt.Errorf("Claude Code chưa cài — cài tại claude.com/claude-code rồi thử lại")
+	}
 	pkg := cliDescriptors[kind].npmPackage
 	if pkg == "" {
 		return fmt.Errorf("connect install: kind %q không cài qua npm", kind)
@@ -327,13 +343,35 @@ var connectCodeRe = regexp.MustCompile(`\b[A-Z0-9]{3,6}-[A-Z0-9]{3,6}\b`)
 // capture a trailing "\x1b[0m" into the URL. Strip before matching, per line.
 var connectANSIRe = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
+// stripANSI removes SGR color escapes from a line before matching — shared by scanDeviceAuth and
+// scanClaudeLoginURL so both scanners agree on how ANSI is handled (see connectANSIRe).
+func stripANSI(s string) string { return connectANSIRe.ReplaceAllString(s, "") }
+
+// claudeVisitRe pulls the login URL out of claude's "…visit: https://…" line. claude login is
+// browser-OAuth: it prints a URL, NO device code — so the code capture in scanDeviceAuth has no
+// analog here.
+var claudeVisitRe = regexp.MustCompile(`visit:\s*(https://\S+)`)
+
+// scanClaudeLoginURL reads `claude auth login --claudeai` stdout and returns the browser-OAuth URL
+// (empty if none seen). Pure (reader-only) so it's testable against the captured sample directly —
+// see TestScanClaudeLoginURL.
+func scanClaudeLoginURL(r io.Reader) string {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		if m := claudeVisitRe.FindStringSubmatch(stripANSI(sc.Text())); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
 // scanDeviceAuth reads `login --device-auth` stdout and pulls the login URL + one-time code.
 // Pure (no process, no I/O beyond the given reader) so it's testable against the captured
 // codex 0.147.0 sample directly — see TestScanDeviceAuth.
 func scanDeviceAuth(r io.Reader) (url, code string) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
-		line := connectANSIRe.ReplaceAllString(sc.Text(), "")
+		line := stripANSI(sc.Text())
 		if url == "" {
 			if m := connectURLRe.FindString(line); m != "" {
 				url = m
@@ -359,6 +397,9 @@ func scanDeviceAuth(r io.Reader) (url, code string) {
 // only kills the direct node child and would orphan its grandchildren — same hazard runCLIProcess
 // documents.
 func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string) (string, string, func() error, error) {
+	if kind == "claude-code" {
+		return d.loginClaude(ctx, configDir)
+	}
 	desc, ok := cliDescriptors[kind]
 	if !ok {
 		return "", "", nil, fmt.Errorf("connect login: kind lạ %q", kind)
@@ -425,6 +466,64 @@ func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string
 	}
 }
 
+// loginClaude runs `claude auth login --claudeai` with CLAUDE_CONFIG_DIR=configDir, scans stdout
+// for the browser-OAuth URL (NO device code — claude prints only a URL), and returns a wait() that
+// blocks on process exit (authorize → "Login successful." → exit 0 writes creds into configDir).
+// Mirrors login()'s codex discipline EXACTLY: exec.Command + killPidTree on ctx cancel (not
+// CommandContext, which would orphan claude's grandchildren), reap-before-read-stderr, and a
+// timeout that kills+reaps if the URL never appears.
+func (d *defaultConnectRunner) loginClaude(ctx context.Context, configDir string) (string, string, func() error, error) {
+	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
+	if err != nil {
+		return "", "", nil, fmt.Errorf("connect login: resolve claude-code: %w", err)
+	}
+	argv := append(append([]string{}, prefixArgs...), "auth", "login", "--claudeai")
+	cmd := exec.Command(program, argv...)
+	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+configDir)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", "", nil, err
+	}
+	pid := cmd.Process.Pid
+	// Kill the whole tree when ctx is cancelled — covers cancel during the URL-wait below AND the
+	// post-return polling phase (run() cancels ctx on every terminal exit). Bounded: exits on ctx done.
+	go func() {
+		<-ctx.Done()
+		_ = killPidTree(pid, "connect-login", d.logger)
+	}()
+	urlCh := make(chan string, 1)
+	// Bounded: exits when the visit line is seen or the pipe closes (process exit).
+	go func() { urlCh <- scanClaudeLoginURL(stdout) }()
+	select {
+	case u := <-urlCh:
+		if u == "" {
+			_ = killPidTree(pid, "connect-login", d.logger)
+			// Reap BEFORE reading errBuf — cmd.Stderr is a bytes.Buffer fed by an internal copy
+			// goroutine that only settles once Wait returns (same as login()'s codex branch).
+			_ = cmd.Wait()
+			if d.logger != nil {
+				d.logger.Error("connect login: không đọc được URL", "kind", "claude-code", "stderr", errBuf.String())
+			}
+			return "", "", nil, errors.New("không đọc được URL đăng nhập từ claude")
+		}
+		wait := func() error { return cmd.Wait() }
+		return u, "", wait, nil
+	case <-time.After(45 * time.Second):
+		_ = killPidTree(pid, "connect-login", d.logger)
+		_ = cmd.Wait() // reap — see the url-empty branch above for why
+		return "", "", nil, errors.New("claude không in URL đăng nhập trong 45s")
+	case <-ctx.Done():
+		// the kill goroutine above handles the tree kill; still need to reap here too.
+		_ = cmd.Wait()
+		return "", "", nil, ctx.Err()
+	}
+}
+
 // pollAuth runs `node <codex.js> login status` with <envVarFor(kind)>=configDir — cheap, no
 // subscription turn spent. Captured live (codex-cli 0.147.0): exit 0 + "Logged in using ChatGPT"
 // when signed in, exit 1 + "Not logged in" otherwise. codex prints no email, so the account label
@@ -433,6 +532,9 @@ func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string
 // Uses CommandContext (unlike login's killPidTree tree-kill): this is a short, read-only status
 // probe with no node grandchildren to orphan — same reasoning as probeClaudeAuth in app_llm_cli.go.
 func (d *defaultConnectRunner) pollAuth(kind, configDir string) authState {
+	if kind == "claude-code" {
+		return d.pollAuthClaude(configDir)
+	}
 	desc, ok := cliDescriptors[kind]
 	if !ok {
 		return authUnknown
@@ -464,13 +566,68 @@ func (d *defaultConnectRunner) pollAuth(kind, configDir string) authState {
 	return authUnknown // couldn't even spawn → unknown, not logged-out
 }
 
+// pollAuthClaude runs `claude auth status --json` with CLAUDE_CONFIG_DIR=configDir and reads
+// loggedIn — a backup signal to login's wait-exit-0. Mirrors probeClaudeAuth's discipline:
+// CommandContext is enough (claude is a single process, no node grandchildren to orphan), and the
+// body is read even on non-zero exit (claude prints valid {"loggedIn":false} while exiting ≠0).
+func (d *defaultConnectRunner) pollAuthClaude(configDir string) authState {
+	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
+	if err != nil {
+		return authUnknown
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	argv := append(append([]string{}, prefixArgs...), "auth", "status", "--json")
+	cmd := exec.CommandContext(ctx, program, argv...)
+	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+configDir)
+	out, _ := cmd.Output() // .Output() returns stdout even on a non-zero exit
+	if ctx.Err() != nil {
+		return authUnknown // timed out probing → don't conclude logged-out
+	}
+	return claudeAuthFromJSON(out)
+}
+
+// accountLabel returns a display label for a freshly connected account. codex prints no email → ""
+// (the state machine keeps the user-given label). claude-code reads the signed-in email from
+// `claude auth status --json` so the account shows WHO it is; email read is best-effort — a missing
+// value returns "" and the account falls back to the user-given label.
+func (d *defaultConnectRunner) accountLabel(kind, configDir string) string {
+	if kind != "claude-code" {
+		return ""
+	}
+	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
+	if err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	argv := append(append([]string{}, prefixArgs...), "auth", "status", "--json")
+	cmd := exec.CommandContext(ctx, program, argv...)
+	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+configDir)
+	out, _ := cmd.Output() // best-effort; body is present even on non-zero exit
+	return claudeEmailFromJSON(out)
+}
+
+// claudeEmailFromJSON reads the "email" field from `claude auth status --json`. Absent / bad JSON →
+// "" (account keeps the user-given label). Sibling of claudeAuthFromJSON (which reads only
+// loggedIn) — kept separate so that parser's callers stay untouched.
+func claudeEmailFromJSON(out []byte) string {
+	var v struct {
+		Email string `json:"email"`
+	}
+	if err := json.Unmarshal(out, &v); err != nil {
+		return ""
+	}
+	return v.Email
+}
+
 // --- HTTP handlers ---
 
 func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 	kind := r.PathValue("kind")
 	if !subscriptionKinds[kind] {
 		a.writeLLMErr(w, http.StatusBadRequest, "CONNECT_KIND_UNSUPPORTED",
-			"chỉ OpenAI Codex mới kết nối được ở bản này", map[string]string{"kind": kind})
+			"loại tài khoản này chưa kết nối được ở bản này", map[string]string{"kind": kind})
 		return
 	}
 	var body struct {
@@ -485,9 +642,9 @@ func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := connectMgr.start(kind, label)
 	if errors.Is(err, errConnectBusy) {
-		// Unreachable while codex is the only subscription kind (a second POST of the same kind
-		// returns the current state, and any other kind is rejected 400 above). Kept for when
-		// claude-code becomes a second connectable kind.
+		// Reachable now that codex and claude-code are both subscription kinds: starting one while
+		// the other is mid-connect returns errConnectBusy (a second POST of the SAME kind returns
+		// the current state instead; unsupported kinds are rejected 400 above).
 		a.writeLLMErr(w, http.StatusConflict, "CONNECT_BUSY", "đang có phiên kết nối khác", nil)
 		return
 	}

@@ -44,6 +44,53 @@ func TestScanDeviceAuth(t *testing.T) {
 	}
 }
 
+// TestScanClaudeLoginURL pins scanClaudeLoginURL against the REAL captured
+// `claude auth login --claudeai` stdout: a "visit: https://…" line (browser OAuth, NO device
+// code) followed by a "Paste code here if prompted >" prompt line with no trailing newline.
+func TestScanClaudeLoginURL(t *testing.T) {
+	sample := "Opening browser to sign in…\n" +
+		"If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz\n" +
+		"Paste code here if prompted > "
+	url := scanClaudeLoginURL(strings.NewReader(sample))
+	if url != "https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz" {
+		t.Errorf("scanClaudeLoginURL = %q", url)
+	}
+}
+
+// TestConnectClaudeLabelsAccountWithEmail proves the claude-code branch: the account is labeled
+// with the email accountLabel reads from `claude auth status --json` (overriding the user-given
+// label), and the Portal snapshot still leaks no config dir.
+func TestConnectClaudeLabelsAccountWithEmail(t *testing.T) {
+	var mu sync.Mutex
+	var createdAcct store.LLMAccount
+	// claude login prints only a URL (no device code) → fake mirrors that with acctLabel set.
+	r := &fakeRunner{installed: true, loginURL: "https://claude.com/cai/oauth/authorize?code=true", auth: authLoggedIn, acctLabel: "user@example.com"}
+	m := newTestManager(t, r,
+		func(string) error { return nil },
+		func(a store.LLMAccount) error { mu.Lock(); createdAcct = a; mu.Unlock(); return nil },
+	)
+	if _, err := m.start("claude-code", "Tài khoản 1"); err != nil {
+		t.Fatalf("start = %v; want nil", err)
+	}
+	st := waitPhase(t, m, "claude-code", phaseConnected)
+	if st.Phase != phaseConnected {
+		t.Fatalf("phase = %q; want connected (err=%q)", st.Phase, st.Error)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if createdAcct.ProviderID != "claude-code" {
+		t.Errorf("provider = %q; want claude-code", createdAcct.ProviderID)
+	}
+	if createdAcct.Label != "user@example.com" {
+		t.Errorf("label = %q; want the email from accountLabel (not the user-given label)", createdAcct.Label)
+	}
+	// SECURITY: config dir must NOT be serialized to the Portal (mirror the codex canary)
+	b, _ := json.Marshal(st)
+	if strings.Contains(string(b), "acc1") || strings.Contains(string(b), "accounts") || strings.Contains(string(b), "config_dir") {
+		t.Errorf("connectState JSON leaks the internal config dir: %s", b)
+	}
+}
+
 type fakeRunner struct {
 	installed  bool
 	loginURL   string
@@ -52,6 +99,7 @@ type fakeRunner struct {
 	loginErr   error
 	installCnt int
 	lastCfgDir string // configDir seen by login/pollAuth — proves isolation is threaded through
+	acctLabel  string // returned by accountLabel — "" (codex) keeps job.label; set = email path
 }
 
 func (f *fakeRunner) detect(string) (bool, error) { return f.installed, nil }
@@ -70,6 +118,7 @@ func (f *fakeRunner) login(ctx context.Context, _, configDir string) (string, st
 	return f.loginURL, "AAAA-BBBBB", func() error { <-ctx.Done(); return ctx.Err() }, nil
 }
 func (f *fakeRunner) pollAuth(_, configDir string) authState { f.lastCfgDir = configDir; return f.auth }
+func (f *fakeRunner) accountLabel(_, _ string) string        { return f.acctLabel }
 
 func newTestManager(t *testing.T, r connectRunner, ensure func(string) error, create func(store.LLMAccount) error) *connectManager {
 	t.Helper()
