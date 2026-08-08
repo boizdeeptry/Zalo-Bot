@@ -6,7 +6,19 @@ current_spec: .planning/specs/2026-08-08-claude-connect-design.md
 current_plan: .planning/plans/2026-08-08-claude-connect.md
 last_updated: 2026-08-08
 
-## Đang làm: Claude connect-in-Portal + multi-account — SPEC XONG, checkpoint LOGIN ĐÃ QUA → sẵn sàng /plan
+## Claude connect-in-Portal + multi-account — CC1–CC6 XONG, gate XANH → final review + ship
+
+**Execute XONG (subagent-driven, mỗi task implementer + review + fix):**
+CC1 kind unify `22162f1` · CC2 Claude browser-OAuth connect runner `ea53233` · CC3 frontend connectable
++ install-hint `2283615` · **CC4 BASE AgentDC** execZaloRunner per-account CLAUDE_CONFIG_DIR `b666721`
+(base repo commit — AgentDC clean) · CC5 appClaudeRunner account selection `ef4aabf` · CC6 CSS `d5d28d3`
++ full build gate XANH (7/7, canary sạch, 3177 tệp/120.8MB, binary có `claude auth`+`pv-connect-hint`).
+- Login flow XÁC MINH THẬT: `claude auth login` in URL + exit 0 + email; CLAUDE_CONFIG_DIR cô lập; `claude -p`
+  với dir đó trả lời đúng account. Daemon connect runner mirror codex (đã review). E2E click-thật = bước user.
+- **CÒN**: final integration review (overlay main..HEAD + base commit `b666721`) → /ship (merge main;
+  base commit ở lại AgentDC history). Nhánh `feat/claude-cliadapter`.
+
+## (cũ) Claude connect-in-Portal + multi-account — SPEC XONG, checkpoint LOGIN ĐÃ QUA → sẵn sàng /plan
 
 Nhánh `feat/claude-cliadapter` (off main `8b92c57`). **Reframe từ "Task 11 gộp Claude vào cliAdapter"** —
 Explore chứng minh gộp sẽ HỎNG KB/tool của Claude (adapter chung cho CLI stateless; Claude agentic đọc KB
