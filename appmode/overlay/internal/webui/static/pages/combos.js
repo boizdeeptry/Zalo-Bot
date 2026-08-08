@@ -588,8 +588,17 @@ export function createCombosPage({
         editBtn.addEventListener("click", () => openEditModal(combo));
         const copyBtn = element("button", { className: "btn", attributes: { type: "button" }, text: "Nhân bản" });
         copyBtn.addEventListener("click", () => { void copy(combo); });
+        // Combo đang dùng HOẶC combo cuối cùng không xoá được (máy chủ chặn — luôn còn ≥1 combo, không
+        // xoá cái bot đang chạy). Khoá nút + tooltip để rõ NGAY, thay vì bấm rồi mới nhận 409.
+        const canDelete = !combo.active && combos.length > 1;
         const del = element("button", {
-          className: "btn", attributes: { type: "button", "aria-label": `Xoá combo ${combo.name || combo.id}` }, text: "Xoá",
+          className: "btn",
+          attributes: {
+            type: "button", disabled: !canDelete,
+            title: canDelete ? undefined : "Combo đang dùng hoặc combo cuối cùng thì không xoá được — tạo/gạt combo khác trước.",
+            "aria-label": `Xoá combo ${combo.name || combo.id}`,
+          },
+          text: "Xoá",
         });
         del.addEventListener("click", () => { void remove(combo.id); });
 

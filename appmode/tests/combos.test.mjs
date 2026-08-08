@@ -341,7 +341,16 @@ test("creating a combo with models added in the modal creates then saves those m
   ]);
 });
 
-test("a protected delete shows the reason instead of crashing", async (t) => {
+test("the active or only combo's delete button is disabled with a reason", async (t) => {
+  const { main } = await mounted(t);
+  const activeDel = button(cards(main)[0], "Xoá"); // c1 đang dùng
+  assert.equal(activeDel.disabled, true, "the active combo can't be deleted");
+  assert.match(activeDel.getAttribute("title") || "", /không xoá được/);
+  // c2 (không active, còn >1 combo) thì xoá được.
+  assert.equal(button(cards(main)[1], "Xoá").disabled, false);
+});
+
+test("a protected delete surfaced by the server shows the reason instead of crashing", async (t) => {
   const { main } = await mounted(t, comboAPI({
     remove: () => {
       throw new AppAPIError({
@@ -351,7 +360,8 @@ test("a protected delete shows the reason instead of crashing", async (t) => {
       });
     },
   }));
-  button(cards(main)[0], "Xoá").click();
+  // c2 xoá được ở client, nhưng máy chủ vẫn có thể chặn (đua trạng thái) — Portal phải báo, không sập.
+  button(cards(main)[1], "Xoá").click();
   await flush();
 
   assert.match(text(pageNotice(main)), /Không xoá được combo đang dùng/);
