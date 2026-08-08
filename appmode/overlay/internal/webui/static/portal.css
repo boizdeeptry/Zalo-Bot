@@ -208,6 +208,8 @@
   color:var(--ink); background:#141417; border:1px solid #2a2a30; border-radius:7px; padding:4px 10px;
   user-select:all;
 }
+.providers-page .pv-connect-hint { font-size:12px; color:var(--dim); margin-top:10px; }
+.providers-page .pv-connect-hint a { color:var(--ink); text-decoration:underline; }
 /* providers:end */
 
 .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
