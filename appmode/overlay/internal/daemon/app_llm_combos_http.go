@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -108,7 +109,8 @@ func (a *api) handleLLMComboActivate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	switch err := a.st.SetActiveLLMCombo(id); {
 	case errors.Is(err, store.ErrNotFound):
-		a.writeLLMErr(w, http.StatusNotFound, "COMBO_NOT_FOUND", "Không tìm thấy combo "+id, nil)
+		a.writeLLMErr(w, http.StatusNotFound, "COMBO_NOT_FOUND",
+			fmt.Sprintf("Không tìm thấy combo %q", id), nil)
 	case err != nil:
 		a.writeLLMInternal(w, "không đổi được combo đang dùng", err)
 	default:
@@ -123,7 +125,8 @@ func (a *api) handleLLMComboDelete(w http.ResponseWriter, r *http.Request) {
 		a.writeLLMErr(w, http.StatusConflict, "COMBO_PROTECTED",
 			"Không xoá được combo đang dùng hoặc combo cuối cùng", nil)
 	case errors.Is(err, store.ErrNotFound):
-		a.writeLLMErr(w, http.StatusNotFound, "COMBO_NOT_FOUND", "Không tìm thấy combo "+id, nil)
+		a.writeLLMErr(w, http.StatusNotFound, "COMBO_NOT_FOUND",
+			fmt.Sprintf("Không tìm thấy combo %q", id), nil)
 	case err != nil:
 		a.writeLLMInternal(w, "không xoá được combo", err)
 	default:

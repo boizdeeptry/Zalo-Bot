@@ -165,6 +165,41 @@ func TestComboEndpoints(t *testing.T) {
 	if code := errCode(t, recStale.Body.Bytes()); code != "COMBO_REVISION_CONFLICT" {
 		t.Errorf("stale-rev code = %q; want COMBO_REVISION_CONFLICT", code)
 	}
+
+	// POST create với name rỗng → 422 COMBO_INVALID (store trả "cần tên").
+	recBad := httptest.NewRecorder()
+	reqBad := httptest.NewRequest("POST", "/llm/combos", strings.NewReader(`{"name":"","type":"fallback"}`))
+	a.handleLLMComboCreate(recBad, reqBad)
+	if recBad.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST /llm/combos (empty name) = %d; want 422 (body=%s)", recBad.Code, recBad.Body)
+	}
+	if code := errCode(t, recBad.Body.Bytes()); code != "COMBO_INVALID" {
+		t.Errorf("empty-name code = %q; want COMBO_INVALID", code)
+	}
+
+	// activate combo không tồn tại → 404 COMBO_NOT_FOUND.
+	recActNF := httptest.NewRecorder()
+	reqActNF := httptest.NewRequest("POST", "/llm/combos/nope/activate", nil)
+	reqActNF.SetPathValue("id", "nope")
+	a.handleLLMComboActivate(recActNF, reqActNF)
+	if recActNF.Code != http.StatusNotFound {
+		t.Fatalf("POST activate(nope) = %d; want 404 (body=%s)", recActNF.Code, recActNF.Body)
+	}
+	if code := errCode(t, recActNF.Body.Bytes()); code != "COMBO_NOT_FOUND" {
+		t.Errorf("activate-missing code = %q; want COMBO_NOT_FOUND", code)
+	}
+
+	// delete combo không tồn tại → 404 COMBO_NOT_FOUND.
+	recDelNF := httptest.NewRecorder()
+	reqDelNF := httptest.NewRequest("DELETE", "/llm/combos/nope", nil)
+	reqDelNF.SetPathValue("id", "nope")
+	a.handleLLMComboDelete(recDelNF, reqDelNF)
+	if recDelNF.Code != http.StatusNotFound {
+		t.Fatalf("DELETE /llm/combos/nope = %d; want 404 (body=%s)", recDelNF.Code, recDelNF.Body)
+	}
+	if code := errCode(t, recDelNF.Body.Bytes()); code != "COMBO_NOT_FOUND" {
+		t.Errorf("delete-missing code = %q; want COMBO_NOT_FOUND", code)
+	}
 }
 
 // TestComboRoutesRegisteredAndCookieReachable mirror TestAppRoutesAreRegisteredAndCookieReachable:
