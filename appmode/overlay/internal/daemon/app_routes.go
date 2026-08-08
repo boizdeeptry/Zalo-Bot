@@ -35,6 +35,13 @@ var appPortalRoutePatterns = []string{
 	"DELETE /llm/providers/{kind}/connect",
 	"GET /llm/route",
 	"PUT /llm/route",
+	// Combos: cùng hạng an toàn với /llm/route — cookie đọc/ghi được, mutation vẫn cần portalHeader,
+	// và không bề mặt nào trả credential hay config dir (chỉ provider_id/model_id).
+	"GET /llm/combos",
+	"POST /llm/combos",
+	"PUT /llm/combos/{id}",
+	"POST /llm/combos/{id}/activate",
+	"DELETE /llm/combos/{id}",
 	"GET /llm/status",
 }
 
@@ -78,5 +85,10 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectCancel))
 	mux.Handle("GET /llm/route", a.auth(a.handleLLMRouteGet))
 	mux.Handle("PUT /llm/route", a.auth(a.handleLLMRoutePut))
+	mux.Handle("GET /llm/combos", a.auth(a.handleLLMComboList))
+	mux.Handle("POST /llm/combos", a.auth(a.handleLLMComboCreate))
+	mux.Handle("PUT /llm/combos/{id}", a.auth(a.handleLLMComboReplace))
+	mux.Handle("POST /llm/combos/{id}/activate", a.auth(a.handleLLMComboActivate))
+	mux.Handle("DELETE /llm/combos/{id}", a.auth(a.handleLLMComboDelete))
 	mux.Handle("GET /llm/status", a.auth(a.handleLLMStatus))
 }
