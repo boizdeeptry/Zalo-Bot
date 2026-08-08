@@ -10,8 +10,9 @@ export const PROVIDER_CATALOG = [
   { kind: "openrouter", name: "OpenRouter", group: "apikey", prefix: "or", logoColor: "#5b5ef0" },
 ];
 // CONNECTABLE_KINDS mirrors the backend subscriptionKinds: only these can run the in-Portal login
-// flow. Both route login through cliAdapter — codex via device-auth code, claude-code via a plain
-// browser URL (no code).
+// flow. Two DIFFERENT login shapes: codex shows a device-auth code, claude-code shows a plain browser
+// URL (no code). (Routing differs too — codex runs via cliAdapter, claude-code via runClaude for KB
+// --add-dir access — but that's a backend concern; here we only drive the login UI.)
 const CONNECTABLE_KINDS = new Set(["codex", "claude-code"]);
 const normalizeKind = (k) => String(k ?? "").replace(/_/g, "-");
 
