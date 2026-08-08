@@ -6,6 +6,7 @@ import { createCombosPage, createComboService } from "../overlay/internal/webui/
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+const settle = async () => { await flush(); await flush(); };
 const hasClass = (node, className) => node.classList?.contains(className) ?? false;
 
 function button(root, label) {
@@ -14,8 +15,23 @@ function button(root, label) {
 
 const comboRows = (main) => findAll(main, (node) => hasClass(node, "crow"));
 const memberRows = (main) => findAll(main, (node) => hasClass(node, "fact"));
+const memberLabel = (row) => text(find(row, (node) => hasClass(node, "mv")));
+const memberLabels = (main) => memberRows(main).map(memberLabel);
+const liveBadge = (row) => text(find(row, (node) => hasClass(node, "live")));
 const radioOf = (row) => find(row, (node) => node.getAttribute?.("type") === "radio");
 const typeBadge = (row) => text(find(row, (node) => hasClass(node, "ctype")));
+
+// Model picker modal: đắp lên document.body (như overlay của Agents), tra qua data-combos-overlay.
+const overlay = () => find(document.body, (node) => node.getAttribute?.("data-combos-overlay") != null);
+const pickRows = (root) => findAll(root, (node) => hasClass(node, "pick-model"));
+const pickGroups = (root) => findAll(root, (node) => hasClass(node, "pick-group-head"));
+const pickSearch = (root) => find(root, (node) => node.tagName === "INPUT");
+const pickRow = (root, name) => find(root, (node) => hasClass(node, "pick-model")
+  && text(node).includes(name));
+
+const putCalls = (calls) => calls
+  .filter((call) => /^\/llm\/combos\/[^/]+$/.test(call.path) && call.options.method === "PUT")
+  .map((call) => ({ path: call.path, body: call.options.body }));
 
 // pageNotice: câu thông báo cấp trang (tạo/đổi/xoá) sống trong cột danh sách, tách khỏi note của
 // editor để một lượt vẽ lại danh sách không thổi bay nó.
@@ -28,13 +44,6 @@ function pageNotice(main) {
 function editorNotice(main) {
   const slot = find(main, (node) => hasClass(node, "ceditor"));
   return find(slot, (node) => hasClass(node, "note"));
-}
-
-function chainOf(main) {
-  return memberRows(main).map((row) => {
-    const [provider, model] = findAll(row, (node) => node.tagName === "SELECT");
-    return `${provider.value}/${model.value}`;
-  });
 }
 
 const PROVIDERS = {
@@ -57,6 +66,11 @@ const PROVIDERS = {
       id: "claude-code", name: "Claude Code", kind: "claude-code", enabled: true, system: true,
       credential_configured: false, credential_unreadable: false,
       models: [{ model_id: "haiku", name: "Haiku", source: "manual", available: true }],
+    },
+    {
+      id: "anthropic-off", name: "Anthropic nghỉ", kind: "anthropic", enabled: false, system: false,
+      credential_configured: true, credential_unreadable: false,
+      models: [{ model_id: "claude-4", name: "Claude 4", source: "discovered", available: true }],
     },
   ],
 };
@@ -214,7 +228,7 @@ test("combo service rejects a missing request function", () => {
   assert.throws(() => createComboService(null), TypeError);
 });
 
-// --- trang Combos ---
+// --- trang Combos: cột danh sách trái ---
 
 test("Combos renders one row per combo with an active radio and a type badge", async (t) => {
   const { main } = await mounted(t);
@@ -227,22 +241,6 @@ test("Combos renders one row per combo with an active radio and a type badge", a
   assert.deepEqual(rows.map(typeBadge), ["Fallback", "Round Robin"]);
 });
 
-test("the active combo's member editor renders its chain with a running badge", async (t) => {
-  const { main } = await mounted(t);
-
-  assert.deepEqual(chainOf(main), ["openai-1/gpt-5", "claude-code/haiku"]);
-  assert.equal(text(find(memberRows(main)[0], (node) => hasClass(node, "live"))), "đang chạy");
-});
-
-test("selecting a combo swaps the editor to that combo's members without a running badge", async (t) => {
-  const { main } = await mounted(t);
-  find(comboRows(main)[1], (node) => hasClass(node, "cname")).click();
-
-  assert.deepEqual(chainOf(main), ["gemini/gemini-2"]);
-  // c2 không phải combo đang chạy, nên không mắt xích nào của nó đeo huy hiệu dù model có trùng hay không.
-  assert.equal(text(find(memberRows(main)[0], (node) => hasClass(node, "live"))), "");
-});
-
 test("activating a combo posts to its activate endpoint", async (t) => {
   const { calls, main } = await mounted(t);
   radioOf(comboRows(main)[1]).dispatchEvent({ type: "change" });
@@ -252,38 +250,6 @@ test("activating a combo posts to its activate endpoint", async (t) => {
     calls.some((call) => call.path === "/llm/combos/c2/activate" && call.options.method === "POST"),
     "gating the active radio must POST to the combo's activate endpoint",
   );
-});
-
-test("saving the selected combo PUTs to its id with its revision and type", async (t) => {
-  const { calls, main } = await mounted(t);
-  button(main, "Lưu").click();
-  await flush();
-
-  assert.deepEqual(calls.at(-1), {
-    path: "/llm/combos/c1",
-    options: {
-      method: "PUT",
-      body: {
-        revision: 4,
-        type: "fallback",
-        entries: [
-          { provider_id: "openai-1", model_id: "gpt-5", enabled: true },
-          { provider_id: "claude-code", model_id: "haiku", enabled: true },
-        ],
-      },
-    },
-  });
-});
-
-test("the per-combo type selector travels with the save", async (t) => {
-  const { calls, main } = await mounted(t);
-  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
-  typeSelect.value = "round_robin";
-  typeSelect.dispatchEvent({ type: "change" });
-  button(main, "Lưu").click();
-  await flush();
-
-  assert.equal(calls.at(-1).options.body.type, "round_robin");
 });
 
 test("creating a combo posts name and type to /llm/combos", async (t) => {
@@ -326,7 +292,169 @@ test("a protected delete shows the reason instead of crashing", async (t) => {
   assert.equal(comboRows(main).length, 2);
 });
 
-test("a revision conflict keeps the draft and offers a reload", async (t) => {
+// --- danh sách mắt xích chỉ-đọc (thay ô chọn kép cũ) ---
+
+test("the active combo's member list shows provider·model labels and a running badge", async (t) => {
+  const { main } = await mounted(t);
+
+  assert.deepEqual(memberLabels(main), ["OpenAI chính · GPT-5", "Claude Code · Haiku"]);
+  assert.equal(liveBadge(memberRows(main)[0]), "đang chạy");
+  assert.equal(liveBadge(memberRows(main)[1]), "");
+});
+
+test("selecting a combo swaps the member list without a running badge", async (t) => {
+  const { main } = await mounted(t);
+  find(comboRows(main)[1], (node) => hasClass(node, "cname")).click();
+
+  assert.deepEqual(memberLabels(main), ["Gemini · Gemini 2"]);
+  // c2 không phải combo đang chạy, nên không mắt xích nào của nó đeo huy hiệu.
+  assert.equal(liveBadge(memberRows(main)[0]), "");
+});
+
+// --- model picker modal ---
+
+test("opening the picker lists every connected provider's models grouped by provider", async (t) => {
+  const { main } = await mounted(t);
+  button(main, "Thêm model").click();
+
+  const modal = overlay();
+  assert.ok(modal, "the Thêm model button must open the picker overlay");
+  // Chỉ Provider đang bật + có model: OpenAI chính, Gemini, Claude Code. Anthropic nghỉ bị loại.
+  assert.deepEqual(pickGroups(modal).map(text), ["OpenAI chính", "Gemini", "Claude Code"]);
+  assert.equal(pickRows(modal).length, 4);
+});
+
+test("typing in the picker search filters the visible models", async (t) => {
+  const { main } = await mounted(t);
+  button(main, "Thêm model").click();
+  const modal = overlay();
+  const search = pickSearch(modal);
+  search.value = "gpt";
+  search.dispatchEvent({ type: "input" });
+
+  assert.equal(pickRows(modal).length, 2);
+  assert.deepEqual(pickGroups(modal).map(text), ["OpenAI chính"]);
+});
+
+test("clicking a non-member model adds it and auto-saves carrying the combo revision; the next toggle uses the returned revision", async (t) => {
+  const { calls, main } = await mounted(t, comboAPI({
+    // revision + 100 chứng minh client nhặt revision TỪ PHẢN HỒI chứ không tự cộng 1.
+    save: (id, body) => ({
+      id, name: "Chính", type: body.type, active: true,
+      revision: body.revision + 100,
+      entries: body.entries.map((entry, position) => ({ position, ...entry })),
+    }),
+  }));
+  button(main, "Thêm model").click();
+  pickRow(overlay(), "Gemini 2").click();
+  await settle();
+
+  assert.ok(memberLabels(main).includes("Gemini · Gemini 2"), "the clicked model becomes a member");
+  const first = putCalls(calls).at(-1);
+  assert.equal(first.body.revision, 4);
+  assert.ok(
+    first.body.entries.some((entry) => entry.provider_id === "gemini" && entry.model_id === "gemini-2"),
+    "the PUT body must include the new member",
+  );
+
+  // Bấm lại vào Gemini 2 (giờ đã là thành viên) → gỡ ra; lượt PUT thứ hai phải mang revision vừa nhận.
+  pickRow(overlay(), "Gemini 2").click();
+  await settle();
+
+  const second = putCalls(calls).at(-1);
+  assert.equal(second.body.revision, 104, "the second save must carry the revision the first save returned");
+  assert.equal(memberLabels(main).includes("Gemini · Gemini 2"), false, "clicking a member again removes it");
+});
+
+test("clicking a model already in the combo removes it and auto-saves", async (t) => {
+  const { calls, main } = await mounted(t);
+  button(main, "Thêm model").click();
+  pickRow(overlay(), "GPT-5").click();
+  await settle();
+
+  assert.deepEqual(memberLabels(main), ["Claude Code · Haiku"]);
+  const put = putCalls(calls).at(-1);
+  assert.equal(put.body.entries.some((entry) => entry.model_id === "gpt-5"), false);
+});
+
+test("removing a member from the list auto-saves", async (t) => {
+  const { calls, main } = await mounted(t);
+  button(memberRows(main)[1], "Xoá").click();
+  await settle();
+
+  assert.deepEqual(memberLabels(main), ["OpenAI chính · GPT-5"]);
+  const put = putCalls(calls).at(-1);
+  assert.deepEqual(put.body.entries, [{ provider_id: "openai-1", model_id: "gpt-5", enabled: true }]);
+});
+
+test("reordering a member from the list auto-saves the new order", async (t) => {
+  const { calls, main } = await mounted(t);
+  button(memberRows(main)[0], "Xuống").click();
+  await settle();
+
+  assert.deepEqual(memberLabels(main), ["Claude Code · Haiku", "OpenAI chính · GPT-5"]);
+  const put = putCalls(calls).at(-1);
+  assert.deepEqual(put.body.entries.map((entry) => entry.model_id), ["haiku", "gpt-5"]);
+});
+
+test("toggling a member's enable checkbox auto-saves", async (t) => {
+  const { calls, main } = await mounted(t);
+  const box = find(memberRows(main)[0], (node) => node.getAttribute?.("type") === "checkbox");
+  box.checked = false;
+  box.dispatchEvent({ type: "change" });
+  await settle();
+
+  const put = putCalls(calls).at(-1);
+  assert.equal(put.body.entries[0].enabled, false);
+});
+
+test("the per-combo type selector auto-saves on change", async (t) => {
+  const { calls, main } = await mounted(t);
+  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  typeSelect.value = "round_robin";
+  typeSelect.dispatchEvent({ type: "change" });
+  await settle();
+
+  assert.equal(putCalls(calls).at(-1).body.type, "round_robin");
+});
+
+// --- CAS revision: tự chữa qua một lượt tải lại, còn kẹt thì mời tải lại tay ---
+
+test("a save conflict re-reads the fresh revision and retries the save once", async (t) => {
+  let saves = 0;
+  let reads = 0;
+  const { calls, main } = await mounted(t, comboAPI({
+    combos: () => {
+      reads += 1;
+      // Lượt đọc đầu (lúc mount) mang revision 4; lượt đọc sau khi xung đột mang 9.
+      if (reads <= 1) return COMBOS;
+      return { combos: [{ ...COMBOS.combos[0], revision: 9 }, COMBOS.combos[1]] };
+    },
+    save: (id, body) => {
+      saves += 1;
+      if (saves === 1) {
+        throw new AppAPIError({ code: "COMBO_REVISION_CONFLICT", message: "xung đột", status: 409 });
+      }
+      return {
+        id, name: "Chính", type: body.type, active: true,
+        revision: body.revision + 1,
+        entries: body.entries.map((entry, position) => ({ position, ...entry })),
+      };
+    },
+  }));
+  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  typeSelect.value = "round_robin";
+  typeSelect.dispatchEvent({ type: "change" });
+  await settle();
+
+  const puts = putCalls(calls);
+  assert.equal(puts.length, 2, "a conflict must trigger exactly one retry");
+  assert.equal(puts[0].body.revision, 4, "the first save uses the stale revision");
+  assert.equal(puts[1].body.revision, 9, "the retry uses the revision from the re-read");
+  assert.equal(button(main, "Tải lại combo"), null, "a self-healed save must not offer the reload control");
+});
+
+test("a persistent conflict keeps the members and offers a reload", async (t) => {
   const { main } = await mounted(t, comboAPI({
     save: () => {
       throw new AppAPIError({
@@ -336,55 +464,59 @@ test("a revision conflict keeps the draft and offers a reload", async (t) => {
       });
     },
   }));
-  button(main, "Lưu").click();
-  await flush();
+  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  typeSelect.value = "round_robin";
+  typeSelect.dispatchEvent({ type: "change" });
+  await settle();
 
   assert.match(text(editorNotice(main)), /lưu ở nơi khác/);
-  assert.ok(button(main, "Tải lại combo"), "a conflict offers the reload control");
-  // Bản nháp còn nguyên: chuỗi hai mắt xích không bị vẽ lại thành trống.
-  assert.deepEqual(chainOf(main), ["openai-1/gpt-5", "claude-code/haiku"]);
+  assert.ok(button(main, "Tải lại combo"), "a persistent conflict offers the reload control");
+  // Danh sách mắt xích còn nguyên: không bị vẽ lại thành trống.
+  assert.deepEqual(memberLabels(main), ["OpenAI chính · GPT-5", "Claude Code · Haiku"]);
 });
-
-const conflictOnSave = () => {
-  throw new AppAPIError({ code: "COMBO_REVISION_CONFLICT", message: "xung đột", status: 409 });
-};
 
 test("reloading a combo re-syncs the list rows to the fresh fetch", async (t) => {
   let reads = 0;
   const { main } = await mounted(t, comboAPI({
-    save: conflictOnSave,
+    save: () => {
+      throw new AppAPIError({ code: "COMBO_REVISION_CONFLICT", message: "xung đột", status: 409 });
+    },
     combos: () => {
       reads += 1;
-      if (reads === 1) return COMBOS;
+      if (reads <= 1) return COMBOS;
       // Ai đó đổi kiểu c1 fallback → round_robin ở nơi khác; lượt tải lại phải cập nhật huy hiệu.
       return { combos: [{ ...COMBOS.combos[0], type: "round_robin", revision: 9 }, COMBOS.combos[1]] };
     },
   }));
-  button(main, "Lưu").click();
-  await flush();
+  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  typeSelect.value = "round_robin";
+  typeSelect.dispatchEvent({ type: "change" });
+  await settle();
   button(main, "Tải lại combo").click();
-  await flush();
+  await settle();
 
   assert.deepEqual(comboRows(main).map(typeBadge), ["Round Robin", "Round Robin"]);
 });
 
-test("reloading a combo deleted elsewhere self-corrects instead of throwing", async (t) => {
+test("a combo deleted elsewhere self-corrects during an auto-save conflict", async (t) => {
   let reads = 0;
   const { main } = await mounted(t, comboAPI({
-    save: conflictOnSave,
+    save: () => {
+      throw new AppAPIError({ code: "COMBO_REVISION_CONFLICT", message: "xung đột", status: 409 });
+    },
     combos: () => {
       reads += 1;
-      if (reads === 1) return COMBOS;
+      if (reads <= 1) return COMBOS;
       return { combos: [COMBOS.combos[1]] }; // c1 (đang chọn) đã bị xoá ở nơi khác
     },
   }));
-  button(main, "Lưu").click();
-  await flush();
-  button(main, "Tải lại combo").click();
-  await flush();
+  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  typeSelect.value = "round_robin";
+  typeSelect.dispatchEvent({ type: "change" });
+  await settle();
 
   assert.equal(comboRows(main).length, 1);
-  assert.deepEqual(chainOf(main), ["gemini/gemini-2"]);
+  assert.deepEqual(memberLabels(main), ["Gemini · Gemini 2"]);
   assert.match(text(pageNotice(main)), /đã bị xoá ở nơi khác/);
 });
 

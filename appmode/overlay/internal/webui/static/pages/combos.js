@@ -3,13 +3,27 @@ import { element, errorPanel, pageHeader } from "../core/ui.js";
 import {
   TYPE_LABELS,
   TYPE_ORDER,
-  createMemberEditor,
+  addEntry,
+  canMove,
+  entryWarning,
   messageOf,
+  moveEntry,
+  patchEntry,
+  removeEntry,
   revisionOf,
   snapshotOf,
+  statusText,
 } from "./route-editor.js";
 
 const STATUS_POLL_MS = 5000;
+
+// Gợi ý dưới ô chọn kiểu combo. Chỉ hai kiểu §Combos hỗ trợ; đặt cạnh editor vì đây là chữ giao diện
+// của editor chứ không phải hàm thuần dùng chung.
+const TYPE_HINTS = Object.freeze({
+  fallback: "Bot thử từ trên xuống, dừng ở mắt xích đầu tiên trả lời được.",
+  round_robin: "Mỗi lượt bắt đầu ở một mắt xích khác rồi mới fallback"
+    + " — chia tải giữa các tài khoản/Provider.",
+});
 
 function comboPath(id, suffix = "") {
   const value = String(id ?? "").trim();
@@ -51,6 +65,379 @@ export function createComboService(request = requestJSON) {
 
 function typeLabel(type) {
   return TYPE_LABELS[type] ?? type;
+}
+
+// createComboEditor dựng cột phải: ô chọn kiểu, nút "Thêm model" mở modal chọn model kiểu 9Router,
+// danh sách mắt xích chỉ-đọc (sắp thứ tự / bật-tắt / xoá), dòng trạng thái + huy hiệu "đang chạy".
+// Nó KHÔNG tự gọi API — trang truyền `save`/`reload` (đã khoá vào đúng combo). MỌI thay đổi thành
+// viên hay kiểu đều TỰ LƯU: không còn nút Lưu. Xung đột revision (409) thì đọc lại revision mới và
+// thử lưu lại đúng một lần; còn kẹt mới mời tải lại tay.
+//
+//   providers   danh sách Provider để dựng modal + phân giải tên.
+//   snapshot    { revision, entries } của combo đang chọn.
+//   type        kiểu combo hiện tại; đi kèm mỗi lượt tự lưu.
+//   live        combo này có đang chạy không — huy hiệu "đang chạy" + dòng trạng thái chỉ hiện khi đúng.
+//   save        async ({ revision, type, entries }) => body đã lưu.
+//   reload      async () => { revision, entries, type } đọc lại từ máy chủ (và tự chữa nếu combo bị xoá).
+//   onSaved     (body) => void, để trang đồng bộ revision/entries/kiểu vào state danh sách.
+//   conflictCode mã lỗi 409 revision.
+export function createComboEditor({
+  providers = [],
+  snapshot = { revision: 0, entries: [] },
+  type = "fallback",
+  live = false,
+  save,
+  reload,
+  onSaved = () => {},
+  conflictCode = "COMBO_REVISION_CONFLICT",
+} = {}) {
+  if (typeof save !== "function") throw new TypeError("Combo editor requires a save function");
+
+  let draft = { revision: revisionOf(snapshot), entries: snapshot.entries ?? [] };
+  let curType = TYPE_ORDER.includes(type) ? type : "fallback";
+  let status = null;
+  let statusError = "";
+  let badges = [];
+  let pendingFocus = null;
+  let disposed = false;
+  let closePicker = () => {};
+  // saveChain nối các lượt tự lưu thành một hàng: mỗi persist đọc draft.revision tại lúc CHẠY (sau khi
+  // lượt trước đã đồng bộ revision), nên bấm thêm/bớt nhanh liên tiếp không gửi một revision cũ.
+  let saveChain = Promise.resolve();
+
+  const nameOf = (providerID) => providers
+    .find((provider) => provider.id === providerID)?.name || providerID;
+  const modelLabelOf = (providerID, modelID) => providers
+    .find((provider) => provider.id === providerID)?.models
+    ?.find((model) => model.model_id === modelID)?.name || modelID;
+
+  const statusLine = element("div", { className: "chainstatus" });
+  const rowsBox = element("div", { className: "facts" });
+  const note = element("span", { className: "note", attributes: { "aria-live": "polite" } });
+  const say = (message) => { note.textContent = message; };
+  const reloadSlot = element("span", { className: "reslot" });
+  const hint = element("div", { className: "hint" });
+
+  const typeSelect = element("select", { attributes: { id: "combo-type" } },
+    TYPE_ORDER.map((id) => element("option", { attributes: { value: id }, text: TYPE_LABELS[id] })));
+  typeSelect.value = curType;
+  const drawHint = () => { hint.textContent = TYPE_HINTS[curType] ?? ""; };
+  typeSelect.addEventListener("change", () => {
+    curType = TYPE_ORDER.includes(typeSelect.value) ? typeSelect.value : "fallback";
+    drawHint();
+    void autoSave();
+  });
+  drawHint();
+
+  const addBtn = element("button", { className: "btn go", attributes: { type: "button" }, text: "Thêm model" });
+  addBtn.addEventListener("click", () => openPicker());
+  const reloadBtn = element("button", { className: "btn", attributes: { type: "button" }, text: "Tải lại combo" });
+  const showReload = () => { reloadBtn.disabled = false; reloadSlot.replaceChildren(reloadBtn); };
+  const hideReload = () => reloadSlot.replaceChildren();
+
+  // --- tự lưu + CAS revision ---
+
+  function autoSave() {
+    saveChain = saveChain.then(() => persist()).catch(() => {});
+    return saveChain;
+  }
+
+  function applySaved(saved) {
+    draft = { ...draft, revision: revisionOf(saved, draft.revision) };
+    onSaved(saved);
+    hideReload();
+    say(`Đã lưu.${live ? " Bot dùng ngay, không cần khởi động lại." : ""}`);
+  }
+
+  async function persist() {
+    if (disposed) return;
+    try {
+      applySaved(await save({ revision: draft.revision, type: curType, entries: draft.entries }));
+    } catch (error) {
+      if (disposed || error?.name === "AbortError") return;
+      if (error?.code === conflictCode) { await retryAfterConflict(error); return; }
+      say(`không lưu được: ${messageOf(error)}`);
+    }
+  }
+
+  // retryAfterConflict đọc lại revision mới rồi gửi LẠI đúng bản nháp đang hiển thị — KHÔNG vẽ lại,
+  // nên lượt sửa của người dùng không bị nuốt. Còn xung đột nữa (người khác lại ghi chen) thì dừng và
+  // mời tải lại tay thay vì lặp vô hạn.
+  async function retryAfterConflict(firstError) {
+    let fresh;
+    try {
+      fresh = await reload();
+    } catch {
+      // reload tự chữa (combo bị xoá ở nơi khác) hoặc editor đã bị dispose — thoát êm, trang lo phần còn lại.
+      return;
+    }
+    if (disposed) return;
+    draft = { ...draft, revision: revisionOf(fresh, draft.revision) };
+    try {
+      applySaved(await save({ revision: draft.revision, type: curType, entries: draft.entries }));
+    } catch (error) {
+      if (disposed || error?.name === "AbortError") return;
+      if (error?.code === conflictCode) {
+        say(`${messageOf(firstError)}. Tải lại combo nếu muốn bỏ bản đang sửa.`);
+        showReload();
+        return;
+      }
+      say(`không lưu được: ${messageOf(error)}`);
+    }
+  }
+
+  reloadBtn.addEventListener("click", async () => {
+    if (typeof reload !== "function") return;
+    reloadBtn.disabled = true;
+    say("Đang đọc lại combo đang lưu…");
+    try {
+      const fresh = await reload();
+      if (disposed) return;
+      draft = { revision: revisionOf(fresh), entries: fresh.entries ?? [] };
+      curType = TYPE_ORDER.includes(fresh.type) ? fresh.type : curType;
+      typeSelect.value = curType;
+      drawHint();
+      hideReload();
+      drawRows();
+      say("Đã thay bản đang sửa bằng combo đang lưu.");
+    } catch (error) {
+      if (disposed || error?.name === "AbortError") return;
+      say(`không đọc lại được: ${messageOf(error)}`);
+      reloadBtn.disabled = false;
+    }
+  });
+
+  // --- danh sách mắt xích ---
+
+  // applyStatus tra bản nháp theo VỊ TRÍ: huy hiệu "đang chạy" + dòng trạng thái chỉ có nghĩa khi combo
+  // này đang chạy, nên cả hai câm khi live=false.
+  function applyStatus() {
+    badges.forEach((node, index) => {
+      const entry = draft.entries[index];
+      const running = live && Boolean(status) && Boolean(entry)
+        && status.active_provider_id === entry.provider_id
+        && status.active_model_id === entry.model_id;
+      node.textContent = running ? "đang chạy" : "";
+    });
+    statusLine.textContent = live ? (statusError || statusText(status, nameOf)) : "";
+  }
+
+  function buildRow(entry, index) {
+    const idBase = `member-${index}`;
+    const badge = element("span", { className: "live" });
+    const label = element("span", {
+      className: "mv",
+      text: `${nameOf(entry.provider_id)} · ${modelLabelOf(entry.provider_id, entry.model_id)}`,
+    });
+    const warning = element("div", { className: "fn", text: entryWarning(providers, entry) });
+
+    const enabledBox = element("input", { attributes: { id: `${idBase}-on`, type: "checkbox" } });
+    enabledBox.checked = Boolean(entry.enabled);
+    enabledBox.addEventListener("change", () => {
+      draft = { ...draft, entries: patchEntry(draft.entries, index, { enabled: Boolean(enabledBox.checked) }) };
+      void autoSave();
+    });
+
+    const mover = (labelText, delta) => {
+      const node = element("button", {
+        className: "btn",
+        attributes: {
+          type: "button",
+          disabled: !canMove(draft.entries, index, delta),
+          "aria-label": `${labelText}: ${nameOf(entry.provider_id)}`,
+        },
+        text: labelText,
+      });
+      node.addEventListener("click", () => {
+        // Con trỏ đi theo mắt xích vừa dời: sau lượt vẽ lại nút cũ không còn tồn tại.
+        pendingFocus = { index: index + delta, kind: labelText === "Lên" ? "up" : "down" };
+        draft = { ...draft, entries: moveEntry(draft.entries, index, delta) };
+        drawRows();
+        void autoSave();
+      });
+      return node;
+    };
+    const up = mover("Lên", -1);
+    const down = mover("Xuống", 1);
+
+    const remove = element("button", {
+      className: "btn",
+      attributes: { type: "button", "aria-label": `Xoá mắt xích ${nameOf(entry.provider_id)}` },
+      text: "Xoá",
+    });
+    remove.addEventListener("click", () => {
+      draft = { ...draft, entries: removeEntry(draft.entries, index) };
+      drawRows();
+      void autoSave();
+    });
+
+    const node = element("div", { className: "fact" },
+      element("div", { className: "fp" }, element("span", { text: `${index + 1}` }), badge),
+      element("div", { className: "fc" }, label),
+      element("div", { className: "fc check" },
+        enabledBox,
+        element("label", { attributes: { for: `${idBase}-on` }, text: "Bật" }),
+      ),
+      element("div", { className: "fb" }, up, down, remove),
+      warning,
+    );
+    return { node, badge, controls: { up, down } };
+  }
+
+  function drawRows() {
+    if (!draft.entries.length) {
+      badges = [];
+      rowsBox.replaceChildren(element("div", {
+        className: "none",
+        text: "Combo chưa có model nào. Bấm “Thêm model” để chọn.",
+      }));
+      applyStatus();
+      return;
+    }
+    const built = draft.entries.map(buildRow);
+    badges = built.map((row) => row.badge);
+    rowsBox.replaceChildren(...built.map((row) => row.node));
+    applyStatus();
+    if (pendingFocus) {
+      const moved = built[pendingFocus.index]?.controls;
+      const wanted = moved?.[pendingFocus.kind];
+      const fallback = moved?.[pendingFocus.kind === "up" ? "down" : "up"];
+      (wanted?.disabled ? fallback : wanted)?.focus();
+      pendingFocus = null;
+    }
+  }
+
+  // --- modal chọn model kiểu 9Router: bấm để thêm, bấm lại để bỏ, thay đổi tự lưu ---
+
+  function isMember(providerID, modelID) {
+    return draft.entries.some((entry) => entry.provider_id === providerID && entry.model_id === modelID);
+  }
+
+  function toggleMember(providerID, modelID) {
+    draft = {
+      ...draft,
+      entries: isMember(providerID, modelID)
+        ? draft.entries.filter((entry) => !(entry.provider_id === providerID && entry.model_id === modelID))
+        : addEntry(draft.entries, { provider_id: providerID, model_id: modelID, enabled: true }),
+    };
+    say("");
+    drawRows();
+    void autoSave();
+  }
+
+  function openPicker() {
+    closePicker();
+    // Chỉ Provider đang bật + có model: một hàng model không có gì để thêm chỉ làm rối modal.
+    const pickable = providers.filter((provider) => provider.enabled
+      && Array.isArray(provider.models) && provider.models.length);
+    const back = element("div", { className: "sheetback", attributes: { "data-combos-overlay": "" } });
+    const search = element("input", {
+      className: "pick-search",
+      attributes: { type: "text", placeholder: "Tìm model…", "aria-label": "Tìm model" },
+    });
+    const listBox = element("div", { className: "pick-list" });
+
+    const matches = (query, provider, model) => !query
+      || (model.name || "").toLowerCase().includes(query)
+      || String(model.model_id).toLowerCase().includes(query)
+      || (provider.name || provider.id).toLowerCase().includes(query);
+
+    const modelRow = (provider, model) => {
+      const active = isMember(provider.id, model.model_id);
+      const row = element("button", {
+        className: active ? "pick-model on" : "pick-model",
+        attributes: { type: "button", "aria-pressed": String(active) },
+      },
+        element("span", { className: "pick-check", text: active ? "✓" : "" }),
+        element("span", { className: "pick-mname", text: model.name || model.model_id }),
+        element("span", { className: "pick-mid", text: model.model_id }),
+      );
+      row.addEventListener("click", () => {
+        toggleMember(provider.id, model.model_id);
+        renderList();
+      });
+      return row;
+    };
+
+    const renderList = () => {
+      const query = search.value.trim().toLowerCase();
+      const groups = pickable
+        .map((provider) => ({ provider, models: provider.models.filter((model) => matches(query, provider, model)) }))
+        .filter((group) => group.models.length);
+      if (!groups.length) {
+        listBox.replaceChildren(element("div", { className: "none", text: "Không có model nào khớp." }));
+        return;
+      }
+      listBox.replaceChildren(...groups.map((group) => element("div", { className: "pick-group" },
+        element("div", { className: "pick-group-head", text: group.provider.name || group.provider.id }),
+        ...group.models.map((model) => modelRow(group.provider, model)),
+      )));
+    };
+    search.addEventListener("input", renderList);
+
+    const closeBtn = element("button", {
+      className: "btn", attributes: { type: "button", "aria-label": "Đóng" }, text: "Đóng",
+    });
+    const sheet = element("div", {
+      className: "sheet",
+      attributes: { role: "dialog", "aria-modal": "true", "aria-label": "Thêm model vào combo" },
+    },
+      element("div", { className: "sheethead" },
+        element("span", { className: "st", text: "Thêm model vào combo" }),
+        closeBtn,
+      ),
+      element("div", { className: "pick-hint", text: "Bấm để thêm, bấm lại để bỏ. Thay đổi tự lưu." }),
+      search,
+      listBox,
+    );
+
+    let closed = false;
+    const onKey = (event) => { if (event.key === "Escape") close(); };
+    const teardown = (restoreFocus) => {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener?.("keydown", onKey);
+      back.remove();
+      closePicker = () => {};
+      if (restoreFocus) addBtn.focus?.();
+    };
+    const close = () => teardown(true);
+    closePicker = () => teardown(false);
+    closeBtn.addEventListener("click", close);
+    back.addEventListener("click", (event) => { if (event.target === back) close(); });
+    document.addEventListener?.("keydown", onKey);
+
+    back.append(sheet);
+    renderList();
+    document.body.append(back);
+    search.focus?.();
+  }
+
+  const node = element("div", { className: "models-page" },
+    statusLine,
+    element("div", { className: "fc" },
+      element("label", { className: "fk", attributes: { for: "combo-type" }, text: "Kiểu combo" }),
+      typeSelect,
+    ),
+    element("div", { className: "row" }, addBtn),
+    rowsBox,
+    element("div", { className: "row" }, reloadSlot, note),
+    hint,
+  );
+  drawRows();
+
+  return Object.freeze({
+    node,
+    setStatus(nextStatus, nextError = "") {
+      status = nextStatus;
+      statusError = nextError;
+      applyStatus();
+    },
+    dispose() {
+      disposed = true;
+      closePicker();
+    },
+  });
 }
 
 export function createCombosPage({
@@ -159,7 +546,7 @@ export function createCombosPage({
           }));
           return;
         }
-        editor = createMemberEditor({
+        editor = createComboEditor({
           providers,
           snapshot: snapshotOf(combo),
           type: combo.type,
@@ -184,8 +571,8 @@ export function createCombosPage({
             return { revision: found.revision, entries: snapshotOf(found).entries, type: found.type };
           },
           onSaved: (saved) => {
-            // Đồng bộ revision + entries + type vào state danh sách để lần dựng lại editor kế tiếp
-            // (đổi combo rồi quay lại) không lưu đè một revision đã cũ.
+            // Đồng bộ revision + entries + kiểu vào state danh sách để lần dựng lại editor kế tiếp không
+            // lưu đè một revision cũ, rồi vẽ lại rows để huy hiệu kiểu bắt kịp lượt đổi kiểu vừa tự lưu.
             combos = combos.map((entry) => (entry.id === combo.id
               ? {
                   ...entry,
@@ -194,6 +581,7 @@ export function createCombosPage({
                   entries: Array.isArray(saved?.entries) ? saved.entries : entry.entries,
                 }
               : entry));
+            drawList();
           },
           conflictCode: "COMBO_REVISION_CONFLICT",
         });

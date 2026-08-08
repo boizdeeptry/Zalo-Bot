@@ -5,7 +5,6 @@ import {
   LLM_ERROR_FIX,
   addEntry,
   canMove,
-  createMemberEditor,
   entryWarning,
   failureText,
   modelChoices,
@@ -17,10 +16,6 @@ import {
   statusText,
   tallyText,
 } from "../overlay/internal/webui/static/pages/route-editor.js";
-import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
-
-const flush = () => new Promise((resolve) => setImmediate(resolve));
-const hasClass = (node, className) => node.classList?.contains(className) ?? false;
 
 // --- các hàm thuần: kiểm thẳng không qua DOM ---
 
@@ -200,163 +195,4 @@ test("tallyText counts the telemetry window, and is empty with no attempts", () 
 test("statusText is empty before the first call and explains an idle chain", () => {
   assert.equal(statusText(null, nameOf), "");
   assert.match(statusText({ active_provider_id: "", attempts: 0 }, nameOf), /Chưa có lượt gọi nào/);
-});
-
-// --- createMemberEditor: các CỬA CHẶN hành vi, kiểm thẳng qua DOM ---
-//
-// Editor là cùng cỗ máy trang Models cũ dùng, chỉ đóng gói theo một combo. Các bài dưới canh đúng
-// những hành vi mà comment trong mã gọi là "lặng lẽ làm sai người dùng": huy hiệu dán nhầm hàng,
-// lượt sửa lúc đang lưu bị nuốt, con trỏ rơi sau khi dời, lỗi trạng thái bị xoá oan.
-
-const SNAPSHOT = {
-  revision: 4,
-  entries: [link("openai-1", "gpt-5"), link("claude-code", "haiku")],
-};
-const RUNNING = { active_provider_id: "openai-1", active_model_id: "gpt-5", last_success_at: "2026-08-06T04:00:00Z", attempts: 12, fallbacks: 2 };
-
-function mountEditor(t, opts = {}) {
-  const dom = installDOM();
-  const saves = [];
-  const editor = createMemberEditor({
-    providers: opts.providers ?? PROVIDERS,
-    snapshot: opts.snapshot ?? SNAPSHOT,
-    type: opts.type ?? "fallback",
-    live: opts.live ?? false,
-    save: opts.save ?? ((payload) => {
-      saves.push(payload);
-      return { revision: payload.revision + 1, type: payload.type, entries: payload.entries };
-    }),
-    reload: opts.reload,
-    onSaved: opts.onSaved ?? (() => {}),
-  });
-  const main = document.createElement("main");
-  main.append(editor.node);
-  t.after(() => { editor.dispose(); dom.restore(); });
-  return { editor, main, saves };
-}
-
-const rows = (main) => findAll(main, (node) => hasClass(node, "fact"));
-const selects = (row) => findAll(row, (node) => node.tagName === "SELECT");
-const badge = (row) => text(find(row, (node) => hasClass(node, "live")));
-const warning = (row) => text(find(row, (node) => hasClass(node, "fn")));
-const note = (main) => find(main, (node) => hasClass(node, "note"));
-const statusLine = (main) => find(main, (node) => hasClass(node, "chainstatus"));
-const button = (root, label) => find(root, (node) => node.tagName === "BUTTON" && text(node) === label);
-function choose(select, value) {
-  select.value = value;
-  select.dispatchEvent({ type: "change" });
-}
-
-test("the running badge sits on the matching link and leaves one repointed elsewhere", (t) => {
-  const { main, editor } = mountEditor(t, { live: true });
-  editor.setStatus(RUNNING);
-  assert.equal(badge(rows(main)[0]), "đang chạy");
-  assert.equal(badge(rows(main)[1]), "");
-
-  // Huy hiệu tra bản nháp theo VỊ TRÍ: repoint hàng 0 sang provider khác thì nó phải rời hàng đó,
-  // không dính lại theo một bản sao provider/model của lúc vẽ.
-  choose(selects(rows(main)[0])[0], "gemini");
-  assert.equal(badge(rows(main)[0]), "");
-});
-
-test("a link on a disabled provider keeps its choice with a step-over warning", (t) => {
-  const { main } = mountEditor(t, {
-    snapshot: { revision: 4, entries: [link("anthropic-1", "claude-4"), link("claude-code", "haiku")] },
-  });
-  const row = rows(main)[0];
-  assert.equal(selects(row)[0].value, "anthropic-1");
-  assert.match(warning(row), /Anthropic dự phòng đang tắt — chuỗi bỏ qua/);
-});
-
-test("a link on a dropped model keeps it with a warning instead of switching", (t) => {
-  const { main } = mountEditor(t, {
-    snapshot: { revision: 4, entries: [link("openai-1", "gpt-4-legacy"), link("claude-code", "haiku")] },
-  });
-  const row = rows(main)[0];
-  assert.equal(selects(row)[1].value, "gpt-4-legacy");
-  assert.match(warning(row), /gpt-4-legacy không còn dùng được/);
-});
-
-test("saving refuses a chain with nothing enabled before it calls save", (t) => {
-  const { main, saves } = mountEditor(t, {
-    snapshot: { revision: 4, entries: [link("openai-1", "gpt-5", false)] },
-  });
-  button(main, "Lưu").click();
-
-  assert.equal(saves.length, 0);
-  assert.match(text(note(main)), /ít nhất một mắt xích đang bật/);
-});
-
-test("saving refuses a link with no model chosen before it calls save", (t) => {
-  const { main, saves } = mountEditor(t, {
-    snapshot: { revision: 4, entries: [link("openai-1", ""), link("claude-code", "haiku")] },
-  });
-  button(main, "Lưu").click();
-
-  assert.equal(saves.length, 0);
-  assert.match(text(note(main)), /Chọn model cho OpenAI chính/);
-});
-
-test("an edit made while the save is in flight is not thrown away", async (t) => {
-  let release = () => {};
-  const saves = [];
-  const { main } = mountEditor(t, {
-    save: (payload) => {
-      saves.push(payload);
-      if (saves.length === 1) {
-        return new Promise((resolve) => { release = () => resolve({ revision: 5, entries: payload.entries }); });
-      }
-      return { revision: 6, entries: payload.entries };
-    },
-  });
-  button(main, "Lưu").click();
-  await flush();
-  button(main, "Thêm mắt xích").click();
-  release();
-  await flush();
-  button(main, "Lưu").click();
-  await flush();
-
-  // Nhánh lưu thành công chỉ nhận revision từ phản hồi, KHÔNG cả snapshot — nên mắt xích thêm trong
-  // lúc PUT còn bay vẫn còn ở lượt lưu kế tiếp.
-  assert.equal(saves[1].entries.length, 3);
-});
-
-// threeLinkChain: hai mắt xích dời được cộng một cái đuôi — chuỗi ngắn nhất mà Lên và Xuống đều có việc.
-const THREE = {
-  revision: 4,
-  entries: [link("openai-1", "gpt-5"), link("gemini", "gemini-2"), link("claude-code", "haiku")],
-};
-
-function assertFocusLandedIn(row, what) {
-  const active = document.activeElement;
-  assert.ok(active, `${what} must leave focus somewhere`);
-  assert.equal(find(row, (node) => node === active), active, `${what} must leave focus in the moved row`);
-  assert.equal(active.disabled, false, `${what} must leave focus on a usable control`);
-}
-
-test("focus follows a link moved down", (t) => {
-  const { main } = mountEditor(t, { snapshot: THREE });
-  button(rows(main)[0], "Xuống").click();
-  assertFocusLandedIn(rows(main)[1], "moving a link down");
-});
-
-test("focus follows a link moved up to the top of the chain", (t) => {
-  const { main } = mountEditor(t, { snapshot: THREE });
-  button(rows(main)[1], "Lên").click();
-  assertFocusLandedIn(rows(main)[0], "moving a link up");
-});
-
-test("a status-read error survives an unrelated edit and clears when the poll recovers", (t) => {
-  const { main, editor } = mountEditor(t, { live: true });
-  editor.setStatus(RUNNING, "không đọc được trạng thái");
-  assert.match(text(statusLine(main)), /không đọc được trạng thái/);
-
-  // Sửa một hàng chạy applyStatus lại — câu lỗi được GIỮ, không bị lượt sửa xoá oan.
-  choose(selects(rows(main)[0])[1], "gpt-5-mini");
-  assert.match(text(statusLine(main)), /không đọc được trạng thái/);
-
-  // Lượt đọc lành lại (statusError rỗng) mới gỡ câu lỗi khỏi màn hình.
-  editor.setStatus(RUNNING, "");
-  assert.doesNotMatch(text(statusLine(main)), /không đọc được trạng thái/);
 });
