@@ -1,10 +1,23 @@
 # Planning state
 
-step: execute
-current_topic: claude-connect
-current_spec: .planning/specs/2026-08-08-claude-connect-design.md
-current_plan: .planning/plans/2026-08-08-claude-connect.md
+step: done
+current_topic:
+current_spec:
+current_plan:
 last_updated: 2026-08-08
+
+## SHIPPED 2026-08-08 → main (`78d1980`) — Claude connect-in-Portal + multi-account
+
+Nhánh `feat/claude-cliadapter` (CC1–CC6 + docs) fast-forward merge vào `main` (`8b92c57`→`78d1980`), nhánh
+xoá. **Base AgentDC** có 1 commit riêng `b666721` (execZaloRunner nhận per-account CLAUDE_CONFIG_DIR) — ở lại
+history AgentDC. Gói: F:\dist\_verify-20260808 (7/7 gate, 3177 tệp/120.8MB, binary có claude auth+pv-connect-hint).
+- Reframe từ Task 11: KHÔNG gộp Claude vào cliAdapter (giữ runClaude agentic KB). Thêm: Claude connect-in-Portal
+  (browser-OAuth, in URL, no device-code, label bằng email) + multi-account (accountSel chọn account claude-code,
+  CLAUDE_CONFIG_DIR per-turn qua execZaloRunner).
+- XÁC MINH THẬT: login (URL+exit0+email), CLAUDE_CONFIG_DIR cô lập, consult stream-json trong workdir mới +
+  --add-dir → trả lời sạch KHÔNG kẹt trust-dialog (không cần seed hasTrustDialogAccepted). Final integration
+  review Pass (0 Critical). Bước cuối = user bấm Connect trong app (hành động OAuth của họ).
+- Local main giờ ahead origin/main — CHƯA push (ship local). Task 11 gốc coi như CLOSED bởi reframe này.
 
 ## Claude connect-in-Portal + multi-account — CC1–CC6 XONG, gate XANH → final review + ship
 
