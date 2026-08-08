@@ -501,6 +501,97 @@ func TestEnsureCLIProviderModelsPopulatesClaudeCode(t *testing.T) {
 	}
 }
 
+// codexCacheFixture ghi một models_cache.json giả (đúng shape thật của codex) vào configDir và trả
+// đường dẫn thư mục — dùng chung cho các test đọc cache live.
+func codexCacheFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	const cache = `{
+	  "fetched_at": "2026-08-08T00:00:00Z",
+	  "models": [
+	    {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list", "supported_in_api": true},
+	    {"slug": "gpt-5.6-sol-wm", "display_name": "GPT-5.6-Sol-WM", "visibility": "hide", "supported_in_api": false},
+	    {"slug": "gpt-5.6-terra", "display_name": "GPT-5.6-Terra", "visibility": "list", "supported_in_api": true},
+	    {"slug": "codex-auto-review", "display_name": "Codex Auto Review", "visibility": "hide", "supported_in_api": true},
+	    {"slug": "no-name", "display_name": "", "visibility": "list", "supported_in_api": true}
+	  ]
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "models_cache.json"), []byte(cache), 0o600); err != nil {
+		t.Fatalf("ghi fixture cache = %v; want nil", err)
+	}
+	return dir
+}
+
+// TestCodexCachedModelsFiltersVisibility: chỉ visibility=="list" đi qua (bỏ *-wm, auto-review ẩn);
+// display_name rỗng thì rơi về slug làm tên. Đây là hợp đồng đọc cache LIVE của codex.
+func TestCodexCachedModelsFiltersVisibility(t *testing.T) {
+	got := codexCachedModels(codexCacheFixture(t))
+	want := []cliModel{
+		{"gpt-5.6-sol", "GPT-5.6-Sol"},
+		{"gpt-5.6-terra", "GPT-5.6-Terra"},
+		{"no-name", "no-name"}, // display_name rỗng → slug
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("codexCachedModels = %v; want %v", got, want)
+	}
+	// Thiếu file / dir rỗng → nil (caller fallback seed).
+	if m := codexCachedModels(t.TempDir()); m != nil {
+		t.Errorf("codexCachedModels(empty dir) = %v; want nil", m)
+	}
+	if m := codexCachedModels(""); m != nil {
+		t.Errorf("codexCachedModels(\"\") = %v; want nil", m)
+	}
+}
+
+// TestCliProviderModelsPrefersLiveCache: có account codex với cache đọc được → cliProviderModels trả
+// list LIVE (gpt-5.6-sol — KHÔNG có trong seed tĩnh), chứng minh đường xanh thay seed bằng cache thật.
+func TestCliProviderModelsPrefersLiveCache(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf(`store.Open(":memory:") = %v; want nil`, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.CreateLLMProvider(store.LLMProvider{ID: "codex", Name: "Codex", Kind: "codex", Enabled: true})
+	_ = st.CreateLLMAccount(store.LLMAccount{ID: "a1", ProviderID: "codex", Label: "x",
+		ConfigDir: codexCacheFixture(t), Enabled: true})
+
+	got := cliProviderModels(st, "codex", "codex")
+	ids := make([]string, len(got))
+	for i, m := range got {
+		ids[i] = m.ModelID
+	}
+	if !slices.Equal(ids, []string{"gpt-5.6-sol", "gpt-5.6-terra", "no-name"}) {
+		t.Fatalf("cliProviderModels(live) ids = %v; want live cache list", ids)
+	}
+	if !slices.Contains(ids, "gpt-5.6-sol") {
+		t.Errorf("list live thiếu gpt-5.6-sol (flagship không có trong seed tĩnh)")
+	}
+}
+
+// TestCliProviderModelsFallsBackToSeeds: không account nào có cache → cliProviderModels trả seed TĨNH
+// của descriptor (đường mới connect, codex chưa chạy lượt nào để ghi cache).
+func TestCliProviderModelsFallsBackToSeeds(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf(`store.Open(":memory:") = %v; want nil`, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.CreateLLMProvider(store.LLMProvider{ID: "codex", Name: "Codex", Kind: "codex", Enabled: true})
+	_ = st.CreateLLMAccount(store.LLMAccount{ID: "a1", ProviderID: "codex", Label: "x",
+		ConfigDir: t.TempDir(), Enabled: true}) // dir rỗng, không cache
+
+	got := cliProviderModels(st, "codex", "codex")
+	want := descriptorModels("codex", "codex")
+	if len(got) != len(want) || len(got) == 0 {
+		t.Fatalf("cliProviderModels(fallback) trả %d model; want %d (= seed)", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ModelID != want[i].ModelID {
+			t.Errorf("model[%d] = %s; want seed %s", i, got[i].ModelID, want[i].ModelID)
+		}
+	}
+}
+
 // readGrandchildPID poll file cho tới khi node ghi xong pid cháu rồi parse. Poll ngắn có giới hạn:
 // đang chờ một tiến trình NGOẠI khởi động, không có channel để đợi.
 func readGrandchildPID(t *testing.T, pidFile string) int {

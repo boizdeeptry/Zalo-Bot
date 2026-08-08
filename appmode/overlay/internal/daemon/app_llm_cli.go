@@ -429,8 +429,17 @@ func descriptorModels(kind, providerID string) []store.LLMModel {
 	if !ok || len(d.modelSeeds) == 0 {
 		return nil
 	}
-	out := make([]store.LLMModel, 0, len(d.modelSeeds))
-	for _, m := range d.modelSeeds {
+	return modelsFromSeeds(d.modelSeeds, providerID)
+}
+
+// modelsFromSeeds ánh xạ một dãy cliModel (seed tĩnh HAY list live đọc từ cache CLI) sang
+// store.LLMModel — nguồn duy nhất của phép map, dùng cho cả hai nguồn. Mọi model discovered + available.
+func modelsFromSeeds(seeds []cliModel, providerID string) []store.LLMModel {
+	if len(seeds) == 0 {
+		return nil
+	}
+	out := make([]store.LLMModel, 0, len(seeds))
+	for _, m := range seeds {
 		out = append(out, store.LLMModel{
 			ProviderID: providerID, ModelID: m.id, Name: m.name,
 			Source: store.LLMModelDiscovered, Available: true,
@@ -439,9 +448,78 @@ func descriptorModels(kind, providerID string) []store.LLMModel {
 	return out
 }
 
-// ensureCLIProviderModels gieo model TĨNH của một CLI provider vào store. Idempotent:
-// ReplaceLLMModels thay trọn nguồn discovered trong MỘT transaction, nên gọi lại không nhân đôi.
-// No-op nếu kind không có seed.
+// codexCachedModels đọc list model LIVE từ cache của CHÍNH codex CLI: <CODEX_HOME>/models_cache.json.
+// Đây là điểm khác biệt XANH với 9Router — họ PROXY phiên OAuth tới endpoint /models của hãng (rủi ro
+// khoá tài khoản); ta chỉ ĐỌC file mà codex tự fetch + ghi, không đụng token, không giả client.
+//
+// Lọc visibility=="list" (bỏ model ẩn: *-wm, codex-auto-review) — đúng tập codex hiện trong picker
+// `/models` của nó. Rỗng (nil) nếu thiếu file / hỏng / rỗng → caller fallback seed tĩnh. Chi tiết nội
+// bộ của hãng (tên file, khoá JSON) nên cô lập ở MỘT hàm để một lần đổi format chỉ vỡ ở đây.
+func codexCachedModels(configDir string) []cliModel {
+	if configDir == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(configDir, "models_cache.json"))
+	if err != nil {
+		return nil
+	}
+	var cache struct {
+		Models []struct {
+			Slug        string `json:"slug"`
+			DisplayName string `json:"display_name"`
+			Visibility  string `json:"visibility"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil
+	}
+	out := make([]cliModel, 0, len(cache.Models))
+	for _, m := range cache.Models {
+		if m.Slug == "" || m.Visibility != "list" {
+			continue
+		}
+		name := m.DisplayName
+		if name == "" {
+			name = m.Slug
+		}
+		out = append(out, cliModel{id: m.Slug, name: name})
+	}
+	return out
+}
+
+// liveCLIModels trả list model LIVE của một CLI provider đọc từ cache của chính CLI (chỉ codex có
+// cache; claude/gemini không). Quét các account đã đăng nhập, dùng cache ĐỌC ĐƯỢC đầu tiên — catalog
+// model là của hãng, giống nhau qua mọi account, nên một account có cache là đủ. Rỗng khi chưa account
+// nào có cache (mới connect, codex chưa chạy lượt nào) → caller fallback seed tĩnh.
+func liveCLIModels(st *store.Store, providerID, kind string) []cliModel {
+	if kind != "codex" || st == nil {
+		return nil
+	}
+	accounts, err := st.LLMAccounts(providerID)
+	if err != nil {
+		return nil
+	}
+	for _, acc := range accounts {
+		if m := codexCachedModels(acc.ConfigDir); len(m) > 0 {
+			return m
+		}
+	}
+	return nil
+}
+
+// cliProviderModels dựng danh sách model của một CLI provider để gieo/khám phá: ưu tiên list LIVE đọc
+// từ cache của CLI (codex — chính chủ, không proxy), fallback về seed TĨNH của descriptor khi chưa có
+// cache. Đây là hàm hai nơi gọi (ensureCLIProviderModels lúc startup/connect, và discover endpoint).
+func cliProviderModels(st *store.Store, providerID, kind string) []store.LLMModel {
+	if live := liveCLIModels(st, providerID, kind); len(live) > 0 {
+		return modelsFromSeeds(live, providerID)
+	}
+	return descriptorModels(kind, providerID)
+}
+
+// ensureCLIProviderModels gieo model của một CLI provider vào store (live cache nếu có, else seed
+// tĩnh). Idempotent: ReplaceLLMModels thay trọn nguồn discovered trong MỘT transaction, nên gọi lại
+// không nhân đôi. No-op nếu kind không có seed.
 //
 // ponytail: best-effort — gieo hỏng chỉ khiến combo picker trống model (không mất dữ liệu khách), và
 // hai nơi gọi (startup, connect goroutine) đều không có đường trả lỗi hợp lý. Vẫn LOG để một hỏng
@@ -450,7 +528,7 @@ func ensureCLIProviderModels(st *store.Store, logger *slog.Logger, providerID, k
 	if st == nil {
 		return // không có store để gieo (registerAppRoutes gọi từ test route bằng api không DB)
 	}
-	m := descriptorModels(kind, providerID)
+	m := cliProviderModels(st, providerID, kind)
 	if len(m) == 0 {
 		return
 	}

@@ -310,12 +310,12 @@ func (a *api) handleLLMProviderDiscover(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	adapter, hasAdapter := llmAdapterFor(p.Kind, p.ID, a.llmAPIClient(), a.logger)
-	if !hasAdapter {
-		// claude-code KHÔNG có adapter (newLLMAdapter vắng case — định tuyến qua runClaude), nhưng
-		// model của nó là TĨNH ở descriptor. Gieo thẳng từ descriptorModels, không cần credential/
-		// adapter. Kind lạ THẬT (không adapter, không seed) vẫn báo 422 như llmProviderAdapter cũ.
-		models := descriptorModels(p.Kind, p.ID)
+	// CLI subscription (codex/gemini-cli/claude-code): danh sách model KHÔNG qua adapter/credential.
+	// codex đọc LIVE từ cache của chính CLI (cliProviderModels — chính chủ, không proxy OAuth như
+	// 9Router); các CLI khác dùng seed tĩnh của descriptor. Kind lạ THẬT (không seed) rơi xuống
+	// nhánh adapter dưới và báo 422 như cũ.
+	if _, isCLI := cliDescriptors[p.Kind]; isCLI {
+		models := cliProviderModels(a.st, p.ID, p.Kind)
 		if len(models) == 0 {
 			a.writeLLMErr(w, http.StatusUnprocessableEntity, "PROVIDER_KIND_UNSUPPORTED",
 				p.Name+" không gọi được qua API", nil)
@@ -326,6 +326,13 @@ func (a *api) handleLLMProviderDiscover(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		a.writeLLMModels(w, http.StatusOK, p.ID)
+		return
+	}
+	adapter, hasAdapter := llmAdapterFor(p.Kind, p.ID, a.llmAPIClient(), a.logger)
+	if !hasAdapter {
+		// Kind lạ THẬT: không phải CLI subscription và newLLMAdapter cũng vắng case → không gọi được.
+		a.writeLLMErr(w, http.StatusUnprocessableEntity, "PROVIDER_KIND_UNSUPPORTED",
+			p.Name+" không gọi được qua API", nil)
 		return
 	}
 	credential, ok := a.loadLLMCredential(w, p)
