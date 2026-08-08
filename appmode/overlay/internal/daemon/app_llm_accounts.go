@@ -116,3 +116,25 @@ func makeAccountEnv(st *store.Store, sel *accountSelector, providerID, kind stri
 		return env, penalize, true
 	}
 }
+
+// makeAccountConfigDir song song makeAccountEnv nhưng trả THẲNG ConfigDir (CODEX_HOME) của account
+// đã chọn, để codexProxyAdapter đọc auth.json thay vì spawn CLI. Cùng selector (round-robin+cooldown)
+// nên proxy và các CLI chia tải account như nhau. ok=false = 0 account enabled → adapter trả credential.
+func makeAccountConfigDir(st *store.Store, sel *accountSelector, providerID, kind string) func() (string, func(rateLimited bool), bool) {
+	return func() (string, func(bool), bool) {
+		accounts, err := st.LLMAccounts(providerID)
+		if err != nil {
+			return "", nil, false
+		}
+		acc, ok := sel.pick(kind, accounts)
+		if !ok {
+			return "", nil, false
+		}
+		penalize := func(rateLimited bool) {
+			if rateLimited {
+				sel.penalize(acc.ID)
+			}
+		}
+		return acc.ConfigDir, penalize, true
+	}
+}

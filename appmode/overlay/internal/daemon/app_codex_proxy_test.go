@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -251,5 +253,84 @@ func TestCodexProxyGenerateRefreshesOn401(t *testing.T) {
 	rt, err := readCodexTokens(dir)
 	if err != nil || rt.AccessToken != "at-fresh" {
 		t.Fatalf("auth.json access = %q err=%v; want at-fresh (đã ghi lại sau refresh)", rt.AccessToken, err)
+	}
+}
+
+// --- PX5: adapter ---
+
+func codexProxyAdapterWith(gen func(context.Context, *http.Client, string, string, string) (string, int, error), penalized *bool) *codexProxyAdapter {
+	return &codexProxyAdapter{
+		providerID: "codex",
+		client:     &http.Client{},
+		pickConfigDir: func() (string, func(bool), bool) {
+			return "cfg", func(rl bool) {
+				if penalized != nil {
+					*penalized = *penalized || rl
+				}
+			}, true
+		},
+		generate: gen,
+	}
+}
+
+func llmErrKind(t *testing.T, err error) llmErrorKind {
+	t.Helper()
+	var le *llmError
+	if !errors.As(err, &le) {
+		t.Fatalf("err = %v; want *llmError", err)
+	}
+	return le.Kind
+}
+
+func TestCodexProxyAdapterGenerateSuccess(t *testing.T) {
+	a := codexProxyAdapterWith(func(context.Context, *http.Client, string, string, string) (string, int, error) {
+		return "Xin chào", 200, nil
+	}, nil)
+	resp, err := a.Generate(context.Background(), llmRequest{Model: "gpt-5.4-mini", Prompt: "hi"}, nil)
+	if err != nil {
+		t.Fatalf("Generate = %v; want nil", err)
+	}
+	if resp.Text != "Xin chào" {
+		t.Fatalf("resp.Text = %q; want %q", resp.Text, "Xin chào")
+	}
+}
+
+func TestCodexProxyAdapterNoAccountIsCredential(t *testing.T) {
+	a := &codexProxyAdapter{providerID: "codex", client: &http.Client{},
+		pickConfigDir: func() (string, func(bool), bool) { return "", nil, false }}
+	_, err := a.Generate(context.Background(), llmRequest{Model: "m", Prompt: "p"}, nil)
+	if k := llmErrKind(t, err); k != llmErrorCredential {
+		t.Fatalf("kind = %s; want credential (0 account → DỪNG chuỗi)", k)
+	}
+}
+
+func TestCodexProxyAdapter429IsRateLimitAndPenalizes(t *testing.T) {
+	var penalized bool
+	a := codexProxyAdapterWith(func(context.Context, *http.Client, string, string, string) (string, int, error) {
+		return "", 429, fmt.Errorf("codex backend trả 429")
+	}, &penalized)
+	_, err := a.Generate(context.Background(), llmRequest{Model: "m", Prompt: "p"}, nil)
+	if k := llmErrKind(t, err); k != llmErrorRateLimit {
+		t.Fatalf("kind = %s; want rate_limit", k)
+	}
+	if !penalized {
+		t.Errorf("penalize(true) không được gọi cho 429")
+	}
+}
+
+func TestCodexProxyAdapter401IsCredentialNotFallback(t *testing.T) {
+	var penalized bool
+	a := codexProxyAdapterWith(func(context.Context, *http.Client, string, string, string) (string, int, error) {
+		return "", 401, fmt.Errorf("refresh token: oauth/token trả 400")
+	}, &penalized)
+	_, err := a.Generate(context.Background(), llmRequest{Model: "m", Prompt: "p"}, nil)
+	if k := llmErrKind(t, err); k != llmErrorCredential {
+		t.Fatalf("kind = %s; want credential (401 sau refresh hỏng → DỪNG)", k)
+	}
+	if isFallbackEligible(llmErrorCredential) {
+		t.Errorf("credential không được là fallback-eligible")
+	}
+	if penalized {
+		t.Errorf("401 không được penalize (chỉ rate_limit mới cooldown)")
 	}
 }

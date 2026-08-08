@@ -17,11 +17,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"agentdc/internal/store"
 )
 
 // codexBackendURL là endpoint responses của codex ở chế độ ChatGPT-subscription (capture từ codex.exe).
@@ -328,4 +331,104 @@ func codexProxyGenerate(ctx context.Context, client *http.Client, configDir, mod
 		return "", status, fmt.Errorf("codex backend trả %d", status)
 	}
 	return text, status, nil
+}
+
+// --- PX5: adapter — proxy THAY cliAdapter cho provider codex ---
+
+var _ providerAdapter = (*codexProxyAdapter)(nil)
+
+// codexProxyAdapter chạy một lượt Codex bằng cách gọi thẳng backend qua token OAuth của account, thay
+// vì spawn codex.exe. Router dùng nó y như một adapter thường. credential KHÔNG dùng — token nằm trong
+// auth.json của account, không đi qua daemon.
+type codexProxyAdapter struct {
+	providerID string
+	logger     *slog.Logger
+	client     *http.Client
+	// pickConfigDir chọn account cho lượt này (round-robin+cooldown, cùng selector với các CLI) và
+	// trả CODEX_HOME của nó + penalize. nil = chưa wire account (đường Test bare) → trả credential.
+	pickConfigDir func() (configDir string, penalize func(rateLimited bool), ok bool)
+	// generate là seam test — nil = gọi codexProxyGenerate thật (mạng).
+	generate func(ctx context.Context, client *http.Client, configDir, model, prompt string) (string, int, error)
+}
+
+// Generate gọi backend qua proxy rồi ánh xạ status/err về taxonomy router (fallback hay dừng chuỗi).
+func (a *codexProxyAdapter) Generate(ctx context.Context, req llmRequest, _ []byte) (llmResponse, error) {
+	if a.pickConfigDir == nil {
+		return llmResponse{}, newLLMError(llmErrorCredential, nil, "codex: chưa chọn được tài khoản")
+	}
+	configDir, penalize, ok := a.pickConfigDir()
+	if !ok {
+		// 0 account đăng nhập = credential (DỪNG chuỗi), như cliAdapter khi accountEnv ok=false.
+		return llmResponse{}, newLLMError(llmErrorCredential, nil, "codex: chưa có tài khoản nào đăng nhập")
+	}
+	gen := a.generate
+	if gen == nil {
+		gen = codexProxyGenerate
+	}
+	text, status, err := gen(ctx, a.client, configDir, req.Model, req.Prompt)
+	if err == nil && status == http.StatusOK {
+		return textOrUpstream("codex proxy", text)
+	}
+	if status == 0 { // chưa có phản hồi → lỗi transport/huỷ ctx
+		return llmResponse{}, transportError("codex proxy", err)
+	}
+	var kind llmErrorKind
+	if status == http.StatusOK {
+		// 200 nhưng nội dung lỗi (response.failed / rỗng): phân loại theo thông báo, như đường CLI
+		// đọc stderr — "usage limit" → rate_limit (đi tiếp), còn lại → rate_limit mặc định.
+		kind = classifyCLIError(errString(err), false)
+	} else {
+		kind = classifyCodexStatus(status)
+	}
+	if penalize != nil {
+		penalize(kind == llmErrorRateLimit)
+	}
+	// Thân lỗi backend KHÔNG đi vào thông báo (có thể chép token/khoá) — chỉ tên + loại.
+	return llmResponse{}, newLLMError(kind, nil, "codex proxy: gọi hỏng")
+}
+
+// Test dò đăng nhập RẺ: chọn account, đọc token trong auth.json. Có token → nil; không → credential.
+func (a *codexProxyAdapter) Test(_ context.Context, _ string, _ []byte) error {
+	if a.pickConfigDir == nil {
+		return newLLMError(llmErrorCredential, nil, "codex: chưa chọn được tài khoản")
+	}
+	configDir, _, ok := a.pickConfigDir()
+	if !ok {
+		return newLLMError(llmErrorCredential, nil, "codex: chưa có tài khoản nào đăng nhập")
+	}
+	if _, err := readCodexTokens(configDir); err != nil {
+		return newLLMError(llmErrorCredential, nil, "codex: tài khoản chưa đăng nhập hoặc thiếu token")
+	}
+	return nil
+}
+
+// Discover: khám phá THẬT của codex đi qua handleLLMProviderDiscover (cliProviderModels — đọc cache
+// live). Đây chỉ là fallback tĩnh để thoả interface, không phải đường được gọi trong luồng discover.
+func (a *codexProxyAdapter) Discover(_ context.Context, _ []byte) ([]store.LLMModel, error) {
+	return descriptorModels("codex", a.providerID), nil
+}
+
+// classifyCodexStatus ánh xạ HTTP status backend → taxonomy. 401/403 credential (refresh đã thử ở
+// codexProxyGenerate), 429 rate_limit, 400/422 request, 5xx upstream; còn lại rate_limit (mơ hồ →
+// cho chuỗi đi tiếp, đồng nhất với classifyCLIError).
+func classifyCodexStatus(status int) llmErrorKind {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return llmErrorRateLimit
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return llmErrorCredential
+	case status == http.StatusBadRequest || status == http.StatusUnprocessableEntity:
+		return llmErrorRequest
+	case status >= 500:
+		return llmErrorUpstream
+	default:
+		return llmErrorRateLimit
+	}
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

@@ -490,7 +490,11 @@ func newLLMAdapter(kind, providerID string, client *http.Client, logger *slog.Lo
 		return newGeminiAdapter(providerID, client), true
 	case "openrouter":
 		return newOpenRouterAdapter(providerID, client), true
-	case "codex", "gemini-cli":
+	case "codex":
+		// codex chạy qua PROXY (gọi thẳng backend bằng token OAuth), KHÔNG spawn CLI nữa — quyết định
+		// của chủ sản phẩm (mang rủi ro khoá, badge nói đúng). pickConfigDir wire ở appLLMAdapters.
+		return &codexProxyAdapter{providerID: providerID, logger: logger, client: client}, true
+	case "gemini-cli":
 		return newCLIAdapter(cliDescriptors[kind], providerID, logger), true
 	}
 	return nil, false
@@ -638,6 +642,10 @@ func (a *api) appLLMAdapters() (map[string]providerAdapter, map[string]bool, err
 			if _, isSub := envVarFor(p.Kind); isSub {
 				ca.accountEnv = makeAccountEnv(a.st, accountSel, p.ID, p.Kind)
 			}
+		}
+		// codex chạy qua proxy: cần CODEX_HOME của account đã chọn để đọc token OAuth (auth.json).
+		if pa, isProxy := adapter.(*codexProxyAdapter); isProxy {
+			pa.pickConfigDir = makeAccountConfigDir(a.st, accountSel, p.ID, p.Kind)
 		}
 		adapters[p.ID] = adapter
 		// Chỉ Provider GỌI ĐƯỢC mới vào tập tắt. Claude Code không có adapter nên nó không bao giờ
