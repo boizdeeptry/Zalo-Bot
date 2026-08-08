@@ -305,7 +305,20 @@
 .models-page .fb { display:flex; gap:6px; justify-content:flex-end; }
 .models-page .fb .btn { min-width:3.4em; text-align:center; justify-content:center; }
 .models-page .fc.check { justify-content:flex-start; white-space:nowrap; }
-.models-page .live { font-size:11px; color:var(--live); white-space:nowrap; }
+/* "đang chạy": huy hiệu viên bo tròn + chấm accent (thay vì chữ xanh trần dưới số cho gọn/đẹp). */
+.models-page .live:empty { display:none; }
+.models-page .live:not(:empty) {
+  display:inline-flex; align-items:center; gap:5px; align-self:flex-start; white-space:nowrap;
+  padding:2px 8px 2px 7px; border-radius:999px; font-size:10px; font-weight:600; line-height:1.5;
+  color:var(--live); background:rgba(52, 211, 153, .12); border:1px solid rgba(52, 211, 153, .32);
+}
+.models-page .live:not(:empty)::before {
+  content:""; width:6px; height:6px; border-radius:50%; background:var(--live); flex:none;
+}
+/* Nền xanh mờ cho HÀNG đang chạy — tách nó khỏi các mắt xích nghỉ. */
+.models-page .fact:has(.live:not(:empty)) { background:rgba(52, 211, 153, .05); }
+/* Nút dời bị khoá phải TRÔNG rõ là khoá (mắt xích đầu không Lên được, cuối không Xuống được). */
+.models-page .fb .btn:disabled { opacity:.38; cursor:default; }
 .models-page .mv { font-size:12.5px; color:var(--ink); overflow-wrap:anywhere; }
 .models-page .fn { grid-column:1 / -1; color:var(--dim); font-size:11.5px; }
 .models-page .fn:empty { display:none; }

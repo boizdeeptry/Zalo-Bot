@@ -275,8 +275,8 @@ export function createComboEditor({
     });
 
     const node = element("div", { className: "fact" },
-      element("div", { className: "fp" }, element("span", { text: `${index + 1}` }), badge),
-      element("div", { className: "fc" }, label),
+      element("div", { className: "fp" }, element("span", { text: `${index + 1}` })),
+      element("div", { className: "fc" }, label, badge),
       element("div", { className: "fc check" },
         enabledBox,
         element("label", { attributes: { for: `${idBase}-on` }, text: "Bật" }),
