@@ -3,7 +3,7 @@
 **Date:** 2026-08-08
 **Branch:** `feat/claude-cliadapter` (off `main` @ `8b92c57`)
 **Supersedes:** the original "Task 11 — merge Claude into cliAdapter" framing (rejected — see Non-goals).
-**Status:** design captured; **BLOCKED on a NEEDS-LOGIN checkpoint** before planning/implementation (see "Capture-first checkpoint").
+**Status:** design captured; **capture-first VERIFIED** with a real Claude login on this machine (2026-08-08) — checkpoint CLEARED, ready for `:writing-plans`.
 
 ---
 
@@ -35,14 +35,20 @@ Plus the small cleanup: unify the seed kind `claude_code` → `claude-code`.
 
 ---
 
-## Research findings (verified 2026-08-08; the ones marked ⚠ still need a real login to fully confirm)
+## Research findings (VERIFIED 2026-08-08 with a real login)
 
-1. **Claude login is silent browser-OAuth.** `claude auth login [--claudeai|--console|--sso|--email]` — there is **no** `--device-auth`. Spawned with an isolated `CLAUDE_CONFIG_DIR`, it printed **nothing** to stdout/stderr and blocked until killed. So it opens the OS default browser to Anthropic's OAuth page and blocks on a localhost callback; **there is no URL/code to display in the Portal.**
-2. **`CLAUDE_CONFIG_DIR` isolates a login** (confirmed): a fresh dir reads logged-out independently via `claude auth status --json` → `{"loggedIn":false,…}`, and Claude writes its config (`.claude.json`, `backups/`) into that dir.
-3. **`claude auth status --json`** → `{loggedIn, authMethod, apiProvider}` — already consumed by `probeClaudeAuth`/`claudeAuthFromJSON` (`app_llm_cli.go:209-249`), exits non-zero when logged out but still prints valid JSON.
-4. **No npm install path** — `claude` is a native install (`claude.com/claude-code`), not `npm i -g`. `#45`'s bundled-npm on-demand install does NOT apply.
-5. ⚠ **Browser-open from the hidden packaged daemon** — unverified: does `claude auth login`, spawned by the run.bat-launched hidden daemon, actually open the buyer's default browser and exit 0 on success? Needs a real login.
-6. ⚠ **Per-account routing** — unverified end-to-end: does `execZaloRunner` with `CLAUDE_CONFIG_DIR=<account dir>` actually consult that account's login? (Isolation is confirmed for `auth status`; the full consult turn is not yet.)
+1. **Claude login = browser-OAuth that PRINTS a URL and completes via a localhost callback.** (Corrects an earlier "silent" reading caused by killing the probe too fast.) `claude auth login --claudeai` emits to **stdout**:
+   ```
+   Opening browser to sign in…
+   If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=…&redirect_uri=…&code_challenge=…&state=…
+   Paste code here if prompted >
+   ```
+   It opens the OS default browser AND listens on `127.0.0.1:<ephemeral>` (observed :64321). When the user authorizes, the localhost callback completes it → prints `Login successful.` → **exits 0**. So the Portal **CAN parse + display the URL** (the line after "If the browser didn't open, visit:") like codex — there is **no separate device-code**; the callback (or the paste-code fallback) finishes it. There is **no** `--device-auth` flag; `[--claudeai|--console|--sso|--email]` only.
+2. **`CLAUDE_CONFIG_DIR` isolates a login** (confirmed): a fresh dir reads logged-out independently; login lands entirely in that dir (`.claude.json`, `backups/`).
+3. **`claude auth status --json`** → `{loggedIn, authMethod, apiProvider, email, orgId, orgName, subscriptionType}`. **Email IS exposed** (e.g. `congnghe@midu.vn`, org "Technology Department", `team`) — so a Claude account can be **labeled with its real email** (better than codex, which exposed none). Consumed today by `probeClaudeAuth`/`claudeAuthFromJSON` (`app_llm_cli.go:209-249`).
+4. **No npm install path** — `claude` is a native install (`claude.com/claude-code`), not `npm i -g`. `#45`'s bundled-npm on-demand install does NOT apply; connect detects + requires manual install.
+5. **Browser-open + exit-0 signal — VERIFIED**: spawned from a background process (user's session), it opened the browser, completed on authorize, printed `Login successful.`, exit 0. In the packaged hidden daemon the browser-open may differ, but the **printed URL is the guaranteed fallback** (Portal shows it; buyer clicks).
+6. **Per-account routing — VERIFIED**: `claude -p "…"` with `CLAUDE_CONFIG_DIR=<that dir>` answered correctly (exit 0), proving inference uses the account in that dir. ⚠ **Trust-dialog note**: a fresh `CLAUDE_CONFIG_DIR` with an untrusted cwd warns `this workspace has not been trusted … set projects[cwd].hasTrustDialogAccepted:true in <dir>\.claude.json` (it still answered). The real runner uses `--add-dir` (grants scope) which likely avoids it; if not, seed `hasTrustDialogAccepted:true` into the per-account `.claude.json` at account-create. Resolve in the plan.
 
 ## Kind-mismatch surface to unify (from Explore, file:line)
 
@@ -66,11 +72,11 @@ Reuse the #2 connect state-machine shape (`app_llm_connect.go`: `connectManager`
 - **`connectRunner` for Claude** — either a `kind`-branch inside `defaultConnectRunner` or a sibling runner selected by kind:
   - `detect(claude-code)` → `resolveCLIProgram` nativeBin `claude` on PATH. Missing → not-installed.
   - `install(claude-code, …)` → **not supported**: return a typed error carrying the manual-install instruction ("Cài Claude Code tại claude.com/claude-code rồi thử lại"). The state machine surfaces it as a clear, non-retryable install failure. (No npm.)
-  - `login(claude-code, configDir)` → spawn `claude auth login --claudeai` with env `CLAUDE_CONFIG_DIR=configDir`. Returns **empty loginURL + empty code** (nothing to show) and a `wait()` that blocks on process exit (exit 0 = success). The process opens the buyer's browser and blocks; `killPidTree` on ctx-cancel.
-  - `pollAuth(claude-code, configDir)` → `claude auth status --json` with `CLAUDE_CONFIG_DIR=configDir` → `claudeAuthFromJSON`. Backup signal to `wait()`-exit-0.
-- **State machine**: `awaiting_login` (message: "Đang mở trình duyệt — hoàn tất đăng nhập Claude ở tab vừa mở") → `polling` (wait for `wait()` exit 0 OR `pollAuth`==loggedIn) → `connected` → `CreateLLMAccount`. `connectState.LoginURL`/`Code` stay empty for Claude — **the frontend must not require them.**
+  - `login(claude-code, configDir)` → spawn `claude auth login --claudeai` with env `CLAUDE_CONFIG_DIR=configDir`. **Scan stdout** for the `If the browser didn't open, visit: <URL>` line → return that **loginURL** (Code stays empty — Claude has no device-code). Return a `wait()` that blocks on process exit (`Login successful.` + exit 0 = success). It also opens the buyer's browser + listens on a localhost callback; `killPidTree` on ctx-cancel. (Reuses the codex `scanDeviceAuth`-style stdout scan, ANSI-strip included, just a different URL line + no code.)
+  - `pollAuth(claude-code, configDir)` → `claude auth status --json` with `CLAUDE_CONFIG_DIR=configDir` → `claudeAuthFromJSON`. Backup signal to `wait()`-exit-0. On success, read the **email** from the same JSON to label the account.
+- **State machine**: `awaiting_login` → set **LoginURL** (the parsed OAuth URL; message: "Bấm vào link để đăng nhập Claude, hoặc dùng tab trình duyệt vừa mở") → `polling` (wait for `wait()` exit 0 OR `pollAuth`==loggedIn) → `connected` → `CreateLLMAccount{Label: email}`. `connectState.Code` stays empty for Claude — the frontend shows the URL, no code block.
 - **`run.bat`**: no global `CLAUDE_CONFIG_DIR` (multi-account sets it per turn in Part 2). The connect flow sets `CLAUDE_CONFIG_DIR=<accountConfigDir(dataDir,"claude-code",id)>` when spawning login.
-- **Frontend** (`providers.js` connect panel): `CONNECTABLE_KINDS += claude-code`; when the connecting kind is `claude-code`, render the **browser-flow copy** (no code block) — "trình duyệt sẽ mở để đăng nhập Claude" — reusing `paintConnect` but branching on kind/`code`-absent. `subscriptionDisplayName`/gallery already show Claude Code.
+- **Frontend** (`providers.js` connect panel): `CONNECTABLE_KINDS += claude-code`; reuse `paintConnect` — Claude has a **loginURL (show the clickable link)** but **no code** (the existing `code ? … : null` guard already handles that). Copy: "Bấm link đăng nhập Claude ở trình duyệt". `subscriptionDisplayName`/gallery already show Claude Code. Account rows label with the captured **email**.
 
 ### Part 2 — Multi-account Claude routing (base AgentDC repo + overlay)
 
@@ -108,13 +114,14 @@ Reuse the #2 connect state-machine shape (`app_llm_connect.go`: `connectManager`
 - Portal: connect panel renders the browser-flow (no code) for claude-code; gallery gating.
 - Full build gate green; security canary unweakened.
 
-## Capture-first checkpoint (BLOCKS planning/impl)
+## Capture-first checkpoint — CLEARED ✅ (2026-08-08)
 
-Before writing the plan, a **real Claude login** on this machine is required (your OAuth action) to confirm the ⚠ items:
+Done via a real login on this machine (`CLAUDE_CONFIG_DIR=C:\Users\Admin\AppData\Local\zalo-claude-capture`, account `congnghe@midu.vn`):
+1. `claude auth login --claudeai` printed the OAuth URL, opened the browser, completed on authorize, printed `Login successful.`, **exit 0**.
+2. `claude auth status --json` → `loggedIn:true` + email in that isolated dir.
+3. `claude -p` with `CLAUDE_CONFIG_DIR=<that dir>` answered (exit 0) — per-account inference confirmed.
 
-1. Run `claude auth login --claudeai` once (any config dir) so Claude is logged in here — needed to capture real behavior + verify routing.
-2. Verify: spawning `claude auth login` with a fresh `CLAUDE_CONFIG_DIR` opens the browser and **exits 0** on completion (the `wait()` signal); `claude auth status --json` flips to `loggedIn:true` in that dir; and a consult turn with `CLAUDE_CONFIG_DIR=<that dir>` uses that login.
-3. Only then: `:writing-plans` → execute (subagent-driven, capture-first, per #4's rhythm).
+This logged-in capture dir is available to test the Part-2 routing during execution. Next: `:writing-plans` → execute (subagent-driven, per #4's rhythm).
 
 ## Open questions / risks
 

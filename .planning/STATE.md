@@ -6,7 +6,7 @@ current_spec: .planning/specs/2026-08-08-claude-connect-design.md
 current_plan:
 last_updated: 2026-08-08
 
-## Đang làm: Claude connect-in-Portal + multi-account — SPEC XONG, CHẶN ở checkpoint LOGIN
+## Đang làm: Claude connect-in-Portal + multi-account — SPEC XONG, checkpoint LOGIN ĐÃ QUA → sẵn sàng /plan
 
 Nhánh `feat/claude-cliadapter` (off main `8b92c57`). **Reframe từ "Task 11 gộp Claude vào cliAdapter"** —
 Explore chứng minh gộp sẽ HỎNG KB/tool của Claude (adapter chung cho CLI stateless; Claude agentic đọc KB
@@ -17,9 +17,12 @@ qua `--add-dir` trong `execZaloRunner`). BỎ merge, giữ `runClaude`. Thay b�
 - **Part 2 (BASE AgentDC repo)**: multi-account — `execZaloRunner` (duty.go) nhận per-turn `CLAUDE_CONFIG_DIR`;
   `appClaudeRunner` chọn account claude-code qua `accountSel`. Đây là thay đổi ĐẦU TIÊN vào base repo.
 - Spec: `.planning/specs/2026-08-08-claude-connect-design.md`.
-- **CHẶN — NEEDS-LOGIN checkpoint**: Claude đang LOGGED OUT trên máy. Phải `claude auth login` thật (hành động
-  OAuth của user) để verify: daemon ẩn có mở được browser? login exit 0 khi xong? `auth status` flip trong dir?
-  consult turn với `CLAUDE_CONFIG_DIR=<dir>` dùng đúng account? → rồi mới `/plan` → execute.
+- **checkpoint LOGIN ĐÃ QUA (2026-08-08)** — login thật `CLAUDE_CONFIG_DIR=C:\Users\Admin\AppData\Local\
+  zalo-claude-capture`, account `congnghe@midu.vn`. XÁC MINH: `claude auth login` IN URL ra stdout (Portal
+  hiện được, KHÔNG silent như tưởng ban đầu) + mở browser + localhost callback + `Login successful.` exit 0;
+  `auth status --json` flip loggedIn + **phơi email** (label account bằng email); `claude -p` với CLAUDE_CONFIG_DIR
+  trả lời đúng account. Note: dir mới cảnh báo "workspace not trusted" (vẫn trả lời; runner thật dùng --add-dir).
+  Dir đã-login này DÙNG LẠI được để test routing Part 2 lúc execute. → SẴN SÀNG `/plan`.
 - **Lỗi cần nhớ**: ĐỪNG `Get-Process claude | Kill` — agent runtime LÀ claude, quét trúng cả session mình +
   các claude khác. Chỉ kill đúng PID mình spawn.
 
