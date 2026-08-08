@@ -313,6 +313,34 @@ test("creating a combo with no name is refused before it reaches the API", async
   assert.match(text(find(modal, (node) => hasClass(node, "note"))), /Đặt tên cho combo mới/);
 });
 
+test("creating a combo with models added in the modal creates then saves those members", async (t) => {
+  const { calls, main } = await mounted(t);
+  button(main, "Tạo combo").click();
+  const modal = comboModal();
+  find(modal, (node) => node.tagName === "INPUT" && node.getAttribute?.("type") === "text").value = "Combo có model";
+
+  // Add Model từ TRONG modal Tạo — mở cùng picker (data-combos-overlay) như editor.
+  button(modal, "Thêm model").click();
+  const picker = overlay();
+  assert.ok(picker, "the create modal's Thêm model must open the shared picker");
+  pickRow(picker, "GPT-5").click();
+  pickRow(picker, "Gemini 2").click();
+  // Model đã thêm hiện trong danh sách nháp của modal Tạo (chưa gọi API — chỉ create mới gửi).
+  assert.equal(putCalls(calls).length, 0, "adding a model in the create modal must not save before Tạo");
+
+  button(modal, "Tạo").click();
+  await settle();
+
+  const post = calls.find((call) => call.path === "/llm/combos" && call.options.method === "POST");
+  assert.deepEqual(post.options.body, { name: "Combo có model", type: "fallback" });
+  const put = putCalls(calls).find((call) => call.path === "/llm/combos/c-new");
+  assert.ok(put, "creating with models must save the chosen members onto the new combo");
+  assert.deepEqual(put.body.entries, [
+    { provider_id: "openai-1", model_id: "gpt-5", enabled: true },
+    { provider_id: "gemini", model_id: "gemini-2", enabled: true },
+  ]);
+});
+
 test("a protected delete shows the reason instead of crashing", async (t) => {
   const { main } = await mounted(t, comboAPI({
     remove: () => {

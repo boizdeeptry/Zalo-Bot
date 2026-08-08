@@ -330,90 +330,14 @@ export function createComboEditor({
 
   function openPicker() {
     closePicker();
-    // Chỉ Provider đang bật + có model: một hàng model không có gì để thêm chỉ làm rối modal.
-    const pickable = providers.filter((provider) => provider.enabled
-      && Array.isArray(provider.models) && provider.models.length);
-    const back = element("div", { className: "sheetback", attributes: { "data-combos-overlay": "" } });
-    const search = element("input", {
-      className: "pick-search",
-      attributes: { type: "text", placeholder: "Tìm model…", "aria-label": "Tìm model" },
+    const picker = openModelPicker({
+      providers,
+      isMember,
+      toggle: toggleMember,
+      hint: "Bấm để thêm, bấm lại để bỏ. Thay đổi tự lưu.",
+      onClose: () => { closePicker = () => {}; addBtn.focus?.(); },
     });
-    const listBox = element("div", { className: "pick-list" });
-
-    const matches = (query, provider, model) => !query
-      || (model.name || "").toLowerCase().includes(query)
-      || String(model.model_id).toLowerCase().includes(query)
-      || (provider.name || provider.id).toLowerCase().includes(query);
-
-    const modelRow = (provider, model) => {
-      const active = isMember(provider.id, model.model_id);
-      const row = element("button", {
-        className: active ? "pick-model on" : "pick-model",
-        attributes: { type: "button", "aria-pressed": String(active) },
-      },
-        element("span", { className: "pick-check", text: active ? "✓" : "" }),
-        element("span", { className: "pick-mname", text: model.name || model.model_id }),
-        element("span", { className: "pick-mid", text: model.model_id }),
-      );
-      row.addEventListener("click", () => {
-        toggleMember(provider.id, model.model_id);
-        renderList();
-      });
-      return row;
-    };
-
-    const renderList = () => {
-      const query = search.value.trim().toLowerCase();
-      const groups = pickable
-        .map((provider) => ({ provider, models: provider.models.filter((model) => matches(query, provider, model)) }))
-        .filter((group) => group.models.length);
-      if (!groups.length) {
-        listBox.replaceChildren(element("div", { className: "none", text: "Không có model nào khớp." }));
-        return;
-      }
-      listBox.replaceChildren(...groups.map((group) => element("div", { className: "pick-group" },
-        element("div", { className: "pick-group-head", text: group.provider.name || group.provider.id }),
-        ...group.models.map((model) => modelRow(group.provider, model)),
-      )));
-    };
-    search.addEventListener("input", renderList);
-
-    const closeBtn = element("button", {
-      className: "btn", attributes: { type: "button", "aria-label": "Đóng" }, text: "Đóng",
-    });
-    const sheet = element("div", {
-      className: "sheet",
-      attributes: { role: "dialog", "aria-modal": "true", "aria-label": "Thêm model vào combo" },
-    },
-      element("div", { className: "sheethead" },
-        element("span", { className: "st", text: "Thêm model vào combo" }),
-        closeBtn,
-      ),
-      element("div", { className: "pick-hint", text: "Bấm để thêm, bấm lại để bỏ. Thay đổi tự lưu." }),
-      search,
-      listBox,
-    );
-
-    let closed = false;
-    const onKey = (event) => { if (event.key === "Escape") close(); };
-    const teardown = (restoreFocus) => {
-      if (closed) return;
-      closed = true;
-      document.removeEventListener?.("keydown", onKey);
-      back.remove();
-      closePicker = () => {};
-      if (restoreFocus) addBtn.focus?.();
-    };
-    const close = () => teardown(true);
-    closePicker = () => teardown(false);
-    closeBtn.addEventListener("click", close);
-    back.addEventListener("click", (event) => { if (event.target === back) close(); });
-    document.addEventListener?.("keydown", onKey);
-
-    back.append(sheet);
-    renderList();
-    document.body.append(back);
-    search.focus?.();
+    closePicker = picker.close;
   }
 
   const node = element("div", { className: "models-page" },
@@ -441,6 +365,94 @@ export function createComboEditor({
       closePicker();
     },
   });
+}
+
+// openModelPicker mở modal chọn model kiểu 9Router (data-combos-overlay): liệt kê model của các
+// Provider ĐANG BẬT (nhóm theo Provider) + ô tìm; bấm một model để thêm/bỏ. Tách khỏi editor để CẢ
+// editor (Sửa model) LẪN modal Tạo combo dùng chung một picker. Trả { close }.
+//   providers  danh sách Provider (chỉ lấy provider.enabled + có models).
+//   isMember(providerID, modelID) → bool: model đã có trong bản nháp của bên gọi chưa.
+//   toggle(providerID, modelID): thêm/bỏ — bên gọi tự cập nhật bản nháp (editor tự lưu, Tạo combo thì chưa).
+//   hint: dòng gợi ý dưới tiêu đề (editor "tự lưu"; Tạo combo thì không).
+//   onClose(): gọi khi picker đóng, để bên gọi dọn handle.
+function openModelPicker({ providers = [], isMember, toggle, hint = "Bấm để thêm, bấm lại để bỏ.", onClose = () => {} } = {}) {
+  const pickable = providers.filter((provider) => provider.enabled
+    && Array.isArray(provider.models) && provider.models.length);
+  const back = element("div", { className: "sheetback", attributes: { "data-combos-overlay": "" } });
+  const search = element("input", {
+    className: "pick-search",
+    attributes: { type: "text", placeholder: "Tìm model…", "aria-label": "Tìm model" },
+  });
+  const listBox = element("div", { className: "pick-list" });
+
+  const matches = (query, provider, model) => !query
+    || (model.name || "").toLowerCase().includes(query)
+    || String(model.model_id).toLowerCase().includes(query)
+    || (provider.name || provider.id).toLowerCase().includes(query);
+
+  const modelRow = (provider, model) => {
+    const active = isMember(provider.id, model.model_id);
+    const row = element("button", {
+      className: active ? "pick-model on" : "pick-model",
+      attributes: { type: "button", "aria-pressed": String(active) },
+    },
+      element("span", { className: "pick-check", text: active ? "✓" : "" }),
+      element("span", { className: "pick-mname", text: model.name || model.model_id }),
+      element("span", { className: "pick-mid", text: model.model_id }),
+    );
+    row.addEventListener("click", () => { toggle(provider.id, model.model_id); renderList(); });
+    return row;
+  };
+
+  function renderList() {
+    const query = search.value.trim().toLowerCase();
+    const groups = pickable
+      .map((provider) => ({ provider, models: provider.models.filter((model) => matches(query, provider, model)) }))
+      .filter((group) => group.models.length);
+    if (!groups.length) {
+      listBox.replaceChildren(element("div", { className: "none", text: "Không có model nào khớp." }));
+      return;
+    }
+    listBox.replaceChildren(...groups.map((group) => element("div", { className: "pick-group" },
+      element("div", { className: "pick-group-head", text: group.provider.name || group.provider.id }),
+      ...group.models.map((model) => modelRow(group.provider, model)),
+    )));
+  }
+  search.addEventListener("input", renderList);
+
+  const closeBtn = element("button", {
+    className: "btn", attributes: { type: "button", "aria-label": "Đóng" }, text: "Đóng",
+  });
+  const sheet = element("div", {
+    className: "sheet",
+    attributes: { role: "dialog", "aria-modal": "true", "aria-label": "Thêm model vào combo" },
+  },
+    element("div", { className: "sheethead" },
+      element("span", { className: "st", text: "Thêm model vào combo" }),
+      closeBtn,
+    ),
+    element("div", { className: "pick-hint", text: hint }),
+    search,
+    listBox,
+  );
+
+  let closed = false;
+  const onKey = (event) => { if (event.key === "Escape") close(); };
+  function close() {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener?.("keydown", onKey);
+    back.remove();
+    onClose();
+  }
+  closeBtn.addEventListener("click", close);
+  back.addEventListener("click", (event) => { if (event.target === back) close(); });
+  document.addEventListener?.("keydown", onKey);
+  back.append(sheet);
+  renderList();
+  document.body.append(back);
+  search.focus?.();
+  return { close };
 }
 
 // openComboModal đắp một modal (tạo/sửa combo) lên document.body — dùng data-combos-modal để tách
@@ -637,22 +649,72 @@ export function createCombosPage({
 
       // --- modal Tạo combo ---
 
+      // openCreateModal — kiểu 9Router "Create Combo": Tên + Kiểu + mục Model (thêm ngay model của các
+      // Provider đang bật qua cùng picker) + Tạo. Model chọn ở đây được lưu LIỀN sau khi tạo (create +
+      // save một combo có sẵn thành viên), không phải tạo rỗng rồi mở Sửa model.
       function openCreateModal() {
+        const draftMembers = []; // [{provider_id, model_id, enabled}] — chưa gửi tới khi bấm Tạo
+        let closePicker = () => {};
+
         const nameInput = element("input", {
           className: "cname-input",
           attributes: { type: "text", placeholder: "Tên combo mới", "aria-label": "Tên combo mới" },
         });
         const typeSel = element("select", { attributes: { "aria-label": "Kiểu combo mới" } },
           TYPE_ORDER.map((id) => element("option", { attributes: { value: id }, text: typeLabel(id) })));
+        const modelsBox = element("div", { className: "cnew-models" });
+        const addModelBtn = element("button", { className: "btn", attributes: { type: "button" }, text: "Thêm model" });
         const mnote = element("span", { className: "note", attributes: { "aria-live": "polite" } });
         const submit = element("button", { className: "btn go", attributes: { type: "button" }, text: "Tạo" });
+
+        const isDraftMember = (providerID, modelID) => draftMembers
+          .some((entry) => entry.provider_id === providerID && entry.model_id === modelID);
+        const toggleDraft = (providerID, modelID) => {
+          const at = draftMembers.findIndex((entry) => entry.provider_id === providerID && entry.model_id === modelID);
+          if (at >= 0) draftMembers.splice(at, 1);
+          else draftMembers.push({ provider_id: providerID, model_id: modelID, enabled: true });
+          drawDraftModels();
+        };
+
+        function drawDraftModels() {
+          if (!draftMembers.length) {
+            modelsBox.replaceChildren(element("div", { className: "none", text: "Chưa thêm model nào." }));
+            return;
+          }
+          modelsBox.replaceChildren(...draftMembers.map((entry, index) => {
+            const remove = element("button", {
+              className: "btn",
+              attributes: { type: "button", "aria-label": `Bỏ ${modelLabelOf(entry.provider_id, entry.model_id)}` },
+              text: "Bỏ",
+            });
+            remove.addEventListener("click", () => { draftMembers.splice(index, 1); drawDraftModels(); });
+            return element("div", { className: "cnew-model" },
+              element("span", { className: "cchip", text: `${nameOf(entry.provider_id)} · ${modelLabelOf(entry.provider_id, entry.model_id)}` }),
+              remove,
+            );
+          }));
+        }
+
+        addModelBtn.addEventListener("click", () => {
+          closePicker();
+          const picker = openModelPicker({
+            providers, isMember: isDraftMember, toggle: toggleDraft,
+            onClose: () => { closePicker = () => {}; addModelBtn.focus?.(); },
+          });
+          closePicker = picker.close;
+        });
+
         const body = element("div", { className: "cnew" },
           element("label", { className: "cfk" }, element("span", { text: "Tên" }), nameInput),
           element("label", { className: "cfk" }, element("span", { text: "Kiểu" }), typeSel),
+          element("div", { className: "cnew-modelhead" }, element("span", { text: "Model" }), addModelBtn),
+          modelsBox,
           element("div", { className: "row" }, submit),
           mnote,
         );
-        const modal = openComboModal({ title: "Tạo combo mới", body, initialFocus: nameInput });
+        const modal = openComboModal({ title: "Tạo combo mới", body, initialFocus: nameInput, onClose: () => closePicker() });
+        drawDraftModels();
+
         submit.addEventListener("click", async () => {
           const name = nameInput.value.trim();
           if (!name) { mnote.textContent = "Đặt tên cho combo mới trước khi tạo."; return; }
@@ -662,12 +724,17 @@ export function createCombosPage({
           try {
             const created = await service.create({ name, type });
             if (disposed) return;
+            // Combo mới có sẵn model đã chọn: lưu liền bộ thành viên (create rỗng → save có member).
+            if (draftMembers.length && created?.id) {
+              await service.save(created.id, { revision: revisionOf(created), type, entries: draftMembers });
+            }
+            if (disposed) return;
             modal.close();
             await refreshList();
             if (disposed) return;
-            say("Đã tạo combo mới. Bấm “Sửa model” để thêm model, gạt “Đang dùng” để bot dùng.");
-            const fresh = combos.find((combo) => combo.id === created?.id);
-            if (fresh) openEditModal(fresh); // mở luôn để thêm model — combo mới trống
+            say(draftMembers.length
+              ? "Đã tạo combo mới kèm model. Gạt “Đang dùng” để bot dùng."
+              : "Đã tạo combo mới. Bấm “Sửa model” để thêm model, gạt “Đang dùng” để bot dùng.");
           } catch (error) {
             if (disposed || error?.name === "AbortError") return;
             mnote.textContent = `không tạo được combo: ${messageOf(error)}`;

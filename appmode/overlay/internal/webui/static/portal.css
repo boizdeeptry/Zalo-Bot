@@ -6,12 +6,14 @@
 .portal-body button,
 .portal-body input,
 .portal-body textarea,
-/* Select polish: bỏ mũi tên native (sát phải, thô), thay bằng chevron SVG canh lề phải rộng rãi +
-   bo góc mềm. Một chỗ cho MỌI select trong Portal; các rule riêng bên dưới chỉ chỉnh width/cỡ chữ,
-   KHÔNG đặt lại background/padding/border-radius (sẽ đè mất chevron). */
+.portal-body select { font:inherit; }
+
+/* Select polish: bỏ mũi tên native (sát phải, thô), thay bằng chevron SVG canh lề phải rộng rãi + bo
+   góc mềm. CHỈ áp cho <select> — TÁCH khỏi reset font phía trên; gộp chung sẽ dính cả button/input/
+   checkbox/radio (biến nút thành hộp chevron, làm mất dấu tích/chấm của toggle & radio). */
 .portal-body select {
   appearance:none; -webkit-appearance:none; -moz-appearance:none;
-  box-sizing:border-box; font:inherit; cursor:pointer; color:var(--ink);
+  box-sizing:border-box; cursor:pointer; color:var(--ink);
   border:1px solid var(--line); border-radius:9px; padding:7px 32px 7px 11px;
   background-color:var(--sunk);
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%239a9aa2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M2.75 4.75 6 8 9.25 4.75'/%3E%3C/svg%3E");
@@ -132,7 +134,7 @@
    hai lớp lồng nhau không đè z-index/attr của nhau. Sheet dùng lại khung overlay; nội dung modal Sửa
    là editor .models-page (đã có style ở khối models), modal Tạo là form .cnew bên dưới. */
 [data-combos-modal].sheetback { position:fixed; z-index:40; inset:0; display:flex; align-items:center; justify-content:center; padding:22px; background:rgba(9, 12, 16, .58); }
-[data-combos-modal] .sheet { box-sizing:border-box; width:min(560px, 100%); max-height:calc(100vh - 44px); overflow:auto; border:1px solid var(--line); border-radius:10px; padding:16px; background:var(--panel); box-shadow:0 16px 55px rgba(0, 0, 0, .35); }
+[data-combos-modal] .sheet { box-sizing:border-box; width:min(640px, 100%); max-height:calc(100vh - 44px); overflow:auto; border:1px solid var(--line); border-radius:10px; padding:16px; background:var(--panel); box-shadow:0 16px 55px rgba(0, 0, 0, .35); }
 [data-combos-modal] .sheethead { display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:12px; }
 [data-combos-modal] .sheethead .st { font-size:15px; font-weight:600; }
 [data-combos-modal] .cnew { display:flex; flex-direction:column; gap:12px; }
@@ -142,6 +144,11 @@
 [data-combos-modal] .cnew select { width:100%; font-size:13px; }
 [data-combos-modal] .cnew .row { margin:0; }
 [data-combos-modal] .note { font-size:12px; color:var(--dim); }
+[data-combos-modal] .cnew-modelhead { display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:12px; font-weight:600; color:var(--dim); }
+[data-combos-modal] .cnew-models { display:flex; flex-direction:column; gap:6px; }
+[data-combos-modal] .cnew-model { display:flex; align-items:center; justify-content:space-between; gap:10px; border:1px solid #26262b; border-radius:9px; padding:7px 11px; background:#161618; }
+[data-combos-modal] .cnew-model .cchip { border:1px solid #2f2f36; border-radius:999px; padding:3px 10px; font-size:11.5px; background:#1c1c20; color:var(--ink); }
+[data-combos-modal] .cnew .none { padding:12px; color:var(--dim); font-style:italic; font-size:12px; border:1px dashed var(--line); border-radius:9px; text-align:center; }
 
 /* providers:begin — Providers gallery + detail (Task 1–6). Nền tối kiểu 9Router: card #161618,
    viền #26262b, accent xanh #34d399 thay cho banner đỏ "may be banned" của bản gốc.
@@ -285,8 +292,8 @@
 .models-page .chainstatus:empty { display:none; }
 .models-page .facts { border:1px solid var(--line); border-radius:8px; overflow:hidden; margin:12px 0; background:var(--panel); }
 .models-page .fact {
-  display:grid; grid-template-columns:auto minmax(0, 1fr) minmax(0, 1fr) auto auto;
-  gap:6px 12px; align-items:center; padding:9px 11px; border-bottom:1px solid var(--line);
+  display:grid; grid-template-columns:2.4em minmax(0, 1fr) auto auto;
+  gap:6px 12px; align-items:center; padding:11px; border-bottom:1px solid var(--line);
   font-size:12.5px;
 }
 .models-page .fact:last-child { border-bottom:0; }
@@ -295,7 +302,9 @@
 .models-page .fc.check { flex-direction:row; align-items:center; gap:7px; }
 .models-page .fk { font-size:11px; color:var(--dim); }
 .models-page .fc select { width:100%; font-size:12.5px; }
-.models-page .fb { display:flex; gap:6px; flex-wrap:wrap; }
+.models-page .fb { display:flex; gap:6px; justify-content:flex-end; }
+.models-page .fb .btn { min-width:3.4em; text-align:center; justify-content:center; }
+.models-page .fc.check { justify-content:flex-start; white-space:nowrap; }
 .models-page .live { font-size:11px; color:var(--live); white-space:nowrap; }
 .models-page .mv { font-size:12.5px; color:var(--ink); overflow-wrap:anywhere; }
 .models-page .fn { grid-column:1 / -1; color:var(--dim); font-size:11.5px; }
