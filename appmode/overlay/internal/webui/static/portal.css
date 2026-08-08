@@ -229,11 +229,10 @@
 
 .row { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin:16px 0; }
 
-/* models:begin — Trang Models là bảng chuỗi fallback: mỗi hàng là một mắt xích Provider/model.
+/* models:begin — Member-editor dùng lại cho trang Combos: mỗi hàng là một mắt xích Provider/model
+   trong một combo. Giữ nguyên tên lớp .models-page để trang Combos dùng lại nguyên khối CSS này.
 
-   MỌI luật từ đây tới models:end phải bắt đầu bằng .models-page. models.test.mjs đọc đúng
-   khoảng giữa hai dấu này để kiểm, nên đừng xoá cặp dấu — không có chúng thì phép kiểm không
-   còn gì để đọc. */
+   MỌI luật từ đây tới models:end phải bắt đầu bằng .models-page để không rò ra trang khác. */
 .models-page .chainstatus { font-size:12.5px; color:var(--dim); margin:14px 0 0; }
 .models-page .chainstatus:empty { display:none; }
 .models-page .facts { border:1px solid var(--line); border-radius:8px; overflow:hidden; margin:12px 0; background:var(--panel); }
@@ -258,6 +257,74 @@
 .models-page .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
 .models-page .reslot:empty { display:none; }
 /* models:end */
+
+/* combos:begin — Trang Combos: cột trái liệt kê combo (radio "đang dùng" + tên + huy hiệu kiểu +
+   nút xoá) và ô tạo combo mới; cột phải là member-editor dùng lại khối .models-page ở trên.
+   Mọi luật từ đây tới combos:end bắt đầu bằng .combos-page để không rò ra trang khác. */
+.combos-page .combos-list { flex:1 1 240px; }
+.combos-page .ceditor { flex:2 1 420px; }
+
+.combos-page .clist {
+  border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--panel);
+}
+.combos-page .crow {
+  display:flex; align-items:center; gap:10px; padding:9px 11px;
+  border-bottom:1px solid var(--line); font-size:12.5px;
+}
+.combos-page .crow:last-child { border-bottom:0; }
+/* Combo đang mở trong editor: nền chìm + sọc accent bên trái, giống mục điều hướng đang chọn. */
+.combos-page .crow.on { background:var(--sunk); box-shadow:inset 2px 0 0 var(--live); }
+
+.combos-page .cactive {
+  display:inline-flex; align-items:center; gap:6px; flex:none;
+  color:var(--dim); font-size:11.5px; white-space:nowrap;
+}
+/* Radio "đang dùng" đã chọn = combo bot đang chạy: tô accent để tách khỏi các combo nghỉ. */
+.combos-page .cactive:has(input:checked) { color:var(--live); font-weight:600; }
+
+.combos-page .cname {
+  flex:1; min-width:0; border:0; background:none; padding:0; text-align:left;
+  color:var(--ink); font:inherit; font-size:13px; font-weight:600; cursor:pointer;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.combos-page .cname:hover { color:var(--live); }
+
+/* Huy hiệu kiểu: nền mờ theo accent (giống .pv-safe-tag), mỗi kiểu một màu để phân biệt nhanh. */
+.combos-page .ctype {
+  display:inline-flex; align-items:center; flex:none; border-radius:20px; padding:3px 9px;
+  font-size:11px; font-weight:500; white-space:nowrap;
+  border:1px solid var(--line); color:var(--dim); background:var(--sunk);
+}
+.combos-page .ctype-fallback {
+  color:#34d399; border-color:rgba(52,211,153,.30); background:rgba(52,211,153,.10);
+}
+.combos-page .ctype-round_robin {
+  color:#a78bfa; border-color:rgba(167,139,250,.32); background:rgba(167,139,250,.12);
+}
+
+.combos-page .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
+
+/* Ô tạo combo mới: ngồi dưới danh sách, cùng ngôn ngữ khung với .clist. */
+.combos-page .cnew {
+  border:1px solid var(--line); border-radius:8px; padding:11px 12px; margin:14px 0 0;
+  background:var(--panel);
+}
+.combos-page .cnew-head {
+  font-size:12px; font-weight:600; color:var(--dim); text-transform:uppercase;
+  letter-spacing:.06em; margin:0 0 8px;
+}
+.combos-page .cnew .row { margin:0; }
+.combos-page .cname-input {
+  flex:1; min-width:140px; box-sizing:border-box; border:1px solid var(--line);
+  border-radius:7px; padding:7px 9px; color:var(--ink); background:var(--sunk); font-size:13px;
+}
+.combos-page .cnew select {
+  border:1px solid var(--line); border-radius:7px; padding:7px 9px;
+  color:var(--ink); background:var(--sunk); font:inherit; font-size:13px;
+}
+
+.combos-page .combos-list > .note { display:block; margin-top:10px; }
+/* combos:end */
 
 .cols { display:flex; gap:16px; flex-wrap:wrap; }
 .cols > div { flex:1 1 264px; min-width:0; }

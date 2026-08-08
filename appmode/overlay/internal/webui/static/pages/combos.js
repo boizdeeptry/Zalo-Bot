@@ -133,7 +133,7 @@ export function createCombosPage({
           drawEditor();
         });
 
-        const badge = element("span", { className: "ctype", text: typeLabel(combo.type) });
+        const badge = element("span", { className: `ctype ctype-${combo.type}`, text: typeLabel(combo.type) });
         const del = element("button", {
           className: "btn",
           attributes: { type: "button", "aria-label": `Xoá combo ${combo.name || combo.id}` },
