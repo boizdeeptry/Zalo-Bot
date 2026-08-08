@@ -1,10 +1,21 @@
 # Planning state
 
-step: ship
-current_topic: providers-combos
-current_spec: .planning/specs/2026-08-08-providers-combos-design.md
-current_plan: .planning/plans/2026-08-08-providers-combos.md
+step: done
+current_topic:
+current_spec:
+current_plan:
 last_updated: 2026-08-08
+
+## SHIPPED 2026-08-08 → main (`5551c4b`)
+
+Nhánh `feat/cli-subscription-providers` (89 commit: engine + UI#1 gallery + #2 connect + #3 multi-account
++ #4 combos) đã **fast-forward merge vào `main`** (`1741728`→`5551c4b`), suite xanh trên bản merged, nhánh
+feature đã xoá. Local main giờ ahead origin/main — CHƯA push (ship local, không PR). Gói cuối:
+F:\dist\_verify-20260808 (7/7 gate, 3177 tệp/120.8MB).
+
+**CÒN LẠI (phiên riêng):** Task 11 (task #55) — gộp Claude vào cliAdapter + bật Claude connect. NEEDS-LOGIN
+(verify CLAUDE_CONFIG_DIR với Claude login thật). Bắt đầu bằng `/discuss` hoặc branch mới off main.
+
 
 ## #4 Combos — XONG HẾT, final review CLEAN, gate XANH → SẴN SÀNG /ship (Task 11 hoãn)
 
