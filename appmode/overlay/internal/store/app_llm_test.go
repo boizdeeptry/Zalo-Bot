@@ -129,6 +129,10 @@ func TestLLMRouteStartsEmptyAtRevisionOne(t *testing.T) {
 	if len(snap.Entries) != 0 {
 		t.Errorf("LLMRoute().Entries = %v; want empty", snap.Entries)
 	}
+	// Route giờ phân giải combo active: máy mới có combo 'default' fallback đang active.
+	if snap.Type != "fallback" || snap.ComboID != "default" {
+		t.Errorf("LLMRoute() type/combo = %q/%q; want fallback/default", snap.Type, snap.ComboID)
+	}
 }
 
 func TestLLMRouteReplaceIsCompareAndSwap(t *testing.T) {

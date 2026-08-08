@@ -72,6 +72,38 @@ func TestDeleteComboRefusesActiveAndLast(t *testing.T) {
 	}
 }
 
+func TestReplaceComboMembersIsCAS(t *testing.T) {
+	st := newLLMStore(t)
+	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
+	entries := []LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}
+	saved, err := st.ReplaceLLMComboMembers("default", 1, "round_robin", entries)
+	if err != nil {
+		t.Fatalf("ReplaceLLMComboMembers(rev 1) = %v", err)
+	}
+	if saved.Revision != 2 || saved.Type != "round_robin" || len(saved.Members) != 1 {
+		t.Fatalf("saved = rev %d type %q members %d; want rev 2 round_robin 1", saved.Revision, saved.Type, len(saved.Members))
+	}
+	if _, err := st.ReplaceLLMComboMembers("default", 1, "fallback", entries); !errors.Is(err, ErrLLMComboConflict) {
+		t.Fatalf("stale rev = %v; want ErrLLMComboConflict", err)
+	}
+}
+
+func TestLLMRouteResolvesActiveCombo(t *testing.T) {
+	st := newLLMStore(t)
+	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
+	if _, err := st.ReplaceLLMComboMembers("default", 1, "round_robin",
+		[]LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := st.LLMRoute()
+	if err != nil {
+		t.Fatalf("LLMRoute() = %v", err)
+	}
+	if snap.Type != "round_robin" || snap.ComboID != "default" || len(snap.Entries) != 1 {
+		t.Errorf("snapshot = type %q combo %q entries %d; want round_robin/default/1", snap.Type, snap.ComboID, len(snap.Entries))
+	}
+}
+
 // Khoá ngoại TẮT trên connection này (DSN không bật foreign_keys), nên ON DELETE CASCADE
 // không chạy — members phải bị xoá tay trong cùng transaction, nếu không sẽ để lại member mồ côi.
 func TestDeleteComboRemovesMembers(t *testing.T) {

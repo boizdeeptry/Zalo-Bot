@@ -12,6 +12,10 @@ import (
 // một combo active để định tuyến, nên hai trạng thái đó không được để rơi vào rỗng.
 var ErrLLMComboProtected = errors.New("llm combo: không xoá được combo đang dùng hoặc combo cuối")
 
+// ErrLLMComboConflict: có người ghi members của combo này giữa lúc người khác đang sửa (CAS),
+// đối xứng ErrLLMRouteConflict.
+var ErrLLMComboConflict = errors.New("llm combo revision conflict")
+
 // LLMCombo là một chiến lược định tuyến có tên: một chuỗi mắt xích (Members) chạy theo type.
 type LLMCombo struct {
 	ID, Name, Type string
@@ -74,6 +78,67 @@ func (s *Store) comboMembers(comboID string) ([]LLMRouteEntry, error) {
 		return nil, fmt.Errorf("iterate combo members %s: %w", comboID, err)
 	}
 	return entries, nil
+}
+
+// activeCombo trả (id, type, revision) của combo đang active. Luôn có đúng một (seed default,
+// SetActive giữ bất biến), nên không tìm thấy là database hỏng — trả lỗi, KHÔNG bịa mặc định.
+func (s *Store) activeCombo() (id, typ string, revision int64, err error) {
+	err = s.db.QueryRow(
+		`SELECT id, type, revision FROM llm_combos WHERE active = 1 LIMIT 1`).Scan(&id, &typ, &revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", 0, fmt.Errorf("active combo: không có combo nào đang active")
+	}
+	return id, typ, revision, err
+}
+
+// ReplaceLLMComboMembers ghi đè members + type của một combo nếu revision người gọi cầm vẫn mới
+// nhất. Hợp lệ hoá qua validateLLMRoute (dùng lại: mắt xích cuối bật + provider/model tồn tại).
+//
+// CAS trước hợp lệ hoá, và cả hai cùng một transaction: một bản nháp dựa trên revision cũ phải
+// được trả lời "hãy tải lại" chứ không phải lỗi trường nào đó, và mọi lỗi đều trả database về
+// nguyên trạng (kể cả lần tăng revision).
+func (s *Store) ReplaceLLMComboMembers(comboID string, expectedRevision int64, typ string, entries []LLMRouteEntry) (LLMCombo, error) {
+	if typ != "fallback" && typ != "round_robin" {
+		return LLMCombo{}, fmt.Errorf("replace combo members: type lạ %q", typ)
+	}
+	next := expectedRevision + 1
+	err := s.inLLMTx("replace combo members", func(tx *sql.Tx) error {
+		res, err := tx.Exec(
+			`UPDATE llm_combos SET revision = ?, type = ? WHERE id = ? AND revision = ?`,
+			next, typ, comboID, expectedRevision)
+		if err != nil {
+			return err
+		}
+		changed, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return ErrLLMComboConflict // sai revision HOẶC combo không tồn tại
+		}
+		if err := validateLLMRoute(tx, entries); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM llm_combo_members WHERE combo_id = ?`, comboID); err != nil {
+			return err
+		}
+		for i, e := range entries {
+			if _, err := tx.Exec(
+				`INSERT INTO llm_combo_members(combo_id, position, provider_id, model_id, enabled) VALUES(?,?,?,?,?)`,
+				comboID, i, e.ProviderID, e.ModelID, boolInt(e.Enabled)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return LLMCombo{}, err
+	}
+	members, err := s.comboMembers(comboID)
+	if err != nil {
+		return LLMCombo{}, err
+	}
+	return LLMCombo{ID: comboID, Type: typ, Revision: next, Members: members}, nil
 }
 
 // CreateLLMCombo thêm một combo INACTIVE: chỉ đổi combo đang phục vụ qua SetActiveLLMCombo,

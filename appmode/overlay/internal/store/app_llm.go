@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 )
 
@@ -33,9 +32,6 @@ const (
 	LLMAttemptOK    = "ok"
 	LLMAttemptError = "error"
 )
-
-// llmRouteRevisionKey là khoá trong app_meta giữ revision hiện tại của route.
-const llmRouteRevisionKey = "llm_route_revision"
 
 // llmAttemptCap giới hạn số lần gọi còn giữ lại.
 //
@@ -77,12 +73,14 @@ type LLMRouteEntry struct {
 	Enabled             bool
 }
 
-// LLMRouteSnapshot là toàn bộ chuỗi fallback tại một revision.
+// LLMRouteSnapshot là toàn bộ chuỗi của combo ĐANG ACTIVE tại một revision.
 //
 // Router đọc đúng một snapshot ở đầu mỗi lượt và giữ nó tới hết lượt, nên một lần lưu giữa
 // chừng không đổi đường đi của lượt đang chạy.
 type LLMRouteSnapshot struct {
 	Revision int64
+	Type     string // type của combo active: "fallback" | "round_robin"
+	ComboID  string // id của combo active (router khoá con trỏ round-robin theo id này)
 	Entries  []LLMRouteEntry
 }
 
@@ -227,9 +225,12 @@ WHERE id = ?`, p.Name, boolInt(p.Enabled), p.LastCheckStatus, p.LastError,
 }
 
 func (s *Store) DeleteLLMProvider(id string) error {
+	// Route giờ là combo: đếm tham chiếu trên llm_combo_members (mọi combo, không chỉ combo
+	// active) vì một combo đang tắt vẫn có thể được bật lại sau, và xoá Provider nó trỏ tới
+	// để lại một chuỗi cụt.
 	var referenced int
 	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM llm_route_entries WHERE provider_id = ?`, id).Scan(&referenced); err != nil {
+		`SELECT COUNT(*) FROM llm_combo_members WHERE provider_id = ?`, id).Scan(&referenced); err != nil {
 		return fmt.Errorf("check llm provider %s route references: %w", id, err)
 	}
 	if referenced > 0 {
@@ -446,60 +447,36 @@ func (s *Store) DeleteLLMAccount(id string) error {
 
 // --- route ---
 
-// LLMRoute đọc chuỗi fallback hiện tại kèm revision của nó.
+// LLMRoute phân giải combo ĐANG ACTIVE thành một snapshot kèm revision của nó.
 //
 // Entries được dựng mới mỗi lần gọi nên người gọi sửa lát cắt mình cầm cũng không chạm được
 // tới lượt sau — đó là điều kiện để router coi snapshot là bất biến trong suốt một lượt.
 func (s *Store) LLMRoute() (LLMRouteSnapshot, error) {
-	revision, err := s.llmRouteRevision()
+	id, typ, revision, err := s.activeCombo()
 	if err != nil {
 		return LLMRouteSnapshot{}, err
 	}
-	entries, err := s.llmRouteEntries()
+	entries, err := s.comboMembers(id)
 	if err != nil {
 		return LLMRouteSnapshot{}, err
 	}
-	return LLMRouteSnapshot{Revision: revision, Entries: entries}, nil
+	return LLMRouteSnapshot{Revision: revision, Type: typ, ComboID: id, Entries: entries}, nil
 }
 
-// ReplaceLLMRoute ghi đè toàn bộ chuỗi nếu revision người gọi cầm vẫn là bản mới nhất.
+// ReplaceLLMRoute ghi đè members của combo ĐANG ACTIVE (alias giữ hợp đồng cũ cho router/UI/tests).
 //
-// Ghi cả chuỗi chứ không sửa từng mục vì thứ tự là một phần của ý nghĩa: một chuỗi nửa cũ nửa
-// mới có thể hợp lệ về mặt hàng nhưng gọi sai Provider. Hợp lệ hoá, xoá, ghi lại và tăng
-// revision nằm chung một transaction, nên mọi lỗi đều trả database về nguyên trạng.
+// Route giờ là combo: đường ghi thật là ReplaceLLMComboMembers. Giữ hàm này để những chỗ gọi cũ
+// (PUT /llm/route, các test router) không phải đổi, và dịch ErrLLMComboConflict về sentinel route
+// mà UI đang bắt.
 func (s *Store) ReplaceLLMRoute(expectedRevision int64, entries []LLMRouteEntry) (LLMRouteSnapshot, error) {
-	next := expectedRevision + 1
-	err := s.inLLMTx("replace llm route", func(tx *sql.Tx) error {
-		// CAS trước hợp lệ hoá: một bản nháp dựa trên revision cũ phải được trả lời "hãy tải
-		// lại" chứ không phải một thông báo lỗi trường nào đó, kể cả khi nó cũng sai chỗ khác.
-		res, err := tx.Exec(`UPDATE app_meta SET value = ? WHERE key = ? AND value = ?`,
-			strconv.FormatInt(next, 10), llmRouteRevisionKey, strconv.FormatInt(expectedRevision, 10))
-		if err != nil {
-			return err
-		}
-		changed, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return ErrLLMRouteConflict
-		}
-		if err := validateLLMRoute(tx, entries); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM llm_route_entries`); err != nil {
-			return err
-		}
-		for i, e := range entries {
-			if _, err := tx.Exec(
-				`INSERT INTO llm_route_entries(position, provider_id, model_id, enabled) VALUES(?,?,?,?)`,
-				i, e.ProviderID, e.ModelID, boolInt(e.Enabled)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	id, typ, _, err := s.activeCombo()
 	if err != nil {
+		return LLMRouteSnapshot{}, err
+	}
+	if _, err := s.ReplaceLLMComboMembers(id, expectedRevision, typ, entries); err != nil {
+		if errors.Is(err, ErrLLMComboConflict) {
+			return LLMRouteSnapshot{}, ErrLLMRouteConflict // giữ sentinel UI đang bắt
+		}
 		return LLMRouteSnapshot{}, err
 	}
 	return s.LLMRoute()
@@ -539,43 +516,6 @@ func validateLLMRoute(tx *sql.Tx, entries []LLMRouteEntry) error {
 		}
 	}
 	return nil
-}
-
-func (s *Store) llmRouteRevision() (int64, error) {
-	var raw string
-	if err := s.db.QueryRow(
-		`SELECT value FROM app_meta WHERE key = ?`, llmRouteRevisionKey).Scan(&raw); err != nil {
-		return 0, fmt.Errorf("read llm route revision: %w", err)
-	}
-	revision, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse llm route revision %q: %w", raw, err)
-	}
-	return revision, nil
-}
-
-func (s *Store) llmRouteEntries() ([]LLMRouteEntry, error) {
-	rows, err := s.db.Query(
-		`SELECT position, provider_id, model_id, enabled FROM llm_route_entries ORDER BY position`)
-	if err != nil {
-		return nil, fmt.Errorf("list llm route entries: %w", err)
-	}
-	defer rows.Close()
-
-	var out []LLMRouteEntry
-	for rows.Next() {
-		var e LLMRouteEntry
-		var enabled int
-		if err := rows.Scan(&e.Position, &e.ProviderID, &e.ModelID, &enabled); err != nil {
-			return nil, fmt.Errorf("scan llm route entry: %w", err)
-		}
-		e.Enabled = enabled == 1
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate llm route entries: %w", err)
-	}
-	return out, nil
 }
 
 // --- telemetry ---
