@@ -1,10 +1,10 @@
 # Planning state
 
-step: execute
-current_topic: providers-multi-account
-current_spec: .planning/specs/2026-08-07-providers-multi-account-design.md
-current_plan: .planning/plans/2026-08-07-providers-multi-account.md
-last_updated: 2026-08-07
+step: plan
+current_topic: providers-combos
+current_spec: .planning/specs/2026-08-08-providers-combos-design.md
+current_plan: .planning/plans/2026-08-08-providers-combos.md
+last_updated: 2026-08-08
 
 ## Đang làm: #2 Connect + #3 Multi-account — CODE XONG + build gate XANH; còn npm-bundle follow-up + E2E + #4
 
