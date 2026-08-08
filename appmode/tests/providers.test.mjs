@@ -86,7 +86,12 @@ test("clicking a card opens its detail; back returns to the gallery", async (t) 
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
   assert.ok(detail);
   assert.equal(text(find(detail, (n) => hasClass(n, "pv-name"))), "OpenAI Codex");
-  assert.ok(find(detail, (n) => hasClass(n, "pv-safe-badge")));
+  // Codex chạy qua PROXY nên detail phải mang huy hiệu RỦI RO (không phải huy hiệu an toàn) — nói thật
+  // về nguy cơ khoá tài khoản, không dán nhãn "không rủi ro".
+  const riskBadge = find(detail, (n) => hasClass(n, "pv-risk-badge"));
+  assert.ok(riskBadge, "Codex (proxy) detail must show the risk badge, not a safety badge");
+  assert.match(text(riskBadge), /rủi ro|khoá/i);
+  assert.equal(find(detail, (n) => hasClass(n, "pv-safe-badge")), null, "no false safety badge on a proxy provider");
   find(detail, (n) => hasClass(n, "pv-back")).click();
   await flush();
   assert.ok(find(main, (n) => hasClass(n, "pv-gallery")));

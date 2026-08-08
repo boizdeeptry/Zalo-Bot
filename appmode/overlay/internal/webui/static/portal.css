@@ -214,6 +214,12 @@
   background:rgba(52,211,153,.08); color:#7fe9c2; border-radius:10px; padding:12px 14px;
   margin:0 0 20px; font-size:13px;
 }
+/* Provider chạy PROXY: tông hổ phách/cảnh báo (không xanh) — nói thật có rủi ro khoá tài khoản. */
+.providers-page .pv-risk-badge {
+  display:flex; align-items:center; gap:10px; border:1px solid rgba(245,180,90,.34);
+  background:rgba(245,180,90,.09); color:#f0c07a; border-radius:10px; padding:12px 14px;
+  margin:0 0 20px; font-size:13px;
+}
 .providers-page .pv-panel {
   border:1px solid #24242a; border-radius:12px; padding:16px 18px; margin:0 0 16px;
   background:var(--panel);

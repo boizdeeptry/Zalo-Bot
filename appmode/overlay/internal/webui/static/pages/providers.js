@@ -99,9 +99,16 @@ function group(title, entries, byKind, onOpen, extraHead = null) {
     element("div", { className: "pv-group-head" }, element("h2", { text: title }), extraHead),
     element("div", { className: "pv-grid" }, entries.map((e) => card(e, byKind, onOpen))));
 }
+// PROXY_KINDS: provider chạy qua PROXY (gọi thẳng API bằng phiên đăng nhập) thay vì CLI chính chủ.
+// Proxy nhanh/nhiều tài khoản NHƯNG mang rủi ro nhà cung cấp hạn chế/khoá tài khoản — badge phải nói
+// đúng, không bán "an toàn tuyệt đối". Hôm nay chỉ codex; claude-code/gemini-cli vẫn CLI chính chủ.
+const PROXY_KINDS = new Set(["codex"]);
+
+// safeTag là nhãn CẤP NHÓM: nhóm thuê bao giờ TRỘN (Claude chính chủ + Codex proxy) nên KHÔNG dán
+// blanket "không rủi ro" ở đây — nói trung tính, để badge chi tiết từng provider mang sự thật riêng.
 const safeTag = () => element("span", { className: "pv-safe-tag" },
   element("span", { className: "pv-dot" }),
-  element("span", { text: "Chính chủ · không rủi ro khoá" }),
+  element("span", { text: "Claude chính chủ · Codex proxy" }),
 );
 // testAllButton nhận service/refresh làm tham số thay vì đóng bao (closure) — group()/renderGallery
 // giữ nguyên là hàm thuần trên tham số đầu vào, không đụng trạng thái của mount(). Promise.allSettled
@@ -126,7 +133,7 @@ function renderGallery(entries, byKind, onOpen, headFor) {
   const sub = entries.filter((e) => e.group === "subscription");
   const api = entries.filter((e) => e.group === "apikey");
   return element("div", { className: "pv-gallery" },
-    group("Gói thuê bao — CLI chính chủ", sub, byKind, onOpen, headFor(sub, byKind, true)),
+    group("Gói thuê bao", sub, byKind, onOpen, headFor(sub, byKind, true)),
     group("API Key", api, byKind, onOpen, headFor(api, byKind, false)));
 }
 
@@ -139,9 +146,12 @@ function detailHead(entry, byKind) {
       element("div", { className: "pv-sub", text: count })),
   );
 }
-const safeBadge = () => element("div", { className: "pv-safe-badge" },
-  element("span", { text: "Đăng nhập chính chủ qua CLI — không giả client, không proxy, không rủi ro khoá tài khoản." }),
-);
+const safeBadge = (kind) => (PROXY_KINDS.has(kind)
+  ? element("div", { className: "pv-risk-badge" },
+    element("span", { text: "Chạy qua PROXY — gọi thẳng API bằng phiên đăng nhập của tài khoản (như 9Router). Nhanh và"
+      + " dùng được nhiều tài khoản, NHƯNG nhà cung cấp có thể hạn chế hoặc KHOÁ tài khoản. Không phải đăng nhập chính chủ." }))
+  : element("div", { className: "pv-safe-badge" },
+    element("span", { text: "Đăng nhập chính chủ qua CLI — không giả client, không proxy, không rủi ro khoá tài khoản." })));
 
 function renderConnections(entry, p, ui) {
   const accounts = Array.isArray(p?.accounts) ? p.accounts : [];
@@ -216,7 +226,7 @@ function renderDetail(entry, byKind, onBack, connUI) {
   return element("div", { className: "pv-detail" },
     element("button", { className: "pv-back", attributes: { type: "button" }, text: "Về Providers", on: { click: onBack } }),
     detailHead(entry, byKind),
-    entry.group === "subscription" ? safeBadge() : null,
+    entry.group === "subscription" ? safeBadge(entry.kind) : null,
     renderConnections(entry, p, connUI),
     renderModels(entry, p),
   );
