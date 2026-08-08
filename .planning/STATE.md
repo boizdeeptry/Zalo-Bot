@@ -6,7 +6,19 @@ current_spec: .planning/specs/2026-08-08-providers-combos-design.md
 current_plan: .planning/plans/2026-08-08-providers-combos.md
 last_updated: 2026-08-08
 
-## Đang làm: #2 Connect + #3 Multi-account — CODE XONG + build gate XANH; còn npm-bundle follow-up + E2E + #4
+## Đang làm: #4 Combos — CB1–CB7 XONG + SHIPPABLE (build gate XANH); CB8 (Task 11, hedged) đang thử
+
+**#4 Combos execute (subagent-driven, mỗi task implementer + spec review + code review):**
+- CB1 schema v4 `1f1ca16` · CB2 combo CRUD `f513cd0` · CB3 active-combo CAS + LLMRoute `e45c12b` ·
+  CB4 router round-robin (rotate+comboRR) `30233d4` · CB5 combo HTTP endpoints (auth+allowlist) `922bcad` ·
+  CB6 Portal Combos page (route-editor.js extract, thay Models) `82c582d` · CB7 CSS + scoping test
+  `96c6aa0`+`bf61491`. Full build gate XANH (3177 tệp/120.8MB, canary sạch), Portal 97/97, go-check xanh.
+- **CB8 = Task 11 (HEDGED, droppable)**: gộp Claude vào cliAdapter, hợp nhất kind claude_code→claude-code,
+  claudeBudget path, bật Claude connect. Bỏ nếu phá seam/canary — Combos ship được KHÔNG cần CB8.
+- Ghi chú CB4: RR xoay CẢ chuỗi (kể cả claude-code terminal) — spec đã duyệt vậy; CB8 làm claude thành
+  member thường sẽ giải quyết tự nhiên. Nếu CB8 bỏ → thêm RR eligible-only (loại claude terminal khỏi anchor).
+
+## (cũ) #2 Connect + #3 Multi-account — CODE XONG + build gate XANH; còn npm-bundle follow-up + E2E + #4
 
 Sub-project #3/4. Mỗi provider subscription (Claude Code/OpenAI Codex) cho NHIỀU account, mỗi account
 một phiên CLI độc lập (thư mục config app tự quản dưới `cfg.Dir/accounts/<kind>/<id>`, cô lập khỏi CLI
