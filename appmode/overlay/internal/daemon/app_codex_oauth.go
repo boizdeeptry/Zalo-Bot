@@ -14,9 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -169,4 +172,95 @@ func createCodexAuthFile(configDir string, tok codexTokens) error {
 		return fmt.Errorf("ghi auth.json.tmp: %w", err)
 	}
 	return os.Rename(tmp, path)
+}
+
+// openBrowser mở URL bằng trình duyệt mặc định (Windows). Là biến để test thay bằng no-op — không thì
+// mỗi lần chạy test lại bật một tab thật. Best-effort: thất bại thì user tự bấm URL hiện ở Portal.
+var openBrowser = func(rawURL string, logger *slog.Logger) {
+	if err := exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL).Start(); err != nil && logger != nil {
+		logger.Debug("không mở được trình duyệt cho OAuth codex", "err", err)
+	}
+}
+
+// startCodexOAuthLogin khởi động luồng đăng nhập OAuth trình duyệt cho một account codex: mở cổng
+// loopback, dựng URL authorize, mở trình duyệt tới trang đăng nhập ChatGPT, và trả (authorizeURL,
+// wait). wait() CHẶN tới khi callback về (hoặc ctx huỷ), đổi code → token → ghi auth.json. Không
+// spawn process nào (khác device-auth) nên không cần killPidTree — chỉ đóng server ở cuối.
+//
+// Trùng hình dạng loginClaude để state machine dùng y hệt: trả URL (không có device code), wait()
+// chặn tới khi xong; pollAuth đọc auth.json để biết đã đăng nhập.
+func startCodexOAuthLogin(ctx context.Context, client *http.Client, configDir string, logger *slog.Logger) (string, func() error, error) {
+	verifier, challenge := codexPKCE()
+	state := codexOAuthState()
+	ln, err := net.Listen("tcp", "127.0.0.1:0") // cổng động, chỉ loopback
+	if err != nil {
+		return "", nil, fmt.Errorf("mở cổng loopback: %w", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d%s", port, codexRedirectPath)
+	authorizeURL := codexBuildAuthorizeURL(redirectURI, challenge, state)
+
+	codeCh := make(chan string, 1)
+	oauthErrCh := make(chan error, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc(codexRedirectPath, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("state") != state { // chống CSRF: state phải khớp cái đã gửi
+			http.Error(w, "state mismatch", http.StatusBadRequest)
+			trySend(oauthErrCh, errors.New("state không khớp (nghi CSRF)"))
+			return
+		}
+		if e := q.Get("error"); e != "" {
+			writeHTML(w, "<p>Đăng nhập bị từ chối. Có thể đóng tab này.</p>")
+			trySend(oauthErrCh, fmt.Errorf("authorize bị từ chối: %s", e))
+			return
+		}
+		code := q.Get("code")
+		if code == "" {
+			http.Error(w, "thiếu code", http.StatusBadRequest)
+			return
+		}
+		writeHTML(w, "<h3>Đã kết nối Codex.</h3><p>Có thể đóng tab này và quay lại phần mềm.</p>")
+		trySend(codeCh, code)
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }() // thoát khi srv.Shutdown
+
+	openBrowser(authorizeURL, logger)
+
+	wait := func() error {
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutCtx)
+		}()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-oauthErrCh:
+			return err
+		case code := <-codeCh:
+			tok, err := codexExchangeCode(ctx, client, code, verifier, redirectURI)
+			if err != nil {
+				return fmt.Errorf("đổi code lấy token: %w", err)
+			}
+			if err := createCodexAuthFile(configDir, tok); err != nil {
+				return fmt.Errorf("ghi auth.json: %w", err)
+			}
+			return nil
+		}
+	}
+	return authorizeURL, wait, nil
+}
+
+func trySend[T any](ch chan<- T, v T) {
+	select {
+	case ch <- v:
+	default:
+	}
+}
+
+func writeHTML(w http.ResponseWriter, body string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(body))
 }

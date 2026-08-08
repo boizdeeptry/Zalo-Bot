@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCodexPKCEChallengeMatchesVerifier(t *testing.T) {
@@ -105,6 +107,44 @@ func TestCodexExchangeCode(t *testing.T) {
 	}
 	if tok.AccessToken != "at" || tok.RefreshToken != "rt" || tok.AccountID != "acct-1" {
 		t.Fatalf("tok = %+v; want at/rt/acct-1 (account_id từ id_token)", tok)
+	}
+}
+
+// TestStartCodexOAuthLoginRoundTrip ghim toàn luồng loopback: authorize URL đúng → callback với code
+// + state → đổi token (stub) → ghi auth.json đọc lại được. openBrowser stub no-op để không bật tab thật.
+func TestStartCodexOAuthLoginRoundTrip(t *testing.T) {
+	prev := openBrowser
+	openBrowser = func(string, *slog.Logger) {}
+	t.Cleanup(func() { openBrowser = prev })
+
+	dir := t.TempDir()
+	idToken := fakeJWT(t, map[string]any{"https://api.openai.com/auth": map[string]string{"chatgpt_account_id": "acct-1"}})
+	client := stubClient(func(*http.Request) (*http.Response, error) {
+		return httpResp(200, `{"access_token":"at","refresh_token":"rt","id_token":"`+idToken+`"}`), nil
+	})
+	authURL, wait, err := startCodexOAuthLogin(context.Background(), client, dir, nil)
+	if err != nil {
+		t.Fatalf("startCodexOAuthLogin = %v", err)
+	}
+	u, _ := url.Parse(authURL)
+	state := u.Query().Get("state")
+	redirect := u.Query().Get("redirect_uri")
+	if state == "" || redirect == "" {
+		t.Fatalf("authorize thiếu state/redirect_uri: %s", authURL)
+	}
+	// Giả trình duyệt gọi callback với code + state đúng.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		if resp, err := http.Get(redirect + "?state=" + url.QueryEscape(state) + "&code=the-code"); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	if err := wait(); err != nil {
+		t.Fatalf("wait = %v; want nil (callback → exchange → write auth.json)", err)
+	}
+	tok, err := readCodexTokens(dir)
+	if err != nil || tok.AccessToken != "at" || tok.AccountID != "acct-1" {
+		t.Fatalf("auth.json sau connect = %+v err=%v; want at/acct-1", tok, err)
 	}
 }
 

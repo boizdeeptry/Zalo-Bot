@@ -409,6 +409,13 @@ func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string
 	if kind == "claude-code" {
 		return d.loginClaude(ctx, configDir)
 	}
+	if kind == "codex" {
+		// codex connect qua OAuth trình duyệt (thay device-auth): tự chạy authorization_code + PKCE,
+		// KHÔNG spawn codex CLI, KHÔNG cần bật device-auth. Trả URL authorize (không device code);
+		// wait() đổi code → ghi auth.json. Client riêng cho lượt đổi token (hạn 30s).
+		url, wait, err := startCodexOAuthLogin(ctx, &http.Client{Timeout: 30 * time.Second}, configDir, d.logger)
+		return url, "", wait, err
+	}
 	desc, ok := cliDescriptors[kind]
 	if !ok {
 		return "", "", nil, fmt.Errorf("connect login: kind lạ %q", kind)
@@ -543,6 +550,14 @@ func (d *defaultConnectRunner) loginClaude(ctx context.Context, configDir string
 func (d *defaultConnectRunner) pollAuth(kind, configDir string) authState {
 	if kind == "claude-code" {
 		return d.pollAuthClaude(configDir)
+	}
+	if kind == "codex" {
+		// codex connect qua OAuth: login wait() ghi thẳng auth.json, không còn hỏi `codex login status`.
+		// Có token đọc được → đã đăng nhập; chưa có → chưa (state machine tiếp tục poll tới khi có).
+		if _, err := readCodexTokens(configDir); err == nil {
+			return authLoggedIn
+		}
+		return authLoggedOut
 	}
 	desc, ok := cliDescriptors[kind]
 	if !ok {
