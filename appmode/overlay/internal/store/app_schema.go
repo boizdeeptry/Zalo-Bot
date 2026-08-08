@@ -13,8 +13,8 @@ CREATE TABLE IF NOT EXISTS app_meta (
 INSERT OR IGNORE INTO app_meta(key, value) VALUES ('schema_version', '1');
 `
 
-// appLLMSchema là schema phiên bản 3: cấu hình Provider, model, account đăng nhập CLI, chuỗi
-// fallback và telemetry.
+// appLLMSchema là schema phiên bản 4: cấu hình Provider, model, account đăng nhập CLI, chuỗi
+// fallback, combos (chiến lược định tuyến có tên) và telemetry.
 //
 // Boolean đi kèm CHECK vì SQLite không có kiểu bool — không có ràng buộc thì một bản ghi
 // enabled = 2 vẫn vào được, và mọi chỗ đọc sau đó phải tự đoán nó nghĩa là gì.
@@ -92,7 +92,32 @@ CREATE TABLE IF NOT EXISTS llm_accounts (
 INSERT OR IGNORE INTO llm_providers(id, name, kind, enabled, system_provider)
 VALUES ('claude-code', 'Claude Code', 'claude_code', 1, 1);
 INSERT OR IGNORE INTO app_meta(key, value) VALUES ('llm_route_revision', '1');
-UPDATE app_meta SET value = '3' WHERE key = 'schema_version';
+
+-- Combos: chiến lược định tuyến có tên. ĐÚNG một hàng active = 1 (bất biến giữ ở tầng app
+-- trong inLLMTx, giống CAS của ReplaceLLMRoute — partial-unique của SQLite mong manh qua
+-- lần chạy migration lặp lại nên không đặt ràng buộc DB).
+CREATE TABLE IF NOT EXISTS llm_combos (
+  id       TEXT PRIMARY KEY,
+  name     TEXT NOT NULL,
+  type     TEXT NOT NULL DEFAULT 'fallback' CHECK (type IN ('fallback','round_robin')),
+  active   INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0,1)),
+  revision INTEGER NOT NULL DEFAULT 1
+);
+
+-- position là danh tính trong một combo (như llm_route_entries): hai mục cùng vị trí làm
+-- thứ tự fallback không xác định.
+CREATE TABLE IF NOT EXISTS llm_combo_members (
+  combo_id    TEXT NOT NULL REFERENCES llm_combos(id) ON DELETE CASCADE,
+  position    INTEGER NOT NULL,
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id),
+  model_id    TEXT NOT NULL,
+  enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  PRIMARY KEY (combo_id, position)
+);
+
+-- OR IGNORE: migration chạy mỗi lần mở database; gieo đè sẽ trả tên combo về mặc định.
+INSERT OR IGNORE INTO llm_combos(id, name, type, active) VALUES ('default', 'Mặc định', 'fallback', 1);
+UPDATE app_meta SET value = '4' WHERE key = 'schema_version';
 `
 
 func migrateApp(db *sql.DB) error {

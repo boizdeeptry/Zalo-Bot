@@ -23,8 +23,8 @@ func TestMigrateAppIsIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != "3" {
-		t.Fatalf("schema_version = %q; want 3", version)
+	if version != "4" {
+		t.Fatalf("schema_version = %q; want 4", version)
 	}
 
 	// Provider hệ thống được gieo trong migration chứ không phải lúc chạy: sau §6 route không
@@ -85,5 +85,63 @@ func TestMigrateAppKeepsEditedSystemProvider(t *testing.T) {
 	}
 	if revision != "7" {
 		t.Errorf("llm_route_revision after re-migration = %q; want 7", revision)
+	}
+}
+
+func TestMigrateAppSeedsDefaultCombo(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := migrateApp(db); err != nil {
+		t.Fatal(err)
+	}
+
+	var id, name, typ string
+	var active int
+	if err := db.QueryRow(
+		`SELECT id, name, type, active FROM llm_combos WHERE active = 1`).Scan(&id, &name, &typ, &active); err != nil {
+		t.Fatalf("read active combo: %v", err)
+	}
+	if id != "default" || typ != "fallback" || active != 1 {
+		t.Errorf("active combo = (%q,%q,%q,%d); want (default,Mặc định,fallback,1)", id, name, typ, active)
+	}
+
+	var version string
+	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key='schema_version'`).Scan(&version); err != nil {
+		t.Fatalf("read schema_version: %v", err)
+	}
+	if version != "4" {
+		t.Errorf("schema_version = %q; want 4", version)
+	}
+}
+
+// Lần chạy thứ hai không được gieo đè: INSERT OR IGNORE trượt thì tên combo người dùng đã
+// sửa sẽ bị trả về mặc định mỗi lần mở máy.
+func TestMigrateAppKeepsEditedCombo(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := migrateApp(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE llm_combos SET name='Của tôi' WHERE id='default'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateApp(db); err != nil { // re-run: INSERT OR IGNORE must not clobber
+		t.Fatalf("re-migrate: %v", err)
+	}
+
+	var name string
+	if err := db.QueryRow(`SELECT name FROM llm_combos WHERE id='default'`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Của tôi" {
+		t.Errorf("combo name after re-migration = %q; want unchanged 'Của tôi'", name)
 	}
 }
