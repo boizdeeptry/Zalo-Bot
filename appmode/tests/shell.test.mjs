@@ -80,13 +80,13 @@ test("desktop shell loads isolated Portal CSS with the legacy rail dimensions", 
   assert.match(css, /#main:focus-visible\s*\{[^}]*outline-offset:\s*-2px/s);
 });
 
-// providerRegions lấy phần thân giữa mỗi cặp dấu providers:begin/end.
+// regionsFor lấy phần thân giữa mỗi cặp dấu <marker>:begin/end.
 //
-// Cắt theo DẤU chứ không lọc theo chữ "provider" trong selector: một luật xổng phạm vi là một
-// luật KHÔNG còn chữ đó, nên lọc theo tên chỉ soi được đúng những luật vốn đã đúng.
-function providerRegions(css) {
-  return [...css.matchAll(/\/\* providers:begin[\s\S]*?\*\/([\s\S]*?)\/\* providers:end \*\//g)]
-    .map(([, body]) => body);
+// Cắt theo DẤU chứ không lọc theo chữ trong selector: một luật xổng phạm vi là một
+// luật KHÔNG còn tiền tố đó, nên lọc theo tên chỉ soi được đúng những luật vốn đã đúng.
+function regionsFor(css, marker) {
+  const re = new RegExp(`/\\* ${marker}:begin[\\s\\S]*?\\*/([\\s\\S]*?)/\\* ${marker}:end \\*/`, "g");
+  return [...css.matchAll(re)].map(([, body]) => body);
 }
 
 // selectorsIn tách theo "}" chứ không theo dòng, nên một danh sách selector trải nhiều dòng vẫn
@@ -100,19 +100,28 @@ function selectorsIn(region) {
     .flatMap((list) => list.split(",").map((part) => part.trim()).filter(Boolean));
 }
 
-test("every rule in the Provider CSS regions stays scoped to its page or sheet", async () => {
-  const css = await readFile(new URL("portal.css", staticRoot), "utf8");
+// Mỗi khối marker phải giữ mọi luật trong tầm trang của nó. .provider-sheet là lớp cùng-sheet
+// duy nhất được phép ngoài .providers-page (detail dùng lại) — giữ nguyên allowance cũ, không nới.
+const SCOPED_REGIONS = [
+  { label: "Provider", marker: "providers", regions: 2, minSelectors: 20, scope: /^\.providers-page\b|^\.provider-sheet\b/ },
+  { label: "Models", marker: "models", regions: 2, minSelectors: 10, scope: /^\.models-page\b/ },
+  { label: "Combos", marker: "combos", regions: 1, minSelectors: 10, scope: /^\.combos-page\b/ },
+];
 
-  const regions = providerRegions(css);
-  assert.equal(regions.length, 2, "expected a desktop and a mobile Provider region");
+for (const { label, marker, regions: regionCount, minSelectors, scope } of SCOPED_REGIONS) {
+  test(`every rule in the ${label} CSS regions stays scoped to its page or sheet`, async () => {
+    const css = await readFile(new URL("portal.css", staticRoot), "utf8");
 
-  const selectors = regions.flatMap(selectorsIn);
-  assert.ok(selectors.length >= 20, `expected the Provider rules inside the markers, got ${selectors.length}`);
-  for (const selector of selectors) {
-    assert.match(
-      selector,
-      /^\.providers-page\b|^\.provider-sheet\b/,
-      `Provider rule "${selector}" must stay scoped`,
+    const regions = regionsFor(css, marker);
+    assert.equal(regions.length, regionCount, `expected ${regionCount} ${label} region(s)`);
+
+    const selectors = regions.flatMap(selectorsIn);
+    assert.ok(
+      selectors.length >= minSelectors,
+      `expected the ${label} rules inside the markers, got ${selectors.length}`,
     );
-  }
-});
+    for (const selector of selectors) {
+      assert.match(selector, scope, `${label} rule "${selector}" must stay scoped`);
+    }
+  });
+}
