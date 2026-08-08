@@ -366,6 +366,48 @@ test("clicking a non-member model adds it and auto-saves carrying the combo revi
   assert.equal(memberLabels(main).includes("Gemini · Gemini 2"), false, "clicking a member again removes it");
 });
 
+test("a change enqueued while the first save is in flight carries the revision the first save returned", async (t) => {
+  // Khác test trên (nó settle() giữa hai lượt nên PUT #1 xong hẳn trước PUT #2). Ở đây GIỮ PUT #1
+  // treo lơ lửng rồi mới đổi lần hai — chứng minh saveChain xếp hàng: PUT #2 chờ PUT #1 xong rồi mới
+  // bay, và nó mang revision PUT #1 TRẢ VỀ chứ không phải revision gốc đã cũ (không double-fire cũ).
+  let release;
+  let saves = 0;
+  const { calls, main } = await mounted(t, comboAPI({
+    save: (id, body) => {
+      saves += 1;
+      const bump = saves === 1 ? 100 : 1;
+      const reply = {
+        id, name: "Chính", type: body.type, active: true,
+        revision: body.revision + bump,
+        entries: body.entries.map((entry, position) => ({ position, ...entry })),
+      };
+      if (saves === 1) return new Promise((resolve) => { release = () => resolve(reply); });
+      return reply;
+    },
+  }));
+  // Đổi #1: xoá mắt xích claude/haiku → PUT #1 bay (revision 4) rồi treo.
+  button(memberRows(main)[1], "Xoá").click();
+  await flush();
+  assert.equal(putCalls(calls).length, 1, "the first change fires its save immediately");
+
+  // Đổi #2 trong lúc PUT #1 CÒN treo: tắt mắt xích còn lại. saveChain phải giữ PUT #2 lại.
+  const box = find(memberRows(main)[0], (node) => node.getAttribute?.("type") === "checkbox");
+  box.checked = false;
+  box.dispatchEvent({ type: "change" });
+  await flush();
+  assert.equal(putCalls(calls).length, 1, "the second change must wait behind the in-flight save");
+
+  release();
+  await settle();
+
+  const puts = putCalls(calls);
+  assert.equal(puts.length, 2, "exactly two PUTs — no stale double-fire");
+  assert.equal(puts[0].body.revision, 4, "the first save uses the original revision");
+  assert.equal(puts[1].body.revision, 104, "the queued save carries the revision the first save returned");
+  // PUT #2 gộp cả hai lượt đổi (đã xoá haiku + tắt gpt-5), không phải một bản nháp cũ.
+  assert.deepEqual(puts[1].body.entries, [{ provider_id: "openai-1", model_id: "gpt-5", enabled: false }]);
+});
+
 test("clicking a model already in the combo removes it and auto-saves", async (t) => {
   const { calls, main } = await mounted(t);
   button(main, "Thêm model").click();
@@ -496,6 +538,26 @@ test("reloading a combo re-syncs the list rows to the fresh fetch", async (t) =>
   await settle();
 
   assert.deepEqual(comboRows(main).map(typeBadge), ["Round Robin", "Round Robin"]);
+});
+
+test("clicking reload closes an open model picker", async (t) => {
+  const { main } = await mounted(t, comboAPI({
+    save: () => {
+      throw new AppAPIError({ code: "COMBO_REVISION_CONFLICT", message: "xung đột", status: 409 });
+    },
+  }));
+  // Xung đột dai → hiện nút "Tải lại combo".
+  const typeSelect = find(main, (node) => node.getAttribute?.("id") === "combo-type");
+  typeSelect.value = "round_robin";
+  typeSelect.dispatchEvent({ type: "change" });
+  await settle();
+  // Mở modal rồi tải lại: tải lại vứt bản nháp nên checkmark của modal đã lỗi thời — modal phải đóng.
+  button(main, "Thêm model").click();
+  assert.ok(overlay(), "the picker is open before reload");
+  button(main, "Tải lại combo").click();
+  await settle();
+
+  assert.equal(overlay(), null, "reload must close the open picker");
 });
 
 test("a combo deleted elsewhere self-corrects during an auto-save conflict", async (t) => {

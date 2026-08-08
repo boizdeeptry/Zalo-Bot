@@ -7,10 +7,8 @@ import {
   canMove,
   entryWarning,
   failureText,
-  modelChoices,
   moveEntry,
   patchEntry,
-  providerChoices,
   removeEntry,
   snapshotOf,
   statusText,
@@ -114,7 +112,7 @@ test("canMove only refuses the two ends of the chain", () => {
   assert.equal(canMove(entries, 1, -1), true);
 });
 
-// --- lựa chọn dựng từ danh sách Provider: giữ lựa chọn không còn hợp lệ thay vì lặng lẽ đổi ---
+// --- entryWarning: cảnh báo mắt xích hỏng (Provider tắt / model bỏ), im khi lành ---
 
 const PROVIDERS = [
   {
@@ -134,28 +132,6 @@ const PROVIDERS = [
     ],
   },
 ];
-const idsOf = (choices) => choices.map((choice) => choice.id);
-
-test("providerChoices offers only enabled providers", () => {
-  assert.deepEqual(idsOf(providerChoices(PROVIDERS, "openai-1")), ["openai-1", "gemini", "claude-code"]);
-});
-
-test("providerChoices keeps a link pointed at a now-disabled provider, flagged off", () => {
-  const choices = providerChoices(PROVIDERS, "anthropic-1");
-  assert.equal(choices[0].id, "anthropic-1");
-  assert.match(choices[0].label, /đang tắt/);
-});
-
-test("modelChoices offers only available models", () => {
-  assert.deepEqual(idsOf(modelChoices(PROVIDERS, "openai-1", "gpt-5")), ["gpt-5", "gpt-5-mini"]);
-});
-
-test("modelChoices keeps a model the provider no longer offers, flagged", () => {
-  const choices = modelChoices(PROVIDERS, "openai-1", "gpt-4-legacy");
-  assert.equal(choices[0].id, "gpt-4-legacy");
-  assert.match(choices[0].label, /không còn dùng được/);
-});
-
 test("entryWarning names each way a link can be broken, and stays silent when healthy", () => {
   assert.match(entryWarning(PROVIDERS, link("anthropic-1", "claude-4")), /đang tắt — chuỗi bỏ qua/);
   assert.match(entryWarning(PROVIDERS, link("openai-1", "")), /Chưa chọn model/);

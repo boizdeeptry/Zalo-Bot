@@ -193,6 +193,9 @@ export function createComboEditor({
     try {
       const fresh = await reload();
       if (disposed) return;
+      // Vứt bản nháp đang sửa nghĩa là mọi checkmark trong modal (nếu đang mở) cũng đã lỗi thời — đóng
+      // nó lại thay vì để nó phản chiếu một bản nháp không còn tồn tại.
+      closePicker();
       draft = { revision: revisionOf(fresh), entries: fresh.entries ?? [] };
       curType = TYPE_ORDER.includes(fresh.type) ? fresh.type : curType;
       typeSelect.value = curType;

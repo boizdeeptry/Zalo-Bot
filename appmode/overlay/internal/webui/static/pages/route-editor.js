@@ -71,33 +71,10 @@ export function snapshotOf(payload) {
   };
 }
 
-// --- lựa chọn dựng từ danh sách Provider ---
+// --- cảnh báo mắt xích + phân giải model từ danh sách Provider ---
 
 function modelsOf(providers, providerID) {
   return providers.find((provider) => provider.id === providerID)?.models ?? [];
-}
-
-// keepCurrent giữ lựa chọn đang lưu kể cả khi nó không còn hợp lệ: bỏ nó khỏi danh sách thì ô chọn
-// tự nhảy sang giá trị khác và người dùng lưu đè lên một mắt xích họ chưa hề thấy. Giữ lại kèm nhãn
-// cảnh báo thì họ thấy chỗ hỏng và sửa được.
-function keepCurrent(choices, currentID, label) {
-  if (!currentID || choices.some((choice) => choice.id === currentID)) return choices;
-  return [{ id: currentID, label }, ...choices];
-}
-
-export function providerChoices(providers, currentID) {
-  const enabled = providers
-    .filter((provider) => provider.enabled)
-    .map((provider) => ({ id: provider.id, label: provider.name || provider.id }));
-  const known = providers.find((provider) => provider.id === currentID);
-  return keepCurrent(enabled, currentID, `${known?.name || currentID} (đang tắt)`);
-}
-
-export function modelChoices(providers, providerID, currentID) {
-  const available = modelsOf(providers, providerID)
-    .filter((model) => model.available)
-    .map((model) => ({ id: model.model_id, label: model.name || model.model_id }));
-  return keepCurrent(available, currentID, `${currentID} (không còn dùng được)`);
 }
 
 export function entryWarning(providers, entry) {
