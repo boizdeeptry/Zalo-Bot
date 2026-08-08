@@ -22,7 +22,7 @@ const TYPE_HINTS = Object.freeze({
     + " — chia tải giữa các tài khoản/Provider.",
 });
 
-const TYPE_ORDER = ["fallback", "round_robin"];
+export const TYPE_ORDER = Object.freeze(["fallback", "round_robin"]);
 
 // --- bản nháp: hàm thuần, không đụng DOM ---
 //

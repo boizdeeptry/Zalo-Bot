@@ -345,6 +345,49 @@ test("a revision conflict keeps the draft and offers a reload", async (t) => {
   assert.deepEqual(chainOf(main), ["openai-1/gpt-5", "claude-code/haiku"]);
 });
 
+const conflictOnSave = () => {
+  throw new AppAPIError({ code: "COMBO_REVISION_CONFLICT", message: "xung đột", status: 409 });
+};
+
+test("reloading a combo re-syncs the list rows to the fresh fetch", async (t) => {
+  let reads = 0;
+  const { main } = await mounted(t, comboAPI({
+    save: conflictOnSave,
+    combos: () => {
+      reads += 1;
+      if (reads === 1) return COMBOS;
+      // Ai đó đổi kiểu c1 fallback → round_robin ở nơi khác; lượt tải lại phải cập nhật huy hiệu.
+      return { combos: [{ ...COMBOS.combos[0], type: "round_robin", revision: 9 }, COMBOS.combos[1]] };
+    },
+  }));
+  button(main, "Lưu").click();
+  await flush();
+  button(main, "Tải lại combo").click();
+  await flush();
+
+  assert.deepEqual(comboRows(main).map(typeBadge), ["Round Robin", "Round Robin"]);
+});
+
+test("reloading a combo deleted elsewhere self-corrects instead of throwing", async (t) => {
+  let reads = 0;
+  const { main } = await mounted(t, comboAPI({
+    save: conflictOnSave,
+    combos: () => {
+      reads += 1;
+      if (reads === 1) return COMBOS;
+      return { combos: [COMBOS.combos[1]] }; // c1 (đang chọn) đã bị xoá ở nơi khác
+    },
+  }));
+  button(main, "Lưu").click();
+  await flush();
+  button(main, "Tải lại combo").click();
+  await flush();
+
+  assert.equal(comboRows(main).length, 1);
+  assert.deepEqual(chainOf(main), ["gemini/gemini-2"]);
+  assert.match(text(pageNotice(main)), /đã bị xoá ở nơi khác/);
+});
+
 test("a failed load renders the shared error panel", async (t) => {
   const { main } = await mounted(t, () => {
     throw new Error("không đọc được danh sách combo");

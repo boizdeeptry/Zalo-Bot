@@ -2,6 +2,7 @@ import { requestJSON } from "../core/api.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
 import {
   TYPE_LABELS,
+  TYPE_ORDER,
   createMemberEditor,
   messageOf,
   revisionOf,
@@ -9,7 +10,6 @@ import {
 } from "./route-editor.js";
 
 const STATUS_POLL_MS = 5000;
-const TYPE_ORDER = ["fallback", "round_robin"];
 
 function comboPath(id, suffix = "") {
   const value = String(id ?? "").trim();
@@ -169,7 +169,18 @@ export function createCombosPage({
             const fresh = await service.list();
             combos = Array.isArray(fresh?.combos) ? fresh.combos : [];
             const found = combos.find((entry) => entry.id === combo.id);
-            if (!found) throw new Error("combo không còn tồn tại");
+            // Danh sách vừa đổi (revision, kiểu, combo đang dùng) — vẽ lại rows để radio/huy hiệu/tên
+            // khớp lại thay vì đứng cũ tới lượt bấm không liên quan kế tiếp.
+            drawList();
+            if (!found) {
+              // Combo bị xoá ở nơi khác trong lúc đang sửa: nhặt lại combo đang dùng/đầu tiên rồi dựng
+              // lại editor theo lựa chọn mới. drawEditor dispose editor hiện tại, nên lượt throw dưới
+              // đây chỉ để thoát handler reload cũ — nó tự bail qua cờ disposed, không hiện câu lỗi.
+              selectedId = (combos.find((entry) => entry.active) ?? combos[0])?.id ?? "";
+              drawEditor();
+              say("Combo này đã bị xoá ở nơi khác — đã chuyển sang combo hiện có.");
+              throw new Error("combo không còn tồn tại");
+            }
             return { revision: found.revision, entries: snapshotOf(found).entries, type: found.type };
           },
           onSaved: (saved) => {
