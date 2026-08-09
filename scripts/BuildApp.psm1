@@ -205,17 +205,26 @@ function Apply-AppSeams {
   $serverPath = Join-Path $stagePath 'internal\daemon\server.go'
   $storePath = Join-Path $stagePath 'internal\store\store.go'
   $zaloPath = Join-Path $stagePath 'internal\daemon\zalo.go'
+  $dutyPath = Join-Path $stagePath 'internal\daemon\duty.go'
 
   $server = [IO.File]::ReadAllText($serverPath)
   $store = [IO.File]::ReadAllText($storePath)
   $zalo = [IO.File]::ReadAllText($zaloPath)
+  $duty = [IO.File]::ReadAllText($dutyPath)
   $serverNewline = if ($server.Contains("`r`n")) { "`r`n" } else { "`n" }
   $storeNewline = if ($store.Contains("`r`n")) { "`r`n" } else { "`n" }
   $zaloNewline = if ($zalo.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $dutyNewline = if ($duty.Contains("`r`n")) { "`r`n" } else { "`n" }
 
   Assert-SignatureAbsent -Text $server -Signature 'a.registerAppRoutes(mux)' -Label 'route seam'
   Assert-SignatureAbsent -Text $store -Signature 'migrateApp(db)' -Label 'migration seam'
   Assert-SignatureAbsent -Text $zalo -Signature 'evaluateAppWorkflow(req, msg)' -Label 'workflow seam'
+  Assert-SignatureAbsent -Text $duty `
+    -Signature 'a.appAnswerZalo(deps, threadID, question, reply, files)' `
+    -Label 'session answer seam'
+  Assert-SignatureAbsent -Text $duty `
+    -Signature 'a.appRunZalo(ctx, run, pz, threadID, question, appZaloCurrentMsgID(reply.ReplyQuote), history, found, files, step)' `
+    -Label 'session runner seam'
 
   $routeNeedle = "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))"
   $serverUpdated = Replace-ExactlyOnce -Text $server -Needle $routeNeedle `
@@ -243,10 +252,28 @@ function Apply-AppSeams {
     -Replacement ($workflowPrefix + $zaloNewline + $workflowNeedle) `
     -Label 'workflow seam'
 
+  $answerNeedle = @(
+    "`t`tctx, cancel := context.WithTimeout(context.Background(), deps.cfg.Timeout)"
+    "`t`tdefer cancel()"
+    "`t`t// Bước của lượt đi vào log dùng chung, không phải một danh sách riêng của lượt:"
+    "`t`t// terminal là một dòng thời gian, và một lượt đã xong vẫn nằm đó để đọc."
+    "`t`tstep := func(text string) { a.zlog.add(ipc.ZaloLogStep, threadID, text) }"
+    "`t`terr := a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)"
+  ) -join $dutyNewline
+  $answerReplacement = "`t`terr := a.appAnswerZalo(deps, threadID, question, reply, files)"
+  $dutyUpdated = Replace-ExactlyOnce -Text $duty -Needle $answerNeedle `
+    -Replacement $answerReplacement -Label 'session answer seam'
+
+  $runnerNeedle = "`traw, err := run.Run(ctx, buildConsultPrompt(pz, question, history, found, files...), step)"
+  $runnerReplacement = "`traw, err := a.appRunZalo(ctx, run, pz, threadID, question, appZaloCurrentMsgID(reply.ReplyQuote), history, found, files, step)"
+  $dutyUpdated = Replace-ExactlyOnce -Text $dutyUpdated -Needle $runnerNeedle `
+    -Replacement $runnerReplacement -Label 'session runner seam'
+
   $utf8NoBom = [Text.UTF8Encoding]::new($false)
   [IO.File]::WriteAllText($serverPath, $serverUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($storePath, $storeUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($zaloPath, $zaloUpdated, $utf8NoBom)
+  [IO.File]::WriteAllText($dutyPath, $dutyUpdated, $utf8NoBom)
 }
 
 function Assert-AppPackage {

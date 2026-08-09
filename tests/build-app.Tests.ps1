@@ -43,6 +43,34 @@ function Write-TestFile {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+function Get-SeamTargetHashes {
+  param([Parameter(Mandatory)][string]$Stage)
+
+  $hashes = @{}
+  foreach ($relative in @(
+      'internal\daemon\server.go',
+      'internal\store\store.go',
+      'internal\daemon\zalo.go',
+      'internal\daemon\duty.go'
+    )) {
+    $hashes[$relative] = (Get-FileHash -LiteralPath (Join-Path $Stage $relative) -Algorithm SHA256).Hash
+  }
+  return $hashes
+}
+
+function Assert-SeamTargetHashes {
+  param(
+    [Parameter(Mandatory)][string]$Stage,
+    [Parameter(Mandatory)][hashtable]$Expected,
+    [Parameter(Mandatory)][string]$Message
+  )
+
+  foreach ($relative in $Expected.Keys) {
+    $actual = (Get-FileHash -LiteralPath (Join-Path $Stage $relative) -Algorithm SHA256).Hash
+    Assert-Equal $actual $Expected[$relative] "$Message ($relative)"
+  }
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('portal-path-' + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -241,6 +269,27 @@ func incoming() {
 		a.batch.add(req.ThreadID, kind, msg.Body, delay, ipc.ZaloOutboxDraft{})
 }
 '@
+  Write-TestFile (Join-Path $repo 'internal\daemon\duty.go') @'
+package daemon
+
+func answer() {
+	raw, err := run.Run(ctx, buildConsultPrompt(pz, question, history, found, files...), step)
+}
+
+func trigger() {
+	go func() {
+		started := time.Now()
+		defer a.turns.end(turn)
+		ctx, cancel := context.WithTimeout(context.Background(), deps.cfg.Timeout)
+		defer cancel()
+		// Bước của lượt đi vào log dùng chung, không phải một danh sách riêng của lượt:
+		// terminal là một dòng thời gian, và một lượt đã xong vẫn nằm đó để đọc.
+		step := func(text string) { a.zlog.add(ipc.ZaloLogStep, threadID, text) }
+		err := a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)
+		took := time.Since(started).Round(time.Second)
+	}()
+}
+'@
   Write-TestFile (Join-Path $repo 'README.md') "tracked`n"
   Write-TestFile (Join-Path $repo 'untracked.txt') "must not be staged`n"
   $upstreamStyles = @{
@@ -269,6 +318,8 @@ func incoming() {
   & git -C $repo add -- 'internal' 'README.md'
   if ($LASTEXITCODE -ne 0) { throw 'Could not stage fixture files' }
   $statusBefore = (& git -C $repo status --short) -join "`n"
+  $sourceDutyPath = Join-Path $repo 'internal\daemon\duty.go'
+  $sourceDutyHashBefore = (Get-FileHash -LiteralPath $sourceDutyPath -Algorithm SHA256).Hash
 
   $gotStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot $stage
   Assert-Equal $gotStage ([IO.Path]::GetFullPath($stage)) 'Stage path was not normalized'
@@ -291,9 +342,21 @@ func incoming() {
   $stagedServer = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\server.go'))
   $stagedStore = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\store\store.go'))
   $stagedZalo = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\zalo.go'))
+  $stagedDuty = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\duty.go'))
   if ([regex]::Matches($stagedServer, 'a\.registerAppRoutes\(mux\)').Count -ne 1) { throw 'Route seam was not applied exactly once' }
   if ([regex]::Matches($stagedStore, 'migrateApp\(db\)').Count -ne 1) { throw 'Migration seam was not applied exactly once' }
   if ([regex]::Matches($stagedZalo, 'evaluateAppWorkflow\(req, msg\)').Count -ne 1) { throw 'Workflow seam was not applied exactly once' }
+  if ([regex]::Matches($stagedDuty, 'a\.appAnswerZalo\(deps, threadID, question, reply, files\)').Count -ne 1) {
+    throw 'Session answer seam was not applied exactly once'
+  }
+  if ([regex]::Matches($stagedDuty, 'a\.appRunZalo\(ctx, run, pz, threadID, question, appZaloCurrentMsgID\(reply\.ReplyQuote\), history, found, files, step\)').Count -ne 1) {
+    throw 'Session runner seam was not applied exactly once'
+  }
+  if ($stagedDuty -match 'context\.WithTimeout\(context\.Background\(\), deps\.cfg\.Timeout\)' -or
+      $stagedDuty -match 'a\.answerZalo\(ctx, deps\.cfg, deps\.run' -or
+      $stagedDuty -match 'run\.Run\(ctx, buildConsultPrompt\(') {
+    throw 'A superseded stateless duty path remains in the stage'
+  }
   Assert-ThrowsLike -Action { Apply-AppSeams -Stage $gotStage } `
     -Pattern 'route seam: inserted signature already present' -Message 'Applying seams twice was accepted'
   if ([regex]::Matches([IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\server.go')), 'a\.registerAppRoutes\(mux\)').Count -ne 1) {
@@ -302,6 +365,10 @@ func incoming() {
 
   $sourceServer = [IO.File]::ReadAllText((Join-Path $repo 'internal\daemon\server.go'))
   if ($sourceServer -match 'registerAppRoutes') { throw 'Source repo was changed by staging' }
+  $sourceDuty = [IO.File]::ReadAllText($sourceDutyPath)
+  if ($sourceDuty -match 'appAnswerZalo|appRunZalo') { throw 'Source duty.go was changed by staging' }
+  $sourceDutyHashAfter = (Get-FileHash -LiteralPath $sourceDutyPath -Algorithm SHA256).Hash
+  Assert-Equal $sourceDutyHashAfter $sourceDutyHashBefore 'Source duty.go hash changed during staging'
   $statusAfter = (& git -C $repo status --short) -join "`n"
   Assert-Equal $statusAfter $statusBefore 'Source Git status changed during staging'
 
@@ -332,6 +399,42 @@ func incoming() {
     throw 'A failed seam validation partially modified the stage'
   }
 
+  $missingAnswerStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Thiếu answer seam')
+  $missingAnswerDutyPath = Join-Path $missingAnswerStage 'internal\daemon\duty.go'
+  $missingAnswerDuty = [IO.File]::ReadAllText($missingAnswerDutyPath).Replace(
+    "`t`terr := a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)",
+    "`t`terr := oldAnswerPathRemoved()")
+  [IO.File]::WriteAllText($missingAnswerDutyPath, $missingAnswerDuty, [Text.UTF8Encoding]::new($false))
+  $missingAnswerHashes = Get-SeamTargetHashes -Stage $missingAnswerStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingAnswerStage } `
+    -Pattern 'session answer seam: expected exactly 1 match' -Message 'A missing session answer marker was accepted'
+  Assert-SeamTargetHashes -Stage $missingAnswerStage -Expected $missingAnswerHashes `
+    -Message 'A missing session answer marker partially modified the stage'
+
+  $missingRunnerStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Thiếu runner seam')
+  $missingRunnerDutyPath = Join-Path $missingRunnerStage 'internal\daemon\duty.go'
+  $missingRunnerDuty = [IO.File]::ReadAllText($missingRunnerDutyPath).Replace(
+    "`traw, err := run.Run(ctx, buildConsultPrompt(pz, question, history, found, files...), step)",
+    "`traw, err := oldRunnerPathRemoved()")
+  [IO.File]::WriteAllText($missingRunnerDutyPath, $missingRunnerDuty, [Text.UTF8Encoding]::new($false))
+  $missingRunnerHashes = Get-SeamTargetHashes -Stage $missingRunnerStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingRunnerStage } `
+    -Pattern 'session runner seam: expected exactly 1 match' -Message 'A missing session runner marker was accepted'
+  Assert-SeamTargetHashes -Stage $missingRunnerStage -Expected $missingRunnerHashes `
+    -Message 'A missing session runner marker partially modified the stage'
+
+  foreach ($inserted in @(
+      @{ Signature = "`t`terr := a.appAnswerZalo(deps, threadID, question, reply, files)"; Pattern = 'session answer seam: inserted signature already present'; Name = 'answer' },
+      @{ Signature = "`traw, err := a.appRunZalo(ctx, run, pz, threadID, question, appZaloCurrentMsgID(reply.ReplyQuote), history, found, files, step)"; Pattern = 'session runner seam: inserted signature already present'; Name = 'runner' }
+    )) {
+    $insertedStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot ("Đã chèn " + $inserted.Name))
+    $insertedDutyPath = Join-Path $insertedStage 'internal\daemon\duty.go'
+    $insertedDuty = [IO.File]::ReadAllText($insertedDutyPath) + "`n" + $inserted.Signature + "`n"
+    [IO.File]::WriteAllText($insertedDutyPath, $insertedDuty, [Text.UTF8Encoding]::new($false))
+    Assert-ThrowsLike -Action { Apply-AppSeams -Stage $insertedStage } `
+      -Pattern $inserted.Pattern -Message ("An already-inserted session " + $inserted.Name + " seam was accepted")
+  }
+
   $duplicateWorkflowStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Trùng workflow')
   $duplicateZaloPath = Join-Path $duplicateWorkflowStage 'internal\daemon\zalo.go'
   $duplicateZalo = [IO.File]::ReadAllText($duplicateZaloPath)
@@ -353,7 +456,7 @@ func incoming() {
     throw 'Launcher does not open the management Portal at /'
   }
 
-  Write-Host 'PASS: staging copies tracked files and applies three guarded seams.'
+  Write-Host 'PASS: staging copies tracked files and applies five guarded seams.'
 } finally {
   if (Test-Path -LiteralPath $stageTestRoot) {
     Remove-Item -LiteralPath $stageTestRoot -Recurse -Force
