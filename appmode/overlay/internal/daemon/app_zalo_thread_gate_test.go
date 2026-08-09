@@ -19,9 +19,7 @@ func TestAppZaloThreadGateSerializesSameThread(t *testing.T) {
 
 	secondEntered := make(chan func(), 1)
 	secondErr := make(chan error, 1)
-	secondAttempting := make(chan struct{})
 	go func() {
-		close(secondAttempting)
 		release, acquireErr := gate.Acquire(context.Background(), "thread-a")
 		if acquireErr != nil {
 			secondErr <- acquireErr
@@ -29,7 +27,7 @@ func TestAppZaloThreadGateSerializesSameThread(t *testing.T) {
 		}
 		secondEntered <- release
 	}()
-	<-secondAttempting
+	waitForAppZaloThreadGateRefs(t, &gate, "thread-a", 2)
 
 	select {
 	case release := <-secondEntered:
@@ -37,7 +35,7 @@ func TestAppZaloThreadGateSerializesSameThread(t *testing.T) {
 		t.Fatal("second turn entered before the first turn released")
 	case err := <-secondErr:
 		t.Fatalf("second acquire failed: %v", err)
-	case <-time.After(25 * time.Millisecond):
+	default:
 	}
 
 	firstRelease()
@@ -92,14 +90,12 @@ func TestAppZaloThreadGateCanceledWaiterIsReclaimed(t *testing.T) {
 	}
 
 	waitContext, cancel := context.WithCancel(context.Background())
-	waiterStarted := make(chan struct{})
 	waiterErr := make(chan error, 1)
 	go func() {
-		close(waiterStarted)
 		_, acquireErr := gate.Acquire(waitContext, "thread-a")
 		waiterErr <- acquireErr
 	}()
-	<-waiterStarted
+	waitForAppZaloThreadGateRefs(t, &gate, "thread-a", 2)
 	cancel()
 
 	select {
@@ -110,6 +106,7 @@ func TestAppZaloThreadGateCanceledWaiterIsReclaimed(t *testing.T) {
 	case <-time.After(appZaloThreadGateTestTimeout):
 		t.Fatal("canceled waiter did not return")
 	}
+	waitForAppZaloThreadGateRefs(t, &gate, "thread-a", 1)
 
 	holderRelease()
 	waitForAppZaloThreadGateLen(t, &gate, 0)
@@ -153,6 +150,26 @@ func waitForAppZaloThreadGateLen(t *testing.T, gate *appZaloThreadGate, want int
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("gate length = %d; want %d", gate.Len(), want)
+		}
+		runtime.Gosched()
+	}
+}
+
+func waitForAppZaloThreadGateRefs(t *testing.T, gate *appZaloThreadGate, threadID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(appZaloThreadGateTestTimeout)
+	for {
+		gate.mu.Lock()
+		got := 0
+		if entry := gate.entries[threadID]; entry != nil {
+			got = entry.refs
+		}
+		gate.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("gate refs for %q = %d; want %d", threadID, got, want)
 		}
 		runtime.Gosched()
 	}
