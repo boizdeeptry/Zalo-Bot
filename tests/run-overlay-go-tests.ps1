@@ -26,7 +26,7 @@ try {
     'daemon' { './internal/daemon' }
     default { './...' }
   }
-  $arguments = @('test', '-count=1')
+  $arguments = @('test', '-count=1', '-skip', (Get-AppGoTestSkipPattern))
   if ($Run) { $arguments += @('-run', $Run) }
   $arguments += $target
 

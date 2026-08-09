@@ -42,6 +42,15 @@ func TestAppRoutesAreRegisteredAndCookieReachable(t *testing.T) {
 		{"DELETE /kb/ingest", "/kb/ingest"},
 		{"GET /kb/model", "/kb/model"},
 		{"PUT /kb/model", "/kb/model"},
+		{"GET /memory", "/memory"},
+		{"GET /memory/threads/{tid}", "/memory/threads/thread-a"},
+		{"POST /memory/threads/{tid}", "/memory/threads/thread-a"},
+		{"PUT /memory/threads/{tid}/{id}", "/memory/threads/thread-a/1"},
+		{"DELETE /memory/threads/{tid}/{id}", "/memory/threads/thread-a/1"},
+		{"GET /memory/lessons", "/memory/lessons"},
+		{"POST /memory/lessons", "/memory/lessons"},
+		{"PUT /memory/lessons/{id}", "/memory/lessons/1"},
+		{"DELETE /memory/lessons/{id}", "/memory/lessons/1"},
 	}
 
 	for _, tt := range tests {
