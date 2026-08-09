@@ -500,6 +500,7 @@ func (a *api) appInvalidateFailedZaloRecovery(
 func (a *api) appCompleteZaloTurn(threadID string, pending appZaloCompletion) {
 	if _, err := a.st.CompleteZaloCLITurn(
 		threadID, pending.generation, pending.contextTokens, pending.messageCursor,
+		"", 0, 0,
 		pending.memoryRevision, pending.lessonsRevision,
 	); err == nil {
 		return
