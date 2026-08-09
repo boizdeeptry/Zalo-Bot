@@ -2,7 +2,7 @@
 
 **Ngày:** 2026-08-09
 
-**Trạng thái:** Đã được người dùng xác nhận ngày 2026-08-09; định dạng prompt nội bộ được gia cố theo security review, không đổi phạm vi người dùng đã duyệt
+**Trạng thái:** Đã được người dùng xác nhận ngày 2026-08-09; định dạng prompt nội bộ được gia cố theo security review; hợp đồng khôi phục được sửa hẹp theo control flow Claude Code 2.1.222 đã ghim, không đổi phạm vi người dùng đã duyệt
 
 **Repository:** `D:\TuvanZalo\_build\.worktrees\portal-m1`
 
@@ -76,6 +76,7 @@ Runner cùng package `daemon` dùng lại profile read-only, `consultArgv`, `par
 - Session đang hoạt động: `claude -p --resume <uuid>` với delta prompt.
 - Mỗi lời gọi vẫn là một process headless ngắn hạn; session liên tục nằm trong transcript Claude, không phải process sống.
 - Runner thu usage từ event `result` khi trường này tồn tại. Parser khoan dung với phiên bản CLI không trả usage.
+- Chỉ chữ ký đã kiểm `No conversation found with session ID` cho phép retry bootstrap ngay trong cùng lượt. Chữ ký chính xác `Failed to resume session <requested UUID>` trả mã sạch `resume_unusable`, không retry cùng lượt; orchestration xoay mapping để lượt kế tiếp bootstrap session mới.
 - Plain stdout, stderr, prompt và nội dung khách không được ghi vào bảng session telemetry.
 
 ### 5.4 Seam vào upstream
@@ -144,7 +145,7 @@ Tạo session mới trước lượt kế tiếp khi một trong các điều ki
 - Đã hoàn tất 48 lượt trong session mà usage không đủ tin cậy.
 - Model hoặc fingerprint thay đổi.
 - Mapping bị đánh dấu `rotate_before_next`.
-- Claude báo session không tồn tại, transcript hỏng hoặc không thể resume.
+- Mapping được đánh dấu xoay sau mã `resume_unusable`, nghĩa là Claude không resume được đúng UUID đã yêu cầu nhưng không có discriminator an toàn để retry trong cùng lượt.
 
 Context token ưu tiên đọc từ usage của event `result`: tổng input, cache creation, cache read và output mà CLI cung cấp. Nếu usage thiếu, dùng ước lượng bảo thủ từ tổng byte prompt và stream output chia 3, cộng dồn theo session. Giá trị chỉ dùng để xoay sớm, không dùng để tính tiền.
 
@@ -167,14 +168,15 @@ Mỗi group có một `thread_id`, nên cả nhóm dùng chung một session. M�
 
 ## 10. Khôi phục và lỗi
 
-- Resume báo session không tồn tại/hỏng: đánh dấu mapping cũ, tạo UUID mới và thử lại đúng một lần bằng bootstrap prompt.
+- Resume trả chữ ký đã kiểm `No conversation found with session ID`: đánh dấu mapping cũ, tạo UUID mới và thử lại đúng một lần ngay trong lượt bằng bootstrap prompt.
+- Resume trả đúng `Failed to resume session <requested UUID>`: trả mã sạch `resume_unusable`, không thử lại trong lượt hiện tại, giữ cursor cũ và để Task 5 đánh dấu mapping xoay; lượt kế tiếp tạo UUID mới cùng bootstrap prompt. Claude Code 2.1.222 không phát discriminator ổn định riêng cho transcript JSON hỏng, nên không ghép fragment stdout/stderr để tạo bất kỳ chữ ký recovery nào.
 - Timeout, cancellation, lỗi mạng hoặc lỗi Claude khác: không tự chạy lại vì có thể tốn tiền hai lần; giữ cursor cũ và báo theo đường handoff hiện tại.
 - Daemon chết giữa lượt: cursor chưa nâng; lần sau delta có thể lặp lại tin cuối nhưng không mất tin. Idempotency outbox hiện tại tiếp tục ngăn gửi trùng theo cơ chế sẵn có.
 - SQLite ghi trạng thái session thất bại sau khi Claude trả lời: answer vẫn qua cửa hiện tại; log lỗi và xoay session ở lượt sau thay vì làm mất câu trả lời hợp lệ.
 - Không đọc được usage: tiếp tục dựa vào turn count và byte estimate.
 - Hai tin cùng thread: tin thứ hai chờ gate; context deadline của lượt chỉ bắt đầu sau khi lấy gate để thời gian chờ hàng đợi không ăn vào ngân sách Claude.
 
-`last_error` chỉ lưu mã lỗi đã làm sạch như `resume_not_found` hoặc `usage_unavailable`, không lưu stderr thô.
+`last_error` chỉ lưu mã lỗi đã làm sạch như `resume_not_found`, `resume_unusable` hoặc `usage_unavailable`, không lưu stderr thô.
 
 ## 11. Tương thích Provider routing
 
@@ -211,7 +213,7 @@ Task runtime seam trong plan Provider phải dùng `ZaloSessionRunner` thay vì 
 - Operator message sau cursor có trong delta.
 - Usage parser có dữ liệu, thiếu dữ liệu và định dạng lạ.
 - Xoay ở 130.000 token, 48 lượt, đổi model và đổi fingerprint.
-- Resume-not-found retry đúng một lần bằng bootstrap; lỗi khác không retry.
+- Resume-not-found đã kiểm retry đúng một lần bằng bootstrap; exact requested-UUID `resume_unusable` không retry cùng lượt, wrong UUID/`--print mode` không được nhận nhầm; lỗi khác không retry.
 - Prompt/stdout/stderr không lọt vào bảng session.
 
 ### Đồng thời
@@ -234,7 +236,7 @@ Task runtime seam trong plan Provider phải dùng `ZaloSessionRunner` thay vì 
 - Tin tiếp theo không lặp full bootstrap prompt khi session còn hợp lệ.
 - Tin do người trực gửi giữa các lượt được Claude thấy ở lượt resume sau.
 - Session tự xoay trước khi vượt ngưỡng và session mới vẫn biết memory cùng lịch sử gần nhất.
-- Daemon restart tiếp tục session nếu transcript còn; transcript mất thì tự phục hồi một lần bằng session mới.
+- Daemon restart tiếp tục session nếu transcript còn; transcript mất với chữ ký missing đã kiểm thì tự phục hồi ngay một lần, còn `resume_unusable` chỉ bootstrap session mới ở lượt kế tiếp.
 - Không xuất hiện trả lời trùng do hai lượt cùng thread chạy song song.
 - Response path không thêm một model call chỉ để quản lý session.
 - Provider routing tương lai không vô hiệu hóa session Claude theo thread.
@@ -246,5 +248,5 @@ Task runtime seam trong plan Provider phải dùng `ZaloSessionRunner` thay vì 
 - Prompt delta bỏ sót tin người trực: dùng message ID cursor từ SQLite, không suy từ timestamp hoặc body.
 - Resume song song làm hỏng transcript: keyed gate bao toàn bộ answer pipeline theo thread.
 - Persona hoặc chính sách đổi nhưng session giữ luật cũ: fingerprint buộc xoay trước lượt kế tiếp.
-- Retry có thể nhân đôi chi phí: chỉ retry lỗi resume-not-found/hỏng transcript, đúng một lần, với runner chỉ-đọc.
-- Session mapping còn nhưng transcript bị dọn ngoài ứng dụng: tự phục hồi bằng bootstrap và generation mới.
+- Retry có thể nhân đôi chi phí: chỉ retry chữ ký resume-not-found đã kiểm, đúng một lần, với runner chỉ-đọc; generic/corrupt không có discriminator an toàn thì tuyệt đối không retry cùng lượt.
+- Session mapping còn nhưng transcript bị dọn ngoài ứng dụng: chữ ký missing phục hồi ngay; `resume_unusable` đánh dấu xoay và phục hồi bằng bootstrap cùng generation mới ở lượt kế tiếp.

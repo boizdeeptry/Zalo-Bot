@@ -26,7 +26,7 @@
 - Create `appmode/overlay/internal/daemon/app_zalo_thread_gate_test.go`: same-thread serialization, cross-thread concurrency, cancellation cleanup.
 - Create `appmode/overlay/internal/daemon/app_zalo_session_prompt.go`: prompt fingerprint, bootstrap/delta selection, token estimate, and rotation policy.
 - Create `appmode/overlay/internal/daemon/app_zalo_session_prompt_test.go`: delta contents, fingerprint, usage, and rotation tests.
-- Create `appmode/overlay/internal/daemon/app_zalo_session_runner.go`: session-aware Claude process execution and one-time resume recovery.
+- Create `appmode/overlay/internal/daemon/app_zalo_session_runner.go`: session-aware Claude process execution, one-time verified-missing recovery, and unusable-resume classification.
 - Create `appmode/overlay/internal/daemon/app_zalo_session_runner_test.go`: argv, session reuse/isolation, usage parsing, recovery, and secret/content-free persistence tests.
 - Create `appmode/overlay/internal/daemon/app_zalo_session_hook.go`: gate-aware `answerZalo` wrapper and structured runner dispatch used by staged seams.
 - Create `appmode/overlay/internal/daemon/app_zalo_session_hook_test.go`: cursor timing, operator catch-up, restart persistence, and legacy fake-runner compatibility.
@@ -213,7 +213,7 @@
 - Create: `appmode/overlay/internal/daemon/app_zalo_session_runner.go`
 - Create: `appmode/overlay/internal/daemon/app_zalo_session_runner_test.go`
 
-**Public behavior to verify:** The runner creates a named Claude session once, resumes it on later turns, captures optional usage, and retries only a missing/corrupt resume with a fresh session.
+**Public behavior to verify:** The runner creates a named Claude session once, resumes it on later turns, captures optional usage, retries only a verified missing transcript with a fresh session, and marks an exact requested-session generic resume failure unusable without retrying it in the same turn.
 
 - [ ] **Step 1: Write failing runner tests against a fake Claude executable**
 
@@ -230,7 +230,7 @@
   }
   ```
 
-  Record argv/stdin and return stream-json fixtures. Assert a new session has `-p --session-id <uuid>` and no `--resume`; an existing session has `-p --resume <same uuid>` and no `--session-id`; model, add-dir, allowed tools, stream-json and environment stripping remain intact. Parse `usage.input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, and `output_tokens`. Unknown/missing usage must not fail the answer. A stderr fixture matching missing/corrupt session triggers one fresh bootstrap attempt; timeout, network, permission, model, and generic exit errors trigger zero retries. Error strings are clipped and persisted only as safe codes.
+  Record argv/stdin and return stream-json fixtures. Assert a new session has `-p --session-id <uuid>` and no `--resume`; an existing session has `-p --resume <same uuid>` and no `--session-id`; model, add-dir, allowed tools, stream-json and environment stripping remain intact. Parse `usage.input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, and `output_tokens`. Unknown/missing usage must not fail the answer. The verified `No conversation found with session ID` signature triggers one fresh bootstrap attempt. The exact `Failed to resume session <requested UUID>` signature returns safe `resume_unusable` metadata and zero same-turn retries; a wrong UUID, `--print mode` wording, timeout, network, permission, model, and generic exit errors also trigger zero retries. Error strings are clipped and persisted only as safe codes.
 
 - [ ] **Step 2: Run and confirm RED**
 
@@ -240,7 +240,7 @@
 
 - [ ] **Step 3: Implement the session-aware process runner**
 
-  Reuse `agent.ConsultReadOnly`, `consultArgv`, `parseStreamLine`, scanner limit, work directory, thinking-token environment and cancellation behavior. For resume argv, replace the exact adjacent `--session-id <uuid>` pair from `consultArgv` with `--resume <uuid>`; fail if the pair is absent or repeated. Parse usage in parallel with existing step/result parsing. Classify resume failure from a narrow allowlist of sanitized CLI messages and never store raw stderr.
+  Reuse `agent.ConsultReadOnly`, `consultArgv`, `parseStreamLine`, scanner limit, work directory, thinking-token environment and cancellation behavior. For resume argv, replace the exact adjacent `--session-id <uuid>` pair from `consultArgv` with `--resume <uuid>`; fail if the pair is absent or repeated. Parse usage in parallel with existing step/result parsing. Retry only the verified missing-session signature. Match `Failed to resume session <uuid>` only when `<uuid>` is the requested resume ID, return safe `resume_unusable` metadata without retrying, never synthesize any recovery signature by pairing unrelated stdout/stderr fragments, and never store raw error text.
 
 - [ ] **Step 4: Run and confirm GREEN**
 
@@ -277,7 +277,7 @@
   func (a *api) appRunZalo(ctx context.Context, run zaloRunner, zc zaloConfig, threadID, question, currentZaloMsgID string, history []ipc.ZaloMessage, found []passage, files []ipc.ZaloAttachment, step func(string)) (string, error)
   ```
 
-  With a recording command fixture, run two turns on the same thread and assert one session ID, then `--resume`; add an operator message between them and assert it is in delta. Recreate `api` with the same store and assert it still resumes. Run a second thread and assert a different UUID. Seed context at 129,999 then 130,000 tokens and assert only the latter creates a new generation. Assert 48 turns, fingerprint/model change and resume-not-found also rotate. Assert `LatestZaloMessageID` is committed only after the answer pipeline completes and no separate summary/model invocation occurs.
+  With a recording command fixture, run two turns on the same thread and assert one session ID, then `--resume`; add an operator message between them and assert it is in delta. Recreate `api` with the same store and assert it still resumes. Run a second thread and assert a different UUID. Seed context at 129,999 then 130,000 tokens and assert only the latter creates a new generation. Assert 48 turns and fingerprint/model changes rotate, verified resume-not-found replaces the generation after its successful same-turn bootstrap, and `resume_unusable` marks the old mapping for a fresh bootstrap on the next turn without a second call in the failing turn. Assert `LatestZaloMessageID` is committed only after the answer pipeline completes and no separate summary/model invocation occurs.
 
 - [ ] **Step 2: Run and confirm RED**
 
@@ -287,7 +287,7 @@
 
 - [ ] **Step 3: Implement orchestration**
 
-  `appAnswerZalo` acquires the thread gate before starting the existing per-turn timeout, then calls `answerZalo` with a session-capable runner and advances the cursor after successful store completion. It extracts the current Zalo `msgId` from the last batched event's `reply.ReplyQuote` and passes that stable identity into `appRunZalo`; Task 3 does not parse reply quotes. `appRunZalo` detects that runner through a private structured-run interface; fake runners and API Provider runners continue to receive `buildConsultPrompt` through their existing `Run` method. Use compare-and-swap generation on every state update; a conflict reloads state once rather than overwriting a concurrent generation.
+  `appAnswerZalo` acquires the thread gate before starting the existing per-turn timeout, then calls `answerZalo` with a session-capable runner and advances the cursor after successful store completion. It extracts the current Zalo `msgId` from the last batched event's `reply.ReplyQuote` and passes that stable identity into `appRunZalo`; Task 3 does not parse reply quotes. `appRunZalo` detects that runner through a private structured-run interface; fake runners and API Provider runners continue to receive `buildConsultPrompt` through their existing `Run` method. Use compare-and-swap generation on every state update; a conflict reloads state once rather than overwriting a concurrent generation. When the runner returns `RecoveryCode=resume_unusable` with `RecoveryAttempted=false`, mark the mapping for rotation and return the current failure without another model call; the next turn selects a new UUID and bootstrap prompt.
 
 - [ ] **Step 4: Run and confirm GREEN**
 
@@ -416,7 +416,7 @@
 - [ ] Same Zalo thread creates once and resumes the same UUID; different threads never share it.
 - [ ] Prompt delta includes all messages after the cursor and does not repeat the bootstrap persona/contract.
 - [ ] Context, turn, fingerprint, model and explicit flags rotate before the next turn without an extra model call.
-- [ ] Missing/corrupt resume retries once; all other failures retain existing handoff behavior and do not double-spend.
+- [ ] Verified missing resume retries once; exact requested-session `resume_unusable` is marked for a next-turn bootstrap and never retried in the same turn; all other failures retain existing handoff behavior and do not double-spend.
 - [ ] Same-thread turns serialize from history read through outbox/message completion; different threads remain concurrent.
 - [ ] Daemon recreation preserves mappings in SQLite and resumes when Claude transcripts exist.
 - [ ] Session storage and package contain no prompt, answer, tool output, raw stderr, or credentials.

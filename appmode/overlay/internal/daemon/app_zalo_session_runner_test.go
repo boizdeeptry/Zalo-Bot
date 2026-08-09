@@ -240,48 +240,78 @@ func TestAppZaloSessionRunnerKeepsExistingStreamStepsAndFallback(t *testing.T) {
 	}
 }
 
-func TestAppZaloSessionRunnerRecoversOnlyMissingOrCorruptResume(t *testing.T) {
+func TestAppZaloSessionRunnerRecoversVerifiedMissingResume(t *testing.T) {
+	fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
+		{stderr: "Error: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1")},
+		{stdout: appZaloResultFixture("recovered answer")},
+	}}
+	runner := appZaloRunnerFixture(fake.run)
+
+	result, err := runner.RunSession(context.Background(), appZaloSessionRunInput{
+		SessionID:         appZaloTestSessionID,
+		Prompt:            "delta prompt",
+		Resume:            true,
+		RecoverySessionID: appZaloTestRecoverySessionID,
+		BootstrapPrompt:   "fresh bootstrap",
+	}, func(string) {})
+	if err != nil {
+		t.Fatalf("RunSession() error = %v", err)
+	}
+	if len(fake.calls) != 2 {
+		t.Fatalf("command calls = %d, want exactly 2", len(fake.calls))
+	}
+	if fake.calls[0].prompt != "delta prompt" || fake.calls[1].prompt != "fresh bootstrap" {
+		t.Errorf("prompts = %q, %q", fake.calls[0].prompt, fake.calls[1].prompt)
+	}
+	if !slices.Equal(fake.calls[0].argv[:3], []string{"-p", "--resume", appZaloTestSessionID}) {
+		t.Errorf("resume argv = %q", fake.calls[0].argv)
+	}
+	if !slices.Equal(fake.calls[1].argv[:3], []string{"-p", "--session-id", appZaloTestRecoverySessionID}) {
+		t.Errorf("recovery argv = %q", fake.calls[1].argv)
+	}
+	if result.Answer != "recovered answer" || result.SessionID != appZaloTestRecoverySessionID ||
+		!result.Recovered || result.RecoveryCode != appZaloErrorResumeNotFound {
+		t.Errorf("recovery result = %+v", result)
+	}
+}
+
+func TestAppZaloSessionRunnerMarksOnlyExactRequestedResumeFailureUnusable(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		stderr string
+		name             string
+		message          string
+		want             string
+		wantRecoveryCode string
 	}{
-		{name: "missing", stderr: "Error: No conversation found with session ID " + appZaloTestSessionID},
-		{name: "corrupt unexpected end", stderr: "Error: --resume session load failed (" + appZaloTestSessionID + "): Unexpected end of JSON input"},
-		{name: "corrupt parse error", stderr: "Error: --resume session load failed (" + appZaloTestSessionID + "): JSON Parse error at byte 812"},
-		{name: "corrupt invalid JSON", stderr: "Error: --resume session load failed (" + appZaloTestSessionID + "): invalid JSON transcript"},
+		{name: "exact requested session", message: "Failed to resume session " + appZaloTestSessionID, want: "resume_unusable", wantRecoveryCode: "resume_unusable"},
+		{name: "wrong session", message: "Failed to resume session " + appZaloTestRecoverySessionID, want: appZaloErrorProcess},
+		{name: "missing session identity", message: "Failed to resume session", want: appZaloErrorProcess},
+		{name: "print mode wording", message: "--print mode: Failed to resume session " + appZaloTestSessionID, want: appZaloErrorProcess},
+		{name: "invented corruption pair", message: "--resume session load failed (" + appZaloTestSessionID + "): Unexpected end of JSON input", want: appZaloErrorProcess},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
-				{stderr: tc.stderr, waitErr: errors.New("exit status 1")},
-				{stdout: appZaloResultFixture("recovered answer")},
+				{stdout: appZaloErrorResultFixture(tc.message)},
+				{stdout: appZaloResultFixture("must not run")},
 			}}
 			runner := appZaloRunnerFixture(fake.run)
-
 			result, err := runner.RunSession(context.Background(), appZaloSessionRunInput{
 				SessionID:         appZaloTestSessionID,
-				Prompt:            "delta prompt",
+				Prompt:            "delta with private content",
 				Resume:            true,
 				RecoverySessionID: appZaloTestRecoverySessionID,
-				BootstrapPrompt:   "fresh bootstrap",
+				BootstrapPrompt:   "bootstrap with private content",
 			}, func(string) {})
-			if err != nil {
-				t.Fatalf("RunSession() error = %v", err)
+			if got := appZaloRunErrorCode(err); got != tc.want {
+				t.Fatalf("error code = %q, want %q (err %v)", got, tc.want, err)
 			}
-			if len(fake.calls) != 2 {
-				t.Fatalf("command calls = %d, want exactly 2", len(fake.calls))
+			if err == nil || err.Error() != tc.want || strings.Contains(err.Error(), appZaloTestSessionID) {
+				t.Errorf("unsafe error = %v", err)
 			}
-			if fake.calls[0].prompt != "delta prompt" || fake.calls[1].prompt != "fresh bootstrap" {
-				t.Errorf("prompts = %q, %q", fake.calls[0].prompt, fake.calls[1].prompt)
+			if len(fake.calls) != 1 {
+				t.Errorf("command calls = %d, want no same-turn retry", len(fake.calls))
 			}
-			if !slices.Equal(fake.calls[0].argv[:3], []string{"-p", "--resume", appZaloTestSessionID}) {
-				t.Errorf("resume argv = %q", fake.calls[0].argv)
-			}
-			if !slices.Equal(fake.calls[1].argv[:3], []string{"-p", "--session-id", appZaloTestRecoverySessionID}) {
-				t.Errorf("recovery argv = %q", fake.calls[1].argv)
-			}
-			if result.Answer != "recovered answer" || result.SessionID != appZaloTestRecoverySessionID ||
-				!result.Recovered || result.RecoveryCode != appZaloErrorResumeNotFound {
-				t.Errorf("recovery result = %+v", result)
+			if result.RecoveryAttempted || result.RecoveryCode != tc.wantRecoveryCode {
+				t.Errorf("result metadata = %+v", result)
 			}
 		})
 	}
@@ -348,6 +378,11 @@ func TestAppZaloSessionRunnerClassifiesStdoutResultErrors(t *testing.T) {
 		{name: "stdout missing session", stdout: appZaloErrorResultFixture("No conversation found with session ID " + appZaloTestSessionID), wantCalls: 2, wantAnswer: "recovered"},
 		{name: "stdout network beats stderr missing", stdout: appZaloErrorResultFixture("network error: connection refused"), stderr: "No conversation found with session ID " + appZaloTestSessionID, want: appZaloErrorNetwork, wantCalls: 1},
 		{name: "stderr permission beats stdout missing", stdout: appZaloErrorResultFixture("No conversation found with session ID " + appZaloTestSessionID), stderr: "permission denied for transcript", want: appZaloErrorPermission, wantCalls: 1},
+		{name: "stderr network beats unusable resume", stdout: appZaloErrorResultFixture("Failed to resume session " + appZaloTestSessionID), stderr: "network error: connection reset", want: appZaloErrorNetwork, wantCalls: 1},
+		{name: "stderr permission beats unusable resume", stdout: appZaloErrorResultFixture("Failed to resume session " + appZaloTestSessionID), stderr: "permission denied reading transcript", want: appZaloErrorPermission, wantCalls: 1},
+		{name: "stderr model beats unusable resume", stdout: appZaloErrorResultFixture("Failed to resume session " + appZaloTestSessionID), stderr: "model sonnet is not available", want: appZaloErrorModel, wantCalls: 1},
+		{name: "split missing signature is not synthesized", stdout: appZaloErrorResultFixture("No conversation found"), stderr: "with session ID " + appZaloTestSessionID, want: appZaloErrorProcess, wantCalls: 1},
+		{name: "split unusable signature is not synthesized", stdout: appZaloErrorResultFixture("Failed to resume"), stderr: "session " + appZaloTestSessionID, want: appZaloErrorProcess, wantCalls: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
@@ -459,7 +494,7 @@ func TestAppZaloSessionRunnerPreservesCancellationAndTimeoutWithoutRetry(t *test
 			ctx, cancel := context.WithCancelCause(context.Background())
 			cancel(tc.ctxErr)
 			fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
-				{stderr: "No conversation found with session ID " + appZaloTestSessionID, waitErr: tc.ctxErr},
+				{stdout: appZaloErrorResultFixture("Failed to resume session " + appZaloTestSessionID), waitErr: tc.ctxErr},
 				{stdout: appZaloResultFixture("must not run")},
 			}}
 			runner := appZaloRunnerFixture(fake.run)

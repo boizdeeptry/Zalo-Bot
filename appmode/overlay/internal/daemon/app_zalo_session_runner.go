@@ -17,6 +17,7 @@ import (
 
 const (
 	appZaloErrorResumeNotFound = "resume_not_found"
+	appZaloErrorResumeUnusable = "resume_unusable"
 	appZaloErrorCanceled       = "canceled"
 	appZaloErrorTimeout        = "timeout"
 	appZaloErrorNetwork        = "network"
@@ -63,8 +64,9 @@ type appZaloRunResult struct {
 	OutputBytes   int64
 	SessionID     string
 	Recovered     bool
-	// RecoveryAttempted remains true even when the fresh bootstrap fails, so
-	// orchestration can invalidate the old resumable mapping safely.
+	// RecoveryAttempted is true only when a same-turn fresh bootstrap was
+	// launched. RecoveryCode can still mark a resume unusable for next-turn
+	// rotation when this field is false.
 	RecoveryAttempted bool
 	RecoveryCode      string
 }
@@ -100,9 +102,10 @@ func appZaloNewRunError(code string, match error) error {
 	return &appZaloSafeRunError{code: code, match: match}
 }
 
-// RunSession executes one Claude turn. A resume is retried only when stderr
-// matches the narrow missing/corrupt transcript allowlist, and then only with
-// the caller-supplied recovery ID and bootstrap prompt.
+// RunSession executes one Claude turn. Only the verified missing-session
+// signature triggers a same-turn retry with the caller-supplied recovery ID.
+// An exact requested-session resume failure is marked unusable for the caller
+// to rotate on the next turn, without spending a second call now.
 func (r appZaloSessionRunner) RunSession(
 	ctx context.Context,
 	in appZaloSessionRunInput,
@@ -113,7 +116,11 @@ func (r appZaloSessionRunner) RunSession(
 		result.SessionID = in.SessionID
 		return result, nil
 	}
-	if !in.Resume || appZaloRunErrorCode(err) != appZaloErrorResumeNotFound {
+	errorCode := appZaloRunErrorCode(err)
+	if in.Resume && errorCode == appZaloErrorResumeUnusable {
+		return appZaloRunResult{RecoveryCode: appZaloErrorResumeUnusable}, err
+	}
+	if !in.Resume || errorCode != appZaloErrorResumeNotFound {
 		return appZaloRunResult{}, err
 	}
 
@@ -162,7 +169,7 @@ func (r appZaloSessionRunner) runAttempt(
 	if err != nil {
 		appZaloClose(stdout)
 		appZaloClose(stderr)
-		code, match := appZaloClassifyClaudeFailure(ctx, err, "", resume)
+		code, match := appZaloClassifyClaudeFailure(ctx, err, "", "", resume, sessionID)
 		if code == appZaloErrorCanceled || code == appZaloErrorTimeout {
 			return appZaloRunResult{}, appZaloNewRunError(code, match)
 		}
@@ -193,8 +200,9 @@ func (r appZaloSessionRunner) runAttempt(
 	stderrText := <-stderrDone
 	waitErr := wait()
 	if waitErr != nil || parsed.isError {
-		evidence := appZaloCombineClaudeErrorEvidence(parsed.errorEvidence, stderrText)
-		code, match := appZaloClassifyClaudeFailure(ctx, waitErr, evidence, resume)
+		code, match := appZaloClassifyClaudeFailure(
+			ctx, waitErr, parsed.errorEvidence, stderrText, resume, sessionID,
+		)
 		return appZaloRunResult{}, appZaloNewRunError(code, match)
 	}
 	if scanErr != nil {
@@ -357,8 +365,10 @@ func appZaloParseClaudeUsage(line []byte) (int64, bool) {
 func appZaloClassifyClaudeFailure(
 	ctx context.Context,
 	waitErr error,
-	stderr string,
+	stdoutEvidence string,
+	stderrEvidence string,
 	resume bool,
+	sessionID string,
 ) (string, error) {
 	if errors.Is(waitErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return appZaloErrorTimeout, context.DeadlineExceeded
@@ -366,7 +376,9 @@ func appZaloClassifyClaudeFailure(
 	if errors.Is(waitErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 		return appZaloErrorCanceled, context.Canceled
 	}
-	normalized := appZaloNormalizeClaudeError(stderr)
+	normalized := appZaloNormalizeClaudeError(
+		appZaloCombineClaudeErrorEvidence(stdoutEvidence, stderrEvidence),
+	)
 	if appZaloContainsAny(normalized,
 		"request timed out", "operation timed out", "network timeout", "etimedout") {
 		return appZaloErrorTimeout, nil
@@ -384,8 +396,17 @@ func appZaloClassifyClaudeFailure(
 		(strings.Contains(normalized, "model ") && appZaloContainsAny(normalized, "not available", "not found")) {
 		return appZaloErrorModel, nil
 	}
-	if resume && appZaloIsRecoverableResumeError(normalized) {
-		return appZaloErrorResumeNotFound, nil
+	if resume {
+		stdoutNormalized := appZaloNormalizeClaudeError(stdoutEvidence)
+		stderrNormalized := appZaloNormalizeClaudeError(stderrEvidence)
+		if appZaloIsVerifiedMissingResumeError(stdoutNormalized) ||
+			appZaloIsVerifiedMissingResumeError(stderrNormalized) {
+			return appZaloErrorResumeNotFound, nil
+		}
+		if appZaloIsExactUnusableResumeError(stdoutNormalized, sessionID) ||
+			appZaloIsExactUnusableResumeError(stderrNormalized, sessionID) {
+			return appZaloErrorResumeUnusable, nil
+		}
 	}
 	return appZaloErrorProcess, nil
 }
@@ -395,17 +416,15 @@ func appZaloNormalizeClaudeError(stderr string) string {
 	return strings.Join(strings.Fields(strings.ToLower(clean)), " ")
 }
 
-func appZaloIsRecoverableResumeError(normalized string) bool {
-	if strings.Contains(normalized, "no conversation found with session id") {
-		return true
-	}
-	if !strings.Contains(normalized, "--resume session load failed (") {
+func appZaloIsVerifiedMissingResumeError(normalized string) bool {
+	return strings.Contains(normalized, "no conversation found with session id")
+}
+
+func appZaloIsExactUnusableResumeError(normalized, sessionID string) bool {
+	if sessionID == "" {
 		return false
 	}
-	return appZaloContainsAny(normalized,
-		"unexpected end of json input",
-		"json parse error",
-		"invalid json")
+	return normalized == "failed to resume session "+strings.ToLower(sessionID)
 }
 
 func appZaloCombineClaudeErrorEvidence(stdout, stderr string) string {
