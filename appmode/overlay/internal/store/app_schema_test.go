@@ -30,6 +30,59 @@ func TestMigrateAppIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMigrateAppAdvancesSchemaVersionMonotonically(t *testing.T) {
+	tests := []struct {
+		name       string
+		seed       string
+		insertSeed bool
+		want       string
+		wantErr    bool
+	}{
+		{name: "missing metadata", want: "2"},
+		{name: "older metadata", seed: "1", insertSeed: true, want: "2"},
+		{name: "current metadata", seed: "2", insertSeed: true, want: "2"},
+		{name: "newer metadata", seed: "7", insertSeed: true, want: "7"},
+		{name: "malformed metadata", seed: "future", insertSeed: true, want: "future", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(`CREATE TABLE app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)`); err != nil {
+				t.Fatal(err)
+			}
+			if tc.insertSeed {
+				if _, err := db.Exec(`INSERT INTO app_meta(key, value) VALUES ('schema_version', ?)`, tc.seed); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			err = migrateApp(db)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "schema_version") {
+					t.Fatalf("migrateApp() error = %v; want schema_version error", err)
+				}
+			} else if err != nil {
+				t.Fatalf("migrateApp() error = %v", err)
+			}
+
+			var got string
+			if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'schema_version'`).Scan(&got); err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("schema_version = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestMigrateAppCreatesContentFreeZaloCLISessionSchema(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

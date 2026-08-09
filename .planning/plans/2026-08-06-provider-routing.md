@@ -22,8 +22,8 @@
 
 - Create `appmode/overlay/internal/store/app_llm.go`: Provider, model, route, revision, and telemetry persistence APIs.
 - Create `appmode/overlay/internal/store/app_llm_test.go`: public store behavior, transaction, conflict, delete guard, and snapshot tests.
-- Modify `appmode/overlay/internal/store/app_schema.go`: schema version 2 and the four LLM tables plus indexes.
-- Modify `appmode/overlay/internal/store/app_schema_test.go`: idempotent migration and system Provider seed assertions.
+- Modify `appmode/overlay/internal/store/app_schema.go`: schema version 3 and the four LLM tables plus indexes; version 2 remains reserved for Zalo CLI sessions.
+- Modify `appmode/overlay/internal/store/app_schema_test.go`: idempotent, monotonic schema-version and system Provider seed assertions.
 - Create `appmode/overlay/internal/daemon/app_secret.go`: package-level secret protector interface and redaction helpers.
 - Create `appmode/overlay/internal/daemon/app_secret_windows.go`: current-user DPAPI encryption and decryption.
 - Create `appmode/overlay/internal/daemon/app_secret_other.go`: fail-closed implementation for non-Windows builds.
@@ -100,6 +100,8 @@
 
   Cover: the seeded `claude-code` system Provider; model upsert and replacement; route revision `1`; successful compare-and-swap to revision `2`; stale revision returning `ErrLLMRouteConflict`; disabled/missing Provider or model rejection; Claude Code required as the enabled final entry; referenced Provider deletion returning `ErrLLMProviderInUse`; and mutation of a returned slice not affecting the next snapshot. Record an `LLMAttempt` and query status, then inspect the schema with `PRAGMA table_info(llm_attempts)` to prove no prompt, request, response, or message column exists.
 
+  Extend the schema migration test from the Zalo-session baseline: version `2` advances to Provider version `3`, repeated migration remains `3`, a pre-existing numeric version greater than `3` is preserved exactly, and malformed version metadata returns an error without being overwritten.
+
 - [ ] **Step 2: Run the staged build and confirm the tests fail for the right reason**
 
   Run:
@@ -110,7 +112,7 @@
 
   Expected: FAIL during `go test` because `LLMProvider`, `LLMRouteSnapshot`, and the new `Store` methods do not exist.
 
-- [ ] **Step 3: Implement schema version 2 and store methods**
+- [ ] **Step 3: Implement schema version 3 and store methods**
 
   Add `llm_providers`, `llm_models`, `llm_route_entries`, and `llm_attempts`. Use foreign keys, unique `(provider_id, model_id)`, unique route `position`, an index on attempt start time, and `CHECK` constraints for booleans. Seed only the protected Provider metadata in migration:
 
@@ -118,8 +120,11 @@
   INSERT OR IGNORE INTO llm_providers(id, name, kind, enabled, system_provider)
   VALUES ('claude-code', 'Claude Code', 'claude_code', 1, 1);
   INSERT OR IGNORE INTO app_meta(key, value) VALUES ('llm_route_revision', '1');
-  UPDATE app_meta SET value = '2' WHERE key = 'schema_version';
+  -- Run only after strict Go parsing proves the current numeric version is below 3.
+  UPDATE app_meta SET value = '3' WHERE key = 'schema_version';
   ```
+
+  Reserve schema version `2` for the Zalo CLI-session migration already present on this branch. Advance to `3` inside the same transaction only when the strictly parsed, non-negative numeric value is lower; preserve higher versions and return an error for malformed metadata instead of coercing or overwriting it.
 
   Implement `LLMProviders`, `CreateLLMProvider`, `UpdateLLMProvider`, `DeleteLLMProvider`, `SetLLMCredentialCipher`, `ClearLLMCredential`, `ReplaceLLMModels`, `AddLLMModel`, `DeleteLLMModel`, `LLMRoute`, `ReplaceLLMRoute`, `BootstrapClaudeRoute`, `RecordLLMAttempt`, and `LLMStatus`. `ReplaceLLMRoute` must validate and replace entries inside one SQL transaction, update the revision with `WHERE value = expected`, and roll back on every validation or conflict error. Cap attempts to the newest 500 rows after insert.
 
