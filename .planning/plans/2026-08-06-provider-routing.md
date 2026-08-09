@@ -347,7 +347,8 @@
   Run:
 
   ```powershell
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  $pester = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru
+  if ($pester.FailedCount -ne 0) { throw "Pester failed: $($pester.FailedCount)" }
   ```
 
   Expected: FAIL because the duty seam and `appZaloRunner` do not exist.
@@ -578,7 +579,8 @@
   Run:
 
   ```powershell
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  $pester = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru
+  if ($pester.FailedCount -ne 0) { throw "Pester failed: $($pester.FailedCount)" }
   ```
 
   Expected: FAIL until the package gate includes the Provider canary scan and the cross-layer fallback fixture reports the expected status.
@@ -593,7 +595,8 @@
 
   ```powershell
   npm --prefix appmode test
-  Invoke-Pester .\tests\build-app.Tests.ps1 -Output Detailed
+  $pester = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru
+  if ($pester.FailedCount -ne 0) { throw "Pester failed: $($pester.FailedCount)" }
   $out = Join-Path $env:TEMP ('provider-final-' + [guid]::NewGuid().ToString('N'))
   pwsh -NoProfile -File .\build-app.ps1 -Repo 'C:\Users\manva\OneDrive\Máy tính\agentdc' -PersonaSource 'D:\TuvanZalo\brain\reference\persona' -Out $out
   git -C 'C:\Users\manva\OneDrive\Máy tính\agentdc' status --short
