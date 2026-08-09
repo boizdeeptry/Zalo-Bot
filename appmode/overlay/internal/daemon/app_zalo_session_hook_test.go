@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -286,6 +287,187 @@ func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t 
 	}
 	if run.legacy != 0 {
 		t.Fatalf("production structured runner used legacy Run %d times", run.legacy)
+	}
+}
+
+func TestAppZaloSessionBootstrapsPersonaOnceAndRefreshesMemoryByRevision(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "thread")
+	personaPath := filepath.Join(t.TempDir(), "persona.md")
+	if err := os.WriteFile(personaPath, []byte("PERSONA-ONCE-MARKER"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	zc.PersonaPath = personaPath
+	created, err := st.CreateAppThreadMemory("thread", store.AppThreadMemoryInput{
+		Text: "MEMORY-ORIGINAL", Pinned: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &appZaloHookRunner{results: []appZaloRunResult{
+		{Answer: `{"answers":["one"]}`},
+		{Answer: `{"answers":["two"]}`},
+		{Answer: `{"answers":["three"]}`},
+		{Answer: `{"answers":["four"]}`},
+	}}
+	deps := &zaloDeps{cfg: zc, run: run}
+
+	questions := []string{"question-1", "question-2", "question-3", "question-4"}
+	for i, question := range questions {
+		if i == 2 {
+			if _, err := st.UpdateAppThreadMemory("thread", created.ID, store.AppThreadMemoryInput{
+				Text: "MEMORY-UPDATED", Pinned: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if i == 3 {
+			if err := st.DeleteAppThreadMemory("thread", created.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		msgID := fmt.Sprintf("memory-msg-%d", i+1)
+		if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", question, msgID); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.appAnswerZalo(deps, "thread", question, appZaloReply(msgID), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	inputs, _ := run.snapshot()
+	if len(inputs) != 4 {
+		t.Fatalf("session calls = %d; want 4", len(inputs))
+	}
+	if inputs[0].Resume || !strings.Contains(inputs[0].Prompt, "PERSONA-ONCE-MARKER") ||
+		!strings.Contains(inputs[0].Prompt, "MEMORY-ORIGINAL") {
+		t.Fatalf("bootstrap prompt missing persona/memory: %+v", inputs[0])
+	}
+	if !inputs[1].Resume || strings.Contains(inputs[1].Prompt, "PERSONA-ONCE-MARKER") ||
+		strings.Contains(inputs[1].Prompt, appZaloMemoryRefreshDirective) {
+		t.Fatalf("unchanged resume repeated bootstrap state: %s", inputs[1].Prompt)
+	}
+	if !strings.Contains(inputs[2].Prompt, appZaloMemoryRefreshDirective) ||
+		!strings.Contains(inputs[2].Prompt, "MEMORY-UPDATED") ||
+		strings.Contains(inputs[2].Prompt, "PERSONA-ONCE-MARKER") {
+		t.Fatalf("changed memory did not produce a delta-only refresh: %s", inputs[2].Prompt)
+	}
+	if !strings.Contains(inputs[3].Prompt, `"scope":"thread_memory","revision":3,"items":[]`) ||
+		strings.Contains(inputs[3].Prompt, "MEMORY-UPDATED") {
+		t.Fatalf("deleted memory did not produce an empty replacement: %s", inputs[3].Prompt)
+	}
+	session, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.MemoryRevision != 3 || session.LessonsRevision != 0 || session.TurnCount != 4 {
+		t.Fatalf("completed memory cursors = %+v", session)
+	}
+}
+
+func TestAppZaloMemoryMutationDuringRunRemainsPendingForNextTurn(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "thread")
+	if _, err := st.CreateAppThreadMemory("thread", store.AppThreadMemoryInput{Text: "BEFORE-RUN"}); err != nil {
+		t.Fatal(err)
+	}
+	run := &appZaloHookRunner{
+		results: []appZaloRunResult{
+			{Answer: `{"answers":["one"]}`},
+			{Answer: `{"answers":["two"]}`},
+		},
+		before: func(call int, _ appZaloSessionRunInput) {
+			if call != 0 {
+				return
+			}
+			if _, err := st.CreateAppThreadMemory("thread", store.AppThreadMemoryInput{Text: "DURING-RUN"}); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	deps := &zaloDeps{cfg: zc, run: run}
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", "first", "mutation-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.appAnswerZalo(deps, "thread", "first", appZaloReply("mutation-1"), nil); err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisions, err := st.AppMemoryRevisions("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.MemoryRevision != 1 || revisions.Memory != 2 {
+		t.Fatalf("concurrent mutation was swallowed: session=%d store=%d", first.MemoryRevision, revisions.Memory)
+	}
+
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", "second", "mutation-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.appAnswerZalo(deps, "thread", "second", appZaloReply("mutation-2"), nil); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 2 || !strings.Contains(inputs[1].Prompt, "DURING-RUN") {
+		t.Fatalf("next turn did not refresh concurrent memory: %+v", inputs)
+	}
+	second, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.MemoryRevision != 2 {
+		t.Fatalf("second turn memory cursor = %d; want 2", second.MemoryRevision)
+	}
+}
+
+func TestAppZaloGlobalLessonRefreshesEveryThreadButMemoryRefreshStaysLocal(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "thread-a", "thread-b")
+	run := &appZaloHookRunner{results: []appZaloRunResult{
+		{Answer: `{"answers":["a1"]}`}, {Answer: `{"answers":["b1"]}`},
+		{Answer: `{"answers":["a2"]}`}, {Answer: `{"answers":["b2"]}`},
+		{Answer: `{"answers":["a3"]}`}, {Answer: `{"answers":["b3"]}`},
+	}}
+	deps := &zaloDeps{cfg: zc, run: run}
+	runTurn := func(threadID, msgID, question string) {
+		t.Helper()
+		if err := appZaloAddMessage(st, threadID, ipc.ZaloIn, "khách", question, msgID); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.appAnswerZalo(deps, threadID, question, appZaloReply(msgID), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runTurn("thread-a", "global-a1", "a first")
+	runTurn("thread-b", "global-b1", "b first")
+	if _, err := st.CreateAppLesson(store.AppLessonInput{Better: "GLOBAL-LESSON", Note: "áp dụng mọi nơi"}); err != nil {
+		t.Fatal(err)
+	}
+	runTurn("thread-a", "global-a2", "a second")
+	runTurn("thread-b", "global-b2", "b second")
+	if _, err := st.CreateAppThreadMemory("thread-a", store.AppThreadMemoryInput{Text: "THREAD-A-ONLY"}); err != nil {
+		t.Fatal(err)
+	}
+	runTurn("thread-a", "global-a3", "a third")
+	runTurn("thread-b", "global-b3", "b third")
+
+	inputs, _ := run.snapshot()
+	if len(inputs) != 6 {
+		t.Fatalf("session calls = %d; want 6", len(inputs))
+	}
+	for _, index := range []int{2, 3} {
+		if !strings.Contains(inputs[index].Prompt, `"scope":"global_lessons"`) ||
+			!strings.Contains(inputs[index].Prompt, "GLOBAL-LESSON") {
+			t.Fatalf("thread call %d missed global lesson refresh: %s", index, inputs[index].Prompt)
+		}
+	}
+	if !strings.Contains(inputs[4].Prompt, `"scope":"thread_memory"`) ||
+		!strings.Contains(inputs[4].Prompt, "THREAD-A-ONLY") {
+		t.Fatalf("thread A missed its memory refresh: %s", inputs[4].Prompt)
+	}
+	if strings.Contains(inputs[5].Prompt, `"scope":"thread_memory"`) ||
+		strings.Contains(inputs[5].Prompt, "THREAD-A-ONLY") {
+		t.Fatalf("thread A memory leaked into thread B: %s", inputs[5].Prompt)
 	}
 }
 
