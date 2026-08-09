@@ -42,8 +42,9 @@
 
 ### Staging seam and Portal
 
-- Modify `scripts/BuildApp.psm1`: apply one guarded `duty.go` seam that wraps the existing `zaloRunner` per turn.
-- Modify `tests/build-app.Tests.ps1`: prove the new seam is inserted exactly once and the source repository is untouched.
+- Modify `appmode/overlay/internal/daemon/app_zalo_session_hook.go`: compose Provider selection at the existing `appAnswerZalo`/`appRunZalo` session boundary; add no new `duty.go` seam.
+- Modify `appmode/overlay/internal/daemon/app_zalo_session_hook_test.go`: prove stateless API success and session-aware Claude attachment/fallback behavior through the existing seams.
+- Modify `tests/build-app.Tests.ps1`: keep proving the two existing session seams are inserted exactly once and the source repository is untouched.
 - Modify `appmode/overlay/internal/daemon/app_foundation_test.go`: route registration and mutation-header coverage.
 - Modify `appmode/overlay/internal/daemon/app_shell_test.go`: embedded Provider page asset coverage.
 - Create `appmode/overlay/internal/webui/static/pages/providers.js`: Provider list, sheet editor, credential mutations, connection test, discovery, and manual models.
@@ -338,11 +339,20 @@
 
 - [ ] **Step 2: Run and confirm RED**
 
-  Run:
+  Build a real stage and run the focused runtime tests inside it (replace the test names below with the exact names added in Step 1):
 
   ```powershell
-  $pester = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru
-  if ($pester.FailedCount -ne 0) { throw "Pester failed: $($pester.FailedCount)" }
+  Import-Module .\scripts\BuildApp.psm1 -Force
+  $stageRoot = Join-Path $env:TEMP ('provider-session-red-' + [guid]::NewGuid().ToString('N'))
+  $stage = New-AppStage -Repo 'C:\Users\manva\OneDrive\Máy tính\agentdc' `
+    -Overlay .\appmode\overlay -StageRoot $stageRoot
+  Apply-AppSeams -Stage $stage
+  Push-Location $stage
+  try {
+    go test -count=1 -run '^(TestAppProviderAPIStateless|TestAppProviderClaudeUsesExistingSessionBoundary)$' `
+      -v ./internal/daemon
+    if ($LASTEXITCODE -ne 0) { throw "focused Provider session tests failed: $LASTEXITCODE" }
+  } finally { Pop-Location }
   ```
 
   Expected: FAIL because the routing bridge at the existing session hook does not exist.

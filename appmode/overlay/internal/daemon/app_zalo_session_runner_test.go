@@ -18,6 +18,8 @@ const (
 	appZaloTestSessionID         = "11111111-1111-4111-8111-111111111111"
 	appZaloTestRecoverySessionID = "22222222-2222-4222-8222-222222222222"
 	appZaloPipeHelperEnv         = "AGENTDC_TEST_ZALO_RUNNER_PIPE_HELPER"
+	appZaloPromptCanary          = "APP_TEST_PROMPT_CANARY_7F18A2"
+	appZaloResponseCanary        = "APP_TEST_RESPONSE_CANARY_93C4D1"
 	appZaloRawStderrCanary       = "APP_TEST_RAW_STDERR_CANARY_5B60E7"
 )
 

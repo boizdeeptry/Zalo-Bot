@@ -1,5 +1,54 @@
 Set-StrictMode -Version Latest
 
+if (-not ('AgentDCAppPackageByteScanner' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+
+public static class AgentDCAppPackageByteScanner
+{
+    private const int BufferSize = 64 * 1024;
+
+    public static bool ContainsAny(string path, byte[][] needles)
+    {
+        if (needles == null || needles.Length == 0) return false;
+        int maxNeedle = 0;
+        foreach (byte[] needle in needles)
+        {
+            if (needle == null || needle.Length == 0) throw new ArgumentException("empty needle");
+            if (needle.Length > maxNeedle) maxNeedle = needle.Length;
+        }
+
+        byte[] buffer = new byte[BufferSize + maxNeedle - 1];
+        int carry = 0;
+        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            int read;
+            while ((read = stream.Read(buffer, carry, BufferSize)) > 0)
+            {
+                int total = carry + read;
+                foreach (byte[] needle in needles)
+                {
+                    int last = total - needle.Length;
+                    for (int offset = 0; offset <= last; offset++)
+                    {
+                        if (buffer[offset] != needle[0]) continue;
+                        int index = 1;
+                        while (index < needle.Length && buffer[offset + index] == needle[index]) index++;
+                        if (index == needle.Length) return true;
+                    }
+                }
+
+                carry = Math.Min(maxNeedle - 1, total);
+                if (carry > 0) Buffer.BlockCopy(buffer, total - carry, buffer, 0, carry);
+            }
+        }
+        return false;
+    }
+}
+'@
+}
+
 function Resolve-BuildPaths {
   [CmdletBinding()]
   param(
@@ -276,6 +325,37 @@ function Apply-AppSeams {
   [IO.File]::WriteAllText($dutyPath, $dutyUpdated, $utf8NoBom)
 }
 
+function Assert-AppPackageSensitiveContentAbsent {
+  param([Parameter(Mandatory)][string]$Out)
+
+  # Test canaries stand in for prompt, response, stderr, and credential data.
+  # Scan bytes rather than decoded text so binaries and the encodings below are
+  # covered with a fixed 64 KiB working buffer.
+  $prefix = 'APP_TEST_'
+  $needles = [Collections.Generic.List[byte[]]]::new()
+  foreach ($encoding in @(
+      [Text.UTF8Encoding]::new($false),
+      [Text.UnicodeEncoding]::new($false, $false),
+      [Text.UnicodeEncoding]::new($true, $false)
+    )) {
+    $needles.Add($encoding.GetBytes($prefix))
+  }
+  $needleArray = $needles.ToArray()
+
+  $outPath = [IO.Path]::GetFullPath($Out)
+  foreach ($file in Get-ChildItem -LiteralPath $outPath -Recurse -File -Force) {
+    $relative = [IO.Path]::GetRelativePath($outPath, $file.FullName)
+    try {
+      $found = [AgentDCAppPackageByteScanner]::ContainsAny($file.FullName, $needleArray)
+    } catch {
+      throw "package content scan failed for '$relative'"
+    }
+    if ($found) {
+      throw "package contains sensitive content in '$relative'"
+    }
+  }
+}
+
 function Assert-AppPackage {
   [CmdletBinding()]
   param(
@@ -303,6 +383,8 @@ function Assert-AppPackage {
   if (-not $AllowZaloCredentials -and (Test-Path -LiteralPath $credentials -PathType Leaf)) {
     throw 'package contains Zalo credentials'
   }
+
+  Assert-AppPackageSensitiveContentAbsent -Out $outPath
 
   return $outPath
 }

@@ -43,18 +43,51 @@ function Write-TestFile {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
-function Assert-NoSensitivePackageCanaries {
+function Write-TestBytes {
   param(
-    [Parameter(Mandatory)][string]$Root,
-    [Parameter(Mandatory)][string[]]$Canaries
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][byte[]]$Bytes
   )
 
-  foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File) {
-    $content = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($file.FullName))
-    foreach ($canary in $Canaries) {
-      if ($content.IndexOf($canary, [StringComparison]::Ordinal) -ge 0) {
-        throw "package contains sensitive canary '$canary' in $($file.FullName)"
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
+  [IO.File]::WriteAllBytes($Path, $Bytes)
+}
+
+function Assert-PackageRejectsCanarySafely {
+  param(
+    [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][string]$RelativePath,
+    [Parameter(Mandatory)][string]$Canary,
+    [Parameter(Mandatory)][Text.Encoding]$Encoding,
+    [int]$PaddingBytes = 0,
+    [switch]$AllowZaloCredentials
+  )
+
+  $path = Join-Path $Root $RelativePath
+  $payload = $Encoding.GetBytes($Canary)
+  $bytes = [byte[]]::new($PaddingBytes + $payload.Length)
+  if ($PaddingBytes -gt 0) {
+    [Array]::Fill($bytes, [byte]0x78, 0, $PaddingBytes)
+  }
+  [Buffer]::BlockCopy($payload, 0, $bytes, $PaddingBytes, $payload.Length)
+  Write-TestBytes -Path $path -Bytes $bytes
+  try {
+    try {
+      Assert-AppPackage -Out $Root -AllowZaloCredentials:$AllowZaloCredentials | Out-Null
+    } catch {
+      $expected = "package contains sensitive content in '$RelativePath'"
+      if ($_.Exception.Message -ne $expected) {
+        throw "Package scan returned unsafe or unexpected detail for '$RelativePath': $($_.Exception.Message)"
       }
+      if ($_.Exception.Message.Contains($Canary)) {
+        throw "Package scan leaked canary content for '$RelativePath'"
+      }
+      return
+    }
+    throw "Package scan accepted sensitive content in '$RelativePath'"
+  } finally {
+    if (Test-Path -LiteralPath $path) {
+      Remove-Item -LiteralPath $path -Force
     }
   }
 }
@@ -111,6 +144,56 @@ function Assert-CRLFUTF8File {
   if ([regex]::IsMatch($text, '\r(?!\n)')) {
     throw 'File contains a bare CR'
   }
+}
+
+function Invoke-StagedZaloSessionAcceptance {
+  param(
+    [Parameter(Mandatory)][string]$Repo,
+    [Parameter(Mandatory)][string]$Overlay
+  )
+
+  $sourceDuty = Join-Path $Repo 'internal\daemon\duty.go'
+  $sourceHashBefore = (Get-FileHash -LiteralPath $sourceDuty -Algorithm SHA256).Hash
+  $sourceStatusBefore = (& git -C $Repo status --short) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw 'Could not read real upstream status before staged acceptance' }
+  $stageRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ('zalo-session-stitched-' + [guid]::NewGuid().ToString('N'))
+
+  try {
+    $stage = New-AppStage -Repo $Repo -Overlay $Overlay -StageRoot $stageRoot
+    Apply-AppSeams -Stage $stage
+    $stagedDuty = [IO.File]::ReadAllText((Join-Path $stage 'internal\daemon\duty.go'))
+    if ([regex]::Matches($stagedDuty, 'a\.appAnswerZalo\(deps, threadID, question, reply, files\)').Count -ne 1 -or
+        [regex]::Matches($stagedDuty, 'a\.appRunZalo\(ctx, run, pz, threadID, question, appZaloCurrentMsgID\(reply\.ReplyQuote\), history, found, files, step\)').Count -ne 1) {
+      throw 'Real staged duty.go does not contain both session seams exactly once'
+    }
+
+    Push-Location $stage
+    try {
+      $output = (& go test -count=1 `
+        -run '^TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation$' `
+        -v ./internal/daemon 2>&1) -join "`n"
+      $goExit = $LASTEXITCODE
+    } finally {
+      Pop-Location
+    }
+    if ($goExit -ne 0) {
+      throw "Focused Go acceptance failed in the stitched stage (exit $goExit)`n$output"
+    }
+    if ($output -notmatch '--- PASS: TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation') {
+      throw 'Focused Go acceptance was not executed in the stitched stage'
+    }
+  } finally {
+    if (Test-Path -LiteralPath $stageRoot) {
+      Remove-Item -LiteralPath $stageRoot -Recurse -Force
+    }
+  }
+
+  $sourceHashAfter = (Get-FileHash -LiteralPath $sourceDuty -Algorithm SHA256).Hash
+  $sourceStatusAfter = (& git -C $Repo status --short) -join "`n"
+  if ($LASTEXITCODE -ne 0) { throw 'Could not read real upstream status after staged acceptance' }
+  Assert-Equal $sourceHashAfter $sourceHashBefore 'Real upstream duty.go changed during staged acceptance'
+  Assert-Equal $sourceStatusAfter $sourceStatusBefore 'Real upstream status changed during staged acceptance'
 }
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('portal-path-' + [guid]::NewGuid().ToString('N'))
@@ -249,13 +332,6 @@ foreach ($testName in $supersededTests) {
 }
 Write-Host 'PASS: Go checkpoint skips exactly seven superseded tests.'
 
-$sessionAcceptancePath = Join-Path $PSScriptRoot '..\appmode\overlay\internal\daemon\app_zalo_session_hook_test.go'
-$sessionAcceptance = [IO.File]::ReadAllText($sessionAcceptancePath)
-if ($sessionAcceptance -notmatch 'func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation\(') {
-  throw 'Staged create-resume and thread-isolation acceptance test is missing'
-}
-Write-Host 'PASS: staged Go suite includes create-resume and thread-isolation acceptance.'
-
 $packageRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-package-' + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -270,25 +346,52 @@ try {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
   Assert-AppPackage -Out $packageRoot | Out-Null
-  $sensitiveCanaries = @(
-    'APP_TEST_PROMPT_CANARY_7F18A2'
-    'APP_TEST_RESPONSE_CANARY_93C4D1'
-    'APP_TEST_RAW_STDERR_CANARY_5B60E7'
-    'APP_TEST_ZALO_CREDENTIAL_CANARY_A8D239'
-    'APP_TEST_PROVIDER_CREDENTIAL_CANARY_C17F46'
-  )
-  Assert-NoSensitivePackageCanaries -Root $packageRoot -Canaries $sensitiveCanaries
 
-  foreach ($canary in $sensitiveCanaries) {
-    $canaryPath = Join-Path $packageRoot 'app\canary-probe.bin'
-    Write-TestFile $canaryPath "prefix`0$canary`0suffix"
-    Assert-ThrowsLike -Action {
-      Assert-NoSensitivePackageCanaries -Root $packageRoot -Canaries $sensitiveCanaries
-    } -Pattern 'package contains sensitive canary' -Message "Package scan missed $canary"
-    Remove-Item -LiteralPath $canaryPath -Force
+  $canaryCases = @(
+    @{
+      Relative = 'app\prompt-probe.bin'
+      Value = 'APP_TEST_PROMPT_CANARY_7F18A2'
+      Encoding = [Text.UTF8Encoding]::new($false)
+      AllowZalo = $false
+      Padding = 65532
+    },
+    @{
+      Relative = 'app\response-probe.bin'
+      Value = 'APP_TEST_RESPONSE_CANARY_93C4D1'
+      Encoding = [Text.UnicodeEncoding]::new($false, $false)
+      AllowZalo = $false
+      Padding = 0
+    },
+    @{
+      Relative = 'app\stderr-probe.bin'
+      Value = 'APP_TEST_RAW_STDERR_CANARY_5B60E7'
+      Encoding = [Text.UnicodeEncoding]::new($true, $false)
+      AllowZalo = $false
+      Padding = 0
+    },
+    @{
+      Relative = 'data\zalo\credentials.json'
+      Value = 'APP_TEST_ZALO_CREDENTIAL_CANARY_A8D239'
+      Encoding = [Text.UTF8Encoding]::new($false)
+      AllowZalo = $true
+      Padding = 0
+    },
+    @{
+      Relative = 'data\providers\credential.cache'
+      Value = 'APP_TEST_PROVIDER_CREDENTIAL_CANARY_C17F46'
+      Encoding = [Text.UnicodeEncoding]::new($false, $false)
+      AllowZalo = $false
+      Padding = 0
+    }
+  )
+  foreach ($case in $canaryCases) {
+    Assert-PackageRejectsCanarySafely -Root $packageRoot -RelativePath $case.Relative `
+      -Canary $case.Value -Encoding $case.Encoding -PaddingBytes $case.Padding `
+      -AllowZaloCredentials:([bool]$case.AllowZalo)
   }
 
-  Write-TestFile (Join-Path $packageRoot 'data\zalo\credentials.json') "secret`n"
+  Write-TestFile (Join-Path $packageRoot 'data\zalo\credentials.json') `
+    "APP_TEST_ZALO_CREDENTIAL_CANARY_A8D239`n"
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'Zalo credentials' -Message 'A package containing Zalo credentials was accepted'
 
@@ -598,3 +701,8 @@ func incoming() {
     Remove-Item -LiteralPath $crlfStage -Recurse -Force
   }
 }
+
+$realUpstream = 'C:\Users\manva\OneDrive\Máy tính\agentdc'
+$realOverlay = Join-Path $PSScriptRoot '..\appmode\overlay'
+Invoke-StagedZaloSessionAcceptance -Repo $realUpstream -Overlay $realOverlay
+Write-Host 'PASS: real staged duty compiles both seams and exercises create/resume/isolation through the runner seam.'

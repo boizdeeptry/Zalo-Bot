@@ -168,18 +168,38 @@ func TestAppRunZaloLeavesStatelessRunnerUnchanged(t *testing.T) {
 }
 
 func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t *testing.T) {
-	a, st, zc := appZaloHookFixture(t, "thread-a", "thread-b")
-	if err := appZaloAddMessage(st, "thread-a", ipc.ZaloIn, "khách", "first question", "msg-1"); err != nil {
+	dbPath := filepath.Join(t.TempDir(), "zalo-sessions.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if st != nil {
+			_ = st.Close()
+		}
+	})
+	for _, threadID := range []string{"thread-a", "thread-b"} {
+		if err := st.UpsertZaloThread(threadID, threadID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := config.Config{Dir: t.TempDir()}
+	a := appZaloAPIWithStore(cfg, st)
+	zc := appZaloHookConfig(t)
+	threadAFirst := appZaloPromptCanary + "_THREAD_A_FIRST"
+	threadASecond := appZaloPromptCanary + "_THREAD_A_SECOND"
+	threadBQuestion := appZaloPromptCanary + "_THREAD_B"
+	if err := appZaloAddMessage(st, "thread-a", ipc.ZaloIn, "khách", threadAFirst, "msg-1"); err != nil {
 		t.Fatal(err)
 	}
 	command := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
-		{stdout: appZaloHookResult(`{"answers":["first answer"]}`, 100)},
+		{stdout: appZaloHookResult(`{"answers":["`+appZaloResponseCanary+`"]}`, 100)},
 		{stdout: appZaloHookResult(`{"answers":["second answer"]}`, 200)},
 		{stdout: appZaloHookResult(`{"answers":["other thread answer"]}`, 10)},
 	}}
 	run := &appZaloCommandHookRunner{runner: appZaloSessionRunner{cfg: zc, command: command.run}}
 	deps := &zaloDeps{cfg: zc, run: run}
-	if err := a.appAnswerZalo(deps, "thread-a", "first question", appZaloReply("msg-1"), nil); err != nil {
+	if err := a.appAnswerZalo(deps, "thread-a", threadAFirst, appZaloReply("msg-1"), nil); err != nil {
 		t.Fatalf("first appAnswerZalo() error = %v", err)
 	}
 	first, err := st.ZaloCLISession("thread-a")
@@ -189,25 +209,37 @@ func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t 
 	if first.TurnCount != 1 || first.MessageCursor == 0 {
 		t.Fatalf("first session = %+v; want completed turn and cursor", first)
 	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st = nil
+	st, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recreated := appZaloAPIWithStore(cfg, st)
+	persisted, err := st.ZaloCLISession("thread-a")
+	if err != nil || persisted.ClaudeSessionID != first.ClaudeSessionID {
+		t.Fatalf("reopened session = %+v, %v; want UUID %s", persisted, err, first.ClaudeSessionID)
+	}
 	if err := appZaloAddMessage(st, "thread-a", ipc.ZaloOut, ipc.ZaloAuthorOperator, "operator correction", "operator-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := appZaloAddMessage(st, "thread-a", ipc.ZaloIn, "khách", "second question", "msg-2"); err != nil {
+	if err := appZaloAddMessage(st, "thread-a", ipc.ZaloIn, "khách", threadASecond, "msg-2"); err != nil {
 		t.Fatal(err)
 	}
-	recreated := appZaloAPIWithStore(a.cfg, st)
 	secondHighWater, err := st.LatestZaloMessageID("thread-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := recreated.appAnswerZalo(deps, "thread-a", "second question", appZaloReply("msg-2"), nil); err != nil {
+	if err := recreated.appAnswerZalo(deps, "thread-a", threadASecond, appZaloReply("msg-2"), nil); err != nil {
 		t.Fatalf("recreated appAnswerZalo() error = %v", err)
 	}
 
-	if err := appZaloAddMessage(st, "thread-b", ipc.ZaloIn, "khách", "other thread question", "thread-b-msg"); err != nil {
+	if err := appZaloAddMessage(st, "thread-b", ipc.ZaloIn, "khách", threadBQuestion, "thread-b-msg"); err != nil {
 		t.Fatal(err)
 	}
-	if err := recreated.appAnswerZalo(deps, "thread-b", "other thread question", appZaloReply("thread-b-msg"), nil); err != nil {
+	if err := recreated.appAnswerZalo(deps, "thread-b", threadBQuestion, appZaloReply("thread-b-msg"), nil); err != nil {
 		t.Fatalf("other-thread appAnswerZalo() error = %v", err)
 	}
 
@@ -224,8 +256,14 @@ func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t 
 		strings.Contains(command.calls[1].prompt, "You answer a customer's question") {
 		t.Errorf("resume prompt did not contain only delta material: %q", command.calls[1].prompt)
 	}
-	if got := strings.Count(command.calls[1].prompt, "second question"); got != 1 {
+	if got := strings.Count(command.calls[1].prompt, threadASecond); got != 1 {
 		t.Errorf("current question occurrences = %d; want 1 from durable msgId match", got)
+	}
+	if !strings.Contains(command.calls[2].prompt, threadBQuestion) ||
+		strings.Contains(command.calls[2].prompt, threadAFirst) ||
+		strings.Contains(command.calls[2].prompt, threadASecond) ||
+		strings.Contains(command.calls[2].prompt, appZaloResponseCanary) {
+		t.Errorf("thread-b bootstrap prompt was not isolated from thread-a")
 	}
 	finalA, err := st.ZaloCLISession("thread-a")
 	if err != nil {
