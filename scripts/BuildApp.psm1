@@ -255,15 +255,18 @@ function Apply-AppSeams {
   $storePath = Join-Path $stagePath 'internal\store\store.go'
   $zaloPath = Join-Path $stagePath 'internal\daemon\zalo.go'
   $dutyPath = Join-Path $stagePath 'internal\daemon\duty.go'
+  $zaloUIPath = Join-Path $stagePath 'internal\webui\static\zalo.js'
 
   $server = [IO.File]::ReadAllText($serverPath)
   $store = [IO.File]::ReadAllText($storePath)
   $zalo = [IO.File]::ReadAllText($zaloPath)
   $duty = [IO.File]::ReadAllText($dutyPath)
+  $zaloUI = [IO.File]::ReadAllText($zaloUIPath)
   $serverNewline = if ($server.Contains("`r`n")) { "`r`n" } else { "`n" }
   $storeNewline = if ($store.Contains("`r`n")) { "`r`n" } else { "`n" }
   $zaloNewline = if ($zalo.Contains("`r`n")) { "`r`n" } else { "`n" }
   $dutyNewline = if ($duty.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $zaloUINewline = if ($zaloUI.Contains("`r`n")) { "`r`n" } else { "`n" }
 
   Assert-SignatureAbsent -Text $server -Signature 'a.registerAppRoutes(mux)' -Label 'route seam'
   Assert-SignatureAbsent -Text $store -Signature 'migrateApp(db)' -Label 'migration seam'
@@ -274,6 +277,9 @@ function Apply-AppSeams {
   Assert-SignatureAbsent -Text $duty `
     -Signature 'a.appRunZalo(ctx, run, pz, threadID, question, appZaloCurrentMsgID(reply.ReplyQuote), history, found, files, step)' `
     -Label 'session runner seam'
+  Assert-SignatureAbsent -Text $zaloUI `
+    -Signature "const requestedThreadID = new URLSearchParams(window.location.search).get('thread')" `
+    -Label 'Zalo deep-link declaration seam'
 
   $routeNeedle = "`tmux.Handle(`"POST /shutdown`", a.auth(a.handleShutdown))"
   $serverUpdated = Replace-ExactlyOnce -Text $server -Needle $routeNeedle `
@@ -318,11 +324,38 @@ function Apply-AppSeams {
   $dutyUpdated = Replace-ExactlyOnce -Text $dutyUpdated -Needle $runnerNeedle `
     -Replacement $runnerReplacement -Label 'session runner seam'
 
+  $zaloUIDeclarationNeedle = 'let curThread = null;'
+  $zaloUIDeclaration = @(
+    $zaloUIDeclarationNeedle
+    "const requestedThreadID = new URLSearchParams(window.location.search).get('thread');"
+    'let requestedThreadHandled = false;'
+  ) -join $zaloUINewline
+  $zaloUIUpdated = Replace-ExactlyOnce -Text $zaloUI -Needle $zaloUIDeclarationNeedle `
+    -Replacement $zaloUIDeclaration -Label 'Zalo deep-link declaration seam'
+
+  $zaloUISelectionNeedle = '    threads = ths || [];'
+  $zaloUISelection = @(
+    $zaloUISelectionNeedle
+    '    if (!requestedThreadHandled) {'
+    '      requestedThreadHandled = true;'
+    '      if (requestedThreadID && threads.some((thread) => thread.id === requestedThreadID)) {'
+    '        curThread = requestedThreadID;'
+    '        void refreshMemCount();'
+    "        feedSig = outboxSig = listSig = '';"
+    "        el('feed').textContent = '';"
+    '        atBottom = true;'
+    '      }'
+    '    }'
+  ) -join $zaloUINewline
+  $zaloUIUpdated = Replace-ExactlyOnce -Text $zaloUIUpdated -Needle $zaloUISelectionNeedle `
+    -Replacement $zaloUISelection -Label 'Zalo deep-link selection seam'
+
   $utf8NoBom = [Text.UTF8Encoding]::new($false)
   [IO.File]::WriteAllText($serverPath, $serverUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($storePath, $storeUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($zaloPath, $zaloUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($dutyPath, $dutyUpdated, $utf8NoBom)
+  [IO.File]::WriteAllText($zaloUIPath, $zaloUIUpdated, $utf8NoBom)
 }
 
 function Assert-AppPackageSensitiveContentAbsent {

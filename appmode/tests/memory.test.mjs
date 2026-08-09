@@ -165,6 +165,44 @@ test("Memory page renders legacy metrics, semantic tabs, thread detail and prove
   assert.ok(requests.every(({ options }) => options.signal instanceof AbortSignal));
 });
 
+test("open conversation link encodes the selected thread", async (t) => {
+  const dom = installDOM();
+  t.after(dom.restore);
+  const page = createMemoryPage({
+    request: async (path) => {
+      if (path === "/memory") {
+        return {
+          metrics: { memories: 1, threads: 1, lessons: 0 },
+          threads: [{
+            id: "group/a?b", name: "Nhóm A", avatar: "", thread_type: "group",
+            memory_count: 1, pinned_count: 0, preview: "Ghi chú", updated_at: "2026-08-09T08:00:00Z",
+          }],
+        };
+      }
+      if (path === "/memory/threads/group%2Fa%3Fb") {
+        return {
+          thread: { id: "group/a?b", name: "Nhóm A", memory_count: 1, pinned_count: 0 },
+          revision: 1,
+          synced_revision: 1,
+          memories: [{
+            id: 1, thread_id: "group/a?b", text: "Ghi chú", pinned: false,
+            source: "operator", created_at: "2026-08-09T08:00:00Z", updated_at: "2026-08-09T08:00:00Z",
+          }],
+        };
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    },
+  });
+  const main = document.createElement("main");
+  const mounted = page.mount(main);
+  t.after(mounted.dispose);
+  await flush();
+  await flush();
+
+  const link = find(main, (node) => node.tagName === "A" && text(node) === "Mở hội thoại");
+  assert.equal(link.getAttribute("href"), "/zalo?thread=group%2Fa%3Fb");
+});
+
 test("Memory page switches to global lessons and keeps scope explicit", async (t) => {
   const dom = installDOM();
   t.after(dom.restore);

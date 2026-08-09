@@ -100,7 +100,8 @@ function Get-SeamTargetHashes {
       'internal\daemon\server.go',
       'internal\store\store.go',
       'internal\daemon\zalo.go',
-      'internal\daemon\duty.go'
+      'internal\daemon\duty.go',
+      'internal\webui\static\zalo.js'
     )) {
     $hashes[$relative] = (Get-FileHash -LiteralPath (Join-Path $Stage $relative) -Algorithm SHA256).Hash
   }
@@ -460,6 +461,22 @@ func trigger() {
 	}()
 }
 '@
+  Write-TestFile (Join-Path $repo 'internal\webui\static\zalo.js') @'
+const el = (id) => document.getElementById(id);
+let curThread = null;
+let threads = [];
+let listSig = '';
+let feedSig = '';
+let outboxSig = '';
+let atBottom = true;
+
+async function refreshMemCount() {}
+async function refresh() {
+  const ths = [];
+    threads = ths || [];
+  renderList();
+}
+'@
   Write-TestFile (Join-Path $repo 'README.md') "tracked`n"
   Write-TestFile (Join-Path $repo 'untracked.txt') "must not be staged`n"
   $upstreamStyles = @{
@@ -513,6 +530,7 @@ func trigger() {
   $stagedStore = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\store\store.go'))
   $stagedZalo = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\zalo.go'))
   $stagedDuty = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\duty.go'))
+  $stagedZaloUI = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\webui\static\zalo.js'))
   if ([regex]::Matches($stagedServer, 'a\.registerAppRoutes\(mux\)').Count -ne 1) { throw 'Route seam was not applied exactly once' }
   if ([regex]::Matches($stagedStore, 'migrateApp\(db\)').Count -ne 1) { throw 'Migration seam was not applied exactly once' }
   if ([regex]::Matches($stagedZalo, 'evaluateAppWorkflow\(req, msg\)').Count -ne 1) { throw 'Workflow seam was not applied exactly once' }
@@ -521,6 +539,12 @@ func trigger() {
   }
   if ([regex]::Matches($stagedDuty, 'a\.appRunZalo\(ctx, run, pz, threadID, question, appZaloCurrentMsgID\(reply\.ReplyQuote\), history, found, files, step\)').Count -ne 1) {
     throw 'Session runner seam was not applied exactly once'
+  }
+  if ([regex]::Matches($stagedZaloUI, [regex]::Escape("const requestedThreadID = new URLSearchParams(window.location.search).get('thread')")).Count -ne 1) {
+    throw 'Zalo deep-link declaration seam was not applied exactly once'
+  }
+  if ([regex]::Matches($stagedZaloUI, [regex]::Escape('if (!requestedThreadHandled) {')).Count -ne 1) {
+    throw 'Zalo deep-link selection seam was not applied exactly once'
   }
   if ($stagedDuty -match 'context\.WithTimeout\(context\.Background\(\), deps\.cfg\.Timeout\)' -or
       $stagedDuty -match 'a\.answerZalo\(ctx, deps\.cfg, deps\.run' -or
@@ -593,6 +617,26 @@ func trigger() {
   Assert-SeamTargetHashes -Stage $missingRunnerStage -Expected $missingRunnerHashes `
     -Message 'A missing session runner marker partially modified the stage'
 
+  $missingZaloUIStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Thiếu Zalo UI seam')
+  $missingZaloUIPath = Join-Path $missingZaloUIStage 'internal\webui\static\zalo.js'
+  $missingZaloUI = [IO.File]::ReadAllText($missingZaloUIPath).Replace('let curThread = null;', 'let selectedThread = null;')
+  [IO.File]::WriteAllText($missingZaloUIPath, $missingZaloUI, [Text.UTF8Encoding]::new($false))
+  $missingZaloUIHashes = Get-SeamTargetHashes -Stage $missingZaloUIStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingZaloUIStage } `
+    -Pattern 'Zalo deep-link declaration seam: expected exactly 1 match' -Message 'A missing Zalo UI deep-link marker was accepted'
+  Assert-SeamTargetHashes -Stage $missingZaloUIStage -Expected $missingZaloUIHashes `
+    -Message 'A missing Zalo UI deep-link marker partially modified the stage'
+
+  $duplicateZaloUIStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Trùng Zalo UI seam')
+  $duplicateZaloUIPath = Join-Path $duplicateZaloUIStage 'internal\webui\static\zalo.js'
+  $duplicateZaloUI = [IO.File]::ReadAllText($duplicateZaloUIPath) + "`n    threads = ths || [];`n"
+  [IO.File]::WriteAllText($duplicateZaloUIPath, $duplicateZaloUI, [Text.UTF8Encoding]::new($false))
+  $duplicateZaloUIHashes = Get-SeamTargetHashes -Stage $duplicateZaloUIStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $duplicateZaloUIStage } `
+    -Pattern 'Zalo deep-link selection seam: expected exactly 1 match' -Message 'A duplicate Zalo UI deep-link marker was accepted'
+  Assert-SeamTargetHashes -Stage $duplicateZaloUIStage -Expected $duplicateZaloUIHashes `
+    -Message 'A duplicate Zalo UI deep-link marker partially modified the stage'
+
   foreach ($inserted in @(
       @{ Signature = "`t`terr := a.appAnswerZalo(deps, threadID, question, reply, files)"; Pattern = 'session answer seam: inserted signature already present'; Name = 'answer' },
       @{ Signature = "`traw, err := a.appRunZalo(ctx, run, pz, threadID, question, appZaloCurrentMsgID(reply.ReplyQuote), history, found, files, step)"; Pattern = 'session runner seam: inserted signature already present'; Name = 'runner' }
@@ -626,7 +670,7 @@ func trigger() {
     throw 'Launcher does not open the management Portal at /'
   }
 
-  Write-Host 'PASS: staging copies tracked files and applies five guarded seams.'
+  Write-Host 'PASS: staging copies tracked files and applies seven guarded seams.'
 } finally {
   if (Test-Path -LiteralPath $stageTestRoot) {
     Remove-Item -LiteralPath $stageTestRoot -Recurse -Force
@@ -679,6 +723,25 @@ func incoming() {
   [IO.Directory]::CreateDirectory((Split-Path -Parent $crlfDutyPath)) | Out-Null
   [IO.File]::WriteAllText($crlfDutyPath, $dutyCRLF, [Text.UTF8Encoding]::new($false))
 
+  $zaloUICRLF = @(
+    "const el = (id) => document.getElementById(id);"
+    'let curThread = null;'
+    'let threads = [];'
+    "let listSig = '';"
+    "let feedSig = '';"
+    "let outboxSig = '';"
+    'let atBottom = true;'
+    'async function refreshMemCount() {}'
+    'async function refresh() {'
+    '    threads = ths || [];'
+    '    renderList();'
+    '}'
+    ''
+  ) -join "`r`n"
+  $crlfZaloUIPath = Join-Path $crlfStage 'internal\webui\static\zalo.js'
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $crlfZaloUIPath)) | Out-Null
+  [IO.File]::WriteAllText($crlfZaloUIPath, $zaloUICRLF, [Text.UTF8Encoding]::new($false))
+
   Apply-AppSeams -Stage $crlfStage
 
   Assert-CRLFUTF8File -Path $crlfDutyPath -ExpectedText $vietnameseComment
@@ -689,6 +752,8 @@ func incoming() {
   if ([regex]::Matches($stagedCRLFDuty, 'a\.appRunZalo\(ctx, run, pz, threadID, question, appZaloCurrentMsgID\(reply\.ReplyQuote\), history, found, files, step\)').Count -ne 1) {
     throw 'CRLF fixture is missing the session runner seam'
   }
+  Assert-CRLFUTF8File -Path $crlfZaloUIPath `
+    -ExpectedText "const requestedThreadID = new URLSearchParams(window.location.search).get('thread');"
 
   $mutatedDutyPath = Join-Path $crlfStage 'internal\daemon\duty-mutated.go'
   [IO.File]::WriteAllText($mutatedDutyPath, $stagedCRLFDuty.Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
