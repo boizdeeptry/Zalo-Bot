@@ -340,16 +340,16 @@ func (a *api) appSelectZaloSession(
 	if err != nil {
 		return appZaloSessionSelection{}, err
 	}
-	prompt := buildAppZaloDeltaPrompt(appZaloSessionPromptInput{
+	deltaPrompt := buildAppZaloDeltaPromptResult(appZaloSessionPromptInput{
 		Config: zc, Question: question, CurrentZaloMsgID: currentZaloMsgID,
 		History: history, Delta: delta, Found: found, Files: files,
 	})
 	completionCursor := session.MessageCursor
-	if len(delta) > 0 {
-		completionCursor = delta[len(delta)-1].ID
+	if deltaPrompt.ConsumedCursor > completionCursor {
+		completionCursor = deltaPrompt.ConsumedCursor
 	}
 	return appZaloSessionSelection{
-		session: session, prompt: prompt, bootstrapPrompt: bootstrap,
+		session: session, prompt: deltaPrompt.Prompt, bootstrapPrompt: bootstrap,
 		completionCursor: completionCursor, bootstrapCursor: bootstrapCursor, resume: true,
 	}, nil
 }

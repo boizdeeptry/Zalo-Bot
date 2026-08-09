@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"agentdc/internal/config"
 	"agentdc/internal/ipc"
@@ -703,6 +704,102 @@ func TestAppAnswerZaloResumeLeavesRowsBeyondFirstDeltaPagePending(t *testing.T) 
 	inputs, _ := run.snapshot()
 	if len(inputs) != 2 || !strings.Contains(inputs[1].Prompt, "message-105") {
 		t.Fatalf("second delta lost rows beyond first page: %+v", inputs)
+	}
+}
+
+func TestAppAnswerZaloResumeDoesNotAdvanceCursorPastTruncatedDeltaRows(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "thread")
+	const correction = "OPERATOR-CORRECTION-MUST-NOT-BE-SKIPPED"
+	ids := make([]int64, 0, 100)
+	markers := make([]string, 0, 100)
+	currentQuestion := ""
+	for i := 0; i < 100; i++ {
+		marker := fmt.Sprintf("BACKLOG-%03d", i)
+		body := marker + "-" + strings.Repeat("x", 286)
+		direction, author := ipc.ZaloIn, "khách"
+		if i == 1 {
+			marker = correction
+			body = marker + "-" + strings.Repeat("x", 250)
+			direction, author = ipc.ZaloOut, ipc.ZaloAuthorOperator
+		}
+		msgID := fmt.Sprintf("backlog-%03d", i)
+		if err := appZaloAddMessage(st, "thread", direction, author, body, msgID); err != nil {
+			t.Fatal(err)
+		}
+		id, err := st.LatestZaloMessageID("thread")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+		markers = append(markers, marker)
+		if i == 99 {
+			currentQuestion = body
+		}
+	}
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+	run := &appZaloHookRunner{results: []appZaloRunResult{
+		{Answer: `{"answers":["answer"]}`},
+		{Answer: `{"answers":["follow-up answer"]}`},
+	}}
+	if err := a.appAnswerZalo(
+		&zaloDeps{cfg: zc, run: run}, "thread", currentQuestion,
+		appZaloReply("backlog-099"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	inputs, _ := run.snapshot()
+	if len(inputs) != 1 {
+		t.Fatalf("structured calls = %d; want 1", len(inputs))
+	}
+	prompt := inputs[0].Prompt
+	if !strings.Contains(prompt, correction) {
+		t.Error("first bounded delta prompt omitted the early operator correction")
+	}
+	if !strings.Contains(prompt, "BACKLOG-099") {
+		t.Error("bounded delta prompt omitted the current inbound event")
+	}
+	session, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.MessageCursor >= ids[len(ids)-1] {
+		t.Fatalf("cursor = %d; want below fetched-page tail %d while the 16 KiB budget leaves rows pending",
+			session.MessageCursor, ids[len(ids)-1])
+	}
+	for i, id := range ids {
+		if id > session.MessageCursor {
+			break
+		}
+		if !strings.Contains(prompt, markers[i]) {
+			t.Fatalf("cursor advanced through omitted row %d (%s): cursor=%d", id, markers[i], session.MessageCursor)
+		}
+	}
+	historyLines := appZaloTestJSONLBlock(t, prompt, appZaloConversationTag)
+	if historyBytes := len(strings.Join(historyLines, "\n")) + 1; historyBytes > appZaloMaxDeltaHistoryBytes {
+		t.Fatalf("rendered delta history = %d bytes; want <= %d", historyBytes, appZaloMaxDeltaHistoryBytes)
+	}
+	if !utf8.ValidString(prompt) {
+		t.Fatal("bounded delta prompt is not valid UTF-8")
+	}
+	pending := -1
+	for i, id := range ids {
+		if id > session.MessageCursor {
+			pending = i
+			break
+		}
+	}
+	if pending < 0 {
+		t.Fatal("bounded prompt left no pending durable row")
+	}
+	if err := a.appAnswerZalo(
+		&zaloDeps{cfg: zc, run: run}, "thread", "follow up", ipc.ZaloOutboxDraft{}, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ = run.snapshot()
+	if len(inputs) != 2 || !strings.Contains(inputs[1].Prompt, markers[pending]) {
+		t.Fatalf("next turn did not resume from first pending row %s: inputs=%+v", markers[pending], inputs)
 	}
 }
 

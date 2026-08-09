@@ -371,7 +371,7 @@ func TestBuildAppZaloDeltaPromptAppendsWhenCurrentEventIsAbsentFromFullDeltaPage
 	}
 }
 
-func TestBuildAppZaloDeltaPromptPinsMatchingCurrentEventInsideHistoryBudget(t *testing.T) {
+func TestBuildAppZaloDeltaPromptPinsMatchingCurrentEventWithContiguousPrefix(t *testing.T) {
 	const question = "CURRENT-QUESTION-MUST-SURVIVE"
 	delta := make([]store.ZaloDeltaMessage, 0, 100)
 	delta = append(delta, store.ZaloDeltaMessage{ID: 1, Message: ipc.ZaloMessage{
@@ -389,11 +389,12 @@ func TestBuildAppZaloDeltaPromptPinsMatchingCurrentEventInsideHistoryBudget(t *t
 			},
 		})
 	}
-	prompt := buildAppZaloDeltaPrompt(appZaloSessionPromptInput{
+	result := buildAppZaloDeltaPromptResult(appZaloSessionPromptInput{
 		Question:         question,
 		CurrentZaloMsgID: "current-event",
 		Delta:            delta,
 	})
+	prompt := result.Prompt
 	records := appZaloTestConversationRecords(t, prompt)
 	questionRecords := 0
 	for _, record := range records {
@@ -409,8 +410,13 @@ func TestBuildAppZaloDeltaPromptPinsMatchingCurrentEventInsideHistoryBudget(t *t
 	}) {
 		t.Fatalf("current event khong duoc pin tai vi tri chronological som nhat: %+v", records)
 	}
-	if !strings.HasPrefix(records[len(records)-1].Body, "NEWER-099-") {
-		t.Fatalf("pin current event lam mat newest tail: %+v", records[len(records)-1])
+	if result.ConsumedCursor <= 1 || result.ConsumedCursor >= int64(len(delta)) {
+		t.Fatalf("consumed cursor = %d; want bounded non-empty prefix below page tail", result.ConsumedCursor)
+	}
+	wantPrefixTail := "NEWER-" + appZaloTestThreeDigits(int(result.ConsumedCursor)-1) + "-"
+	if !strings.HasPrefix(records[len(records)-1].Body, wantPrefixTail) {
+		t.Fatalf("serialized prefix tail = %+v; want marker %q for consumed cursor %d",
+			records[len(records)-1], wantPrefixTail, result.ConsumedCursor)
 	}
 	historyLines := appZaloTestJSONLBlock(t, prompt, "untrusted_conversation_jsonl")
 	history := strings.Join(historyLines, "\n") + "\n"
@@ -468,7 +474,7 @@ func TestBuildAppZaloDeltaPromptPreservesInboundAuthorWithinSafeBound(t *testing
 	}
 }
 
-func TestBuildAppZaloDeltaPromptBoundsBodiesAndKeepsNewestHistory(t *testing.T) {
+func TestBuildAppZaloDeltaPromptBoundsBodiesAndKeepsContiguousHistory(t *testing.T) {
 	delta := make([]store.ZaloDeltaMessage, 0, 100)
 	for i := 0; i < 100; i++ {
 		body := "MESSAGE-" + appZaloTestThreeDigits(i) + "-"
@@ -479,18 +485,26 @@ func TestBuildAppZaloDeltaPromptBoundsBodiesAndKeepsNewestHistory(t *testing.T) 
 		})
 	}
 
-	prompt := buildAppZaloDeltaPrompt(appZaloSessionPromptInput{
+	result := buildAppZaloDeltaPromptResult(appZaloSessionPromptInput{
 		Question: "MESSAGE-099-" + strings.Repeat("x", 500),
 		Delta:    delta,
 	})
+	prompt := result.Prompt
 	if len(prompt) > (17 << 10) {
 		t.Fatalf("delta prompt dai %d byte; lich su 16 KiB phai giu prompt gan hang so", len(prompt))
 	}
 	if !strings.Contains(prompt, "MESSAGE-099-") {
 		t.Error("delta prompt thieu tin moi nhat")
 	}
-	if strings.Contains(prompt, "MESSAGE-000-") {
-		t.Error("delta prompt con tin cu khi vuot tran; phai cat tu dau")
+	if !strings.Contains(prompt, "MESSAGE-000-") {
+		t.Error("delta prompt thieu dau prefix lien tuc nen cursor khong the tien an toan")
+	}
+	if result.ConsumedCursor <= 0 || result.ConsumedCursor >= int64(len(delta)) {
+		t.Fatalf("consumed cursor = %d; want bounded prefix below page tail", result.ConsumedCursor)
+	}
+	nextPending := "MESSAGE-" + appZaloTestThreeDigits(int(result.ConsumedCursor)) + "-"
+	if strings.Contains(prompt, nextPending) {
+		t.Fatalf("prompt contains first pending durable row %q beyond cursor %d", nextPending, result.ConsumedCursor)
 	}
 	if strings.Contains(prompt, strings.Repeat("x", 301)) {
 		t.Error("delta prompt co body vuot 300 byte")
