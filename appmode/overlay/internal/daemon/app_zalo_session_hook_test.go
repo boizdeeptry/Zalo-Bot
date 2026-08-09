@@ -86,7 +86,13 @@ type appZaloCommandHookRunner struct {
 }
 
 type appZaloDeadlineHookRunner struct {
-	ctxErr chan error
+	observed chan appZaloDeadlineObservation
+}
+
+type appZaloDeadlineObservation struct {
+	err          error
+	hasDeadline  bool
+	timeToExpiry time.Duration
 }
 
 func (r *appZaloDeadlineHookRunner) Run(_ context.Context, _ string, _ func(string)) (string, error) {
@@ -98,7 +104,12 @@ func (r *appZaloDeadlineHookRunner) appRunZaloSession(
 	in appZaloSessionRunInput,
 	_ func(string),
 ) (appZaloRunResult, error) {
-	r.ctxErr <- ctx.Err()
+	deadline, hasDeadline := ctx.Deadline()
+	r.observed <- appZaloDeadlineObservation{
+		err:          ctx.Err(),
+		hasDeadline:  hasDeadline,
+		timeToExpiry: time.Until(deadline),
+	}
 	return appZaloRunResult{Answer: `{"answers":["second"]}`, SessionID: in.SessionID}, nil
 }
 
@@ -714,6 +725,57 @@ func TestAppAnswerZaloStoreFailureDoesNotAdvancePendingCompletion(t *testing.T) 
 	}
 }
 
+func TestAppAnswerZaloCompletionWriteFailureMarksSessionForRotation(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "completion.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.UpsertZaloThread("thread", "thread"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", "question", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	a := appZaloAPIWithStore(config.Config{}, st)
+	zc := appZaloHookConfig(t)
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TRIGGER app_test_fail_turn_completion
+BEFORE UPDATE OF turn_count ON app_zalo_cli_sessions
+BEGIN
+  SELECT RAISE(ABORT, 'injected completion failure');
+END`); err != nil {
+		t.Fatal(err)
+	}
+
+	run := &appZaloHookRunner{results: []appZaloRunResult{{
+		Answer: `{"answers":["answer"]}`, ContextTokens: 77, UsageMeasured: true,
+	}}}
+	if err := a.appAnswerZalo(
+		&zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil,
+	); err != nil {
+		t.Fatalf("appAnswerZalo() = %v; answer pipeline should remain successful", err)
+	}
+
+	got, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.RotateBeforeNext || got.LastError != appZaloErrorStateUpdate {
+		t.Fatalf("completion failure session = %+v; want safe rotation marker", got)
+	}
+	if got.TurnCount != 0 || got.MessageCursor != 0 || got.ContextTokens != 0 {
+		t.Fatalf("completion failure advanced session = %+v", got)
+	}
+}
+
 func TestAppAnswerZaloGateSerializesSameStoreAndThreadAcrossAPIs(t *testing.T) {
 	a, st, zc := appZaloHookFixture(t, "thread")
 	otherAPI := appZaloAPIWithStore(a.cfg, st)
@@ -730,10 +792,11 @@ func TestAppAnswerZaloGateSerializesSameStoreAndThreadAcrossAPIs(t *testing.T) {
 	go func() { errs <- a.appAnswerZalo(deps, "thread", "first", ipc.ZaloOutboxDraft{}, nil) }()
 	appZaloAwaitHookEntry(t, run.entered)
 	go func() { errs <- otherAPI.appAnswerZalo(deps, "thread", "second", ipc.ZaloOutboxDraft{}, nil) }()
+	waitForAppZaloThreadGateRefs(t, &appZaloProcessThreadGate, appZaloHookGateKey(st, "thread"), 2)
 	select {
 	case <-run.entered:
 		t.Fatal("same store/thread entered the structured runner concurrently")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	run.release <- struct{}{}
 	appZaloAwaitHookEntry(t, run.entered)
@@ -792,27 +855,36 @@ func TestAppAnswerZaloStartsTurnTimeoutAfterGateAcquisition(t *testing.T) {
 	appZaloAwaitHookEntry(t, first.entered)
 
 	secondConfig := firstConfig
-	secondConfig.Timeout = 10 * time.Millisecond
-	second := &appZaloDeadlineHookRunner{ctxErr: make(chan error, 1)}
+	secondConfig.Timeout = 250 * time.Millisecond
+	second := &appZaloDeadlineHookRunner{observed: make(chan appZaloDeadlineObservation, 1)}
 	secondErr := make(chan error, 1)
 	go func() {
 		secondErr <- otherAPI.appAnswerZalo(
 			&zaloDeps{cfg: secondConfig, run: second}, "thread", "second", ipc.ZaloOutboxDraft{}, nil,
 		)
 	}()
+	waitForAppZaloThreadGateRefs(t, &appZaloProcessThreadGate, appZaloHookGateKey(st, "thread"), 2)
+	queuedLongerThanTurnBudget := time.NewTimer(secondConfig.Timeout + 100*time.Millisecond)
+	defer queuedLongerThanTurnBudget.Stop()
 	select {
-	case err := <-second.ctxErr:
-		t.Fatalf("second turn entered while the first still held the gate (ctx error %v)", err)
-	case <-time.After(30 * time.Millisecond):
+	case observation := <-second.observed:
+		t.Fatalf("second turn entered while the first still held the gate: %+v", observation)
+	case <-queuedLongerThanTurnBudget.C:
 	}
 	first.release <- struct{}{}
 	if err := <-firstErr; err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case err := <-second.ctxErr:
-		if err != nil {
-			t.Fatalf("second turn context was already expired on gate entry: %v", err)
+	case observation := <-second.observed:
+		if observation.err != nil {
+			t.Fatalf("second turn context was already expired on gate entry: %v", observation.err)
+		}
+		if !observation.hasDeadline {
+			t.Fatal("second turn context has no deadline")
+		}
+		if minimum := secondConfig.Timeout - 100*time.Millisecond; observation.timeToExpiry < minimum {
+			t.Fatalf("second turn deadline budget = %v; want at least %v after gate", observation.timeToExpiry, minimum)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("second turn did not enter after gate release")
@@ -950,6 +1022,10 @@ func appZaloHookFixture(t *testing.T, threadIDs ...string) (*api, *store.Store, 
 		portal: newPortalStore(),
 	}
 	return a, st, appZaloHookConfig(t)
+}
+
+func appZaloHookGateKey(st *store.Store, threadID string) string {
+	return fmt.Sprintf("%p\x00%s", st, threadID)
 }
 
 func appZaloHookConfig(t *testing.T) zaloConfig {
