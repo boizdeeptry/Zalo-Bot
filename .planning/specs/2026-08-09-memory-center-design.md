@@ -1,7 +1,7 @@
 # Memory Center và đồng bộ Memory với Zalo CLI session
 
 Ngày: 2026-08-09
-Trạng thái: chờ người dùng duyệt spec
+Trạng thái: đã được người dùng duyệt
 
 ## 1. Bối cảnh
 
