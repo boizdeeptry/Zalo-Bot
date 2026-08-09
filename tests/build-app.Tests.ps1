@@ -346,7 +346,17 @@ try {
   foreach ($relative in $required) {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
+  $packageBinary = Join-Path $packageRoot 'app\agentdc.exe'
+  Write-TestFile $packageBinary "fixture /memory/threads/ app_memory_revisions`n"
   Assert-AppPackage -Out $packageRoot | Out-Null
+
+  Write-TestFile $packageBinary "fixture app_memory_revisions`n"
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'Memory API signature' -Message 'A package missing the Memory API signature was accepted'
+  Write-TestFile $packageBinary "fixture /memory/threads/`n"
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'Memory schema signature' -Message 'A package missing the Memory schema signature was accepted'
+  Write-TestFile $packageBinary "fixture /memory/threads/ app_memory_revisions`n"
 
   $canaryCases = @(
     @{

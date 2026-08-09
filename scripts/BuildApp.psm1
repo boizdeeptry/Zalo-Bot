@@ -389,6 +389,25 @@ function Assert-AppPackageSensitiveContentAbsent {
   }
 }
 
+function Assert-AppPackageBinaryContains {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Signature,
+    [Parameter(Mandatory)][string]$Label
+  )
+
+  $needles = [byte[][]]::new(1)
+  $needles[0] = [Text.UTF8Encoding]::new($false).GetBytes($Signature)
+  try {
+    $found = [AgentDCAppPackageByteScanner]::ContainsAny($Path, $needles)
+  } catch {
+    throw "package binary scan failed for $Label"
+  }
+  if (-not $found) {
+    throw "package binary missing $Label"
+  }
+}
+
 function Assert-AppPackage {
   [CmdletBinding()]
   param(
@@ -416,6 +435,10 @@ function Assert-AppPackage {
   if (-not $AllowZaloCredentials -and (Test-Path -LiteralPath $credentials -PathType Leaf)) {
     throw 'package contains Zalo credentials'
   }
+
+  $binary = Join-Path $outPath 'app\agentdc.exe'
+  Assert-AppPackageBinaryContains -Path $binary -Signature '/memory/threads/' -Label 'Memory API signature'
+  Assert-AppPackageBinaryContains -Path $binary -Signature 'app_memory_revisions' -Label 'Memory schema signature'
 
   Assert-AppPackageSensitiveContentAbsent -Out $outPath
 
