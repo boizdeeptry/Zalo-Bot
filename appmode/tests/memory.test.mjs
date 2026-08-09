@@ -15,6 +15,16 @@ import {
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const hasClass = (node, className) => node.classList?.contains(className) ?? false;
 
+function installKeyDispatcher(doc) {
+  const listeners = new Set();
+  doc.addEventListener = (type, listener) => { if (type === "keydown") listeners.add(listener); };
+  doc.removeEventListener = (type, listener) => { if (type === "keydown") listeners.delete(listener); };
+  doc.dispatchKeydown = (event) => {
+    for (const listener of [...listeners]) listener(event);
+  };
+  return { listenerCount: () => listeners.size };
+}
+
 function overviewFixture() {
   return {
     metrics: { memories: 2, threads: 1, lessons: 1 },
@@ -87,6 +97,34 @@ test("memory service encodes filters and uses exact read endpoints", async () =>
   assert.ok(calls.every(({ options }) => options === undefined));
 });
 
+test("memory service uses exact mutation endpoints and bodies", async () => {
+  const calls = [];
+  const service = createMemoryService(async (path, options) => {
+    calls.push({ path, options });
+    return {};
+  });
+  const threadBody = { text: "Giao sau 9 giờ", pinned: true };
+  const lessonBody = {
+    thread_id: "thread-a", bot_text: "Giao ngay", better: "Em sẽ kiểm tra", note: "Không hứa", pinned: false,
+  };
+
+  await service.createThread("group/a?b", threadBody);
+  await service.updateThread("group/a?b", 7, threadBody);
+  await service.deleteThread("group/a?b", 7);
+  await service.createLesson(lessonBody);
+  await service.updateLesson(3, lessonBody);
+  await service.deleteLesson(3);
+
+  assert.deepEqual(calls, [
+    { path: "/memory/threads/group%2Fa%3Fb", options: { method: "POST", body: threadBody } },
+    { path: "/memory/threads/group%2Fa%3Fb/7", options: { method: "PUT", body: threadBody } },
+    { path: "/memory/threads/group%2Fa%3Fb/7", options: { method: "DELETE" } },
+    { path: "/memory/lessons", options: { method: "POST", body: lessonBody } },
+    { path: "/memory/lessons/3", options: { method: "PUT", body: lessonBody } },
+    { path: "/memory/lessons/3", options: { method: "DELETE" } },
+  ]);
+});
+
 test("Memory page renders legacy metrics, semantic tabs, thread detail and provenance", async (t) => {
   const dom = installDOM();
   t.after(dom.restore);
@@ -153,6 +191,11 @@ test("Memory page switches to global lessons and keeps scope explicit", async (t
   assert.match(text(main), /Áp dụng cho mọi hội thoại/);
   assert.match(text(main), /Không hứa khi chưa có dữ liệu/);
   assert.match(text(main), /Em sẽ kiểm tra thời gian giao cụ thể/);
+  const lesson = find(main, (node) => hasClass(node, "memory-lesson"));
+  assert.deepEqual(
+    findAll(lesson, (node) => node.tagName === "BUTTON").map(text),
+    ["Bỏ ghim", "Sửa", "Xoá"],
+  );
 });
 
 test("Memory page debounces server search and pinned filtering", async (t) => {
@@ -237,4 +280,239 @@ test("Memory page renders a real empty state", async (t) => {
   assert.match(text(main), /Chưa có người hoặc nhóm nào/);
   const add = find(main, (node) => node.tagName === "BUTTON" && text(node).includes("Thêm ghi chú"));
   assert.equal(add.disabled, true);
+});
+
+test("memory thread edit sends trimmed content then refreshes detail", async (t) => {
+  const dom = installDOM();
+  installKeyDispatcher(document);
+  t.after(dom.restore);
+  const calls = [];
+  const page = createMemoryPage({
+    request: async (path, options = {}) => {
+      calls.push({ path, options });
+      if (path === "/memory") return overviewFixture();
+      if (path === "/memory/threads/thread-a/7" && options.method === "PUT") return detailFixture().memories[0];
+      if (path === "/memory/threads/thread-a") return detailFixture();
+      throw new Error(`Unexpected request: ${path}`);
+    },
+  });
+  const main = document.createElement("main");
+  const mounted = page.mount(main);
+  t.after(mounted.dispose);
+  await flush();
+  await flush();
+
+  const entry = find(main, (node) => hasClass(node, "memory-entry") && text(node).includes("Nhận hàng buổi sáng"));
+  find(entry, (node) => node.tagName === "BUTTON" && text(node) === "Sửa").click();
+  await flush();
+  const overlay = find(document.body, (node) => node.hasAttribute?.("data-memory-overlay"));
+  const textarea = find(overlay, (node) => node.tagName === "TEXTAREA" && node.getAttribute("name") === "text");
+  textarea.value = "  nhận hàng sau 9 giờ  ";
+  find(overlay, (node) => node.tagName === "FORM").dispatchEvent({ type: "submit" });
+  await flush();
+  await flush();
+  await flush();
+
+  const update = calls.find(({ path, options }) => path === "/memory/threads/thread-a/7" && options.method === "PUT");
+  assert.deepEqual(update.options.body, { text: "nhận hàng sau 9 giờ", pinned: true });
+  assert.ok(update.options.signal instanceof AbortSignal);
+  assert.ok(calls.filter(({ path, options }) => path === "/memory/threads/thread-a" && !options.method).length >= 2);
+  assert.match(text(find(main, (node) => hasClass(node, "memory-live"))), /Đã lưu ghi chú/);
+  assert.equal(find(document.body, (node) => node.hasAttribute?.("data-memory-overlay")), null);
+});
+
+test("memory can add a global lesson with trimmed fields", async (t) => {
+  const dom = installDOM();
+  installKeyDispatcher(document);
+  t.after(dom.restore);
+  const calls = [];
+  const page = createMemoryPage({
+    request: async (path, options = {}) => {
+      calls.push({ path, options });
+      if (path === "/memory") return overviewFixture();
+      if (path === "/memory/threads/thread-a") return detailFixture();
+      if (path === "/memory/lessons" && options.method === "POST") return lessonFixture().lessons[0];
+      if (path === "/memory/lessons") return lessonFixture();
+      throw new Error(`Unexpected request: ${path}`);
+    },
+  });
+  const main = document.createElement("main");
+  const mounted = page.mount(main);
+  t.after(mounted.dispose);
+  await flush();
+  await flush();
+  find(main, (node) => node.getAttribute?.("role") === "tab" && text(node) === "Bài học chung").click();
+  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && text(node).includes("Thêm bài học")).click();
+  await flush();
+
+  const overlay = find(document.body, (node) => node.hasAttribute?.("data-memory-overlay"));
+  find(overlay, (node) => node.getAttribute?.("name") === "bot_text").value = "  Đơn sẽ tới ngay  ";
+  find(overlay, (node) => node.getAttribute?.("name") === "better").value = "  Em sẽ kiểm tra lại  ";
+  find(overlay, (node) => node.getAttribute?.("name") === "note").value = "  Không hứa trước  ";
+  const pinned = find(overlay, (node) => node.getAttribute?.("name") === "pinned");
+  pinned.checked = true;
+  find(overlay, (node) => node.tagName === "FORM").dispatchEvent({ type: "submit" });
+  await flush();
+  await flush();
+
+  const create = calls.find(({ path, options }) => path === "/memory/lessons" && options.method === "POST");
+  assert.deepEqual(create.options.body, {
+    thread_id: "", bot_text: "Đơn sẽ tới ngay", better: "Em sẽ kiểm tra lại", note: "Không hứa trước", pinned: true,
+  });
+  assert.match(text(find(main, (node) => hasClass(node, "memory-live"))), /Đã thêm bài học/);
+});
+
+test("memory delete is confirmed and dialog supports keyboard focus lifecycle", async (t) => {
+  const dom = installDOM();
+  const keys = installKeyDispatcher(document);
+  t.after(dom.restore);
+  const calls = [];
+  const page = createMemoryPage({
+    request: async (path, options = {}) => {
+      calls.push({ path, options });
+      if (path === "/memory") return overviewFixture();
+      if (path === "/memory/threads/thread-a/7" && options.method === "DELETE") return null;
+      if (path === "/memory/threads/thread-a") return detailFixture();
+      throw new Error(`Unexpected request: ${path}`);
+    },
+  });
+  const main = document.createElement("main");
+  const mounted = page.mount(main);
+  t.after(mounted.dispose);
+  await flush();
+  await flush();
+
+  const entry = find(main, (node) => hasClass(node, "memory-entry") && text(node).includes("Nhận hàng buổi sáng"));
+  const opener = find(entry, (node) => node.tagName === "BUTTON" && text(node) === "Xoá");
+  opener.click();
+  await flush();
+  let overlay = find(document.body, (node) => node.hasAttribute?.("data-memory-overlay"));
+  const dialog = find(overlay, (node) => node.getAttribute?.("role") === "dialog");
+  assert.equal(dialog.getAttribute("aria-modal"), "true");
+  assert.ok(dialog.getAttribute("aria-labelledby"));
+  assert.ok(dialog.getAttribute("aria-describedby"));
+  assert.equal(calls.some(({ options }) => options.method === "DELETE"), false);
+  const cancel = find(overlay, (node) => node.tagName === "BUTTON" && text(node) === "Huỷ");
+  const confirm = find(overlay, (node) => node.tagName === "BUTTON" && text(node) === "Xác nhận xoá");
+  confirm.focus();
+  let prevented = 0;
+  overlay.dispatchEvent({ type: "keydown", key: "Tab", preventDefault: () => { prevented++; } });
+  assert.equal(prevented, 1);
+  assert.equal(document.activeElement, cancel);
+  cancel.focus();
+  overlay.dispatchEvent({ type: "keydown", key: "Tab", shiftKey: true, preventDefault: () => { prevented++; } });
+  assert.equal(document.activeElement, confirm);
+  document.dispatchKeydown({ key: "Escape" });
+  assert.equal(document.activeElement, opener);
+  assert.equal(keys.listenerCount(), 0);
+
+  opener.click();
+  await flush();
+  overlay = find(document.body, (node) => node.hasAttribute?.("data-memory-overlay"));
+  find(overlay, (node) => node.tagName === "BUTTON" && text(node) === "Xác nhận xoá").click();
+  await flush();
+  await flush();
+  assert.equal(calls.filter(({ options }) => options.method === "DELETE").length, 1);
+  assert.equal(calls.find(({ options }) => options.method === "DELETE").path, "/memory/threads/thread-a/7");
+  assert.equal(document.activeElement, opener);
+  assert.match(text(find(main, (node) => hasClass(node, "memory-live"))), /Đã xoá ghi chú/);
+});
+
+test("memory pin failure keeps rendered data and announces the API message", async (t) => {
+  const dom = installDOM();
+  installKeyDispatcher(document);
+  t.after(dom.restore);
+  const page = createMemoryPage({
+    request: async (path, options = {}) => {
+      if (path === "/memory") return overviewFixture();
+      if (path === "/memory/threads/thread-a/6" && options.method === "PUT") {
+        throw new Error("đã đạt giới hạn nội dung được ghim");
+      }
+      if (path === "/memory/threads/thread-a") return detailFixture();
+      throw new Error(`Unexpected request: ${path}`);
+    },
+  });
+  const main = document.createElement("main");
+  const mounted = page.mount(main);
+  t.after(mounted.dispose);
+  await flush();
+  await flush();
+
+  const entry = find(main, (node) => hasClass(node, "memory-entry") && text(node).includes("Ưu tiên trả lời ngắn"));
+  const pin = find(entry, (node) => node.tagName === "BUTTON" && text(node) === "Ghim");
+  pin.click();
+  await flush();
+
+  assert.match(text(main), /Ưu tiên trả lời ngắn/);
+  assert.match(text(find(main, (node) => hasClass(node, "memory-live"))), /đã đạt giới hạn nội dung được ghim/);
+  assert.equal(find(main, (node) => node.tagName === "BUTTON" && text(node) === "Ghim").disabled, false);
+});
+
+test("memory keeps the last detail visible when post-mutation refresh fails", async (t) => {
+  const dom = installDOM();
+  installKeyDispatcher(document);
+  t.after(dom.restore);
+  let detailReads = 0;
+  const page = createMemoryPage({
+    request: async (path, options = {}) => {
+      if (path === "/memory") return overviewFixture();
+      if (path === "/memory/threads/thread-a/6" && options.method === "PUT") return detailFixture().memories[1];
+      if (path === "/memory/threads/thread-a") {
+        detailReads++;
+        if (detailReads > 1) throw new Error("không thể làm mới chi tiết");
+        return detailFixture();
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    },
+  });
+  const main = document.createElement("main");
+  const mounted = page.mount(main);
+  t.after(mounted.dispose);
+  await flush();
+  await flush();
+
+  const entry = find(main, (node) => hasClass(node, "memory-entry") && text(node).includes("Ưu tiên trả lời ngắn"));
+  find(entry, (node) => node.tagName === "BUTTON" && text(node) === "Ghim").click();
+  await flush();
+  await flush();
+  await flush();
+
+  assert.match(text(main), /Ưu tiên trả lời ngắn/);
+  assert.match(text(main), /không thể làm mới chi tiết/);
+});
+
+test("memory dispose aborts a pending mutation and ignores its late result", async (t) => {
+  const dom = installDOM();
+  installKeyDispatcher(document);
+  t.after(dom.restore);
+  let resolveMutation;
+  let mutationSignal;
+  let overviewReads = 0;
+  const page = createMemoryPage({
+    request: (path, options = {}) => {
+      if (path === "/memory") {
+        overviewReads++;
+        return Promise.resolve(overviewFixture());
+      }
+      if (path === "/memory/threads/thread-a/6" && options.method === "PUT") {
+        mutationSignal = options.signal;
+        return new Promise((resolve) => { resolveMutation = resolve; });
+      }
+      if (path === "/memory/threads/thread-a") return Promise.resolve(detailFixture());
+      throw new Error(`Unexpected request: ${path}`);
+    },
+  });
+  const main = document.createElement("main");
+  const mounted = page.mount(main);
+  await flush();
+  await flush();
+  const entry = find(main, (node) => hasClass(node, "memory-entry") && text(node).includes("Ưu tiên trả lời ngắn"));
+  find(entry, (node) => node.tagName === "BUTTON" && text(node) === "Ghim").click();
+  assert.equal(mutationSignal.aborted, false);
+  mounted.dispose();
+  assert.equal(mutationSignal.aborted, true);
+  resolveMutation({});
+  await flush();
+  assert.equal(overviewReads, 1);
 });
