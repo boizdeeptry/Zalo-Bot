@@ -167,15 +167,15 @@ func TestAppRunZaloLeavesStatelessRunnerUnchanged(t *testing.T) {
 	}
 }
 
-func TestAppAnswerZaloCreatesResumesAndSurvivesAPIRecreation(t *testing.T) {
-	a, st, zc := appZaloHookFixture(t, "thread-a")
+func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "thread-a", "thread-b")
 	if err := appZaloAddMessage(st, "thread-a", ipc.ZaloIn, "khách", "first question", "msg-1"); err != nil {
 		t.Fatal(err)
 	}
 	command := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
 		{stdout: appZaloHookResult(`{"answers":["first answer"]}`, 100)},
 		{stdout: appZaloHookResult(`{"answers":["second answer"]}`, 200)},
-		{stdout: appZaloHookResult(`{"answers":["third answer"]}`, 300)},
+		{stdout: appZaloHookResult(`{"answers":["other thread answer"]}`, 10)},
 	}}
 	run := &appZaloCommandHookRunner{runner: appZaloSessionRunner{cfg: zc, command: command.run}}
 	deps := &zaloDeps{cfg: zc, run: run}
@@ -195,20 +195,20 @@ func TestAppAnswerZaloCreatesResumesAndSurvivesAPIRecreation(t *testing.T) {
 	if err := appZaloAddMessage(st, "thread-a", ipc.ZaloIn, "khách", "second question", "msg-2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.appAnswerZalo(deps, "thread-a", "second question", appZaloReply("msg-2"), nil); err != nil {
-		t.Fatalf("second appAnswerZalo() error = %v", err)
-	}
-
 	recreated := appZaloAPIWithStore(a.cfg, st)
-	if err := appZaloAddMessage(st, "thread-a", ipc.ZaloIn, "khách", "third question", "msg-3"); err != nil {
-		t.Fatal(err)
-	}
-	thirdHighWater, err := st.LatestZaloMessageID("thread-a")
+	secondHighWater, err := st.LatestZaloMessageID("thread-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := recreated.appAnswerZalo(deps, "thread-a", "third question", appZaloReply("msg-3"), nil); err != nil {
-		t.Fatalf("restart appAnswerZalo() error = %v", err)
+	if err := recreated.appAnswerZalo(deps, "thread-a", "second question", appZaloReply("msg-2"), nil); err != nil {
+		t.Fatalf("recreated appAnswerZalo() error = %v", err)
+	}
+
+	if err := appZaloAddMessage(st, "thread-b", ipc.ZaloIn, "khách", "other thread question", "thread-b-msg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := recreated.appAnswerZalo(deps, "thread-b", "other thread question", appZaloReply("thread-b-msg"), nil); err != nil {
+		t.Fatalf("other-thread appAnswerZalo() error = %v", err)
 	}
 
 	if len(command.calls) != 3 {
@@ -217,10 +217,8 @@ func TestAppAnswerZaloCreatesResumesAndSurvivesAPIRecreation(t *testing.T) {
 	if !appZaloHasArgPair(command.calls[0].argv, "--session-id", first.ClaudeSessionID) {
 		t.Errorf("first argv = %q; want --session-id %s", command.calls[0].argv, first.ClaudeSessionID)
 	}
-	for i := 1; i < 3; i++ {
-		if !appZaloHasArgPair(command.calls[i].argv, "--resume", first.ClaudeSessionID) {
-			t.Errorf("call %d argv = %q; want --resume %s", i+1, command.calls[i].argv, first.ClaudeSessionID)
-		}
+	if !appZaloHasArgPair(command.calls[1].argv, "--resume", first.ClaudeSessionID) {
+		t.Errorf("second argv = %q; want --resume %s", command.calls[1].argv, first.ClaudeSessionID)
 	}
 	if !strings.Contains(command.calls[1].prompt, "operator correction") ||
 		strings.Contains(command.calls[1].prompt, "You answer a customer's question") {
@@ -229,41 +227,26 @@ func TestAppAnswerZaloCreatesResumesAndSurvivesAPIRecreation(t *testing.T) {
 	if got := strings.Count(command.calls[1].prompt, "second question"); got != 1 {
 		t.Errorf("current question occurrences = %d; want 1 from durable msgId match", got)
 	}
-	final, err := st.ZaloCLISession("thread-a")
+	finalA, err := st.ZaloCLISession("thread-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.ClaudeSessionID != first.ClaudeSessionID || final.TurnCount != 3 || final.MessageCursor != thirdHighWater {
-		t.Fatalf("durable resumed session = %+v; consumed high-water = %d", final, thirdHighWater)
+	finalB, err := st.ZaloCLISession("thread-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalA.ClaudeSessionID != first.ClaudeSessionID || finalA.TurnCount != 2 || finalA.MessageCursor != secondHighWater {
+		t.Fatalf("durable resumed session = %+v; consumed high-water = %d", finalA, secondHighWater)
+	}
+	if finalB.ClaudeSessionID == "" || finalB.ClaudeSessionID == first.ClaudeSessionID {
+		t.Fatalf("thread sessions = %q and %q; want distinct UUIDs", first.ClaudeSessionID, finalB.ClaudeSessionID)
+	}
+	if !appZaloHasArgPair(command.calls[2].argv, "--session-id", finalB.ClaudeSessionID) ||
+		appZaloHasArgPair(command.calls[2].argv, "--resume", first.ClaudeSessionID) {
+		t.Errorf("other-thread argv = %q; want new isolated session %s", command.calls[2].argv, finalB.ClaudeSessionID)
 	}
 	if run.legacy != 0 {
 		t.Fatalf("production structured runner used legacy Run %d times", run.legacy)
-	}
-}
-
-func TestAppAnswerZaloUsesDifferentSessionForSecondThread(t *testing.T) {
-	a, st, zc := appZaloHookFixture(t, "thread-a", "thread-b")
-	command := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
-		{stdout: appZaloHookResult(`{"answers":["a"]}`, 10)},
-		{stdout: appZaloHookResult(`{"answers":["b"]}`, 10)},
-	}}
-	run := &appZaloCommandHookRunner{runner: appZaloSessionRunner{cfg: zc, command: command.run}}
-	deps := &zaloDeps{cfg: zc, run: run}
-	for _, threadID := range []string{"thread-a", "thread-b"} {
-		if err := appZaloAddMessage(st, threadID, ipc.ZaloIn, "khách", threadID+" question", threadID+"-msg"); err != nil {
-			t.Fatal(err)
-		}
-		if err := a.appAnswerZalo(deps, threadID, threadID+" question", appZaloReply(threadID+"-msg"), nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	one, _ := st.ZaloCLISession("thread-a")
-	two, _ := st.ZaloCLISession("thread-b")
-	if one.ClaudeSessionID == "" || two.ClaudeSessionID == "" || one.ClaudeSessionID == two.ClaudeSessionID {
-		t.Fatalf("thread sessions = %q and %q; want distinct UUIDs", one.ClaudeSessionID, two.ClaudeSessionID)
-	}
-	if len(command.calls) != 2 {
-		t.Fatalf("Claude calls = %d; want exactly one per thread", len(command.calls))
 	}
 }
 

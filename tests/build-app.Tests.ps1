@@ -43,6 +43,22 @@ function Write-TestFile {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+function Assert-NoSensitivePackageCanaries {
+  param(
+    [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][string[]]$Canaries
+  )
+
+  foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File) {
+    $content = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($file.FullName))
+    foreach ($canary in $Canaries) {
+      if ($content.IndexOf($canary, [StringComparison]::Ordinal) -ge 0) {
+        throw "package contains sensitive canary '$canary' in $($file.FullName)"
+      }
+    }
+  }
+}
+
 function Get-SeamTargetHashes {
   param([Parameter(Mandatory)][string]$Stage)
 
@@ -233,6 +249,13 @@ foreach ($testName in $supersededTests) {
 }
 Write-Host 'PASS: Go checkpoint skips exactly seven superseded tests.'
 
+$sessionAcceptancePath = Join-Path $PSScriptRoot '..\appmode\overlay\internal\daemon\app_zalo_session_hook_test.go'
+$sessionAcceptance = [IO.File]::ReadAllText($sessionAcceptancePath)
+if ($sessionAcceptance -notmatch 'func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation\(') {
+  throw 'Staged create-resume and thread-isolation acceptance test is missing'
+}
+Write-Host 'PASS: staged Go suite includes create-resume and thread-isolation acceptance.'
+
 $packageRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-package-' + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -247,11 +270,29 @@ try {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
   Assert-AppPackage -Out $packageRoot | Out-Null
+  $sensitiveCanaries = @(
+    'APP_TEST_PROMPT_CANARY_7F18A2'
+    'APP_TEST_RESPONSE_CANARY_93C4D1'
+    'APP_TEST_RAW_STDERR_CANARY_5B60E7'
+    'APP_TEST_ZALO_CREDENTIAL_CANARY_A8D239'
+    'APP_TEST_PROVIDER_CREDENTIAL_CANARY_C17F46'
+  )
+  Assert-NoSensitivePackageCanaries -Root $packageRoot -Canaries $sensitiveCanaries
+
+  foreach ($canary in $sensitiveCanaries) {
+    $canaryPath = Join-Path $packageRoot 'app\canary-probe.bin'
+    Write-TestFile $canaryPath "prefix`0$canary`0suffix"
+    Assert-ThrowsLike -Action {
+      Assert-NoSensitivePackageCanaries -Root $packageRoot -Canaries $sensitiveCanaries
+    } -Pattern 'package contains sensitive canary' -Message "Package scan missed $canary"
+    Remove-Item -LiteralPath $canaryPath -Force
+  }
 
   Write-TestFile (Join-Path $packageRoot 'data\zalo\credentials.json') "secret`n"
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'Zalo credentials' -Message 'A package containing Zalo credentials was accepted'
 
+  Write-Host 'PASS: package scan rejects prompt, response, raw-stderr, Zalo and Provider credential canaries.'
   Write-Host 'PASS: Assert-AppPackage requires runtime files and rejects credentials.'
 } finally {
   if (Test-Path -LiteralPath $packageRoot) {

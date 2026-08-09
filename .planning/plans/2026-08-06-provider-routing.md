@@ -318,29 +318,23 @@
 ### Task 5: Integrate routing into the staged daemon without restart
 
 **Files:**
-- Modify: `scripts/BuildApp.psm1` (inside `Apply-AppSeams`)
-- Modify: `tests/build-app.Tests.ps1` (seam fixture section)
+- Modify: `appmode/overlay/internal/daemon/app_zalo_session_hook.go`
+- Modify: `appmode/overlay/internal/daemon/app_zalo_session_hook_test.go`
 - Modify: `appmode/overlay/internal/daemon/app_llm_router.go`
 - Modify: `appmode/overlay/internal/daemon/app_llm_router_test.go`
 - Modify: `appmode/overlay/internal/daemon/app_routes.go`
 
-**Public behavior to verify:** The existing Zalo answer pipeline uses the newest saved route on the next message, keeps the old snapshot for an in-flight message, migrates `data/model.txt` to Claude Code once, and requires no daemon restart.
+**Public behavior to verify:** The existing Zalo answer pipeline uses the newest saved route on the next message, keeps the old snapshot for an in-flight message, leaves API turns stateless, and delegates attachment or API fallback into Claude through the existing per-thread resumable-session path without a daemon restart.
 
-- [ ] **Step 1: Write failing seam and runtime tests**
+- [ ] **Step 1: Write failing runtime-boundary tests**
 
-  Extend the PowerShell fixture to require exactly one staged replacement of:
+  Keep the two already-shipped `duty.go` seams (`appAnswerZalo` and `appRunZalo`) unchanged; do not add a Provider-specific answer seam. Add tests proving:
 
-  ```go
-  a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)
-  ```
-
-  with:
-
-  ```go
-  a.answerZalo(ctx, deps.cfg, a.appZaloRunner(deps.cfg, deps.run, len(files) > 0), threadID, question, step, reply, files...)
-  ```
-
-  Assert the source `duty.go` remains byte-identical and applying seams twice fails. In Go tests, save route A, create a runner, block its first adapter call, save route B, and prove the blocked turn completes on A while a new runner uses B. Bootstrap a temporary `data/model.txt` containing `sonnet`, assert the system route ends with `claude-code/sonnet`, run bootstrap again after a route edit, and prove the edit is not overwritten.
+  - an API success receives one complete safe prompt as a stateless request, does not invoke `appZaloStructuredRunner`, and does not advance/create Claude session state;
+  - an attachment skips every API adapter and delegates once to the injected `appZaloStructuredRunner`;
+  - an eligible API failure delegates once to that same structured runner, preserving its recovery metadata and safe error classification;
+  - a saved route/model or prompt-fingerprint change causes the existing session selector to rotate before the next Claude turn, while an in-flight turn keeps its immutable route snapshot; and
+  - bootstrapping `data/model.txt` containing `sonnet` creates a final `claude-code/sonnet` route once, then preserves later route edits.
 
 - [ ] **Step 2: Run and confirm RED**
 
@@ -351,25 +345,27 @@
   if ($pester.FailedCount -ne 0) { throw "Pester failed: $($pester.FailedCount)" }
   ```
 
-  Expected: FAIL because the duty seam and `appZaloRunner` do not exist.
+  Expected: FAIL because the routing bridge at the existing session hook does not exist.
 
-- [ ] **Step 3: Implement the guarded runtime seam**
+- [ ] **Step 3: Integrate at the existing session-aware boundary**
 
-  Extend `Apply-AppSeams` to read and write `internal/daemon/duty.go` with `Replace-ExactlyOnce` and `Assert-SignatureAbsent`. Implement `appZaloRunner` so each invocation constructs a fresh routed runner and creates a same-package `execZaloRunner` with a copied `zaloConfig.Model` for the selected Claude model; retain the injected base runner when its model already matches so upstream fake-runner tests remain valid. Call `BootstrapClaudeRoute` from `registerAppRoutes`, reading the legacy model through the same validation used by `/kb/model`; default to the current `zaloConfig` model when the file is absent. Keep `data/model.txt` untouched for rollback.
+  Load and deep-copy the route once per Zalo turn inside the existing `appAnswerZalo`/`appRunZalo` integration. API adapters consume the fully constructed prompt as a one-shot stateless request; API success must not create or advance a Claude mapping. When an attachment selects Claude immediately, or when the API chain falls back to Claude, delegate to the injected `appZaloStructuredRunner` rather than calling its legacy `Run` method. Preserve the existing per-thread gate, cursor, recovery and completion semantics.
+
+  Feed the selected Claude model and the effective route/prompt revision into the existing session model/fingerprint inputs so a change marks the mapping for rotation before the next Claude call. Do not patch `duty.go` again and do not change `Apply-AppSeams`; the already-shipped answer and runner seams remain the sole integration points. Call `BootstrapClaudeRoute` from `registerAppRoutes`, reading the legacy model through the same validation used by `/kb/model`; default to the current `zaloConfig` model when the file is absent. Keep `data/model.txt` untouched for rollback.
 
 - [ ] **Step 4: Run focused and full verification**
 
   Run the Pester command, then the staged-build command with output prefix `provider-runtime-green-`.
 
-  Expected: both PASS; the source repository status is unchanged and the existing Zalo tests remain green.
+  Expected: both PASS; the source repository status is unchanged, API-only turns leave Claude session state untouched, and attachment/fallback Claude turns create or resume the correct per-thread UUID.
 
 - [ ] **Step 5: Refactor and commit**
 
-  Keep the new seam adjacent to the existing answer call and avoid modifying upstream source directly.
+  Keep routing snapshot selection separate from the session hook, preserve the existing two staged seams, and avoid modifying upstream source directly.
 
   ```powershell
-  git add scripts/BuildApp.psm1 tests/build-app.Tests.ps1 appmode/overlay/internal/daemon/app_llm_router.go appmode/overlay/internal/daemon/app_llm_router_test.go appmode/overlay/internal/daemon/app_routes.go
-  git commit -m "feat: activate provider routes per Zalo turn"
+  git add appmode/overlay/internal/daemon/app_zalo_session_hook.go appmode/overlay/internal/daemon/app_zalo_session_hook_test.go appmode/overlay/internal/daemon/app_llm_router.go appmode/overlay/internal/daemon/app_llm_router_test.go appmode/overlay/internal/daemon/app_routes.go
+  git commit -m "feat: route providers through Zalo session boundary"
   ```
 
 ### Task 6: Expose secure Provider administration APIs

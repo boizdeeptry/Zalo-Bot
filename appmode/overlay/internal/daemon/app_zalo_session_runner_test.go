@@ -18,6 +18,7 @@ const (
 	appZaloTestSessionID         = "11111111-1111-4111-8111-111111111111"
 	appZaloTestRecoverySessionID = "22222222-2222-4222-8222-222222222222"
 	appZaloPipeHelperEnv         = "AGENTDC_TEST_ZALO_RUNNER_PIPE_HELPER"
+	appZaloRawStderrCanary       = "APP_TEST_RAW_STDERR_CANARY_5B60E7"
 )
 
 type appZaloCommandCall struct {
@@ -327,7 +328,7 @@ func TestAppZaloSessionRunnerDoesNotRetryOtherFailures(t *testing.T) {
 		{name: "network", stderr: "network error: connection reset by peer", waitErr: errors.New("exit status 1"), want: appZaloErrorNetwork},
 		{name: "permission", stderr: "permission denied for this account", waitErr: errors.New("exit status 1"), want: appZaloErrorPermission},
 		{name: "model", stderr: "model sonnet is not available", waitErr: errors.New("exit status 1"), want: appZaloErrorModel},
-		{name: "generic", stderr: "customer-secret-canary: unexpected failure", waitErr: errors.New("exit status 1"), want: appZaloErrorProcess},
+		{name: "generic", stderr: appZaloRawStderrCanary + ": unexpected failure", waitErr: errors.New("exit status 1"), want: appZaloErrorProcess},
 		{name: "session wording not allowlisted", stderr: "network session not found while connecting", waitErr: errors.New("exit status 1"), want: appZaloErrorNetwork},
 		{name: "resume phrase after timeout", stderr: "request timed out: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorTimeout},
 		{name: "resume phrase after network error", stderr: "network error: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorNetwork},
@@ -356,7 +357,7 @@ func TestAppZaloSessionRunnerDoesNotRetryOtherFailures(t *testing.T) {
 			if len(fake.calls) != 1 {
 				t.Errorf("command calls = %d, want no retry", len(fake.calls))
 			}
-			if strings.Contains(err.Error(), "customer-secret-canary") || strings.Contains(err.Error(), "private content") {
+			if strings.Contains(err.Error(), appZaloRawStderrCanary) || strings.Contains(err.Error(), "private content") {
 				t.Errorf("error leaked raw content: %q", err)
 			}
 		})
