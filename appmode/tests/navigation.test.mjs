@@ -40,7 +40,7 @@ test("navigation exposes the legacy menu contract", () => {
           id: "memory",
           icon: "🗃",
           label: "Memory",
-          todo: "Ghi chú bot tự viết cho từng hội thoại, và bài học rút từ lần người trực sửa câu. Hiện xem trong trang Zalo.",
+          todo: undefined,
           href: undefined,
         },
       ],

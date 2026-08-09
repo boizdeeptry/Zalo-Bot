@@ -21,12 +21,7 @@ export const NAVIGATION = Object.freeze([
         todo: "Nối agent với công cụ ngoài qua MCP: CRM, đơn hàng, tồn kho.",
       },
       { id: "models", icon: "🧩", label: "Models" },
-      {
-        id: "memory",
-        icon: "🗃",
-        label: "Memory",
-        todo: "Ghi chú bot tự viết cho từng hội thoại, và bài học rút từ lần người trực sửa câu. Hiện xem trong trang Zalo.",
-      },
+      { id: "memory", icon: "🗃", label: "Memory" },
     ]),
   }),
   Object.freeze({

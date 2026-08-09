@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createPortalController } from "../overlay/internal/webui/static/app-main.js";
-import { createRouteHost } from "../overlay/internal/webui/static/core/router.js";
+import { createPortalController, loadRoutePage } from "../overlay/internal/webui/static/app-main.js";
+import { ROUTES, createRouteHost } from "../overlay/internal/webui/static/core/router.js";
 
 function deferred() {
   let resolve;
@@ -179,4 +179,9 @@ test("dispose invalidates pending navigation and disposes the host once", async 
   assert.deepEqual(harness.mounts, [{ page: agentsPage, routeId: "agents" }]);
   assert.equal(harness.focusCalls.length, 1);
   assert.equal(harness.disposeCalls, 1);
+});
+
+test("Memory route lazy-loads the real page module", async () => {
+  const page = await loadRoutePage(ROUTES.memory);
+  assert.equal(typeof page.mount, "function");
 });

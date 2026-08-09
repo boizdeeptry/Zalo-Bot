@@ -15,9 +15,13 @@ const implementedPages = Object.freeze({
     const page = await import("./pages/models.js");
     return { mount: page.mount };
   },
+  memory: async () => {
+    const page = await import("./pages/memory.js");
+    return { mount: page.mount };
+  },
 });
 
-async function loadRoutePage(route) {
+export async function loadRoutePage(route) {
   if (route.todo) {
     const page = await import("./pages/roadmap.js");
     return page.createRoadmapPage(route);

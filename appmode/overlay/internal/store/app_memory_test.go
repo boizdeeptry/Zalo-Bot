@@ -85,12 +85,18 @@ func TestAppThreadMemoryCRUDIsOwnedAndBumpsOnlyItsRevision(t *testing.T) {
 	if err := s.DeleteAppThreadMemory("thread-a", created.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.CreateZaloCLISession(ZaloCLISession{
+		ThreadID: "thread-a", ClaudeSessionID: "session-a", Model: "sonnet",
+		PromptFingerprint: "persona-v1", MemoryRevision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	detail, err := s.AppThreadMemories("thread-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(detail.Memories) != 0 || detail.Revision != 3 {
-		t.Fatalf("detail after delete = %#v; want empty revision 3", detail)
+	if len(detail.Memories) != 0 || detail.Revision != 3 || detail.SyncedRevision != 1 {
+		t.Fatalf("detail after delete = %#v; want empty revision 3 synced at 1", detail)
 	}
 }
 

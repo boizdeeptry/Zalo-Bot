@@ -70,9 +70,10 @@ type AppThreadMemory struct {
 }
 
 type AppThreadMemoryDetail struct {
-	Thread   AppMemoryThread   `json:"thread"`
-	Revision int64             `json:"revision"`
-	Memories []AppThreadMemory `json:"memories"`
+	Thread         AppMemoryThread   `json:"thread"`
+	Revision       int64             `json:"revision"`
+	SyncedRevision int64             `json:"synced_revision"`
+	Memories       []AppThreadMemory `json:"memories"`
 }
 
 type AppLessonInput struct {
@@ -194,6 +195,10 @@ WHERE scope = 'thread' AND scope_id = ?`, threadID).Scan(&out.Revision); errors.
 		out.Revision = 0
 	} else if err != nil {
 		return AppThreadMemoryDetail{}, fmt.Errorf("read memory revision for %s: %w", threadID, err)
+	}
+	if err := s.db.QueryRow(`SELECT COALESCE((SELECT memory_revision
+FROM app_zalo_cli_sessions WHERE thread_id = ?), 0)`, threadID).Scan(&out.SyncedRevision); err != nil {
+		return AppThreadMemoryDetail{}, fmt.Errorf("read synced memory revision for %s: %w", threadID, err)
 	}
 
 	rows, err := s.db.Query(appThreadMemorySelect+`
