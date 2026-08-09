@@ -470,21 +470,11 @@ func appApplyMemoryForget(
 	if !appMemoryTargetIsActiveInScope(target, threadID, subjectUID, now) {
 		return appMemoryMutationNoop, false, nil
 	}
-	if _, err := tx.Exec(`WITH RECURSIVE lineage(id) AS (
-  SELECT ?
-  UNION
-  SELECT CASE WHEN linked.id = lineage.id THEN linked.supersedes_id ELSE linked.id END
-  FROM zalo_memory linked JOIN lineage
-    ON linked.id = lineage.id OR linked.supersedes_id = lineage.id
-  WHERE linked.thread_id = ? AND linked.uid = ? AND linked.supersedes_id > 0
-)
-DELETE FROM zalo_memory
-WHERE thread_id = ? AND uid = ? AND id IN (SELECT id FROM lineage)`,
-		target.id, threadID, subjectUID, threadID, subjectUID,
-	); err != nil {
-		return appMemoryMutationNoop, false, fmt.Errorf("forget Memory lineage %d: %w", target.id, err)
+	activeChanged, err := appDeleteMemoryLineage(tx, threadID, subjectUID, target.id)
+	if err != nil {
+		return appMemoryMutationNoop, false, err
 	}
-	return appMemoryMutationActive, true, nil
+	return appMemoryMutationActive, activeChanged, nil
 }
 
 type AppPromptMemoryItem struct {
@@ -666,4 +656,102 @@ func appReadPromptMemoryScope(
 		return nil, fmt.Errorf("select prompt Memory scope for %s: %w", threadID, err)
 	}
 	return out, nil
+}
+
+func appValidateMemoryFields(memoryKey, text, category string) error {
+	if !appMemoryKeyPattern.MatchString(memoryKey) {
+		return fmt.Errorf("%w: invalid memory key", ErrAppMemoryInvalid)
+	}
+	if _, ok := appMemoryAllowedCategories[category]; !ok {
+		return fmt.Errorf("%w: invalid memory category", ErrAppMemoryInvalid)
+	}
+	if text == "" || len([]rune(text)) > appMemoryMaxValueRunes ||
+		strings.ContainsAny(text, "\r\n\u0085\u2028\u2029") {
+		return fmt.Errorf("%w: invalid memory text", ErrAppMemoryInvalid)
+	}
+	return nil
+}
+
+func appRequireExpectedMemoryRevision(
+	tx *sql.Tx,
+	threadID, uid string,
+	expected int64,
+	legacy bool,
+) error {
+	var current int64
+	if err := tx.QueryRow(`SELECT COALESCE((SELECT revision
+FROM app_memory_subject_revisions WHERE thread_id = ? AND uid = ?), 0)`,
+		threadID, uid,
+	).Scan(&current); err != nil {
+		return fmt.Errorf("read subject Memory revision for %s: %w", threadID, err)
+	}
+	if !legacy && current != expected {
+		return fmt.Errorf("%w: expected %d, current %d", ErrAppMemoryConflict, expected, current)
+	}
+	return nil
+}
+
+func appRequireAvailableActiveMemoryKey(
+	tx *sql.Tx,
+	threadID, uid, memoryKey string,
+	excludeID int64,
+) error {
+	var conflictID int64
+	err := tx.QueryRow(`SELECT id FROM zalo_memory
+WHERE thread_id = ? AND uid = ? AND memory_key = ? AND status = 'active' AND id <> ?
+ORDER BY id DESC LIMIT 1`, threadID, uid, memoryKey, excludeID).Scan(&conflictID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check active Memory key availability: %w", err)
+	}
+	return fmt.Errorf("%w: active memory key already exists", ErrAppMemoryConflict)
+}
+
+func appBumpMemoryRevisions(tx *sql.Tx, threadID, uid string) error {
+	if err := appBumpMemoryRevision(tx, "thread", threadID); err != nil {
+		return err
+	}
+	return appBumpSubjectMemoryRevision(tx, threadID, uid)
+}
+
+const appMemoryLineageCTE = `WITH RECURSIVE lineage(id) AS (
+  SELECT ?
+  UNION
+  SELECT CASE WHEN linked.id = lineage.id THEN linked.supersedes_id ELSE linked.id END
+  FROM zalo_memory linked JOIN lineage
+    ON linked.id = lineage.id OR linked.supersedes_id = lineage.id
+  WHERE linked.thread_id = ? AND linked.uid = ? AND linked.supersedes_id > 0
+)`
+
+func appDeleteMemoryLineage(
+	tx *sql.Tx,
+	threadID, uid string,
+	id int64,
+) (bool, error) {
+	var activeCount int
+	if err := tx.QueryRow(appMemoryLineageCTE+`
+SELECT COUNT(*) FROM zalo_memory
+WHERE thread_id = ? AND uid = ? AND status = 'active' AND id IN (SELECT id FROM lineage)`,
+		id, threadID, uid, threadID, uid,
+	).Scan(&activeCount); err != nil {
+		return false, fmt.Errorf("inspect Memory lineage %d: %w", id, err)
+	}
+	result, err := tx.Exec(appMemoryLineageCTE+`
+DELETE FROM zalo_memory
+WHERE thread_id = ? AND uid = ? AND id IN (SELECT id FROM lineage)`,
+		id, threadID, uid, threadID, uid,
+	)
+	if err != nil {
+		return false, fmt.Errorf("delete Memory lineage %d: %w", id, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect Memory lineage delete %d: %w", id, err)
+	}
+	if count == 0 {
+		return false, fmt.Errorf("memory %d in %s: %w", id, threadID, ErrAppMemoryNotFound)
+	}
+	return activeCount > 0, nil
 }

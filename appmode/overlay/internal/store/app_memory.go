@@ -22,6 +22,7 @@ var (
 	ErrAppMemoryNotFound = errors.New("memory not found")
 	ErrAppMemoryPinLimit = errors.New("memory pin limit reached")
 	ErrAppMemoryInvalid  = errors.New("invalid memory input")
+	ErrAppMemoryConflict = errors.New("memory revision conflict")
 )
 
 type AppMemoryRevision struct {
@@ -52,28 +53,67 @@ type AppMemoryOverview struct {
 }
 
 type AppThreadMemoryInput struct {
-	Text   string `json:"text"`
-	Pinned bool   `json:"pinned"`
+	UID              string `json:"uid"`
+	MemoryKey        string `json:"memory_key"`
+	Text             string `json:"text"`
+	Category         string `json:"category"`
+	Pinned           bool   `json:"pinned"`
+	ExpectedRevision int64  `json:"expected_revision"`
 }
 
 type AppThreadMemory struct {
-	ID              int64     `json:"id"`
-	ThreadID        string    `json:"thread_id"`
-	ThreadName      string    `json:"thread_name"`
-	Text            string    `json:"text"`
-	Pinned          bool      `json:"pinned"`
-	Source          string    `json:"source"`
-	SourceMessageID int64     `json:"source_message_id"`
-	SourcePreview   string    `json:"source_preview"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID              int64            `json:"id"`
+	ThreadID        string           `json:"thread_id"`
+	ThreadName      string           `json:"thread_name"`
+	UID             string           `json:"uid"`
+	MemoryKey       string           `json:"memory_key"`
+	Text            string           `json:"text"`
+	Category        string           `json:"category"`
+	Confidence      float64          `json:"confidence"`
+	Status          string           `json:"status"`
+	ProposalAction  string           `json:"proposal_action"`
+	SupersedesID    int64            `json:"supersedes_id"`
+	ProposalTarget  *AppThreadMemory `json:"proposal_target,omitempty"`
+	Pinned          bool             `json:"pinned"`
+	Source          string           `json:"source"`
+	SourceMessageID int64            `json:"source_message_id"`
+	SourcePreview   string           `json:"source_preview"`
+	LastConfirmedAt *time.Time       `json:"last_confirmed_at,omitempty"`
+	ExpiresAt       *time.Time       `json:"expires_at,omitempty"`
+	CreatedAt       time.Time        `json:"created_at"`
+	UpdatedAt       time.Time        `json:"updated_at"`
+}
+
+type AppMemoryScopeCounts struct {
+	Active  int `json:"active"`
+	Pending int `json:"pending"`
+	Expired int `json:"expired"`
+}
+
+type AppMemoryMember struct {
+	UID    string `json:"uid"`
+	Name   string `json:"name"`
+	Avatar string `json:"avatar"`
+	AppMemoryScopeCounts
 }
 
 type AppThreadMemoryDetail struct {
-	Thread         AppMemoryThread   `json:"thread"`
-	Revision       int64             `json:"revision"`
-	SyncedRevision int64             `json:"synced_revision"`
-	Memories       []AppThreadMemory `json:"memories"`
+	Thread                AppMemoryThread      `json:"thread"`
+	SelectedUID           string               `json:"selected_uid"`
+	Members               []AppMemoryMember    `json:"members"`
+	Common                AppMemoryScopeCounts `json:"common"`
+	CommonRevision        int64                `json:"common_revision"`
+	SubjectRevision       int64                `json:"subject_revision"`
+	SyncedCommonRevision  int64                `json:"synced_common_revision"`
+	SyncedSubjectRevision int64                `json:"synced_subject_revision"`
+	SessionSubjectUID     string               `json:"session_subject_uid"`
+	Synced                bool                 `json:"synced"`
+	Active                []AppThreadMemory    `json:"active"`
+	Pending               []AppThreadMemory    `json:"pending"`
+	Expired               []AppThreadMemory    `json:"expired"`
+	Revision              int64                `json:"revision"`
+	SyncedRevision        int64                `json:"synced_revision"`
+	Memories              []AppThreadMemory    `json:"memories"`
 }
 
 type AppLessonInput struct {
@@ -120,23 +160,42 @@ func (s *Store) AppMemoryOverview(query string, pinnedOnly bool) (AppMemoryOverv
 	if pinnedOnly {
 		pinned = 1
 	}
+	now := ts(time.Now())
 	rows, err := s.db.Query(`
 SELECT t.id, t.name, t.avatar, t.thread_type,
        (SELECT COUNT(*) FROM zalo_memory m WHERE m.thread_id = t.id),
-       (SELECT COUNT(*) FROM zalo_memory m WHERE m.thread_id = t.id AND m.pinned = 1),
+       (SELECT COUNT(*) FROM zalo_memory m
+        WHERE m.thread_id = t.id AND m.pinned = 1 AND m.status = 'active'
+          AND (m.expires_at IS NULL OR m.expires_at > ?)
+          AND ((t.thread_type = 'group' AND m.uid = '') OR
+               (t.thread_type = 'user' AND m.uid = t.id))),
        COALESCE((SELECT m.text FROM zalo_memory m
-                 WHERE m.thread_id = t.id ORDER BY m.pinned DESC, m.id DESC LIMIT 1), ''),
+                 WHERE m.thread_id = t.id AND m.status = 'active'
+                   AND (m.expires_at IS NULL OR m.expires_at > ?)
+                   AND ((t.thread_type = 'group' AND m.uid = '') OR
+                        (t.thread_type = 'user' AND m.uid = t.id))
+                 ORDER BY m.pinned DESC, m.id DESC LIMIT 1), ''),
        t.updated_at
 FROM zalo_threads t
 WHERE (? = '' OR t.name LIKE ? ESCAPE '\' COLLATE NOCASE OR
        EXISTS (SELECT 1 FROM zalo_memory m
-               WHERE m.thread_id = t.id AND m.text LIKE ? ESCAPE '\' COLLATE NOCASE))
+               WHERE m.thread_id = t.id AND m.text LIKE ? ESCAPE '\' COLLATE NOCASE
+                 AND m.status = 'active' AND (m.expires_at IS NULL OR m.expires_at > ?)
+                 AND ((t.thread_type = 'group' AND m.uid = '') OR
+                      (t.thread_type = 'user' AND m.uid = t.id))))
   AND (? = 0 OR EXISTS (SELECT 1 FROM zalo_memory m
-                        WHERE m.thread_id = t.id AND m.pinned = 1))
-ORDER BY CASE WHEN EXISTS (SELECT 1 FROM zalo_memory m WHERE m.thread_id = t.id)
+                        WHERE m.thread_id = t.id AND m.pinned = 1 AND m.status = 'active'
+                          AND (m.expires_at IS NULL OR m.expires_at > ?)
+                          AND ((t.thread_type = 'group' AND m.uid = '') OR
+                               (t.thread_type = 'user' AND m.uid = t.id))))
+ORDER BY CASE WHEN EXISTS (SELECT 1 FROM zalo_memory m
+                           WHERE m.thread_id = t.id AND m.status = 'active'
+                             AND (m.expires_at IS NULL OR m.expires_at > ?)
+                             AND ((t.thread_type = 'group' AND m.uid = '') OR
+                                  (t.thread_type = 'user' AND m.uid = t.id)))
               THEN 0 ELSE 1 END,
          t.updated_at DESC, t.id ASC
-LIMIT ?`, trimmed, pattern, pattern, pinned, appOverviewLimit)
+LIMIT ?`, now, now, trimmed, pattern, pattern, now, pinned, now, now, appOverviewLimit)
 	if err != nil {
 		return AppMemoryOverview{}, fmt.Errorf("list memory threads: %w", err)
 	}
@@ -165,46 +224,33 @@ LIMIT ?`, trimmed, pattern, pattern, pinned, appOverviewLimit)
 
 func (s *Store) AppThreadMemories(threadID string) (AppThreadMemoryDetail, error) {
 	threadID = strings.TrimSpace(threadID)
-	if threadID == "" {
-		return AppThreadMemoryDetail{}, fmt.Errorf("%w: thread ID is required", ErrAppMemoryInvalid)
-	}
-	var out AppThreadMemoryDetail
-	var updatedAt string
-	if err := s.db.QueryRow(`SELECT id, name, avatar, thread_type, updated_at
-FROM zalo_threads WHERE id = ?`, threadID).Scan(
-		&out.Thread.ID, &out.Thread.Name, &out.Thread.Avatar, &out.Thread.ThreadType, &updatedAt,
-	); errors.Is(err, sql.ErrNoRows) {
-		return AppThreadMemoryDetail{}, fmt.Errorf("thread %s: %w", threadID, ErrAppMemoryNotFound)
-	} else if err != nil {
-		return AppThreadMemoryDetail{}, fmt.Errorf("read memory thread %s: %w", threadID, err)
-	}
-	var err error
-	out.Thread.UpdatedAt, err = parseTS(updatedAt)
+	out, err := s.AppThreadMemoryScope(threadID, "", time.Now())
 	if err != nil {
-		return AppThreadMemoryDetail{}, fmt.Errorf("parse memory thread %s updated_at: %w", threadID, err)
+		return AppThreadMemoryDetail{}, err
 	}
 	if err := s.db.QueryRow(`SELECT
-  COUNT(*), COALESCE(SUM(CASE WHEN pinned = 1 THEN 1 ELSE 0 END), 0)
-FROM zalo_memory WHERE thread_id = ?`, threadID).Scan(
-		&out.Thread.MemoryCount, &out.Thread.PinnedCount,
+  COALESCE((SELECT revision FROM app_memory_revisions
+            WHERE scope = 'thread' AND scope_id = ?), 0),
+  COALESCE((SELECT memory_revision FROM app_zalo_cli_sessions
+            WHERE thread_id = ?), 0)`, threadID, threadID).Scan(
+		&out.Revision, &out.SyncedRevision,
 	); err != nil {
-		return AppThreadMemoryDetail{}, fmt.Errorf("count memory for %s: %w", threadID, err)
+		return AppThreadMemoryDetail{}, fmt.Errorf("read legacy Memory revisions for %s: %w", threadID, err)
 	}
-	if err := s.db.QueryRow(`SELECT COALESCE(revision, 0) FROM app_memory_revisions
-WHERE scope = 'thread' AND scope_id = ?`, threadID).Scan(&out.Revision); errors.Is(err, sql.ErrNoRows) {
-		out.Revision = 0
-	} else if err != nil {
-		return AppThreadMemoryDetail{}, fmt.Errorf("read memory revision for %s: %w", threadID, err)
+	uid := ""
+	includeLegacyCommon := false
+	if out.Thread.ThreadType == ipc.ZaloThreadUser {
+		uid = threadID
+		includeLegacyCommon = true
 	}
-	if err := s.db.QueryRow(`SELECT COALESCE((SELECT memory_revision
-FROM app_zalo_cli_sessions WHERE thread_id = ?), 0)`, threadID).Scan(&out.SyncedRevision); err != nil {
-		return AppThreadMemoryDetail{}, fmt.Errorf("read synced memory revision for %s: %w", threadID, err)
-	}
-
 	rows, err := s.db.Query(appThreadMemorySelect+`
-WHERE m.thread_id = ? ORDER BY m.pinned DESC, m.id DESC LIMIT ?`, threadID, appThreadMemoryLimit)
+WHERE m.thread_id = ? AND m.status = 'active'
+  AND (m.uid = ? OR (? = 1 AND m.uid = ''))
+  AND (m.expires_at IS NULL OR m.expires_at > ?)
+ORDER BY m.pinned DESC, m.id DESC LIMIT ?`,
+		threadID, uid, includeLegacyCommon, ts(time.Now()), appThreadMemoryLimit)
 	if err != nil {
-		return AppThreadMemoryDetail{}, fmt.Errorf("list memory for %s: %w", threadID, err)
+		return AppThreadMemoryDetail{}, fmt.Errorf("list legacy Memory for %s: %w", threadID, err)
 	}
 	defer rows.Close()
 	out.Memories = make([]AppThreadMemory, 0)
@@ -216,7 +262,15 @@ WHERE m.thread_id = ? ORDER BY m.pinned DESC, m.id DESC LIMIT ?`, threadID, appT
 		out.Memories = append(out.Memories, memory)
 	}
 	if err := rows.Err(); err != nil {
-		return AppThreadMemoryDetail{}, fmt.Errorf("list memory for %s: %w", threadID, err)
+		return AppThreadMemoryDetail{}, fmt.Errorf("list legacy Memory for %s: %w", threadID, err)
+	}
+	out.Active = out.Memories
+	out.Thread.MemoryCount = len(out.Memories)
+	out.Thread.PinnedCount = 0
+	for _, memory := range out.Memories {
+		if memory.Pinned {
+			out.Thread.PinnedCount++
+		}
 	}
 	if len(out.Memories) > 0 {
 		out.Thread.Preview = out.Memories[0].Text
@@ -224,127 +278,248 @@ WHERE m.thread_id = ? ORDER BY m.pinned DESC, m.id DESC LIMIT ?`, threadID, appT
 	return out, nil
 }
 
-func (s *Store) CreateAppThreadMemory(threadID string, input AppThreadMemoryInput) (AppThreadMemory, error) {
-	threadID = strings.TrimSpace(threadID)
-	input, err := validateAppThreadMemoryInput(threadID, input)
+func (s *Store) AppThreadMemoryScope(
+	threadID, selectedUID string,
+	now time.Time,
+) (AppThreadMemoryDetail, error) {
+	threadID, selectedUID, err := validateAppPromptMemoryScope(threadID, selectedUID)
 	if err != nil {
-		return AppThreadMemory{}, err
+		return AppThreadMemoryDetail{}, err
+	}
+	if now.IsZero() {
+		now = time.Now()
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return AppThreadMemory{}, fmt.Errorf("begin memory create: %w", err)
+		return AppThreadMemoryDetail{}, fmt.Errorf("begin scoped Memory read for %s: %w", threadID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := appRequireMemoryThread(tx, threadID); err != nil {
-		return AppThreadMemory{}, err
+
+	var out AppThreadMemoryDetail
+	var updatedAt string
+	if err := tx.QueryRow(`SELECT id, name, avatar, thread_type, updated_at
+FROM zalo_threads WHERE id = ?`, threadID).Scan(
+		&out.Thread.ID, &out.Thread.Name, &out.Thread.Avatar,
+		&out.Thread.ThreadType, &updatedAt,
+	); errors.Is(err, sql.ErrNoRows) {
+		return AppThreadMemoryDetail{}, fmt.Errorf("thread %s: %w", threadID, ErrAppMemoryNotFound)
+	} else if err != nil {
+		return AppThreadMemoryDetail{}, fmt.Errorf("read Memory thread %s: %w", threadID, err)
 	}
-	if input.Pinned {
-		if err := appEnforcePinLimit(tx, "zalo_memory", "thread_id", threadID, 0, appMemoryPinLimit); err != nil {
-			return AppThreadMemory{}, err
+	out.Thread.UpdatedAt, err = parseTS(updatedAt)
+	if err != nil {
+		return AppThreadMemoryDetail{}, fmt.Errorf("parse Memory thread %s updated_at: %w", threadID, err)
+	}
+	if out.Thread.ThreadType == ipc.ZaloThreadUser {
+		selectedUID = threadID
+	}
+	out.SelectedUID = selectedUID
+
+	if err := appExpirePromptMemory(tx, now); err != nil {
+		return AppThreadMemoryDetail{}, err
+	}
+	out.Common, err = appReadMemoryScopeCounts(tx, threadID, "")
+	if err != nil {
+		return AppThreadMemoryDetail{}, err
+	}
+	out.Members, err = appReadMemoryMembers(tx, out.Thread, selectedUID)
+	if err != nil {
+		return AppThreadMemoryDetail{}, err
+	}
+	if err := tx.QueryRow(`SELECT
+  COALESCE((SELECT revision FROM app_memory_subject_revisions
+            WHERE thread_id = ? AND uid = ''), 0),
+  COALESCE((SELECT revision FROM app_memory_subject_revisions
+            WHERE thread_id = ? AND uid = ?), 0)`,
+		threadID, threadID, selectedUID,
+	).Scan(&out.CommonRevision, &out.SubjectRevision); err != nil {
+		return AppThreadMemoryDetail{}, fmt.Errorf("read scoped Memory revisions for %s: %w", threadID, err)
+	}
+	if selectedUID == "" {
+		out.SubjectRevision = 0
+	}
+	if err := tx.QueryRow(`SELECT
+  COALESCE((SELECT memory_subject_uid FROM app_zalo_cli_sessions WHERE thread_id = ?), ''),
+  COALESCE((SELECT memory_subject_revision FROM app_zalo_cli_sessions WHERE thread_id = ?), 0),
+  COALESCE((SELECT memory_common_revision FROM app_zalo_cli_sessions WHERE thread_id = ?), 0)`,
+		threadID, threadID, threadID,
+	).Scan(&out.SessionSubjectUID, &out.SyncedSubjectRevision, &out.SyncedCommonRevision); err != nil {
+		return AppThreadMemoryDetail{}, fmt.Errorf("read scoped Memory sync for %s: %w", threadID, err)
+	}
+	if selectedUID == "" {
+		out.Synced = out.SyncedCommonRevision == out.CommonRevision
+	} else {
+		out.Synced = out.SessionSubjectUID == selectedUID &&
+			out.SyncedSubjectRevision == out.SubjectRevision &&
+			out.SyncedCommonRevision == out.CommonRevision
+	}
+
+	out.Active, err = appReadThreadMemorySection(tx, threadID, selectedUID, "active")
+	if err != nil {
+		return AppThreadMemoryDetail{}, err
+	}
+	out.Pending, err = appReadThreadMemorySection(tx, threadID, selectedUID, "pending")
+	if err != nil {
+		return AppThreadMemoryDetail{}, err
+	}
+	out.Expired, err = appReadThreadMemorySection(tx, threadID, selectedUID, "expired")
+	if err != nil {
+		return AppThreadMemoryDetail{}, err
+	}
+	targets, err := appReadProposalTargets(tx, threadID, selectedUID)
+	if err != nil {
+		return AppThreadMemoryDetail{}, err
+	}
+	for i := range out.Pending {
+		target, ok := targets[out.Pending[i].SupersedesID]
+		if ok {
+			out.Pending[i].ProposalTarget = &target
 		}
 	}
-	now := ts(time.Now())
-	result, err := tx.Exec(`INSERT INTO zalo_memory(
-thread_id, uid, text, created_at, pinned, source, source_message_id, updated_at)
-VALUES (?, '', ?, ?, ?, 'operator', 0, ?)`, threadID, input.Text, now, input.Pinned, now)
-	if err != nil {
-		return AppThreadMemory{}, fmt.Errorf("create memory for %s: %w", threadID, err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return AppThreadMemory{}, fmt.Errorf("read created memory ID for %s: %w", threadID, err)
-	}
-	if err := appBumpMemoryRevision(tx, "thread", threadID); err != nil {
-		return AppThreadMemory{}, err
-	}
-	if err := appBumpSubjectMemoryRevision(tx, threadID, ""); err != nil {
-		return AppThreadMemory{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return AppThreadMemory{}, fmt.Errorf("commit memory create for %s: %w", threadID, err)
-	}
-	return s.appThreadMemoryByID(threadID, id)
-}
-
-func (s *Store) UpdateAppThreadMemory(threadID string, id int64, input AppThreadMemoryInput) (AppThreadMemory, error) {
-	threadID = strings.TrimSpace(threadID)
-	input, err := validateAppThreadMemoryInput(threadID, input)
-	if err != nil {
-		return AppThreadMemory{}, err
-	}
-	if id <= 0 {
-		return AppThreadMemory{}, fmt.Errorf("%w: memory ID must be positive", ErrAppMemoryInvalid)
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return AppThreadMemory{}, fmt.Errorf("begin memory update: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	var wasPinned bool
-	var uid string
-	if err := tx.QueryRow(`SELECT pinned, uid FROM zalo_memory WHERE thread_id = ? AND id = ?`, threadID, id).Scan(&wasPinned, &uid); errors.Is(err, sql.ErrNoRows) {
-		return AppThreadMemory{}, fmt.Errorf("memory %d in %s: %w", id, threadID, ErrAppMemoryNotFound)
-	} else if err != nil {
-		return AppThreadMemory{}, fmt.Errorf("read memory %d in %s: %w", id, threadID, err)
-	}
-	if input.Pinned && !wasPinned {
-		if err := appEnforcePinLimit(tx, "zalo_memory", "thread_id", threadID, id, appMemoryPinLimit); err != nil {
-			return AppThreadMemory{}, err
+	out.Thread.MemoryCount = len(out.Active) + len(out.Pending) + len(out.Expired)
+	for _, memory := range append(append(
+		append([]AppThreadMemory(nil), out.Active...), out.Pending...), out.Expired...) {
+		if memory.Pinned {
+			out.Thread.PinnedCount++
 		}
 	}
-	if _, err := tx.Exec(`UPDATE zalo_memory SET text = ?, pinned = ?, updated_at = ?
-WHERE thread_id = ? AND id = ?`, input.Text, input.Pinned, ts(time.Now()), threadID, id); err != nil {
-		return AppThreadMemory{}, fmt.Errorf("update memory %d in %s: %w", id, threadID, err)
+	if len(out.Active) > 0 {
+		out.Thread.Preview = out.Active[0].Text
 	}
-	if err := appBumpMemoryRevision(tx, "thread", threadID); err != nil {
-		return AppThreadMemory{}, err
+	out.Revision = out.SubjectRevision
+	out.SyncedRevision = out.SyncedSubjectRevision
+	if selectedUID == "" {
+		out.Revision = out.CommonRevision
+		out.SyncedRevision = out.SyncedCommonRevision
 	}
-	if err := appBumpSubjectMemoryRevision(tx, threadID, uid); err != nil {
-		return AppThreadMemory{}, err
-	}
+	out.Memories = out.Active
 	if err := tx.Commit(); err != nil {
-		return AppThreadMemory{}, fmt.Errorf("commit memory update %d in %s: %w", id, threadID, err)
+		return AppThreadMemoryDetail{}, fmt.Errorf("commit scoped Memory read for %s: %w", threadID, err)
 	}
-	return s.appThreadMemoryByID(threadID, id)
+	return out, nil
 }
 
-func (s *Store) DeleteAppThreadMemory(threadID string, id int64) error {
-	threadID = strings.TrimSpace(threadID)
-	if threadID == "" || id <= 0 {
-		return fmt.Errorf("%w: thread and memory IDs are required", ErrAppMemoryInvalid)
+func appReadMemoryScopeCounts(tx *sql.Tx, threadID, uid string) (AppMemoryScopeCounts, error) {
+	var out AppMemoryScopeCounts
+	if err := tx.QueryRow(`SELECT
+  COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END), 0)
+FROM zalo_memory WHERE thread_id = ? AND uid = ?`, threadID, uid).Scan(
+		&out.Active, &out.Pending, &out.Expired,
+	); err != nil {
+		return AppMemoryScopeCounts{}, fmt.Errorf("count scoped Memory for %s: %w", threadID, err)
 	}
-	tx, err := s.db.Begin()
+	return out, nil
+}
+
+func appReadMemoryMembers(
+	tx *sql.Tx,
+	thread AppMemoryThread,
+	selectedUID string,
+) ([]AppMemoryMember, error) {
+	if thread.ThreadType == ipc.ZaloThreadUser {
+		counts, err := appReadMemoryScopeCounts(tx, thread.ID, thread.ID)
+		if err != nil {
+			return nil, err
+		}
+		member := AppMemoryMember{UID: thread.ID, Name: thread.Name, Avatar: thread.Avatar}
+		member.AppMemoryScopeCounts = counts
+		if err := tx.QueryRow(`SELECT
+  COALESCE(NULLIF(display_name, ''), NULLIF(zalo_name, ''), ?),
+  COALESCE(NULLIF(avatar, ''), ?)
+FROM zalo_users WHERE uid = ?`, thread.Name, thread.Avatar, thread.ID).Scan(
+			&member.Name, &member.Avatar,
+		); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("read private Memory member %s: %w", thread.ID, err)
+		}
+		return []AppMemoryMember{member}, nil
+	}
+
+	rows, err := tx.Query(`SELECT gm.uid,
+       COALESCE(NULLIF(u.display_name, ''), NULLIF(u.zalo_name, ''), gm.uid),
+       COALESCE(u.avatar, ''),
+       COALESCE(SUM(CASE WHEN m.status = 'active' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN m.status = 'pending' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN m.status = 'expired' THEN 1 ELSE 0 END), 0)
+FROM zalo_group_members gm
+LEFT JOIN zalo_users u ON u.uid = gm.uid
+LEFT JOIN zalo_memory m ON m.thread_id = gm.group_id AND m.uid = gm.uid
+WHERE gm.group_id = ?
+GROUP BY gm.uid, u.display_name, u.zalo_name, u.avatar
+ORDER BY gm.uid ASC`, thread.ID)
 	if err != nil {
-		return fmt.Errorf("begin memory delete: %w", err)
+		return nil, fmt.Errorf("list Memory members for %s: %w", thread.ID, err)
 	}
-	defer func() { _ = tx.Rollback() }()
-	var uid string
-	if err := tx.QueryRow(`SELECT uid FROM zalo_memory WHERE thread_id = ? AND id = ?`, threadID, id).Scan(&uid); errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("memory %d in %s: %w", id, threadID, ErrAppMemoryNotFound)
-	} else if err != nil {
-		return fmt.Errorf("read memory %d in %s: %w", id, threadID, err)
+	defer rows.Close()
+	members := make([]AppMemoryMember, 0)
+	for rows.Next() {
+		var member AppMemoryMember
+		if err := rows.Scan(
+			&member.UID, &member.Name, &member.Avatar,
+			&member.Active, &member.Pending, &member.Expired,
+		); err != nil {
+			return nil, fmt.Errorf("scan Memory member for %s: %w", thread.ID, err)
+		}
+		members = append(members, member)
 	}
-	result, err := tx.Exec(`DELETE FROM zalo_memory WHERE thread_id = ? AND id = ?`, threadID, id)
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list Memory members for %s: %w", thread.ID, err)
+	}
+	return members, nil
+}
+
+func appReadThreadMemorySection(
+	tx *sql.Tx,
+	threadID, uid, status string,
+) ([]AppThreadMemory, error) {
+	rows, err := tx.Query(appThreadMemorySelect+`
+WHERE m.thread_id = ? AND m.uid = ? AND m.status = ?
+ORDER BY m.pinned DESC, m.id DESC LIMIT ?`, threadID, uid, status, appThreadMemoryLimit)
 	if err != nil {
-		return fmt.Errorf("delete memory %d in %s: %w", id, threadID, err)
+		return nil, fmt.Errorf("list %s Memory for %s: %w", status, threadID, err)
 	}
-	count, err := result.RowsAffected()
+	defer rows.Close()
+	out := make([]AppThreadMemory, 0)
+	for rows.Next() {
+		memory, err := scanAppThreadMemory(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, memory)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list %s Memory for %s: %w", status, threadID, err)
+	}
+	return out, nil
+}
+
+func appReadProposalTargets(
+	tx *sql.Tx,
+	threadID, uid string,
+) (map[int64]AppThreadMemory, error) {
+	rows, err := tx.Query(appThreadMemorySelect+`
+WHERE m.thread_id = ? AND m.uid = ? AND m.id IN (
+  SELECT proposal.supersedes_id FROM zalo_memory proposal
+  WHERE proposal.thread_id = ? AND proposal.uid = ?
+    AND proposal.status = 'pending' AND proposal.supersedes_id > 0
+)`, threadID, uid, threadID, uid)
 	if err != nil {
-		return fmt.Errorf("inspect memory delete %d in %s: %w", id, threadID, err)
+		return nil, fmt.Errorf("list proposal targets for %s: %w", threadID, err)
 	}
-	if count != 1 {
-		return fmt.Errorf("memory %d in %s: %w", id, threadID, ErrAppMemoryNotFound)
+	defer rows.Close()
+	targets := make(map[int64]AppThreadMemory)
+	for rows.Next() {
+		target, err := scanAppThreadMemory(rows)
+		if err != nil {
+			return nil, err
+		}
+		targets[target.ID] = target
 	}
-	if err := appBumpMemoryRevision(tx, "thread", threadID); err != nil {
-		return err
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list proposal targets for %s: %w", threadID, err)
 	}
-	if err := appBumpSubjectMemoryRevision(tx, threadID, uid); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit memory delete %d in %s: %w", id, threadID, err)
-	}
-	return nil
+	return targets, nil
 }
 
 func (s *Store) AppLessons(query string, pinnedOnly bool) (AppLessonList, error) {
@@ -387,115 +562,6 @@ ORDER BY l.pinned DESC, l.id DESC LIMIT ?`,
 	return out, nil
 }
 
-func (s *Store) CreateAppLesson(input AppLessonInput) (AppLesson, error) {
-	input, err := validateAppLessonInput(input)
-	if err != nil {
-		return AppLesson{}, err
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return AppLesson{}, fmt.Errorf("begin lesson create: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if input.ThreadID != "" {
-		if err := appRequireMemoryThread(tx, input.ThreadID); err != nil {
-			return AppLesson{}, err
-		}
-	}
-	if input.Pinned {
-		if err := appEnforcePinLimit(tx, "zalo_lessons", "", "", 0, appLessonPinLimit); err != nil {
-			return AppLesson{}, err
-		}
-	}
-	now := ts(time.Now())
-	result, err := tx.Exec(`INSERT INTO zalo_lessons(
-thread_id, bot_text, better, note, created_at, pinned, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, input.ThreadID, input.BotText, input.Better, input.Note, now, input.Pinned, now)
-	if err != nil {
-		return AppLesson{}, fmt.Errorf("create lesson: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return AppLesson{}, fmt.Errorf("read created lesson ID: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return AppLesson{}, fmt.Errorf("commit lesson create: %w", err)
-	}
-	return s.appLessonByID(id)
-}
-
-func (s *Store) UpdateAppLesson(id int64, input AppLessonInput) (AppLesson, error) {
-	input, err := validateAppLessonInput(input)
-	if err != nil {
-		return AppLesson{}, err
-	}
-	if id <= 0 {
-		return AppLesson{}, fmt.Errorf("%w: lesson ID must be positive", ErrAppMemoryInvalid)
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return AppLesson{}, fmt.Errorf("begin lesson update: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if input.ThreadID != "" {
-		if err := appRequireMemoryThread(tx, input.ThreadID); err != nil {
-			return AppLesson{}, err
-		}
-	}
-	var wasPinned bool
-	if err := tx.QueryRow(`SELECT pinned FROM zalo_lessons WHERE id = ?`, id).Scan(&wasPinned); errors.Is(err, sql.ErrNoRows) {
-		return AppLesson{}, fmt.Errorf("lesson %d: %w", id, ErrAppMemoryNotFound)
-	} else if err != nil {
-		return AppLesson{}, fmt.Errorf("read lesson %d: %w", id, err)
-	}
-	if input.Pinned && !wasPinned {
-		if err := appEnforcePinLimit(tx, "zalo_lessons", "", "", id, appLessonPinLimit); err != nil {
-			return AppLesson{}, err
-		}
-	}
-	if _, err := tx.Exec(`UPDATE zalo_lessons SET
-thread_id = ?, bot_text = ?, better = ?, note = ?, pinned = ?, updated_at = ?
-WHERE id = ?`, input.ThreadID, input.BotText, input.Better, input.Note, input.Pinned, ts(time.Now()), id); err != nil {
-		return AppLesson{}, fmt.Errorf("update lesson %d: %w", id, err)
-	}
-	if err := appBumpMemoryRevision(tx, "lessons", ""); err != nil {
-		return AppLesson{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return AppLesson{}, fmt.Errorf("commit lesson update %d: %w", id, err)
-	}
-	return s.appLessonByID(id)
-}
-
-func (s *Store) DeleteAppLesson(id int64) error {
-	if id <= 0 {
-		return fmt.Errorf("%w: lesson ID must be positive", ErrAppMemoryInvalid)
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin lesson delete: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	result, err := tx.Exec(`DELETE FROM zalo_lessons WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete lesson %d: %w", id, err)
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("inspect lesson delete %d: %w", id, err)
-	}
-	if count != 1 {
-		return fmt.Errorf("lesson %d: %w", id, ErrAppMemoryNotFound)
-	}
-	if err := appBumpMemoryRevision(tx, "lessons", ""); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit lesson delete %d: %w", id, err)
-	}
-	return nil
-}
-
 func (s *Store) AppMemoryRevisions(threadID string) (AppMemoryRevision, error) {
 	var out AppMemoryRevision
 	if err := s.db.QueryRow(`SELECT
@@ -511,17 +577,31 @@ func (s *Store) AppMemoryRevisions(threadID string) (AppMemoryRevision, error) {
 }
 
 func (s *Store) AppPromptMemory(threadID string, limit int) ([]ipc.ZaloMemory, int64, error) {
-	snapshot, err := s.AppPromptMemoryForSubject(threadID, "", limit, time.Now())
+	subjectUID := ""
+	var threadType string
+	if err := s.db.QueryRow(`SELECT thread_type FROM zalo_threads WHERE id = ?`,
+		threadID).Scan(&threadType); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, 0, fmt.Errorf("read legacy prompt Memory thread %s: %w", threadID, err)
+	}
+	if threadType == ipc.ZaloThreadUser {
+		subjectUID = threadID
+	}
+	snapshot, err := s.AppPromptMemoryForSubject(threadID, subjectUID, limit, time.Now())
 	if err != nil {
 		return nil, 0, err
 	}
-	out := make([]ipc.ZaloMemory, 0, len(snapshot.Common))
-	for _, item := range snapshot.Common {
+	items := append(append([]AppPromptMemoryItem(nil), snapshot.Common...), snapshot.Subject...)
+	out := make([]ipc.ZaloMemory, 0, len(items))
+	for _, item := range items {
 		out = append(out, ipc.ZaloMemory{
 			ThreadID: threadID, UID: item.UID, Text: item.Text, CreatedAt: item.createdAt,
 		})
 	}
-	return out, snapshot.CommonRevision, nil
+	revision := snapshot.CommonRevision
+	if subjectUID != "" {
+		revision = snapshot.SubjectRevision
+	}
+	return out, revision, nil
 }
 
 func (s *Store) AppPromptLessons(limit int) ([]ipc.ZaloLesson, int64, error) {
@@ -579,7 +659,9 @@ SELECT m.id, m.thread_id, COALESCE(t.name, ''), m.text, m.pinned, m.source,
        COALESCE((SELECT sm.body FROM zalo_messages sm
                  WHERE sm.id = m.source_message_id AND sm.thread_id = m.thread_id), ''),
        m.created_at,
-       CASE WHEN m.updated_at <> '' THEN m.updated_at ELSE m.created_at END
+       CASE WHEN m.updated_at <> '' THEN m.updated_at ELSE m.created_at END,
+       m.uid, m.memory_key, m.category, m.confidence, m.status, m.proposal_action,
+       m.supersedes_id, m.last_confirmed_at, m.expires_at
 FROM zalo_memory m
 LEFT JOIN zalo_threads t ON t.id = m.thread_id`
 
@@ -596,10 +678,13 @@ type appRowScanner interface {
 
 func scanAppThreadMemory(row appRowScanner) (AppThreadMemory, error) {
 	var out AppThreadMemory
-	var createdAt, updatedAt string
+	var createdAt, updatedAt, lastConfirmedAt string
+	var expiresAt sql.NullString
 	if err := row.Scan(
 		&out.ID, &out.ThreadID, &out.ThreadName, &out.Text, &out.Pinned, &out.Source,
 		&out.SourceMessageID, &out.SourcePreview, &createdAt, &updatedAt,
+		&out.UID, &out.MemoryKey, &out.Category, &out.Confidence, &out.Status,
+		&out.ProposalAction, &out.SupersedesID, &lastConfirmedAt, &expiresAt,
 	); err != nil {
 		return AppThreadMemory{}, fmt.Errorf("scan app memory: %w", err)
 	}
@@ -611,6 +696,20 @@ func scanAppThreadMemory(row appRowScanner) (AppThreadMemory, error) {
 	out.UpdatedAt, err = parseTS(updatedAt)
 	if err != nil {
 		return AppThreadMemory{}, fmt.Errorf("parse app memory updated_at: %w", err)
+	}
+	if lastConfirmedAt != "" {
+		parsed, err := parseTS(lastConfirmedAt)
+		if err != nil {
+			return AppThreadMemory{}, fmt.Errorf("parse app memory last_confirmed_at: %w", err)
+		}
+		out.LastConfirmedAt = &parsed
+	}
+	if expiresAt.Valid && expiresAt.String != "" {
+		parsed, err := parseTS(expiresAt.String)
+		if err != nil {
+			return AppThreadMemory{}, fmt.Errorf("parse app memory expires_at: %w", err)
+		}
+		out.ExpiresAt = &parsed
 	}
 	return out, nil
 }
@@ -653,20 +752,6 @@ func (s *Store) appLessonByID(id int64) (AppLesson, error) {
 	return out, err
 }
 
-func validateAppThreadMemoryInput(threadID string, input AppThreadMemoryInput) (AppThreadMemoryInput, error) {
-	if threadID == "" {
-		return AppThreadMemoryInput{}, fmt.Errorf("%w: thread ID is required", ErrAppMemoryInvalid)
-	}
-	input.Text = strings.TrimSpace(input.Text)
-	if input.Text == "" {
-		return AppThreadMemoryInput{}, fmt.Errorf("%w: memory text is required", ErrAppMemoryInvalid)
-	}
-	if len([]rune(input.Text)) > maxZaloMemoryLen {
-		return AppThreadMemoryInput{}, fmt.Errorf("%w: memory exceeds %d runes", ErrAppMemoryInvalid, maxZaloMemoryLen)
-	}
-	return input, nil
-}
-
 func validateAppLessonInput(input AppLessonInput) (AppLessonInput, error) {
 	input.ThreadID = strings.TrimSpace(input.ThreadID)
 	input.BotText = strings.TrimSpace(input.BotText)
@@ -685,56 +770,6 @@ func validateAppLessonInput(input AppLessonInput) (AppLessonInput, error) {
 		return AppLessonInput{}, fmt.Errorf("%w: lesson requires better text or note", ErrAppMemoryInvalid)
 	}
 	return input, nil
-}
-
-func appRequireMemoryThread(tx *sql.Tx, threadID string) error {
-	var exists int
-	if err := tx.QueryRow(`SELECT 1 FROM zalo_threads WHERE id = ?`, threadID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("thread %s: %w", threadID, ErrAppMemoryNotFound)
-	} else if err != nil {
-		return fmt.Errorf("read memory thread %s: %w", threadID, err)
-	}
-	return nil
-}
-
-func appEnforcePinLimit(
-	tx *sql.Tx,
-	table, scopeColumn, scopeID string,
-	excludeID int64,
-	limit int,
-) error {
-	query := `SELECT COUNT(*) FROM ` + table + ` WHERE pinned = 1 AND id <> ?`
-	args := []any{excludeID}
-	if scopeColumn != "" {
-		query += ` AND ` + scopeColumn + ` = ?`
-		args = append(args, scopeID)
-	}
-	var count int
-	if err := tx.QueryRow(query, args...).Scan(&count); err != nil {
-		return fmt.Errorf("count pinned memory: %w", err)
-	}
-	if count >= limit {
-		return fmt.Errorf("%w: maximum %d", ErrAppMemoryPinLimit, limit)
-	}
-	return nil
-}
-
-func appBumpMemoryRevision(tx *sql.Tx, scope, scopeID string) error {
-	if _, err := tx.Exec(`INSERT INTO app_memory_revisions(scope, scope_id, revision)
-VALUES (?, ?, 1)
-ON CONFLICT(scope, scope_id) DO UPDATE SET revision = revision + 1`, scope, scopeID); err != nil {
-		return fmt.Errorf("bump %s memory revision: %w", scope, err)
-	}
-	return nil
-}
-
-func appBumpSubjectMemoryRevision(tx *sql.Tx, threadID, uid string) error {
-	if _, err := tx.Exec(`INSERT INTO app_memory_subject_revisions(thread_id, uid, revision)
-VALUES (?, ?, 1)
-ON CONFLICT(thread_id, uid) DO UPDATE SET revision = revision + 1`, threadID, uid); err != nil {
-		return fmt.Errorf("bump subject Memory revision: %w", err)
-	}
-	return nil
 }
 
 func appMemoryLikePattern(query string) string {
