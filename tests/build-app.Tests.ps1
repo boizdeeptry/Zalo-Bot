@@ -71,6 +71,32 @@ function Assert-SeamTargetHashes {
   }
 }
 
+function Assert-CRLFUTF8File {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$ExpectedText
+  )
+
+  $bytes = [IO.File]::ReadAllBytes($Path)
+  if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    throw 'UTF-8 BOM was added'
+  }
+  $strictUTF8 = [Text.UTF8Encoding]::new($false, $true)
+  $text = $strictUTF8.GetString($bytes)
+  if (-not $text.Contains($ExpectedText)) {
+    throw 'Vietnamese text did not survive UTF-8 decoding'
+  }
+  if (-not $text.Contains("`r`n")) {
+    throw 'CRLF line endings were removed'
+  }
+  if ([regex]::IsMatch($text, '(?<!\r)\n')) {
+    throw 'File contains a bare LF'
+  }
+  if ([regex]::IsMatch($text, '\r(?!\n)')) {
+    throw 'File contains a bare CR'
+  }
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('portal-path-' + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -460,5 +486,74 @@ func trigger() {
 } finally {
   if (Test-Path -LiteralPath $stageTestRoot) {
     Remove-Item -LiteralPath $stageTestRoot -Recurse -Force
+  }
+}
+
+$crlfStage = Join-Path ([IO.Path]::GetTempPath()) ('portal-crlf-stage-' + [guid]::NewGuid().ToString('N'))
+
+try {
+  Write-TestFile (Join-Path $crlfStage 'internal\daemon\server.go') @'
+func server() {
+	mux.Handle("POST /shutdown", a.auth(a.handleShutdown))
+}
+'@
+  Write-TestFile (Join-Path $crlfStage 'internal\store\store.go') @'
+func migrate(db *sql.DB) error {
+	return nil
+}
+
+// hasColumn asks SQLite rather than tracking a version number.
+'@
+  Write-TestFile (Join-Path $crlfStage 'internal\daemon\zalo.go') @'
+func incoming() {
+		a.batch.add(req.ThreadID, kind, msg.Body, delay, ipc.ZaloOutboxDraft{})
+}
+'@
+
+  $vietnameseComment = '// Giữ nguyên tiếng Việt sau khi chèn đường nối phiên Zalo.'
+  $dutyCRLF = @(
+    'package daemon'
+    ''
+    $vietnameseComment
+    'func answer() {'
+    "`traw, err := run.Run(ctx, buildConsultPrompt(pz, question, history, found, files...), step)"
+    '}'
+    ''
+    'func trigger() {'
+    "`tgo func() {"
+    "`t`tctx, cancel := context.WithTimeout(context.Background(), deps.cfg.Timeout)"
+    "`t`tdefer cancel()"
+    "`t`t// Bước của lượt đi vào log dùng chung, không phải một danh sách riêng của lượt:"
+    "`t`t// terminal là một dòng thời gian, và một lượt đã xong vẫn nằm đó để đọc."
+    "`t`tstep := func(text string) { a.zlog.add(ipc.ZaloLogStep, threadID, text) }"
+    "`t`terr := a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)"
+    "`t}()"
+    '}'
+    ''
+  ) -join "`r`n"
+  $crlfDutyPath = Join-Path $crlfStage 'internal\daemon\duty.go'
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $crlfDutyPath)) | Out-Null
+  [IO.File]::WriteAllText($crlfDutyPath, $dutyCRLF, [Text.UTF8Encoding]::new($false))
+
+  Apply-AppSeams -Stage $crlfStage
+
+  Assert-CRLFUTF8File -Path $crlfDutyPath -ExpectedText $vietnameseComment
+  $stagedCRLFDuty = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($crlfDutyPath))
+  if ([regex]::Matches($stagedCRLFDuty, 'a\.appAnswerZalo\(deps, threadID, question, reply, files\)').Count -ne 1) {
+    throw 'CRLF fixture is missing the session answer seam'
+  }
+  if ([regex]::Matches($stagedCRLFDuty, 'a\.appRunZalo\(ctx, run, pz, threadID, question, appZaloCurrentMsgID\(reply\.ReplyQuote\), history, found, files, step\)').Count -ne 1) {
+    throw 'CRLF fixture is missing the session runner seam'
+  }
+
+  $mutatedDutyPath = Join-Path $crlfStage 'internal\daemon\duty-mutated.go'
+  [IO.File]::WriteAllText($mutatedDutyPath, $stagedCRLFDuty.Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Assert-CRLFUTF8File -Path $mutatedDutyPath -ExpectedText $vietnameseComment } `
+    -Pattern 'CRLF line endings were removed|bare LF' -Message 'The CRLF regression assertion accepted an LF mutation'
+
+  Write-Host 'PASS: duty seam preserves CRLF and BOM-free UTF-8 Vietnamese text.'
+} finally {
+  if (Test-Path -LiteralPath $crlfStage) {
+    Remove-Item -LiteralPath $crlfStage -Recurse -Force
   }
 }
