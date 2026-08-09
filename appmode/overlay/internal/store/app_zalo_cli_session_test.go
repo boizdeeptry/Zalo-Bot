@@ -35,16 +35,20 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 	}
 
 	group, err := s.CreateZaloCLISession(ZaloCLISession{
-		ThreadID:          "group-1",
-		ClaudeSessionID:   "claude-group-1",
-		Model:             "claude-sonnet",
-		PromptFingerprint: "persona-v1",
+		ThreadID:              "group-1",
+		ClaudeSessionID:       "session-1",
+		Model:                 "sonnet",
+		PromptFingerprint:     "v2",
+		MemorySubjectUID:      "user-1",
+		MemorySubjectRevision: 7,
+		MemoryCommonRevision:  3,
 	})
 	if err != nil {
 		t.Fatalf("CreateZaloCLISession(group): %v", err)
 	}
-	if group.ClaudeSessionID == user.ClaudeSessionID {
-		t.Fatal("different user/group threads shared a Claude session")
+	if group.ClaudeSessionID == user.ClaudeSessionID || group.MemorySubjectUID != "user-1" ||
+		group.MemorySubjectRevision != 7 || group.MemoryCommonRevision != 3 {
+		t.Fatalf("created group session = %#v; want independent session with Memory cursors user-1/7/3", group)
 	}
 
 	next := user
@@ -63,35 +67,40 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReplaceZaloCLISession: %v", err)
 	}
-	if replaced.Generation != 2 || replaced.ClaudeSessionID != "claude-user-2" || replaced.MessageCursor != 7 {
-		t.Fatalf("replaced session = %#v; want generation 2, claude-user-2, cursor still 7", replaced)
+	if replaced.Generation != 2 || replaced.ClaudeSessionID != "claude-user-2" || replaced.MessageCursor != 7 ||
+		replaced.MemorySubjectUID != "" || replaced.MemorySubjectRevision != 0 || replaced.MemoryCommonRevision != 0 {
+		t.Fatalf("replaced session = %#v; want generation 2, claude-user-2, cursor still 7, Memory cursors reset", replaced)
 	}
 
 	unchangedGroup, err := s.ZaloCLISession("group-1")
 	if err != nil {
 		t.Fatalf("ZaloCLISession(group): %v", err)
 	}
-	if unchangedGroup.Generation != 1 || unchangedGroup.ClaudeSessionID != "claude-group-1" {
+	if unchangedGroup.Generation != 1 || unchangedGroup.ClaudeSessionID != "session-1" ||
+		unchangedGroup.MemorySubjectUID != "user-1" || unchangedGroup.MemorySubjectRevision != 7 ||
+		unchangedGroup.MemoryCommonRevision != 3 {
 		t.Fatalf("group session changed with user session: %#v", unchangedGroup)
 	}
 
-	completed, err := s.CompleteZaloCLITurn("user-1", 2, 8_192, 12, 5, 3)
+	completed, err := s.CompleteZaloCLITurn("user-1", 2, 8_192, 12, "subject-1", 6, 4, 5, 3)
 	if err != nil {
 		t.Fatalf("CompleteZaloCLITurn(first): %v", err)
 	}
 	if completed.ContextTokens != 8_192 || completed.TurnCount != 1 || completed.MessageCursor != 12 ||
-		completed.MemoryRevision != 5 || completed.LessonsRevision != 3 {
-		t.Fatalf("completed session = %#v; want tokens=8192 turn=1 cursor=12 revisions=5/3", completed)
+		completed.MemorySubjectUID != "subject-1" || completed.MemorySubjectRevision != 6 ||
+		completed.MemoryCommonRevision != 4 || completed.MemoryRevision != 5 || completed.LessonsRevision != 3 {
+		t.Fatalf("completed session = %#v; want tokens=8192 turn=1 cursor=12 Memory cursors=subject-1/6/4 revisions=5/3", completed)
 	}
-	completed, err = s.CompleteZaloCLITurn("user-1", 2, 9_000, 5, 7, 4)
+	completed, err = s.CompleteZaloCLITurn("user-1", 2, 9_000, 5, "subject-2", 8, 6, 7, 4)
 	if err != nil {
 		t.Fatalf("CompleteZaloCLITurn(lower cursor): %v", err)
 	}
 	if completed.ContextTokens != 9_000 || completed.TurnCount != 2 || completed.MessageCursor != 12 ||
-		completed.MemoryRevision != 7 || completed.LessonsRevision != 4 {
-		t.Fatalf("completed session = %#v; want tokens=9000 turn=2 cursor=12 revisions=7/4", completed)
+		completed.MemorySubjectUID != "subject-2" || completed.MemorySubjectRevision != 8 ||
+		completed.MemoryCommonRevision != 6 || completed.MemoryRevision != 7 || completed.LessonsRevision != 4 {
+		t.Fatalf("completed session = %#v; want tokens=9000 turn=2 cursor=12 Memory cursors=subject-2/8/6 revisions=7/4", completed)
 	}
-	if _, err := s.CompleteZaloCLITurn("user-1", 1, 10_000, 13, 8, 5); !errors.Is(err, ErrZaloCLISessionConflict) {
+	if _, err := s.CompleteZaloCLITurn("user-1", 1, 10_000, 13, "subject-3", 9, 7, 8, 5); !errors.Is(err, ErrZaloCLISessionConflict) {
 		t.Fatalf("CompleteZaloCLITurn(stale) = %v; want ErrZaloCLISessionConflict", err)
 	}
 

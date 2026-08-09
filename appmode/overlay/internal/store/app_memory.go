@@ -254,6 +254,12 @@ VALUES (?, '', ?, ?, ?, 'operator', 0, ?)`, threadID, input.Text, now, input.Pin
 	if err != nil {
 		return AppThreadMemory{}, fmt.Errorf("read created memory ID for %s: %w", threadID, err)
 	}
+	if err := appBumpMemoryRevision(tx, "thread", threadID); err != nil {
+		return AppThreadMemory{}, err
+	}
+	if err := appBumpSubjectMemoryRevision(tx, threadID, ""); err != nil {
+		return AppThreadMemory{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return AppThreadMemory{}, fmt.Errorf("commit memory create for %s: %w", threadID, err)
 	}
@@ -275,7 +281,8 @@ func (s *Store) UpdateAppThreadMemory(threadID string, id int64, input AppThread
 	}
 	defer func() { _ = tx.Rollback() }()
 	var wasPinned bool
-	if err := tx.QueryRow(`SELECT pinned FROM zalo_memory WHERE thread_id = ? AND id = ?`, threadID, id).Scan(&wasPinned); errors.Is(err, sql.ErrNoRows) {
+	var uid string
+	if err := tx.QueryRow(`SELECT pinned, uid FROM zalo_memory WHERE thread_id = ? AND id = ?`, threadID, id).Scan(&wasPinned, &uid); errors.Is(err, sql.ErrNoRows) {
 		return AppThreadMemory{}, fmt.Errorf("memory %d in %s: %w", id, threadID, ErrAppMemoryNotFound)
 	} else if err != nil {
 		return AppThreadMemory{}, fmt.Errorf("read memory %d in %s: %w", id, threadID, err)
@@ -290,6 +297,9 @@ WHERE thread_id = ? AND id = ?`, input.Text, input.Pinned, ts(time.Now()), threa
 		return AppThreadMemory{}, fmt.Errorf("update memory %d in %s: %w", id, threadID, err)
 	}
 	if err := appBumpMemoryRevision(tx, "thread", threadID); err != nil {
+		return AppThreadMemory{}, err
+	}
+	if err := appBumpSubjectMemoryRevision(tx, threadID, uid); err != nil {
 		return AppThreadMemory{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -308,6 +318,12 @@ func (s *Store) DeleteAppThreadMemory(threadID string, id int64) error {
 		return fmt.Errorf("begin memory delete: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var uid string
+	if err := tx.QueryRow(`SELECT uid FROM zalo_memory WHERE thread_id = ? AND id = ?`, threadID, id).Scan(&uid); errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("memory %d in %s: %w", id, threadID, ErrAppMemoryNotFound)
+	} else if err != nil {
+		return fmt.Errorf("read memory %d in %s: %w", id, threadID, err)
+	}
 	result, err := tx.Exec(`DELETE FROM zalo_memory WHERE thread_id = ? AND id = ?`, threadID, id)
 	if err != nil {
 		return fmt.Errorf("delete memory %d in %s: %w", id, threadID, err)
@@ -320,6 +336,9 @@ func (s *Store) DeleteAppThreadMemory(threadID string, id int64) error {
 		return fmt.Errorf("memory %d in %s: %w", id, threadID, ErrAppMemoryNotFound)
 	}
 	if err := appBumpMemoryRevision(tx, "thread", threadID); err != nil {
+		return err
+	}
+	if err := appBumpSubjectMemoryRevision(tx, threadID, uid); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -740,6 +759,15 @@ func appBumpMemoryRevision(tx *sql.Tx, scope, scopeID string) error {
 VALUES (?, ?, 1)
 ON CONFLICT(scope, scope_id) DO UPDATE SET revision = revision + 1`, scope, scopeID); err != nil {
 		return fmt.Errorf("bump %s memory revision: %w", scope, err)
+	}
+	return nil
+}
+
+func appBumpSubjectMemoryRevision(tx *sql.Tx, threadID, uid string) error {
+	if _, err := tx.Exec(`INSERT INTO app_memory_subject_revisions(thread_id, uid, revision)
+VALUES (?, ?, 1)
+ON CONFLICT(thread_id, uid) DO UPDATE SET revision = revision + 1`, threadID, uid); err != nil {
+		return fmt.Errorf("bump subject Memory revision: %w", err)
 	}
 	return nil
 }

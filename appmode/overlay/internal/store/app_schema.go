@@ -2,11 +2,13 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
+	"time"
 )
 
-const appSchemaVersion int64 = 3
+const appSchemaVersion int64 = 4
 
 const appFoundationSchema = `
 CREATE TABLE IF NOT EXISTS app_meta (
@@ -56,6 +58,38 @@ var appV3Columns = []appColumnMigration{
 	{table: "app_zalo_cli_sessions", column: "lessons_revision", definition: "INTEGER NOT NULL DEFAULT 0"},
 }
 
+var appV4Columns = []appColumnMigration{
+	{table: "zalo_memory", column: "memory_key", definition: "TEXT NOT NULL DEFAULT ''"},
+	{table: "zalo_memory", column: "category", definition: "TEXT NOT NULL DEFAULT 'profile'"},
+	{table: "zalo_memory", column: "confidence", definition: "REAL NOT NULL DEFAULT 1"},
+	{table: "zalo_memory", column: "status", definition: "TEXT NOT NULL DEFAULT 'active'"},
+	{table: "zalo_memory", column: "proposal_action", definition: "TEXT NOT NULL DEFAULT ''"},
+	{table: "zalo_memory", column: "supersedes_id", definition: "INTEGER NOT NULL DEFAULT 0"},
+	{table: "zalo_memory", column: "last_confirmed_at", definition: "TEXT NOT NULL DEFAULT ''"},
+	{table: "zalo_memory", column: "expires_at", definition: "TEXT"},
+	{table: "app_zalo_cli_sessions", column: "memory_subject_uid", definition: "TEXT NOT NULL DEFAULT ''"},
+	{table: "app_zalo_cli_sessions", column: "memory_subject_revision", definition: "INTEGER NOT NULL DEFAULT 0"},
+	{table: "app_zalo_cli_sessions", column: "memory_common_revision", definition: "INTEGER NOT NULL DEFAULT 0"},
+}
+
+const appMemoryV4Schema = `
+CREATE TABLE IF NOT EXISTS app_memory_subject_revisions (
+  thread_id TEXT NOT NULL,
+  uid       TEXT NOT NULL,
+  revision  INTEGER NOT NULL,
+  PRIMARY KEY(thread_id, uid)
+);
+`
+
+const appMemoryV4Indexes = `
+CREATE INDEX IF NOT EXISTS idx_zalo_memory_subject_status
+  ON zalo_memory(thread_id, uid, status, pinned, id);
+CREATE INDEX IF NOT EXISTS idx_zalo_memory_subject_key_status
+  ON zalo_memory(thread_id, uid, memory_key, status);
+CREATE INDEX IF NOT EXISTS idx_zalo_memory_status_expires_at
+  ON zalo_memory(status, expires_at);
+`
+
 const appZaloMemoryProvenanceTriggerSchema = `
 CREATE TRIGGER IF NOT EXISTS app_zalo_memory_insert_provenance
 AFTER INSERT ON zalo_memory
@@ -98,43 +132,62 @@ func migrateApp(db *sql.DB) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var rawVersion string
+	versionExists := false
+	metaExists, err := appTableExists(tx, "app_meta")
+	if err != nil {
+		return err
+	}
+	if metaExists {
+		if err := tx.QueryRow(
+			`SELECT value FROM app_meta WHERE key = 'schema_version'`,
+		).Scan(&rawVersion); errors.Is(err, sql.ErrNoRows) {
+			versionExists = false
+		} else if err != nil {
+			return fmt.Errorf("read Portal schema_version: %w", err)
+		} else {
+			versionExists = true
+		}
+	}
+	version := int64(0)
+	if versionExists {
+		var parseErr error
+		version, parseErr = strconv.ParseInt(rawVersion, 10, 64)
+		if parseErr != nil {
+			return fmt.Errorf("parse Portal schema_version %q: %w", rawVersion, parseErr)
+		}
+		if version < 0 {
+			return fmt.Errorf("invalid Portal schema_version %q: version must be non-negative", rawVersion)
+		}
+	}
+	if versionExists && version >= appSchemaVersion {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit Portal foundation migration: %w", err)
+		}
+		return nil
+	}
+
 	if _, err := tx.Exec(appFoundationSchema); err != nil {
 		return fmt.Errorf("migrate Portal foundation: %w", err)
 	}
-	legacyMemory := false
-	for _, migration := range appV3Columns {
-		added, err := appEnsureColumn(tx, migration)
-		if err != nil {
+	if version < 3 {
+		if err := appMigrateMemoryV3(tx); err != nil {
 			return err
 		}
-		if migration.table == "zalo_memory" && migration.column == "source" {
-			legacyMemory = added
+	}
+	if version < 4 {
+		if err := appMigrateMemoryV4(tx); err != nil {
+			return err
 		}
 	}
-	if err := appMigrateMemoryRevisions(tx, legacyMemory); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(
-		`INSERT OR IGNORE INTO app_meta(key, value) VALUES ('schema_version', ?)`,
-		strconv.FormatInt(appSchemaVersion, 10),
-	); err != nil {
-		return fmt.Errorf("initialize Portal schema_version: %w", err)
-	}
-
-	var rawVersion string
-	if err := tx.QueryRow(
-		`SELECT value FROM app_meta WHERE key = 'schema_version'`,
-	).Scan(&rawVersion); err != nil {
-		return fmt.Errorf("read Portal schema_version: %w", err)
-	}
-	version, parseErr := strconv.ParseInt(rawVersion, 10, 64)
-	if parseErr != nil {
-		return fmt.Errorf("parse Portal schema_version %q: %w", rawVersion, parseErr)
-	}
-	if version < 0 {
-		return fmt.Errorf("invalid Portal schema_version %q: version must be non-negative", rawVersion)
-	}
-	if version < appSchemaVersion {
+	if !versionExists {
+		if _, err := tx.Exec(
+			`INSERT INTO app_meta(key, value) VALUES ('schema_version', ?)`,
+			strconv.FormatInt(appSchemaVersion, 10),
+		); err != nil {
+			return fmt.Errorf("initialize Portal schema_version: %w", err)
+		}
+	} else if version < appSchemaVersion {
 		if _, err := tx.Exec(
 			`UPDATE app_meta SET value = ? WHERE key = 'schema_version'`,
 			strconv.FormatInt(appSchemaVersion, 10),
@@ -198,7 +251,18 @@ func appTableExists(tx *sql.Tx, table string) (bool, error) {
 	return count == 1, nil
 }
 
-func appMigrateMemoryRevisions(tx *sql.Tx, legacyMemory bool) error {
+func appMigrateMemoryV3(tx *sql.Tx) error {
+	legacyMemory := false
+	for _, migration := range appV3Columns {
+		added, err := appEnsureColumn(tx, migration)
+		if err != nil {
+			return err
+		}
+		if migration.table == "zalo_memory" && migration.column == "source" {
+			legacyMemory = added
+		}
+	}
+
 	memoryExists, err := appTableExists(tx, "zalo_memory")
 	if err != nil {
 		return err
@@ -241,6 +305,67 @@ SELECT 'lessons', '', 1 WHERE EXISTS (SELECT 1 FROM zalo_lessons LIMIT 1)`); err
 	}
 	if _, err := tx.Exec(appZaloLessonTriggerSchema); err != nil {
 		return fmt.Errorf("create Zalo lesson trigger: %w", err)
+	}
+	return nil
+}
+
+func appMigrateMemoryV4(tx *sql.Tx) error {
+	for _, migration := range appV4Columns {
+		if _, err := appEnsureColumn(tx, migration); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(appMemoryV4Schema); err != nil {
+		return fmt.Errorf("create Memory V2 subject revisions: %w", err)
+	}
+
+	memoryExists, err := appTableExists(tx, "zalo_memory")
+	if err != nil {
+		return err
+	}
+	if !memoryExists {
+		return nil
+	}
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS app_zalo_memory_insert_revision`); err != nil {
+		return fmt.Errorf("drop legacy Zalo memory revision trigger: %w", err)
+	}
+	if _, err := tx.Exec(appMemoryV4Indexes); err != nil {
+		return fmt.Errorf("create Memory V2 indexes: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE zalo_memory
+SET memory_key = CASE WHEN memory_key = '' THEN 'legacy.' || id ELSE memory_key END,
+    category = CASE WHEN category = '' THEN 'profile' ELSE category END,
+    confidence = 1,
+    status = CASE WHEN status = '' THEN 'active' ELSE status END,
+    last_confirmed_at = CASE
+      WHEN last_confirmed_at <> '' THEN last_confirmed_at
+      WHEN updated_at <> '' THEN updated_at
+      ELSE created_at
+    END`); err != nil {
+		return fmt.Errorf("backfill Memory V2 metadata: %w", err)
+	}
+	threadsExist, err := appTableExists(tx, "zalo_threads")
+	if err != nil {
+		return err
+	}
+	if threadsExist {
+		if _, err := tx.Exec(`UPDATE zalo_memory
+SET uid = thread_id
+WHERE uid = '' AND EXISTS (
+  SELECT 1 FROM zalo_threads t
+  WHERE t.id = zalo_memory.thread_id AND t.thread_type = 'user'
+)`); err != nil {
+			return fmt.Errorf("backfill direct-thread Memory subjects: %w", err)
+		}
+	}
+	expiresAt := ts(time.Now().Add(180 * 24 * time.Hour))
+	if _, err := tx.Exec(`UPDATE zalo_memory
+SET expires_at = CASE WHEN pinned = 1 THEN NULL ELSE ? END`, expiresAt); err != nil {
+		return fmt.Errorf("backfill Memory V2 expiry: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO app_memory_subject_revisions(thread_id, uid, revision)
+SELECT thread_id, uid, 1 FROM zalo_memory WHERE status = 'active' GROUP BY thread_id, uid`); err != nil {
+		return fmt.Errorf("seed subject Memory revisions: %w", err)
 	}
 	return nil
 }

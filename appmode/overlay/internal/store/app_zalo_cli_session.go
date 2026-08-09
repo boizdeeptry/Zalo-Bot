@@ -16,20 +16,23 @@ var ErrZaloCLISessionConflict = errors.New("zalo CLI session generation conflict
 
 // ZaloCLISession is content-free routing state for one Zalo conversation.
 type ZaloCLISession struct {
-	ThreadID          string
-	ClaudeSessionID   string
-	Model             string
-	PromptFingerprint string
-	LastError         string
-	Generation        int64
-	ContextTokens     int64
-	TurnCount         int64
-	MessageCursor     int64
-	MemoryRevision    int64
-	LessonsRevision   int64
-	RotateBeforeNext  bool
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ThreadID              string
+	ClaudeSessionID       string
+	Model                 string
+	PromptFingerprint     string
+	LastError             string
+	Generation            int64
+	ContextTokens         int64
+	TurnCount             int64
+	MessageCursor         int64
+	MemoryRevision        int64
+	LessonsRevision       int64
+	MemorySubjectUID      string
+	MemorySubjectRevision int64
+	MemoryCommonRevision  int64
+	RotateBeforeNext      bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 // ZaloDeltaMessage preserves the durable message row ID alongside its payload.
@@ -41,7 +44,8 @@ type ZaloDeltaMessage struct {
 const zaloCLISessionColumns = `thread_id, claude_session_id, generation, model,
 prompt_fingerprint, context_tokens, turn_count, message_cursor,
 rotate_before_next, last_error, created_at, updated_at,
-memory_revision, lessons_revision`
+memory_revision, lessons_revision, memory_subject_uid,
+memory_subject_revision, memory_common_revision`
 
 type zaloCLISessionScanner interface {
 	Scan(dest ...any) error
@@ -66,6 +70,9 @@ func scanZaloCLISession(row zaloCLISessionScanner) (ZaloCLISession, error) {
 		&updatedAt,
 		&session.MemoryRevision,
 		&session.LessonsRevision,
+		&session.MemorySubjectUID,
+		&session.MemorySubjectRevision,
+		&session.MemoryCommonRevision,
 	); err != nil {
 		return ZaloCLISession{}, err
 	}
@@ -101,7 +108,8 @@ func (s *Store) CreateZaloCLISession(next ZaloCLISession) (ZaloCLISession, error
 	_, err := s.db.Exec(`INSERT INTO app_zalo_cli_sessions(
 thread_id, claude_session_id, generation, model, prompt_fingerprint,
 context_tokens, turn_count, message_cursor, rotate_before_next, last_error,
-created_at, updated_at, memory_revision, lessons_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+created_at, updated_at, memory_revision, lessons_revision, memory_subject_uid,
+memory_subject_revision, memory_common_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		next.ThreadID,
 		next.ClaudeSessionID,
 		int64(1),
@@ -116,6 +124,9 @@ created_at, updated_at, memory_revision, lessons_revision) VALUES(?,?,?,?,?,?,?,
 		now,
 		next.MemoryRevision,
 		next.LessonsRevision,
+		next.MemorySubjectUID,
+		next.MemorySubjectRevision,
+		next.MemoryCommonRevision,
 	)
 	if err != nil {
 		return ZaloCLISession{}, fmt.Errorf("create Zalo CLI session %s: %w", next.ThreadID, err)
@@ -128,7 +139,8 @@ func (s *Store) ReplaceZaloCLISession(expectedGeneration int64, next ZaloCLISess
 	result, err := s.db.Exec(`UPDATE app_zalo_cli_sessions SET
 claude_session_id = ?, generation = generation + 1, model = ?, prompt_fingerprint = ?,
 context_tokens = ?, turn_count = ?, message_cursor = MAX(message_cursor, ?), rotate_before_next = ?,
-last_error = ?, updated_at = ?, memory_revision = ?, lessons_revision = ?
+last_error = ?, updated_at = ?, memory_revision = ?, lessons_revision = ?,
+memory_subject_uid = '', memory_subject_revision = 0, memory_common_revision = 0
 WHERE thread_id = ? AND generation = ?`,
 		next.ClaudeSessionID,
 		next.Model,
@@ -157,18 +169,24 @@ WHERE thread_id = ? AND generation = ?`,
 // cursor to move backwards.
 func (s *Store) CompleteZaloCLITurn(
 	threadID string,
-	expectedGeneration, contextTokens, messageCursor, memoryRevision, lessonsRevision int64,
+	expectedGeneration, contextTokens, messageCursor int64,
+	memorySubjectUID string,
+	memorySubjectRevision, memoryCommonRevision, memoryRevision, lessonsRevision int64,
 ) (ZaloCLISession, error) {
 	result, err := s.db.Exec(`UPDATE app_zalo_cli_sessions SET
 context_tokens = ?, turn_count = turn_count + 1,
 message_cursor = MAX(message_cursor, ?), updated_at = ?,
-memory_revision = ?, lessons_revision = ?
+memory_revision = ?, lessons_revision = ?, memory_subject_uid = ?,
+memory_subject_revision = ?, memory_common_revision = ?
 WHERE thread_id = ? AND generation = ?`,
 		contextTokens,
 		messageCursor,
 		ts(time.Now()),
 		memoryRevision,
 		lessonsRevision,
+		memorySubjectUID,
+		memorySubjectRevision,
+		memoryCommonRevision,
 		threadID,
 		expectedGeneration,
 	)
