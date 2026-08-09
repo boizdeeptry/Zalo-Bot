@@ -22,7 +22,7 @@ func TestAppZaloBootstrapPromptKeepsExistingContract(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prompt := buildConsultPrompt(zaloConfig{PersonaPath: personaPath}, "cau hoi bootstrap", nil, nil)
+	prompt := buildAppZaloBootstrapPrompt(zaloConfig{PersonaPath: personaPath}, "cau hoi bootstrap", nil, nil)
 	for _, want := range []string{
 		"BOOTSTRAP-PERSONA-MARKER",
 		"Reply with a single JSON object and nothing else",
@@ -30,6 +30,53 @@ func TestAppZaloBootstrapPromptKeepsExistingContract(t *testing.T) {
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("buildConsultPrompt() thieu %q", want)
+		}
+	}
+}
+
+func TestAppZaloMemoryContractAppearsOnceInBootstrapAndDeltaPrompts(t *testing.T) {
+	prompts := map[string]string{
+		"bootstrap": buildAppZaloBootstrapPrompt(zaloConfig{}, "cau hoi bootstrap", nil, nil),
+		"delta": buildAppZaloDeltaPrompt(appZaloSessionPromptInput{
+			Question: "cau hoi delta",
+		}),
+	}
+	for name, prompt := range prompts {
+		t.Run(name, func(t *testing.T) {
+			if got := strings.Count(prompt, `"memory_ops"`); got != 1 {
+				t.Fatalf("memory_ops contract appears %d times; want exactly once:\n%s", got, prompt)
+			}
+			if got := strings.Count(prompt, appZaloMemoryContractVersion); got != 1 {
+				t.Fatalf("Memory contract version appears %d times; want exactly once:\n%s", got, prompt)
+			}
+			if got := strings.Count(prompt, appZaloMemoryTrustReminder); got != 1 {
+				t.Fatalf("Memory trust reminder appears %d times; want exactly once:\n%s", got, prompt)
+			}
+		})
+	}
+}
+
+func TestAppZaloMemoryContractDescribesBoundedSpeakerScopedOperations(t *testing.T) {
+	prompt := buildAppZaloBootstrapPrompt(zaloConfig{}, "cau hoi", nil, nil)
+	for _, want := range []string{
+		"add, replace, or forget",
+		"current trusted speaker",
+		"at most 3",
+		"memory_key",
+		"80 bytes",
+		"240 runes",
+		"profile, family, interest, preference, health, financial, address, identity, or order",
+		"finite number from 0 to 1",
+		"reuse the visible target_id and memory_key",
+		"clarify instead of guessing",
+		"Never emit UID, subject_uid, thread, thread_id, date, expiry, status, approval, or pin fields",
+		"health, financial, address, identity, and order",
+		"proposals only",
+		"not facts or sources",
+		`use [] when there is no operation`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("Memory contract missing %q:\n%s", want, prompt)
 		}
 	}
 }
@@ -209,11 +256,11 @@ func TestBuildAppZaloDeltaPromptEncodesUntrustedMaterialAsJSONLines(t *testing.T
 	}
 
 	trustReminder := appZaloDeltaTrustReminder
-	if !strings.HasSuffix(strings.TrimSpace(prompt), trustReminder) {
-		t.Fatalf("delta prompt khong ket thuc bang fixed trust reminder:\n%s", prompt)
-	}
 	if strings.LastIndex(prompt, trustReminder) < strings.LastIndex(prompt, "KB-QUOTE-SAFE") {
 		t.Fatal("trust reminder phai dung sau toan bo external material")
+	}
+	if strings.LastIndex(prompt, appZaloMemoryContractVersion) < strings.LastIndex(prompt, trustReminder) {
+		t.Fatal("Memory response contract phai la suffix sau external-material reminder")
 	}
 }
 
@@ -230,11 +277,11 @@ func TestBuildAppZaloDeltaPromptKeepsGeneratedKBWarningsAuthoritative(t *testing
 	if !strings.Contains(prompt, "!!! CẢNH BÁO CỦA TRANG NÀY: SAFETY-WARN-MARKER") {
 		t.Fatalf("delta prompt thieu generated page warning:\n%s", prompt)
 	}
-	if !strings.HasSuffix(strings.TrimSpace(prompt), reminder) {
-		t.Fatalf("final trust reminder lam mat tham quyen warning:\n%s", prompt)
-	}
 	if strings.LastIndex(prompt, reminder) < strings.LastIndex(prompt, "SAFETY-WARN-MARKER") {
 		t.Fatal("warning authority reminder phai nam sau retrieved material")
+	}
+	if strings.LastIndex(prompt, appZaloMemoryContractVersion) < strings.LastIndex(prompt, reminder) {
+		t.Fatal("Memory response contract phai theo sau warning authority reminder")
 	}
 }
 
@@ -716,6 +763,7 @@ func appZaloRewritePromptFixture(t *testing.T, path, body string) {
 func appZaloTestFingerprint(version string, zc zaloConfig, persona, roster, overlay string) string {
 	h := sha256.New()
 	appZaloTestWriteFingerprintField(h, "contract_version", version)
+	appZaloTestWriteFingerprintField(h, "memory_contract_version", appZaloMemoryContractVersion)
 	appZaloTestWriteFingerprintField(h, "model", zc.Model)
 	appZaloTestWriteFingerprintField(h, "cite_mode", zc.CiteMode)
 	appZaloTestWriteFingerprintField(h, "owner_uid", zc.OwnerUID)

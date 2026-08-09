@@ -17,8 +17,10 @@ const (
 	appZaloContextRotateTokens int64 = 130000
 	appZaloMaxSessionTurns     int64 = 48
 
-	appZaloMaxDeltaBodyBytes     = 300
-	appZaloMaxDeltaHistoryBytes  = 16 << 10
+	appZaloMaxDeltaBodyBytes = 300
+	// Reserve the fixed response-contract suffix inside the established delta
+	// prompt envelope instead of allowing it to grow with transcript history.
+	appZaloMaxDeltaHistoryBytes  = (16 << 10) - len(appZaloMemoryContract) - 2
 	appZaloPromptContractVersion = "zalo-session-prompt/v1"
 
 	appZaloConversationTag        = "untrusted_conversation_jsonl"
@@ -82,6 +84,7 @@ type appZaloFileRecord struct {
 func appZaloPromptFingerprint(zc zaloConfig, threadID string) string {
 	h := sha256.New()
 	appZaloWriteFingerprintField(h, "contract_version", appZaloPromptContractVersion)
+	appZaloWriteFingerprintField(h, "memory_contract_version", appZaloMemoryContractVersion)
 	appZaloWriteFingerprintField(h, "model", zc.Model)
 	appZaloWriteFingerprintField(h, "cite_mode", zc.CiteMode)
 	appZaloWriteFingerprintField(h, "owner_uid", zc.OwnerUID)
@@ -92,6 +95,32 @@ func appZaloPromptFingerprint(zc zaloConfig, threadID string) string {
 		appZaloWriteFingerprintField(h, "kb_root", root)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// buildAppZaloBootstrapPrompt adds the overlay-owned response contract after
+// the read-only upstream bootstrap prompt. Orchestration callers migrate to this
+// seam together with the speaker-scoped Memory work.
+func buildAppZaloBootstrapPrompt(
+	zc zaloConfig,
+	question string,
+	history []ipc.ZaloMessage,
+	found []passage,
+	files ...ipc.ZaloAttachment,
+) string {
+	return appZaloAppendMemoryContract(
+		buildConsultPrompt(zc, question, history, found, files...),
+	)
+}
+
+func appZaloAppendMemoryContract(prompt string) string {
+	trimmed := strings.TrimRight(prompt, "\r\n")
+	if strings.HasSuffix(trimmed, appZaloMemoryContract) {
+		return trimmed + "\n"
+	}
+	if trimmed == "" {
+		return appZaloMemoryContract + "\n"
+	}
+	return trimmed + "\n\n" + appZaloMemoryContract + "\n"
 }
 
 func appZaloWriteFingerprintField(h hash.Hash, name, value string) {
@@ -149,7 +178,10 @@ func buildAppZaloDeltaPromptResult(in appZaloSessionPromptInput) appZaloDeltaPro
 	}
 
 	b.WriteString("\n" + appZaloDeltaTrustReminder + "\n")
-	return appZaloDeltaPromptResult{Prompt: b.String(), ConsumedCursor: consumedCursor}
+	return appZaloDeltaPromptResult{
+		Prompt:         appZaloAppendMemoryContract(b.String()),
+		ConsumedCursor: consumedCursor,
+	}
 }
 
 type appZaloMemoryRefreshRecord struct {
