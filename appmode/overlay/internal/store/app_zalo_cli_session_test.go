@@ -75,21 +75,23 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 		t.Fatalf("group session changed with user session: %#v", unchangedGroup)
 	}
 
-	completed, err := s.CompleteZaloCLITurn("user-1", 2, 8_192, 12)
+	completed, err := s.CompleteZaloCLITurn("user-1", 2, 8_192, 12, 5, 3)
 	if err != nil {
 		t.Fatalf("CompleteZaloCLITurn(first): %v", err)
 	}
-	if completed.ContextTokens != 8_192 || completed.TurnCount != 1 || completed.MessageCursor != 12 {
-		t.Fatalf("completed session = %#v; want tokens=8192 turn=1 cursor=12", completed)
+	if completed.ContextTokens != 8_192 || completed.TurnCount != 1 || completed.MessageCursor != 12 ||
+		completed.MemoryRevision != 5 || completed.LessonsRevision != 3 {
+		t.Fatalf("completed session = %#v; want tokens=8192 turn=1 cursor=12 revisions=5/3", completed)
 	}
-	completed, err = s.CompleteZaloCLITurn("user-1", 2, 9_000, 5)
+	completed, err = s.CompleteZaloCLITurn("user-1", 2, 9_000, 5, 7, 4)
 	if err != nil {
 		t.Fatalf("CompleteZaloCLITurn(lower cursor): %v", err)
 	}
-	if completed.ContextTokens != 9_000 || completed.TurnCount != 2 || completed.MessageCursor != 12 {
-		t.Fatalf("completed session = %#v; want tokens=9000 turn=2 cursor still 12", completed)
+	if completed.ContextTokens != 9_000 || completed.TurnCount != 2 || completed.MessageCursor != 12 ||
+		completed.MemoryRevision != 7 || completed.LessonsRevision != 4 {
+		t.Fatalf("completed session = %#v; want tokens=9000 turn=2 cursor=12 revisions=7/4", completed)
 	}
-	if _, err := s.CompleteZaloCLITurn("user-1", 1, 10_000, 13); !errors.Is(err, ErrZaloCLISessionConflict) {
+	if _, err := s.CompleteZaloCLITurn("user-1", 1, 10_000, 13, 8, 5); !errors.Is(err, ErrZaloCLISessionConflict) {
 		t.Fatalf("CompleteZaloCLITurn(stale) = %v; want ErrZaloCLISessionConflict", err)
 	}
 

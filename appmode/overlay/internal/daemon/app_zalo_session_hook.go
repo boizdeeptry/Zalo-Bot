@@ -30,10 +30,12 @@ type appZaloStructuredRunner interface {
 }
 
 type appZaloCompletion struct {
-	generation    int64
-	contextTokens int64
-	messageCursor int64
-	ready         bool
+	generation      int64
+	contextTokens   int64
+	messageCursor   int64
+	memoryRevision  int64
+	lessonsRevision int64
+	ready           bool
 }
 
 type appZaloCompletionCarrier struct {
@@ -420,6 +422,7 @@ func (a *api) appInvalidateFailedZaloRecovery(
 func (a *api) appCompleteZaloTurn(threadID string, pending appZaloCompletion) {
 	if _, err := a.st.CompleteZaloCLITurn(
 		threadID, pending.generation, pending.contextTokens, pending.messageCursor,
+		pending.memoryRevision, pending.lessonsRevision,
 	); err == nil {
 		return
 	} else if errors.Is(err, store.ErrZaloCLISessionConflict) {
