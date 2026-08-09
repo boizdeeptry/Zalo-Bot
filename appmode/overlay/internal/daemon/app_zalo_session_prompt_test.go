@@ -371,6 +371,54 @@ func TestBuildAppZaloDeltaPromptAppendsWhenCurrentEventIsAbsentFromFullDeltaPage
 	}
 }
 
+func TestBuildAppZaloDeltaPromptPinsMatchingCurrentEventInsideHistoryBudget(t *testing.T) {
+	const question = "CURRENT-QUESTION-MUST-SURVIVE"
+	delta := make([]store.ZaloDeltaMessage, 0, 100)
+	delta = append(delta, store.ZaloDeltaMessage{ID: 1, Message: ipc.ZaloMessage{
+		Direction: ipc.ZaloIn,
+		Author:    "Chi Lan",
+		Body:      question,
+		ZaloMsgID: "current-event",
+	}})
+	for i := 1; i < 100; i++ {
+		delta = append(delta, store.ZaloDeltaMessage{
+			ID: int64(i + 1),
+			Message: ipc.ZaloMessage{
+				Direction: ipc.ZaloOut,
+				Body:      "NEWER-" + appZaloTestThreeDigits(i) + "-" + strings.Repeat("x", 500),
+			},
+		})
+	}
+	prompt := buildAppZaloDeltaPrompt(appZaloSessionPromptInput{
+		Question:         question,
+		CurrentZaloMsgID: "current-event",
+		Delta:            delta,
+	})
+	records := appZaloTestConversationRecords(t, prompt)
+	questionRecords := 0
+	for _, record := range records {
+		if record.Body == question {
+			questionRecords++
+		}
+	}
+	if questionRecords != 1 {
+		t.Fatalf("bounded transcript co current question %d lan; muon dung 1: %+v", questionRecords, records)
+	}
+	if len(records) == 0 || records[0] != (appZaloTestConversationRecord{
+		Role: "customer", DisplayName: "Chi Lan", Body: question,
+	}) {
+		t.Fatalf("current event khong duoc pin tai vi tri chronological som nhat: %+v", records)
+	}
+	if !strings.HasPrefix(records[len(records)-1].Body, "NEWER-099-") {
+		t.Fatalf("pin current event lam mat newest tail: %+v", records[len(records)-1])
+	}
+	historyLines := appZaloTestJSONLBlock(t, prompt, "untrusted_conversation_jsonl")
+	history := strings.Join(historyLines, "\n") + "\n"
+	if len(history) > 16<<10 {
+		t.Fatalf("pinned transcript dai %d byte; muon toi da %d", len(history), 16<<10)
+	}
+}
+
 func TestBuildAppZaloDeltaPromptSuppressesFallbackForMatchingCurrentEventID(t *testing.T) {
 	prompt := buildAppZaloDeltaPrompt(appZaloSessionPromptInput{
 		Question:         "phan dau\nphan cuoi",
