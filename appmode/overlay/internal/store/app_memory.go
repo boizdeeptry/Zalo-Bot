@@ -511,52 +511,17 @@ func (s *Store) AppMemoryRevisions(threadID string) (AppMemoryRevision, error) {
 }
 
 func (s *Store) AppPromptMemory(threadID string, limit int) ([]ipc.ZaloMemory, int64, error) {
-	if limit <= 0 || limit > appMemoryPinLimit {
-		limit = appMemoryPinLimit
-	}
-	tx, err := s.db.Begin()
+	snapshot, err := s.AppPromptMemoryForSubject(threadID, "", limit, time.Now())
 	if err != nil {
-		return nil, 0, fmt.Errorf("begin prompt memory read for %s: %w", threadID, err)
+		return nil, 0, err
 	}
-	defer func() { _ = tx.Rollback() }()
-	var revision int64
-	if err := tx.QueryRow(`SELECT COALESCE((SELECT revision FROM app_memory_revisions
-WHERE scope = 'thread' AND scope_id = ?), 0)`, threadID).Scan(&revision); err != nil {
-		return nil, 0, fmt.Errorf("read prompt memory revision for %s: %w", threadID, err)
+	out := make([]ipc.ZaloMemory, 0, len(snapshot.Common))
+	for _, item := range snapshot.Common {
+		out = append(out, ipc.ZaloMemory{
+			ThreadID: threadID, UID: item.UID, Text: item.Text, CreatedAt: item.createdAt,
+		})
 	}
-	rows, err := tx.Query(`SELECT thread_id, uid, text, created_at FROM (
-  SELECT id, thread_id, uid, text, created_at FROM zalo_memory
-  WHERE thread_id = ? ORDER BY pinned DESC, id DESC LIMIT ?
-) ORDER BY id ASC`, threadID, limit)
-	if err != nil {
-		return nil, 0, fmt.Errorf("select prompt memory for %s: %w", threadID, err)
-	}
-	out := make([]ipc.ZaloMemory, 0, limit)
-	for rows.Next() {
-		var memory ipc.ZaloMemory
-		var createdAt string
-		if err := rows.Scan(&memory.ThreadID, &memory.UID, &memory.Text, &createdAt); err != nil {
-			rows.Close()
-			return nil, 0, fmt.Errorf("scan prompt memory for %s: %w", threadID, err)
-		}
-		memory.CreatedAt, err = parseTS(createdAt)
-		if err != nil {
-			rows.Close()
-			return nil, 0, fmt.Errorf("parse prompt memory for %s: %w", threadID, err)
-		}
-		out = append(out, memory)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, 0, fmt.Errorf("select prompt memory for %s: %w", threadID, err)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, 0, fmt.Errorf("close prompt memory for %s: %w", threadID, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, 0, fmt.Errorf("commit prompt memory read for %s: %w", threadID, err)
-	}
-	return out, revision, nil
+	return out, snapshot.CommonRevision, nil
 }
 
 func (s *Store) AppPromptLessons(limit int) ([]ipc.ZaloLesson, int64, error) {
