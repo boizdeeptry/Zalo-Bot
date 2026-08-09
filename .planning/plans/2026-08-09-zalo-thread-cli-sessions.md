@@ -166,6 +166,7 @@
   type appZaloSessionPromptInput struct {
       Config zaloConfig
       Question string
+      CurrentZaloMsgID string
       History []ipc.ZaloMessage
       Delta []store.ZaloDeltaMessage
       Found []passage
@@ -177,7 +178,7 @@
   func appZaloShouldRotate(store.ZaloCLISession, model, fingerprint string) bool
   ```
 
-  Assert bootstrap still comes from `buildConsultPrompt`; delta includes messages after cursor as JSON Lines inside fixed untrusted boundaries, current retrieved quotes in their existing citable representation, and file metadata in a separate untrusted JSONL boundary. Assert role is generated from trusted direction/operator fields rather than display name; newline and closing-tag payloads cannot escape JSON; display name, body and title are capped UTF-8-safely at 300 bytes; current question is suppressed only when the tail inbound row is the same event; and the bootstrap persona marker is absent from delta. Fingerprints must change for model, persona, roster, overlay, cite mode, `OwnerUID`, KB roots, or contract version. Rotation fires at 130,000 tokens, 48 turns, a changed fingerprint/model, or an explicit flag, but not one unit below each limit.
+  Assert bootstrap still comes from `buildConsultPrompt`; delta includes messages after cursor as JSON Lines inside fixed untrusted boundaries, current retrieved quotes in their existing citable representation, and file metadata in a separate untrusted JSONL boundary. Assert role is generated from trusted direction/operator fields rather than display name; newline and closing-tag payloads cannot escape JSON; display name, body and title are capped UTF-8-safely at 300 bytes; current question is suppressed only when an inbound delta record has the same non-empty durable `ZaloMsgID` as `CurrentZaloMsgID`; same text with another ID, an empty identity, or a current ID absent from a full 100-row page must append the fallback. Assert generated `CẢNH BÁO CỦA TRANG NÀY` directives retain authority in the final trust reminder and the bootstrap persona marker is absent from delta. Fingerprints must change for model, persona, roster, overlay, cite mode, `OwnerUID`, KB roots, or contract version. Rotation fires at 130,000 tokens, 48 turns, a changed fingerprint/model, or an explicit flag, but not one unit below each limit.
 
 - [ ] **Step 2: Run and confirm RED**
 
@@ -187,7 +188,7 @@
 
 - [ ] **Step 3: Implement prompt policy**
 
-  Hash a versioned, length-delimited sequence with SHA-256 so concatenation cannot collide, including `OwnerUID` because bootstrap embeds it in the authorization contract. Read persona, roster and thread overlay through existing helpers. Serialize transcript records with application-generated `role`, capped `display_name` and capped `body` as JSON Lines inside `<untrusted_conversation_jsonl>`; serialize capped file metadata separately inside `<untrusted_customer_files_jsonl>`. Keep retrieved KB passages in the existing citable representation, cap the conversation JSONL payload at 16 KiB while preserving newest records, and append the fixed trust reminder after every external-material section. Use byte/3 as conservative token estimate only when measured usage is unavailable.
+  Hash a versioned, length-delimited sequence with SHA-256 so concatenation cannot collide, including `OwnerUID` because bootstrap embeds it in the authorization contract. Read persona, roster and thread overlay through existing helpers. Serialize transcript records with application-generated `role`, capped `display_name` and capped `body` as JSON Lines inside `<untrusted_conversation_jsonl>`; serialize capped file metadata separately inside `<untrusted_customer_files_jsonl>`. Keep retrieved KB passages in the existing citable representation, cap the conversation JSONL payload at 16 KiB while preserving newest records, and append the fixed trust reminder after every external-material section. The reminder must preserve the authority of application-generated page-warning directives while rejecting conversation/file data as instructions. Dedupe the current event by non-empty durable Zalo message identity only, never by text. Use byte/3 as conservative token estimate only when measured usage is unavailable.
 
 - [ ] **Step 4: Run and confirm GREEN**
 
@@ -273,7 +274,7 @@
 
   ```go
   func (a *api) appAnswerZalo(deps *zaloDeps, threadID, question string, reply ipc.ZaloOutboxDraft, files []ipc.ZaloAttachment) error
-  func (a *api) appRunZalo(ctx context.Context, run zaloRunner, zc zaloConfig, threadID, question string, history []ipc.ZaloMessage, found []passage, files []ipc.ZaloAttachment, step func(string)) (string, error)
+  func (a *api) appRunZalo(ctx context.Context, run zaloRunner, zc zaloConfig, threadID, question, currentZaloMsgID string, history []ipc.ZaloMessage, found []passage, files []ipc.ZaloAttachment, step func(string)) (string, error)
   ```
 
   With a recording command fixture, run two turns on the same thread and assert one session ID, then `--resume`; add an operator message between them and assert it is in delta. Recreate `api` with the same store and assert it still resumes. Run a second thread and assert a different UUID. Seed context at 129,999 then 130,000 tokens and assert only the latter creates a new generation. Assert 48 turns, fingerprint/model change and resume-not-found also rotate. Assert `LatestZaloMessageID` is committed only after the answer pipeline completes and no separate summary/model invocation occurs.
@@ -286,7 +287,7 @@
 
 - [ ] **Step 3: Implement orchestration**
 
-  `appAnswerZalo` acquires the thread gate before starting the existing per-turn timeout, then calls `answerZalo` with a session-capable runner and advances the cursor after successful store completion. `appRunZalo` detects that runner through a private structured-run interface; fake runners and API Provider runners continue to receive `buildConsultPrompt` through their existing `Run` method. Use compare-and-swap generation on every state update; a conflict reloads state once rather than overwriting a concurrent generation.
+  `appAnswerZalo` acquires the thread gate before starting the existing per-turn timeout, then calls `answerZalo` with a session-capable runner and advances the cursor after successful store completion. It extracts the current Zalo `msgId` from the last batched event's `reply.ReplyQuote` and passes that stable identity into `appRunZalo`; Task 3 does not parse reply quotes. `appRunZalo` detects that runner through a private structured-run interface; fake runners and API Provider runners continue to receive `buildConsultPrompt` through their existing `Run` method. Use compare-and-swap generation on every state update; a conflict reloads state once rather than overwriting a concurrent generation.
 
 - [ ] **Step 4: Run and confirm GREEN**
 
@@ -324,7 +325,7 @@
   by:
 
   ```go
-  raw, err := a.appRunZalo(ctx, run, pz, threadID, question, history, found, files, step)
+  raw, err := a.appRunZalo(ctx, run, pz, threadID, question, appZaloCurrentMsgID(reply.ReplyQuote), history, found, files, step)
   ```
 
   Assert both signatures occur exactly once in the stage, neither appears in source, source hashes match before/after, missing needles fail before partial writes, and applying seams twice fails with the inserted-signature message.

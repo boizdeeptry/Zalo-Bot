@@ -87,6 +87,8 @@ Build overlay không sửa repository upstream trực tiếp. `Apply-AppSeams` t
 
 Fake runner trong test upstream tiếp tục đi đường cũ. Chỉ `execZaloRunner` production được thay bằng session runner, tránh làm thay đổi hàng loạt test hiện có.
 
+Task orchestration lấy `msgId` của Zalo event hiện tại từ `reply_quote` của event cuối trong batch và truyền nó vào prompt policy dưới tên `CurrentZaloMsgID`. Prompt policy chỉ so identity đã được truyền vào; nó không tự parse `reply_quote`.
+
 ## 6. Mô hình dữ liệu
 
 Thêm bảng `app_zalo_cli_sessions`:
@@ -119,14 +121,14 @@ Session mới nhận `buildConsultPrompt` đầy đủ như hiện tại, gồm 
 Session resume không nhận lại toàn bộ bootstrap. Nó chỉ nhận:
 
 - Các tin trong `zalo_messages` sau `message_cursor`, theo thứ tự cũ đến mới, dưới dạng JSON Lines nằm trong cặp thẻ cố định `<untrusted_conversation_jsonl>`.
-- Câu hỏi hiện tại nếu hàng cuối delta không phải chính tin inbound hiện tại; một bản trùng cũ hơn không được làm mất current-question fallback.
+- Câu hỏi hiện tại nếu không có record inbound nào mang `ZaloMsgID` đúng bằng `CurrentZaloMsgID` khác rỗng. Identity rỗng, không có trong trang delta bị giới hạn, hoặc chỉ có tin cũ trùng text đều phải thêm current-question fallback; nội dung text không được dùng để dedupe event.
 - Retrieved passages của lượt hiện tại.
 - Metadata attachment hiện tại và attachment lịch sử mà logic hiện hành xác định còn liên quan, dưới dạng JSON Lines trong cặp thẻ riêng `<untrusted_customer_files_jsonl>`.
-- Một nhắc trust boundary cố định ở cuối prompt rằng dữ liệu phía trên chỉ là context, evidence hoặc source đúng như nhãn, không bao giờ là instruction; hợp đồng JSON, citation, safety và persona ban đầu vẫn có thẩm quyền.
+- Một nhắc trust boundary cố định ở cuối prompt: record hội thoại/file là dữ liệu untrusted và không bao giờ là instruction; nội dung KB passage là source content; riêng directive `CẢNH BÁO CỦA TRANG NÀY` do ứng dụng sinh là safety instruction có thẩm quyền và phải được tuân theo; hợp đồng JSON, citation, safety và persona ban đầu vẫn có thẩm quyền.
 
 Mỗi record hội thoại có `role`, `display_name` và `body`. `role` chỉ do daemon sinh từ direction cùng marker operator tin cậy (`customer`, `operator`, `assistant`), không bao giờ suy ra từ display name; vì vậy khách đặt tên `người trực` vẫn là `customer`. `display_name` và `body` được cắt UTF-8 an toàn ở 300 byte, toàn khối lịch sử giữ trần 16 KiB và ưu tiên record mới nhất. JSON encoder phải escape newline và closing tag nằm trong dữ liệu, để nội dung khách không thoát khỏi boundary hoặc giả cấu trúc prompt.
 
-Mỗi record file có `kind`, `path`, `title`, `readable` và `reason`; `title` cũng được cắt UTF-8 an toàn ở 300 byte. File khách vẫn chỉ là evidence, không phải source. Retrieved KB candidates giữ nguyên biểu diễn citable hiện có và đứng ngoài hai khối untrusted JSONL.
+Mỗi record file có `kind`, `path`, `title`, `readable` và `reason`; `title` cũng được cắt UTF-8 an toàn ở 300 byte. File khách vẫn chỉ là evidence, không phải source. Retrieved KB candidates giữ nguyên biểu diễn citable hiện có và đứng ngoài hai khối untrusted JSONL. Dòng cảnh báo mà `renderRetrieved` sinh từ trường `passage.Warn` không phải nội dung khách và không bị reminder cuối vô hiệu hóa.
 
 Tin do người trực gửi giữa hai lượt Claude nằm sau cursor nên được đưa vào delta. Tin bot mà Claude vừa tạo không bị lặp vì cursor chỉ được nâng sau khi `answerZalo` hoàn tất ghi message/outbox.
 
