@@ -278,6 +278,11 @@ func TestAppZaloSessionRunnerDoesNotRetryOtherFailures(t *testing.T) {
 		{name: "model", stderr: "model sonnet is not available", waitErr: errors.New("exit status 1"), want: appZaloErrorModel},
 		{name: "generic", stderr: "customer-secret-canary: unexpected failure", waitErr: errors.New("exit status 1"), want: appZaloErrorProcess},
 		{name: "session wording not allowlisted", stderr: "network session not found while connecting", waitErr: errors.New("exit status 1"), want: appZaloErrorNetwork},
+		{name: "resume phrase after timeout", stderr: "request timed out: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorTimeout},
+		{name: "resume phrase after network error", stderr: "network error: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorNetwork},
+		{name: "resume phrase after permission error", stderr: "permission denied: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorPermission},
+		{name: "resume phrase after invalid model", stderr: "invalid model sonnet: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorModel},
+		{name: "resume phrase after unknown model", stderr: "unknown model sonnet: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorModel},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{

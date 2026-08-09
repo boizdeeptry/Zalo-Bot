@@ -312,9 +312,6 @@ func appZaloClassifyClaudeFailure(
 		return appZaloErrorCanceled, context.Canceled
 	}
 	normalized := appZaloNormalizeClaudeError(stderr)
-	if resume && appZaloIsRecoverableResumeError(normalized) {
-		return appZaloErrorResumeNotFound, nil
-	}
 	if appZaloContainsAny(normalized,
 		"request timed out", "operation timed out", "network timeout", "etimedout") {
 		return appZaloErrorTimeout, nil
@@ -331,6 +328,9 @@ func appZaloClassifyClaudeFailure(
 	if strings.Contains(normalized, "invalid model") || strings.Contains(normalized, "unknown model") ||
 		(strings.Contains(normalized, "model ") && appZaloContainsAny(normalized, "not available", "not found")) {
 		return appZaloErrorModel, nil
+	}
+	if resume && appZaloIsRecoverableResumeError(normalized) {
+		return appZaloErrorResumeNotFound, nil
 	}
 	return appZaloErrorProcess, nil
 }
