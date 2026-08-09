@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"agentdc/internal/ipc"
 	"agentdc/internal/store"
@@ -125,6 +126,26 @@ func TestBuildAppZaloDeltaPromptAppendsMissingQuestionOnce(t *testing.T) {
 	emptyDelta := buildAppZaloDeltaPrompt(appZaloSessionPromptInput{Question: question})
 	if got := strings.Count(emptyDelta, question); got != 1 {
 		t.Fatalf("empty delta co question %d lan; muon dung 1:\n%s", got, emptyDelta)
+	}
+}
+
+func TestBuildAppZaloDeltaPromptPreservesFullInboundAuthorLabel(t *testing.T) {
+	author := strings.Repeat("TácGiả", 24)
+	if len(author) <= 100 {
+		t.Fatalf("fixture author chi dai %d byte; test can vuot 100", len(author))
+	}
+	prompt := buildAppZaloDeltaPrompt(appZaloSessionPromptInput{
+		Delta: []store.ZaloDeltaMessage{{Message: ipc.ZaloMessage{
+			Direction: ipc.ZaloIn,
+			Author:    author,
+			Body:      "noi dung moi",
+		}}},
+	})
+	if !strings.Contains(prompt, author+": noi dung moi") {
+		t.Fatalf("delta prompt khong giu nguyen author label dai:\n%s", prompt)
+	}
+	if !utf8.ValidString(prompt) {
+		t.Fatal("delta prompt khong con la UTF-8 hop le")
 	}
 }
 

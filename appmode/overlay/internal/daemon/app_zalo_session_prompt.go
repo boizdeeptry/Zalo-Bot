@@ -143,7 +143,7 @@ func appZaloMessageLabel(message ipc.ZaloMessage) string {
 	case message.Direction == ipc.ZaloOut:
 		return "bạn (bot)"
 	case message.Author != "":
-		return appZaloClipUTF8(message.Author, 100)
+		return message.Author
 	default:
 		return "khách"
 	}
