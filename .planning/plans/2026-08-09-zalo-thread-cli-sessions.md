@@ -177,7 +177,7 @@
   func appZaloShouldRotate(store.ZaloCLISession, model, fingerprint string) bool
   ```
 
-  Assert bootstrap still comes from `buildConsultPrompt`; delta includes messages after cursor, current retrieved quotes and file paths; operator messages retain the `người trực` label; current question appears exactly once; the bootstrap persona marker is absent from delta; fingerprints change for model, persona, roster, overlay, cite mode, KB roots, or contract version; rotation fires at 130,000 tokens, 48 turns, a changed fingerprint/model, or an explicit flag, but not one unit below each limit.
+  Assert bootstrap still comes from `buildConsultPrompt`; delta includes messages after cursor as JSON Lines inside fixed untrusted boundaries, current retrieved quotes in their existing citable representation, and file metadata in a separate untrusted JSONL boundary. Assert role is generated from trusted direction/operator fields rather than display name; newline and closing-tag payloads cannot escape JSON; display name, body and title are capped UTF-8-safely at 300 bytes; current question is suppressed only when the tail inbound row is the same event; and the bootstrap persona marker is absent from delta. Fingerprints must change for model, persona, roster, overlay, cite mode, `OwnerUID`, KB roots, or contract version. Rotation fires at 130,000 tokens, 48 turns, a changed fingerprint/model, or an explicit flag, but not one unit below each limit.
 
 - [ ] **Step 2: Run and confirm RED**
 
@@ -187,7 +187,7 @@
 
 - [ ] **Step 3: Implement prompt policy**
 
-  Hash a versioned, length-delimited sequence with SHA-256 so concatenation cannot collide. Read persona, roster and thread overlay through existing helpers. Render delta messages with the same author labels as `renderHistory`, cap each body at 300 bytes and the whole delta history at 16 KiB, then append only current passages and files. Include the exact short reminder that the original JSON/citation/persona contract remains active. Use byte/3 as conservative token estimate only when measured usage is unavailable.
+  Hash a versioned, length-delimited sequence with SHA-256 so concatenation cannot collide, including `OwnerUID` because bootstrap embeds it in the authorization contract. Read persona, roster and thread overlay through existing helpers. Serialize transcript records with application-generated `role`, capped `display_name` and capped `body` as JSON Lines inside `<untrusted_conversation_jsonl>`; serialize capped file metadata separately inside `<untrusted_customer_files_jsonl>`. Keep retrieved KB passages in the existing citable representation, cap the conversation JSONL payload at 16 KiB while preserving newest records, and append the fixed trust reminder after every external-material section. Use byte/3 as conservative token estimate only when measured usage is unavailable.
 
 - [ ] **Step 4: Run and confirm GREEN**
 
@@ -197,7 +197,7 @@
 
 - [ ] **Step 5: Refactor while green**
 
-  Share message labeling with a private helper without modifying the observable output of `renderHistory`. Re-run the tests.
+  Keep role mapping in one private helper and test every direction/operator combination, including an inbound display name equal to `người trực`. Re-run the tests.
 
 - [ ] **Step 6: Commit**
 
