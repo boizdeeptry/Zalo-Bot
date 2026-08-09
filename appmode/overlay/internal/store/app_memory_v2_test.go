@@ -7,15 +7,19 @@ import (
 )
 
 type appMemoryV2TestRow struct {
-	threadID  string
-	uid       string
-	memoryKey string
-	category  string
-	text      string
-	status    string
-	pinned    bool
-	createdAt time.Time
-	expiresAt *time.Time
+	threadID, uid   string
+	memoryKey       string
+	category, text  string
+	status          string
+	pinned          bool
+	createdAt       time.Time
+	expiresAt       *time.Time
+	confidence      float64
+	proposalAction  string
+	supersedesID    int64
+	lastConfirmedAt time.Time
+	source          string
+	sourceMessageID int64
 }
 
 func insertAppMemoryV2TestRow(t *testing.T, s *Store, row appMemoryV2TestRow) int64 {
@@ -24,11 +28,22 @@ func insertAppMemoryV2TestRow(t *testing.T, s *Store, row appMemoryV2TestRow) in
 	if row.expiresAt != nil {
 		expiresAt = ts(*row.expiresAt)
 	}
+	lastConfirmedAt := ""
+	if !row.lastConfirmedAt.IsZero() {
+		lastConfirmedAt = ts(row.lastConfirmedAt)
+	}
+	source := row.source
+	if source == "" {
+		source = "agent"
+	}
 	result, err := s.db.Exec(`INSERT INTO zalo_memory(
-thread_id, uid, memory_key, category, text, status, pinned, created_at, updated_at, expires_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		row.threadID, row.uid, row.memoryKey, row.category, row.text, row.status, row.pinned,
-		ts(row.createdAt), ts(row.createdAt), expiresAt,
+thread_id, uid, memory_key, category, text, confidence, status, proposal_action,
+supersedes_id, pinned, source, source_message_id, created_at, updated_at,
+last_confirmed_at, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		row.threadID, row.uid, row.memoryKey, row.category, row.text, row.confidence,
+		row.status, row.proposalAction, row.supersedesID, row.pinned, source,
+		row.sourceMessageID, ts(row.createdAt), ts(row.createdAt), lastConfirmedAt, expiresAt,
 	)
 	if err != nil {
 		t.Fatalf("insert Memory V2 test row: %v", err)

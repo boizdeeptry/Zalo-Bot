@@ -2,12 +2,490 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"math"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-const appMemoryPendingRetention = 30 * 24 * time.Hour
+const (
+	appMemoryPendingRetention = 30 * 24 * time.Hour
+	appMemoryMaxOperations    = 3
+	appMemoryMaxValueRunes    = 240
+	appMemoryAutoConfidence   = 0.85
+	appMemoryLongDuration     = 180 * 24 * time.Hour
+	appMemoryShortDuration    = 30 * 24 * time.Hour
+)
+
+var (
+	appMemoryKeyPattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9._:-]{0,79}$`)
+	appMemoryAllowedCategories = map[string]struct{}{
+		"profile": {}, "family": {}, "interest": {}, "preference": {},
+		"health": {}, "financial": {}, "address": {}, "identity": {}, "order": {},
+	}
+	appMemoryAutoCategories = map[string]time.Duration{
+		"profile": appMemoryLongDuration, "family": appMemoryLongDuration,
+		"interest": appMemoryShortDuration, "preference": appMemoryShortDuration,
+	}
+)
+
+type AppMemoryOperation struct {
+	Action     string
+	MemoryKey  string
+	Value      string
+	Category   string
+	Confidence float64
+	TargetID   int64
+}
+
+type AppMemoryApplyInput struct {
+	ThreadID         string
+	SubjectUID       string
+	SourceMessageID  int64
+	AllowedTargetIDs map[int64]struct{}
+	Operations       []AppMemoryOperation
+	Now              time.Time
+}
+
+type AppMemoryApplyResult struct {
+	Active  int
+	Pending int
+	Ignored int
+}
+
+type appValidatedMemoryOperation struct {
+	action          string
+	memoryKey       string
+	value           string
+	normalizedValue string
+	category        string
+	confidence      float64
+	targetID        int64
+}
+
+type appMemoryMutationOutcome uint8
+
+const (
+	appMemoryMutationNoop appMemoryMutationOutcome = iota
+	appMemoryMutationActive
+	appMemoryMutationPending
+	appMemoryMutationIgnored
+)
+
+func (s *Store) ApplyAppMemoryOperations(input AppMemoryApplyInput) (AppMemoryApplyResult, error) {
+	threadID, subjectUID, err := validateAppPromptMemoryScope(input.ThreadID, input.SubjectUID)
+	if err != nil {
+		return AppMemoryApplyResult{}, err
+	}
+	operationCount := len(input.Operations)
+	if operationCount > appMemoryMaxOperations {
+		operationCount = appMemoryMaxOperations
+	}
+	if operationCount == 0 {
+		return AppMemoryApplyResult{}, nil
+	}
+	if subjectUID == "" {
+		return AppMemoryApplyResult{Ignored: operationCount}, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AppMemoryApplyResult{}, fmt.Errorf("begin applying Memory operations for %s: %w", threadID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var result AppMemoryApplyResult
+	activeChanged := false
+	for _, rawOperation := range input.Operations[:operationCount] {
+		operation, valid := validateAppMemoryOperation(rawOperation)
+		if !valid {
+			result.Ignored++
+			continue
+		}
+		outcome, changed, err := appApplyMemoryOperation(
+			tx, threadID, subjectUID, input.SourceMessageID,
+			input.AllowedTargetIDs, operation, input.Now,
+		)
+		if err != nil {
+			return AppMemoryApplyResult{}, err
+		}
+		activeChanged = activeChanged || changed
+		switch outcome {
+		case appMemoryMutationActive:
+			result.Active++
+		case appMemoryMutationPending:
+			result.Pending++
+		case appMemoryMutationIgnored:
+			result.Ignored++
+		}
+	}
+	if activeChanged {
+		if err := appBumpSubjectMemoryRevision(tx, threadID, subjectUID); err != nil {
+			return AppMemoryApplyResult{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return AppMemoryApplyResult{}, fmt.Errorf("commit Memory operations for %s: %w", threadID, err)
+	}
+	return result, nil
+}
+
+func validateAppMemoryOperation(operation AppMemoryOperation) (appValidatedMemoryOperation, bool) {
+	if !appMemoryKeyPattern.MatchString(operation.MemoryKey) {
+		return appValidatedMemoryOperation{}, false
+	}
+	if _, allowed := appMemoryAllowedCategories[operation.Category]; !allowed {
+		return appValidatedMemoryOperation{}, false
+	}
+	if math.IsNaN(operation.Confidence) || math.IsInf(operation.Confidence, 0) ||
+		operation.Confidence < 0 || operation.Confidence > 1 {
+		return appValidatedMemoryOperation{}, false
+	}
+	if !utf8.ValidString(operation.Value) {
+		return appValidatedMemoryOperation{}, false
+	}
+	value := strings.TrimSpace(operation.Value)
+	if strings.ContainsAny(value, "\r\n\u0085\u2028\u2029") || len([]rune(value)) > appMemoryMaxValueRunes {
+		return appValidatedMemoryOperation{}, false
+	}
+	switch operation.Action {
+	case "add":
+		if value == "" || operation.TargetID != 0 {
+			return appValidatedMemoryOperation{}, false
+		}
+	case "replace":
+		if value == "" || operation.TargetID <= 0 {
+			return appValidatedMemoryOperation{}, false
+		}
+	case "forget":
+		if value != "" || operation.TargetID <= 0 {
+			return appValidatedMemoryOperation{}, false
+		}
+	default:
+		return appValidatedMemoryOperation{}, false
+	}
+	return appValidatedMemoryOperation{
+		action: operation.Action, memoryKey: operation.MemoryKey, value: value,
+		normalizedValue: appNormalizeMemoryValue(value), category: operation.Category,
+		confidence: operation.Confidence, targetID: operation.TargetID,
+	}, true
+}
+
+func appNormalizeMemoryValue(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+}
+
+func appApplyMemoryOperation(
+	tx *sql.Tx,
+	threadID, subjectUID string,
+	sourceMessageID int64,
+	allowedTargetIDs map[int64]struct{},
+	operation appValidatedMemoryOperation,
+	now time.Time,
+) (appMemoryMutationOutcome, bool, error) {
+	switch operation.action {
+	case "add":
+		return appApplyMemoryAdd(tx, threadID, subjectUID, sourceMessageID, operation, now)
+	case "replace":
+		return appApplyMemoryReplace(
+			tx, threadID, subjectUID, sourceMessageID, allowedTargetIDs, operation, now,
+		)
+	case "forget":
+		return appApplyMemoryForget(tx, threadID, subjectUID, allowedTargetIDs, operation, now)
+	default:
+		return appMemoryMutationIgnored, false, nil
+	}
+}
+
+type appMemoryActiveRow struct {
+	id        int64
+	threadID  string
+	uid       string
+	memoryKey string
+	category  string
+	text      string
+	status    string
+	pinned    bool
+	expiresAt sql.NullString
+}
+
+func appApplyMemoryAdd(
+	tx *sql.Tx,
+	threadID, subjectUID string,
+	sourceMessageID int64,
+	operation appValidatedMemoryOperation,
+	now time.Time,
+) (appMemoryMutationOutcome, bool, error) {
+	active, found, err := appFindActiveMemoryByKey(tx, threadID, subjectUID, operation.memoryKey, now)
+	if err != nil {
+		return appMemoryMutationNoop, false, err
+	}
+	if found && appNormalizeMemoryValue(active.text) == operation.normalizedValue {
+		if err := appConfirmActiveMemory(tx, active, now); err != nil {
+			return appMemoryMutationNoop, false, err
+		}
+		return appMemoryMutationActive, false, nil
+	}
+	if found {
+		if err := appUpsertPendingReplacement(
+			tx, threadID, subjectUID, sourceMessageID, active.id, operation, now,
+		); err != nil {
+			return appMemoryMutationNoop, false, err
+		}
+		return appMemoryMutationPending, false, nil
+	}
+
+	duration, automatic := appMemoryAutoCategories[operation.category]
+	if automatic && operation.confidence >= appMemoryAutoConfidence {
+		if err := appInsertActiveMemory(
+			tx, threadID, subjectUID, sourceMessageID, operation, now, duration,
+		); err != nil {
+			return appMemoryMutationNoop, false, err
+		}
+		return appMemoryMutationActive, true, nil
+	}
+	if err := appInsertPendingAdd(tx, threadID, subjectUID, sourceMessageID, operation, now); err != nil {
+		return appMemoryMutationNoop, false, err
+	}
+	return appMemoryMutationPending, false, nil
+}
+
+func appFindActiveMemoryByKey(
+	tx *sql.Tx,
+	threadID, subjectUID, memoryKey string,
+	now time.Time,
+) (appMemoryActiveRow, bool, error) {
+	var row appMemoryActiveRow
+	err := tx.QueryRow(`SELECT id, thread_id, uid, memory_key, category, text, status, pinned, expires_at
+FROM zalo_memory
+WHERE thread_id = ? AND uid = ? AND memory_key = ? AND status = 'active'
+  AND (expires_at IS NULL OR expires_at > ?)
+ORDER BY id DESC LIMIT 1`, threadID, subjectUID, memoryKey, ts(now)).Scan(
+		&row.id, &row.threadID, &row.uid, &row.memoryKey, &row.category,
+		&row.text, &row.status, &row.pinned, &row.expiresAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return appMemoryActiveRow{}, false, nil
+	}
+	if err != nil {
+		return appMemoryActiveRow{}, false, fmt.Errorf("find active Memory by key: %w", err)
+	}
+	return row, true, nil
+}
+
+func appConfirmActiveMemory(tx *sql.Tx, active appMemoryActiveRow, now time.Time) error {
+	var expiresAt any
+	if !active.pinned {
+		expiresAt = ts(now.Add(appMemoryDuration(active.category)))
+	}
+	if _, err := tx.Exec(`UPDATE zalo_memory
+SET last_confirmed_at = ?, expires_at = ?, updated_at = ?
+WHERE id = ? AND thread_id = ? AND uid = ? AND status = 'active'`,
+		ts(now), expiresAt, ts(now), active.id, active.threadID, active.uid,
+	); err != nil {
+		return fmt.Errorf("confirm active Memory %d: %w", active.id, err)
+	}
+	return nil
+}
+
+func appMemoryDuration(category string) time.Duration {
+	if duration, ok := appMemoryAutoCategories[category]; ok {
+		return duration
+	}
+	return appMemoryLongDuration
+}
+
+func appInsertActiveMemory(
+	tx *sql.Tx,
+	threadID, subjectUID string,
+	sourceMessageID int64,
+	operation appValidatedMemoryOperation,
+	now time.Time,
+	duration time.Duration,
+) error {
+	if _, err := tx.Exec(`INSERT INTO zalo_memory(
+thread_id, uid, memory_key, category, text, confidence, status, proposal_action,
+supersedes_id, pinned, source, source_message_id, created_at, updated_at,
+last_confirmed_at, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, 'active', '', 0, 0, 'agent', ?, ?, ?, ?, ?)`,
+		threadID, subjectUID, operation.memoryKey, operation.category, operation.value,
+		operation.confidence, sourceMessageID, ts(now), ts(now), ts(now), ts(now.Add(duration)),
+	); err != nil {
+		return fmt.Errorf("insert active Memory: %w", err)
+	}
+	return nil
+}
+
+func appInsertPendingAdd(
+	tx *sql.Tx,
+	threadID, subjectUID string,
+	sourceMessageID int64,
+	operation appValidatedMemoryOperation,
+	now time.Time,
+) error {
+	if _, err := tx.Exec(`INSERT INTO zalo_memory(
+thread_id, uid, memory_key, category, text, confidence, status, proposal_action,
+supersedes_id, pinned, source, source_message_id, created_at, updated_at,
+last_confirmed_at, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, 'pending', 'add', 0, 0, 'agent', ?, ?, ?, '', NULL)`,
+		threadID, subjectUID, operation.memoryKey, operation.category, operation.value,
+		operation.confidence, sourceMessageID, ts(now), ts(now),
+	); err != nil {
+		return fmt.Errorf("insert pending Memory add: %w", err)
+	}
+	return nil
+}
+
+func appApplyMemoryReplace(
+	tx *sql.Tx,
+	threadID, subjectUID string,
+	sourceMessageID int64,
+	allowedTargetIDs map[int64]struct{},
+	operation appValidatedMemoryOperation,
+	now time.Time,
+) (appMemoryMutationOutcome, bool, error) {
+	if _, allowed := allowedTargetIDs[operation.targetID]; !allowed {
+		return appMemoryMutationIgnored, false, nil
+	}
+	target, found, err := appReadMemoryTarget(tx, operation.targetID)
+	if err != nil {
+		return appMemoryMutationNoop, false, err
+	}
+	if !found || !appMemoryTargetIsActiveInScope(target, threadID, subjectUID, now) {
+		return appMemoryMutationIgnored, false, nil
+	}
+	if err := appUpsertPendingReplacement(
+		tx, threadID, subjectUID, sourceMessageID, target.id, operation, now,
+	); err != nil {
+		return appMemoryMutationNoop, false, err
+	}
+	return appMemoryMutationPending, false, nil
+}
+
+func appReadMemoryTarget(tx *sql.Tx, id int64) (appMemoryActiveRow, bool, error) {
+	var row appMemoryActiveRow
+	err := tx.QueryRow(`SELECT id, thread_id, uid, memory_key, category, text, status, pinned, expires_at
+FROM zalo_memory WHERE id = ?`, id).Scan(
+		&row.id, &row.threadID, &row.uid, &row.memoryKey, &row.category,
+		&row.text, &row.status, &row.pinned, &row.expiresAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return appMemoryActiveRow{}, false, nil
+	}
+	if err != nil {
+		return appMemoryActiveRow{}, false, fmt.Errorf("read Memory target %d: %w", id, err)
+	}
+	return row, true, nil
+}
+
+func appMemoryTargetIsActiveInScope(
+	target appMemoryActiveRow,
+	threadID, subjectUID string,
+	now time.Time,
+) bool {
+	if target.threadID != threadID || target.uid != subjectUID || target.status != "active" {
+		return false
+	}
+	if !target.expiresAt.Valid {
+		return true
+	}
+	expiresAt, err := parseTS(target.expiresAt.String)
+	return err == nil && expiresAt.After(now)
+}
+
+func appUpsertPendingReplacement(
+	tx *sql.Tx,
+	threadID, subjectUID string,
+	sourceMessageID, targetID int64,
+	operation appValidatedMemoryOperation,
+	now time.Time,
+) error {
+	var pendingID int64
+	err := tx.QueryRow(`SELECT id FROM zalo_memory
+WHERE thread_id = ? AND uid = ? AND status = 'pending'
+  AND proposal_action = 'replace' AND supersedes_id = ? AND created_at >= ?
+ORDER BY id DESC LIMIT 1`,
+		threadID, subjectUID, targetID, ts(now.Add(-appMemoryPendingRetention)),
+	).Scan(&pendingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("find pending Memory replacement for %d: %w", targetID, err)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := tx.Exec(`INSERT INTO zalo_memory(
+thread_id, uid, memory_key, category, text, confidence, status, proposal_action,
+supersedes_id, pinned, source, source_message_id, created_at, updated_at,
+last_confirmed_at, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, 'pending', 'replace', ?, 0, 'agent', ?, ?, ?, '', NULL)`,
+			threadID, subjectUID, operation.memoryKey, operation.category, operation.value,
+			operation.confidence, targetID, sourceMessageID, ts(now), ts(now),
+		); err != nil {
+			return fmt.Errorf("insert pending Memory replacement for %d: %w", targetID, err)
+		}
+		return nil
+	}
+	if _, err := tx.Exec(`UPDATE zalo_memory
+SET memory_key = ?, category = ?, text = ?, confidence = ?, source = 'agent',
+    source_message_id = ?, created_at = ?, updated_at = ?, last_confirmed_at = '',
+    expires_at = NULL
+WHERE id = ? AND thread_id = ? AND uid = ? AND status = 'pending'
+  AND proposal_action = 'replace' AND supersedes_id = ?`,
+		operation.memoryKey, operation.category, operation.value, operation.confidence,
+		sourceMessageID, ts(now), ts(now), pendingID, threadID, subjectUID, targetID,
+	); err != nil {
+		return fmt.Errorf("refresh pending Memory replacement %d: %w", pendingID, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM zalo_memory
+WHERE thread_id = ? AND uid = ? AND status = 'pending'
+  AND proposal_action = 'replace' AND supersedes_id = ? AND created_at >= ? AND id <> ?`,
+		threadID, subjectUID, targetID, ts(now.Add(-appMemoryPendingRetention)), pendingID,
+	); err != nil {
+		return fmt.Errorf("remove competing Memory replacements for %d: %w", targetID, err)
+	}
+	return nil
+}
+
+func appApplyMemoryForget(
+	tx *sql.Tx,
+	threadID, subjectUID string,
+	allowedTargetIDs map[int64]struct{},
+	operation appValidatedMemoryOperation,
+	now time.Time,
+) (appMemoryMutationOutcome, bool, error) {
+	if _, allowed := allowedTargetIDs[operation.targetID]; !allowed {
+		return appMemoryMutationIgnored, false, nil
+	}
+	target, found, err := appReadMemoryTarget(tx, operation.targetID)
+	if err != nil {
+		return appMemoryMutationNoop, false, err
+	}
+	if !found {
+		return appMemoryMutationNoop, false, nil
+	}
+	if target.threadID != threadID || target.uid != subjectUID {
+		return appMemoryMutationIgnored, false, nil
+	}
+	if !appMemoryTargetIsActiveInScope(target, threadID, subjectUID, now) {
+		return appMemoryMutationNoop, false, nil
+	}
+	if _, err := tx.Exec(`WITH RECURSIVE lineage(id) AS (
+  SELECT ?
+  UNION
+  SELECT CASE WHEN linked.id = lineage.id THEN linked.supersedes_id ELSE linked.id END
+  FROM zalo_memory linked JOIN lineage
+    ON linked.id = lineage.id OR linked.supersedes_id = lineage.id
+  WHERE linked.thread_id = ? AND linked.uid = ? AND linked.supersedes_id > 0
+)
+DELETE FROM zalo_memory
+WHERE thread_id = ? AND uid = ? AND id IN (SELECT id FROM lineage)`,
+		target.id, threadID, subjectUID, threadID, subjectUID,
+	); err != nil {
+		return appMemoryMutationNoop, false, fmt.Errorf("forget Memory lineage %d: %w", target.id, err)
+	}
+	return appMemoryMutationActive, true, nil
+}
 
 type AppPromptMemoryItem struct {
 	ID        int64
