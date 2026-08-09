@@ -2,16 +2,22 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const (
 	appZaloTestSessionID         = "11111111-1111-4111-8111-111111111111"
 	appZaloTestRecoverySessionID = "22222222-2222-4222-8222-222222222222"
+	appZaloPipeHelperEnv         = "AGENTDC_TEST_ZALO_RUNNER_PIPE_HELPER"
 )
 
 type appZaloCommandCall struct {
@@ -74,6 +80,19 @@ func appZaloRunnerFixture(command appZaloClaudeCommand) appZaloSessionRunner {
 
 func appZaloResultFixture(answer string) string {
 	return `{"type":"result","result":"` + answer + `","duration_ms":10,"num_turns":1}` + "\n"
+}
+
+func appZaloErrorResultFixture(message string) string {
+	event := struct {
+		Type    string `json:"type"`
+		Result  string `json:"result"`
+		IsError bool   `json:"is_error"`
+	}{Type: "result", Result: message, IsError: true}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded) + "\n"
 }
 
 func TestAppZaloSessionRunnerCreatesNamedSessionWithReadOnlyProfile(t *testing.T) {
@@ -227,7 +246,9 @@ func TestAppZaloSessionRunnerRecoversOnlyMissingOrCorruptResume(t *testing.T) {
 		stderr string
 	}{
 		{name: "missing", stderr: "Error: No conversation found with session ID " + appZaloTestSessionID},
-		{name: "corrupt", stderr: "Error: Session transcript is corrupted and cannot be resumed"},
+		{name: "corrupt unexpected end", stderr: "Error: --resume session load failed (" + appZaloTestSessionID + "): Unexpected end of JSON input"},
+		{name: "corrupt parse error", stderr: "Error: --resume session load failed (" + appZaloTestSessionID + "): JSON Parse error at byte 812"},
+		{name: "corrupt invalid JSON", stderr: "Error: --resume session load failed (" + appZaloTestSessionID + "): invalid JSON transcript"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
@@ -283,6 +304,8 @@ func TestAppZaloSessionRunnerDoesNotRetryOtherFailures(t *testing.T) {
 		{name: "resume phrase after permission error", stderr: "permission denied: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorPermission},
 		{name: "resume phrase after invalid model", stderr: "invalid model sonnet: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorModel},
 		{name: "resume phrase after unknown model", stderr: "unknown model sonnet: No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1"), want: appZaloErrorModel},
+		{name: "generic resume failure is not corruption", stderr: "Failed to resume session: Unexpected end of JSON input", waitErr: errors.New("exit status 1"), want: appZaloErrorProcess},
+		{name: "load failure permission wins", stderr: "--resume session load failed (" + appZaloTestSessionID + "): permission denied reading transcript", waitErr: errors.New("exit status 1"), want: appZaloErrorPermission},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
@@ -305,6 +328,119 @@ func TestAppZaloSessionRunnerDoesNotRetryOtherFailures(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "customer-secret-canary") || strings.Contains(err.Error(), "private content") {
 				t.Errorf("error leaked raw content: %q", err)
+			}
+		})
+	}
+}
+
+func TestAppZaloSessionRunnerClassifiesStdoutResultErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stdout     string
+		stderr     string
+		want       string
+		wantCalls  int
+		wantAnswer string
+	}{
+		{name: "stdout timeout", stdout: appZaloErrorResultFixture("API Error: request timed out"), want: appZaloErrorTimeout, wantCalls: 1},
+		{name: "stdout network", stdout: appZaloErrorResultFixture("API network error: connection reset by peer"), want: appZaloErrorNetwork, wantCalls: 1},
+		{name: "stdout model", stdout: appZaloErrorResultFixture("invalid model sonnet"), want: appZaloErrorModel, wantCalls: 1},
+		{name: "stdout missing session", stdout: appZaloErrorResultFixture("No conversation found with session ID " + appZaloTestSessionID), wantCalls: 2, wantAnswer: "recovered"},
+		{name: "stdout network beats stderr missing", stdout: appZaloErrorResultFixture("network error: connection refused"), stderr: "No conversation found with session ID " + appZaloTestSessionID, want: appZaloErrorNetwork, wantCalls: 1},
+		{name: "stderr permission beats stdout missing", stdout: appZaloErrorResultFixture("No conversation found with session ID " + appZaloTestSessionID), stderr: "permission denied for transcript", want: appZaloErrorPermission, wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
+				{stdout: tc.stdout, stderr: tc.stderr},
+				{stdout: appZaloResultFixture("recovered")},
+			}}
+			runner := appZaloRunnerFixture(fake.run)
+			result, err := runner.RunSession(context.Background(), appZaloSessionRunInput{
+				SessionID:         appZaloTestSessionID,
+				Prompt:            "delta with private content",
+				Resume:            true,
+				RecoverySessionID: appZaloTestRecoverySessionID,
+				BootstrapPrompt:   "bootstrap with private content",
+			}, func(string) {})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("RunSession() error = %v", err)
+				}
+				if result.Answer != tc.wantAnswer || !result.Recovered {
+					t.Errorf("result = %+v, want recovered answer", result)
+				}
+			} else {
+				if got := appZaloRunErrorCode(err); got != tc.want {
+					t.Fatalf("error code = %q, want %q (err %v)", got, tc.want, err)
+				}
+				if err == nil || err.Error() != tc.want {
+					t.Errorf("error = %v, want safe code only %q", err, tc.want)
+				}
+			}
+			if len(fake.calls) != tc.wantCalls {
+				t.Errorf("command calls = %d, want %d", len(fake.calls), tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestAppZaloSessionRunnerIgnoresErrorWordsOutsideErrorResults(t *testing.T) {
+	stream := `{"type":"assistant","message":{"content":[{"type":"text","text":"network error: no conversation found with session id"}]}}` + "\n" +
+		appZaloResultFixture("answer")
+	fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{{stdout: stream}}}
+	runner := appZaloRunnerFixture(fake.run)
+
+	result, err := runner.RunSession(context.Background(), appZaloSessionRunInput{
+		SessionID:         appZaloTestSessionID,
+		Prompt:            "delta",
+		Resume:            true,
+		RecoverySessionID: appZaloTestRecoverySessionID,
+		BootstrapPrompt:   "bootstrap",
+	}, func(string) {})
+	if err != nil {
+		t.Fatalf("RunSession() error = %v", err)
+	}
+	if result.Answer != "answer" || len(fake.calls) != 1 {
+		t.Errorf("result = %+v, calls = %d", result, len(fake.calls))
+	}
+}
+
+func TestAppZaloSessionRunnerReturnsRecoveryMetadataWhenBootstrapFails(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response appZaloCommandResponse
+		want     string
+	}{
+		{name: "network", response: appZaloCommandResponse{stderr: "network error: connection reset by peer", waitErr: errors.New("exit status 1")}, want: appZaloErrorNetwork},
+		{name: "timeout", response: appZaloCommandResponse{stderr: "private timeout details", waitErr: context.DeadlineExceeded}, want: appZaloErrorTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
+				{stderr: "No conversation found with session ID " + appZaloTestSessionID, waitErr: errors.New("exit status 1")},
+				tc.response,
+			}}
+			runner := appZaloRunnerFixture(fake.run)
+			result, err := runner.RunSession(context.Background(), appZaloSessionRunInput{
+				SessionID:         appZaloTestSessionID,
+				Prompt:            "delta",
+				Resume:            true,
+				RecoverySessionID: appZaloTestRecoverySessionID,
+				BootstrapPrompt:   "bootstrap",
+			}, func(string) {})
+			if got := appZaloRunErrorCode(err); got != tc.want {
+				t.Fatalf("error code = %q, want %q", got, tc.want)
+			}
+			if !result.RecoveryAttempted {
+				t.Errorf("result lacks true RecoveryAttempted metadata: %+v", result)
+			}
+			if result.RecoveryCode != appZaloErrorResumeNotFound || result.Recovered {
+				t.Errorf("recovery metadata = %+v", result)
+			}
+			if len(fake.calls) != 2 {
+				t.Errorf("command calls = %d, want exactly 2", len(fake.calls))
+			}
+			if err == nil || strings.Contains(err.Error(), "private") || err.Error() != tc.want {
+				t.Errorf("unsafe error = %v", err)
 			}
 		})
 	}
@@ -430,6 +566,140 @@ func TestAppZaloSessionRunnerRetainsEightMiBScannerLimit(t *testing.T) {
 	}, func(string) {})
 	if got := appZaloRunErrorCode(err); got != appZaloErrorOutput {
 		t.Fatalf("error code = %q, want %q (err %v)", got, appZaloErrorOutput, err)
+	}
+}
+
+func TestAppZaloSessionRunnerCapsAggregateFallbackWhileDrainingAllOutput(t *testing.T) {
+	line := strings.Repeat("x", 1024) + "\n"
+	stream := strings.Repeat(line, (appZaloMaxClaudeStreamLine/len(line))+2)
+	fake := &appZaloRecordingCommand{responses: []appZaloCommandResponse{
+		{stdout: stream},
+		{stdout: stream + appZaloResultFixture("bounded answer")},
+	}}
+	runner := appZaloRunnerFixture(fake.run)
+
+	_, err := runner.RunSession(context.Background(), appZaloSessionRunInput{
+		SessionID: appZaloTestSessionID,
+		Prompt:    "bootstrap",
+	}, func(string) {})
+	if got := appZaloRunErrorCode(err); got != appZaloErrorOutput {
+		t.Fatalf("fallback error code = %q, want %q", got, appZaloErrorOutput)
+	}
+
+	result, err := runner.RunSession(context.Background(), appZaloSessionRunInput{
+		SessionID: appZaloTestRecoverySessionID,
+		Prompt:    "bootstrap",
+	}, func(string) {})
+	if err != nil {
+		t.Fatalf("valid final result after aggregate cap error = %v", err)
+	}
+	if result.Answer != "bounded answer" || result.OutputBytes != int64(len(stream)+len(appZaloResultFixture("bounded answer"))) {
+		t.Errorf("result = %+v", result)
+	}
+}
+
+func TestAppZaloRunnerPipeHelper(_ *testing.T) {
+	if os.Getenv(appZaloPipeHelperEnv) != "overlong-line" {
+		return
+	}
+	_, _ = io.WriteString(os.Stdout, strings.Repeat("x", appZaloMaxClaudeStreamLine+(64<<10)))
+}
+
+func TestAppZaloSessionRunnerDrainsOversizedOSPipeAndReapsChild(t *testing.T) {
+	var waitCalls atomic.Int32
+	command := func(
+		ctx context.Context,
+		_ string,
+		_ []string,
+		_ string,
+		_ []string,
+	) (io.ReadCloser, io.ReadCloser, func() error, error) {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAppZaloRunnerPipeHelper$")
+		cmd.Env = append(os.Environ(), appZaloPipeHelperEnv+"=overlong-line")
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			_ = stdout.Close()
+			return nil, nil, nil, err
+		}
+		if err := cmd.Start(); err != nil {
+			_ = stdout.Close()
+			_ = stderr.Close()
+			return nil, nil, nil, err
+		}
+		return stdout, stderr, func() error {
+			waitCalls.Add(1)
+			return cmd.Wait()
+		}, nil
+	}
+	runner := appZaloRunnerFixture(command)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	started := time.Now()
+
+	_, err := runner.RunSession(ctx, appZaloSessionRunInput{
+		SessionID: appZaloTestSessionID,
+		Prompt:    "bootstrap",
+	}, func(string) {})
+	elapsed := time.Since(started)
+	if got := appZaloRunErrorCode(err); got != appZaloErrorOutput {
+		t.Fatalf("error code = %q, want %q after %s (ctx err %v)", got, appZaloErrorOutput, elapsed, ctx.Err())
+	}
+	if ctx.Err() != nil || elapsed >= 2*time.Second {
+		t.Fatalf("runner waited for cancellation instead of draining/reaping: elapsed %s, ctx err %v", elapsed, ctx.Err())
+	}
+	if got := waitCalls.Load(); got != 1 {
+		t.Fatalf("wait calls = %d, want exactly 1", got)
+	}
+}
+
+type appZaloReadErrorCloser struct {
+	closed atomic.Bool
+}
+
+func (r *appZaloReadErrorCloser) Read([]byte) (int, error) {
+	return 0, errors.New("injected stdout read failure")
+}
+
+func (r *appZaloReadErrorCloser) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+func TestAppZaloSessionRunnerClosesUnreadableStdoutBeforeWait(t *testing.T) {
+	stdout := &appZaloReadErrorCloser{}
+	var closedAtWait atomic.Bool
+	var waitCalls atomic.Int32
+	command := func(
+		context.Context,
+		string,
+		[]string,
+		string,
+		[]string,
+	) (io.ReadCloser, io.ReadCloser, func() error, error) {
+		return stdout, io.NopCloser(strings.NewReader("")), func() error {
+			waitCalls.Add(1)
+			closedAtWait.Store(stdout.closed.Load())
+			return nil
+		}, nil
+	}
+	runner := appZaloRunnerFixture(command)
+
+	_, err := runner.RunSession(context.Background(), appZaloSessionRunInput{
+		SessionID: appZaloTestSessionID,
+		Prompt:    "bootstrap",
+	}, func(string) {})
+	if got := appZaloRunErrorCode(err); got != appZaloErrorOutput {
+		t.Fatalf("error code = %q, want %q", got, appZaloErrorOutput)
+	}
+	if !closedAtWait.Load() {
+		t.Error("stdout was not closed before Wait after drain failed")
+	}
+	if got := waitCalls.Load(); got != 1 {
+		t.Fatalf("wait calls = %d, want exactly 1", got)
 	}
 }
 

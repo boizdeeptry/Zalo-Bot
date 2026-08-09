@@ -27,8 +27,9 @@ const (
 	appZaloErrorArgv           = "invalid_session_argv"
 	appZaloErrorStart          = "process_start_failed"
 
-	appZaloMaxClaudeStreamLine = 8 << 20
-	appZaloMaxStderrBytes      = 4 << 10
+	appZaloMaxClaudeStreamLine    = 8 << 20
+	appZaloMaxFallbackOutputBytes = 8 << 20
+	appZaloMaxErrorEvidenceBytes  = 4 << 10
 )
 
 // appZaloClaudeCommand is the process boundary used by the session runner.
@@ -62,7 +63,10 @@ type appZaloRunResult struct {
 	OutputBytes   int64
 	SessionID     string
 	Recovered     bool
-	RecoveryCode  string
+	// RecoveryAttempted remains true even when the fresh bootstrap fails, so
+	// orchestration can invalidate the old resumable mapping safely.
+	RecoveryAttempted bool
+	RecoveryCode      string
 }
 
 type appZaloSessionRunner struct {
@@ -113,12 +117,17 @@ func (r appZaloSessionRunner) RunSession(
 		return appZaloRunResult{}, err
 	}
 
+	recovery := appZaloRunResult{
+		RecoveryAttempted: true,
+		RecoveryCode:      appZaloErrorResumeNotFound,
+	}
 	result, err = r.runAttempt(ctx, in.RecoverySessionID, in.BootstrapPrompt, false, step)
 	if err != nil {
-		return appZaloRunResult{}, err
+		return recovery, err
 	}
 	result.SessionID = in.RecoverySessionID
 	result.Recovered = true
+	result.RecoveryAttempted = true
 	result.RecoveryCode = appZaloErrorResumeNotFound
 	return result, nil
 }
@@ -173,19 +182,25 @@ func (r appZaloSessionRunner) runAttempt(
 
 	stderrDone := make(chan string, 1)
 	go func() {
-		stderrDone <- appZaloReadClipped(stderr, appZaloMaxStderrBytes)
+		stderrDone <- appZaloReadClipped(stderr, appZaloMaxErrorEvidenceBytes)
 	}()
 	parsed, scanErr := appZaloParseClaudeStream(stdout, step)
+	if scanErr != nil {
+		// A persistent read error cannot be drained. Closing the read end is the
+		// fallback that releases a child blocked on stdout before stderr/Wait join.
+		_ = stdout.Close()
+	}
 	stderrText := <-stderrDone
 	waitErr := wait()
-	if waitErr != nil {
-		code, match := appZaloClassifyClaudeFailure(ctx, waitErr, stderrText, resume)
+	if waitErr != nil || parsed.isError {
+		evidence := appZaloCombineClaudeErrorEvidence(parsed.errorEvidence, stderrText)
+		code, match := appZaloClassifyClaudeFailure(ctx, waitErr, evidence, resume)
 		return appZaloRunResult{}, appZaloNewRunError(code, match)
 	}
 	if scanErr != nil {
 		return appZaloRunResult{}, appZaloNewRunError(appZaloErrorOutput, nil)
 	}
-	return parsed, nil
+	return parsed.result, nil
 }
 
 // appZaloResumeArgv replaces exactly one adjacent --session-id value generated
@@ -222,38 +237,78 @@ func (r *appZaloCountingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func appZaloParseClaudeStream(stdout io.Reader, step func(string)) (appZaloRunResult, error) {
+type appZaloParsedClaudeStream struct {
+	result        appZaloRunResult
+	isError       bool
+	errorEvidence string
+}
+
+func appZaloParseClaudeStream(stdout io.Reader, step func(string)) (appZaloParsedClaudeStream, error) {
 	counted := &appZaloCountingReader{r: stdout}
 	scanner := bufio.NewScanner(counted)
 	scanner.Buffer(make([]byte, 0, 64<<10), appZaloMaxClaudeStreamLine)
 
-	var result appZaloRunResult
+	var parsed appZaloParsedClaudeStream
 	var body strings.Builder
 	var sawResult bool
+	var fallbackTooLarge bool
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		body.Write(line)
-		body.WriteByte('\n')
 		streamStep, answer, isResult := parseStreamLine(line)
 		if streamStep != "" {
 			step(streamStep)
 		}
 		if !isResult {
+			if !sawResult && !fallbackTooLarge {
+				lineBytes := len(line) + 1
+				if lineBytes > appZaloMaxFallbackOutputBytes-body.Len() {
+					fallbackTooLarge = true
+				} else {
+					body.Write(line)
+					body.WriteByte('\n')
+				}
+			}
 			continue
 		}
-		result.Answer = answer
+		parsed.result.Answer = answer
 		sawResult = true
-		result.ContextTokens, result.UsageMeasured = appZaloParseClaudeUsage(line)
+		body.Reset()
+		parsed.result.ContextTokens, parsed.result.UsageMeasured = appZaloParseClaudeUsage(line)
+		parsed.isError, parsed.errorEvidence = appZaloParseClaudeResultError(line)
 	}
-	result.OutputBytes = counted.n
+	parsed.result.OutputBytes = counted.n
 	if err := scanner.Err(); err != nil {
-		return result, err
+		// Scanner stops consuming after ErrTooLong or a read error. Keep draining
+		// the OS pipe so the child cannot remain blocked in Write while runAttempt
+		// waits for stderr EOF and reaps it exactly once.
+		_, _ = io.Copy(io.Discard, counted)
+		parsed.result.OutputBytes = counted.n
+		return parsed, err
 	}
 	if !sawResult {
+		if fallbackTooLarge {
+			return parsed, errors.New(appZaloErrorOutput)
+		}
 		step("không thấy event result, đọc cả stdout")
-		result.Answer = body.String()
+		parsed.result.Answer = body.String()
 	}
-	return result, nil
+	return parsed, nil
+}
+
+func appZaloParseClaudeResultError(line []byte) (bool, string) {
+	var event struct {
+		Type    string `json:"type"`
+		Result  string `json:"result"`
+		IsError bool   `json:"is_error"`
+	}
+	if json.Unmarshal(line, &event) != nil || event.Type != "result" || !event.IsError {
+		return false, ""
+	}
+	evidence := strings.TrimSpace(event.Result)
+	if len(evidence) > appZaloMaxErrorEvidenceBytes {
+		evidence = evidence[:appZaloMaxErrorEvidenceBytes]
+	}
+	return true, evidence
 }
 
 func appZaloParseClaudeUsage(line []byte) (int64, bool) {
@@ -341,14 +396,27 @@ func appZaloNormalizeClaudeError(stderr string) string {
 }
 
 func appZaloIsRecoverableResumeError(normalized string) bool {
+	if strings.Contains(normalized, "no conversation found with session id") {
+		return true
+	}
+	if !strings.Contains(normalized, "--resume session load failed (") {
+		return false
+	}
 	return appZaloContainsAny(normalized,
-		"no conversation found with session id",
-		"no session found with id",
-		"session transcript is corrupt",
-		"session transcript is corrupted",
-		"corrupt session transcript",
-		"failed to resume session: session not found",
-		"failed to resume session: transcript corrupt")
+		"unexpected end of json input",
+		"json parse error",
+		"invalid json")
+}
+
+func appZaloCombineClaudeErrorEvidence(stdout, stderr string) string {
+	switch {
+	case stdout == "":
+		return stderr
+	case stderr == "":
+		return stdout
+	default:
+		return stdout + "\n" + stderr
+	}
 }
 
 func appZaloContainsAny(value string, needles ...string) bool {
