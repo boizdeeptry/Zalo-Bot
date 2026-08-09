@@ -2,7 +2,7 @@
 
 **Ngày:** 2026-08-09
 
-**Trạng thái:** Chờ người dùng xác nhận spec
+**Trạng thái:** Đã được người dùng xác nhận ngày 2026-08-09
 
 **Repository:** `D:\TuvanZalo\_build\.worktrees\portal-m1`
 
