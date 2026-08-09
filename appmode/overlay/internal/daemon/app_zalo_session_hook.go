@@ -8,6 +8,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -15,7 +16,11 @@ import (
 	"agentdc/internal/store"
 )
 
-const appZaloErrorStateUpdate = "session_state_update_failed"
+const (
+	appZaloErrorStateUpdate = "session_state_update_failed"
+	appZaloErrorMemoryRead  = "memory_read_failed"
+	appZaloErrorMemoryApply = "memory_apply_failed"
+)
 
 var appZaloProcessThreadGate appZaloThreadGate
 
@@ -30,12 +35,15 @@ type appZaloStructuredRunner interface {
 }
 
 type appZaloCompletion struct {
-	generation      int64
-	contextTokens   int64
-	messageCursor   int64
-	memoryRevision  int64
-	lessonsRevision int64
-	ready           bool
+	generation            int64
+	contextTokens         int64
+	messageCursor         int64
+	memorySubjectUID      string
+	memorySubjectRevision int64
+	memoryCommonRevision  int64
+	memoryRevision        int64
+	lessonsRevision       int64
+	ready                 bool
 }
 
 type appZaloCompletionCarrier struct {
@@ -60,29 +68,36 @@ func (c *appZaloCompletionCarrier) take() (appZaloCompletion, bool) {
 type appZaloCompletionContextKey struct{}
 
 type appZaloSessionSelection struct {
-	session          store.ZaloCLISession
-	prompt           string
-	bootstrapPrompt  string
-	completionCursor int64
-	bootstrapCursor  int64
-	memoryRevision   int64
-	lessonsRevision  int64
-	resume           bool
+	session               store.ZaloCLISession
+	prompt                string
+	bootstrapPrompt       string
+	completionCursor      int64
+	bootstrapCursor       int64
+	memorySubject         store.AppMemorySubject
+	subjectMemory         []store.AppPromptMemoryItem
+	memorySubjectUID      string
+	memorySubjectRevision int64
+	memoryCommonRevision  int64
+	memoryRevision        int64
+	lessonsRevision       int64
+	memoryOK              bool
+	resume                bool
 }
 
 type appZaloMemorySnapshot struct {
-	memory          []ipc.ZaloMemory
+	common          []store.AppPromptMemoryItem
+	subject         []store.AppPromptMemoryItem
 	lessons         []ipc.ZaloLesson
-	memoryRevision  int64
+	commonRevision  int64
+	subjectRevision int64
 	lessonsRevision int64
 	memoryOK        bool
 	lessonsOK       bool
 }
 
-// appZaloStructuredAnswerRunner keeps Task 5 testable before the guarded Task 6
-// source seam is installed. Its Run method reconstructs the structured arguments
-// from the durable store; after Task 6, appRunZalo sees the private structured
-// method directly and this compatibility Run path is no longer selected.
+// appZaloStructuredAnswerRunner adapts the upstream single-string runner hook to
+// the overlay's structured session seam. It rebuilds trusted turn inputs from the
+// durable store and deliberately ignores the upstream legacy-Memory prompt.
 type appZaloStructuredAnswerRunner struct {
 	a                *api
 	run              appZaloStructuredRunner
@@ -96,7 +111,7 @@ type appZaloStructuredAnswerRunner struct {
 
 func (r *appZaloStructuredAnswerRunner) Run(
 	ctx context.Context,
-	bootstrapPrompt string,
+	_ string,
 	step func(string),
 ) (string, error) {
 	history, err := r.a.st.ZaloMessages(r.threadID, zaloHistoryTurns)
@@ -111,9 +126,7 @@ func (r *appZaloStructuredAnswerRunner) Run(
 	}
 	files := mergeZaloFiles(r.files, history)
 	pz := r.zc
-	if memory, memoryErr := r.a.st.ZaloMemory(r.threadID, zaloMemoryLines); memoryErr == nil {
-		pz.Memory = memory
-	}
+	pz.Memory = nil
 	if lessons, lessonsErr := r.a.st.ZaloLessons(zaloLessonLines); lessonsErr == nil {
 		pz.Lessons = lessons
 	}
@@ -129,7 +142,7 @@ func (r *appZaloStructuredAnswerRunner) Run(
 		retrieve(r.question, r.zc.KBRoots),
 		files,
 		step,
-		bootstrapPrompt,
+		"",
 		bootstrapCursor,
 	)
 }
@@ -255,14 +268,17 @@ func (a *api) appRunZaloStructured(
 		a.appInvalidateFailedZaloRecovery(selection.session, result)
 		return "", runErr
 	}
+	result.Answer = a.appProcessZaloMemoryAnswer(result.Answer, selection)
 
 	recovered := result.Recovered
+	freshRecovery := false
 	if recovered && result.SessionID != "" && result.SessionID != selection.session.ClaudeSessionID {
 		replaced, replacedOK := a.appReplaceRecoveredZaloSession(selection.session, result.SessionID)
 		if !replacedOK {
 			return result.Answer, nil
 		}
 		selection.session = replaced
+		freshRecovery = true
 	}
 	prompt := selection.prompt
 	previousContext := selection.session.ContextTokens
@@ -273,14 +289,61 @@ func (a *api) appRunZaloStructured(
 		completionCursor = selection.bootstrapCursor
 	}
 	contextTokens := appZaloObservedContext(previousContext, prompt, result)
+	memorySubjectUID := selection.memorySubjectUID
+	memorySubjectRevision := selection.memorySubjectRevision
+	memoryCommonRevision := selection.memoryCommonRevision
+	if freshRecovery && !selection.memoryOK {
+		memorySubjectUID = ""
+		memorySubjectRevision = 0
+		memoryCommonRevision = 0
+	}
 	if carrier, ok := ctx.Value(appZaloCompletionContextKey{}).(*appZaloCompletionCarrier); ok {
 		carrier.set(appZaloCompletion{
 			generation: selection.session.Generation, contextTokens: contextTokens,
-			messageCursor: completionCursor, memoryRevision: selection.memoryRevision,
-			lessonsRevision: selection.lessonsRevision, ready: true,
+			messageCursor:         completionCursor,
+			memorySubjectUID:      memorySubjectUID,
+			memorySubjectRevision: memorySubjectRevision,
+			memoryCommonRevision:  memoryCommonRevision,
+			memoryRevision:        selection.memoryRevision,
+			lessonsRevision:       selection.lessonsRevision, ready: true,
 		})
 	}
 	return result.Answer, nil
+}
+
+func (a *api) appProcessZaloMemoryAnswer(
+	raw string,
+	selection appZaloSessionSelection,
+) string {
+	sanitized, operations, ok := appZaloSanitizeMemoryAnswer(raw)
+	if !ok {
+		return raw
+	}
+	if len(operations) == 0 || !selection.memoryOK || selection.memorySubject.UID == "" {
+		return sanitized
+	}
+	allowedTargetIDs := make(map[int64]struct{}, len(selection.subjectMemory))
+	for _, item := range selection.subjectMemory {
+		allowedTargetIDs[item.ID] = struct{}{}
+	}
+	converted := make([]store.AppMemoryOperation, 0, len(operations))
+	for _, operation := range operations {
+		converted = append(converted, store.AppMemoryOperation{
+			Action: operation.Action, MemoryKey: operation.MemoryKey,
+			Value: operation.Value, Category: operation.Category,
+			Confidence: operation.Confidence, TargetID: operation.TargetID,
+		})
+	}
+	if _, err := a.st.ApplyAppMemoryOperations(store.AppMemoryApplyInput{
+		ThreadID: selection.session.ThreadID, SubjectUID: selection.memorySubject.UID,
+		SourceMessageID:  selection.memorySubject.MessageID,
+		AllowedTargetIDs: allowedTargetIDs, Operations: converted, Now: time.Now(),
+	}); err != nil {
+		a.logger.Warn("zalo session: Memory operation apply failed",
+			"thread", selection.session.ThreadID, "code", appZaloErrorMemoryApply,
+			"error_type", fmt.Sprintf("%T", err))
+	}
+	return sanitized
 }
 
 func (a *api) appSelectZaloSession(
@@ -292,12 +355,13 @@ func (a *api) appSelectZaloSession(
 	bootstrapOverride string,
 	bootstrapCursorOverride int64,
 ) (appZaloSessionSelection, error) {
+	_ = bootstrapOverride
 	fingerprint := appZaloPromptFingerprint(zc, threadID)
-	snapshot := a.appLoadZaloMemorySnapshot(threadID)
+	memorySubject := a.appResolveZaloMemorySubject(threadID, currentZaloMsgID)
+	snapshot := a.appLoadZaloMemorySnapshot(threadID, memorySubject.UID)
 	bootstrapConfig := zc
-	if snapshot.memoryOK {
-		bootstrapConfig.Memory = snapshot.memory
-	}
+	bootstrapConfig.Memory = nil
+	bootstrapConfig.Lessons = nil
 	if snapshot.lessonsOK {
 		bootstrapConfig.Lessons = snapshot.lessons
 	}
@@ -305,17 +369,37 @@ func (a *api) appSelectZaloSession(
 	if bootstrapCursorOverride >= 0 {
 		bootstrapCursor = bootstrapCursorOverride
 	}
-	bootstrap := bootstrapOverride
-	if snapshot.memoryOK || snapshot.lessonsOK || bootstrap == "" {
-		bootstrap = buildConsultPrompt(bootstrapConfig, question, history, found, files...)
-	}
-	bootstrapMemoryRevision := int64(0)
+	bootstrap := buildConsultPrompt(bootstrapConfig, question, history, found, files...)
 	if snapshot.memoryOK {
-		bootstrapMemoryRevision = snapshot.memoryRevision
+		fullMemory := appZaloRenderMemoryRefresh(&appZaloMemoryRefresh{
+			Common: snapshot.common, Subject: snapshot.subject,
+			ReplaceCommon: true, ReplaceSubject: true,
+			CommonRevision:  snapshot.commonRevision,
+			SubjectRevision: snapshot.subjectRevision,
+		})
+		if fullMemory != "" {
+			bootstrap = strings.TrimRight(bootstrap, "\r\n") + "\n\n" + fullMemory
+		}
 	}
-	bootstrapLessonsRevision := int64(0)
-	if snapshot.lessonsOK {
-		bootstrapLessonsRevision = snapshot.lessonsRevision
+	bootstrap = appZaloAppendMemoryContract(bootstrap)
+	bootstrapSelection := func(session store.ZaloCLISession) appZaloSessionSelection {
+		selection := appZaloSessionSelection{
+			session: session, prompt: bootstrap, bootstrapPrompt: bootstrap,
+			completionCursor: bootstrapCursor, bootstrapCursor: bootstrapCursor,
+			memorySubject: memorySubject, subjectMemory: snapshot.subject,
+			memoryRevision: session.MemoryRevision, memoryOK: snapshot.memoryOK,
+		}
+		if snapshot.memoryOK {
+			selection.memorySubjectUID = memorySubject.UID
+			selection.memorySubjectRevision = snapshot.subjectRevision
+			selection.memoryCommonRevision = snapshot.commonRevision
+		}
+		if snapshot.lessonsOK {
+			selection.lessonsRevision = snapshot.lessonsRevision
+		} else {
+			selection.lessonsRevision = session.LessonsRevision
+		}
+		return selection
 	}
 	session, err := a.st.ZaloCLISession(threadID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -324,11 +408,7 @@ func (a *api) appSelectZaloSession(
 			PromptFingerprint: fingerprint,
 		})
 		if createErr == nil {
-			return appZaloSessionSelection{
-				session: created, prompt: bootstrap, bootstrapPrompt: bootstrap,
-				completionCursor: bootstrapCursor, bootstrapCursor: bootstrapCursor,
-				memoryRevision: bootstrapMemoryRevision, lessonsRevision: bootstrapLessonsRevision,
-			}, nil
+			return bootstrapSelection(created), nil
 		}
 		// Another process may have inserted the mapping. Reload once and never
 		// overwrite the generation it won.
@@ -353,11 +433,7 @@ func (a *api) appSelectZaloSession(
 		next.LastError = ""
 		replaced, replaceErr := a.st.ReplaceZaloCLISession(session.Generation, next)
 		if replaceErr == nil {
-			return appZaloSessionSelection{
-				session: replaced, prompt: bootstrap, bootstrapPrompt: bootstrap,
-				completionCursor: bootstrapCursor, bootstrapCursor: bootstrapCursor,
-				memoryRevision: bootstrapMemoryRevision, lessonsRevision: bootstrapLessonsRevision,
-			}, nil
+			return bootstrapSelection(replaced), nil
 		}
 		if !errors.Is(replaceErr, store.ErrZaloCLISessionConflict) {
 			return appZaloSessionSelection{}, replaceErr
@@ -375,14 +451,30 @@ func (a *api) appSelectZaloSession(
 		return appZaloSessionSelection{}, err
 	}
 	refresh := &appZaloMemoryRefresh{}
-	memoryRevision := session.MemoryRevision
+	memorySubjectUID := session.MemorySubjectUID
+	memorySubjectRevision := session.MemorySubjectRevision
+	memoryCommonRevision := session.MemoryCommonRevision
 	if snapshot.memoryOK {
-		memoryRevision = snapshot.memoryRevision
-		if snapshot.memoryRevision != session.MemoryRevision {
-			refresh.ReplaceMemory = true
-			refresh.Memory = snapshot.memory
-			refresh.MemoryRevision = snapshot.memoryRevision
-		}
+		memorySubjectUID = memorySubject.UID
+		memorySubjectRevision = snapshot.subjectRevision
+		memoryCommonRevision = snapshot.commonRevision
+		refresh.ReplaceSubject = memorySubject.UID != session.MemorySubjectUID ||
+			snapshot.subjectRevision != session.MemorySubjectRevision
+		refresh.ReplaceCommon = snapshot.commonRevision != session.MemoryCommonRevision
+		refresh.Subject = snapshot.subject
+		refresh.Common = snapshot.common
+		refresh.SubjectRevision = snapshot.subjectRevision
+		refresh.CommonRevision = snapshot.commonRevision
+	} else if memorySubject.UID != session.MemorySubjectUID {
+		// The next speaker is trusted, but their snapshot is unreadable. Remove
+		// the resident prior speaker rather than exposing it across the turn.
+		// Persist an empty subject cursor so every later trusted speaker must
+		// refresh from a readable authoritative snapshot.
+		memorySubjectUID = ""
+		memorySubjectRevision = 0
+		refresh.ReplaceSubject = true
+		refresh.Subject = nil
+		refresh.SubjectRevision = 0
 	}
 	lessonsRevision := session.LessonsRevision
 	if snapshot.lessonsOK {
@@ -393,7 +485,7 @@ func (a *api) appSelectZaloSession(
 			refresh.LessonsRevision = snapshot.lessonsRevision
 		}
 	}
-	if !refresh.ReplaceMemory && !refresh.ReplaceLessons {
+	if !refresh.ReplaceCommon && !refresh.ReplaceSubject && !refresh.ReplaceLessons {
 		refresh = nil
 	}
 	deltaPrompt := buildAppZaloDeltaPromptResult(appZaloSessionPromptInput{
@@ -407,19 +499,43 @@ func (a *api) appSelectZaloSession(
 	return appZaloSessionSelection{
 		session: session, prompt: deltaPrompt.Prompt, bootstrapPrompt: bootstrap,
 		completionCursor: completionCursor, bootstrapCursor: bootstrapCursor,
-		memoryRevision: memoryRevision, lessonsRevision: lessonsRevision, resume: true,
+		memorySubject: memorySubject, subjectMemory: snapshot.subject,
+		memorySubjectUID:      memorySubjectUID,
+		memorySubjectRevision: memorySubjectRevision,
+		memoryCommonRevision:  memoryCommonRevision,
+		memoryRevision:        session.MemoryRevision, lessonsRevision: lessonsRevision,
+		memoryOK: snapshot.memoryOK, resume: true,
 	}, nil
 }
 
-func (a *api) appLoadZaloMemorySnapshot(threadID string) appZaloMemorySnapshot {
-	var snapshot appZaloMemorySnapshot
-	memory, revision, err := a.st.AppPromptMemory(threadID, zaloMemoryLines)
+func (a *api) appResolveZaloMemorySubject(threadID, currentZaloMsgID string) store.AppMemorySubject {
+	if strings.TrimSpace(currentZaloMsgID) == "" {
+		return store.AppMemorySubject{}
+	}
+	subject, err := a.st.AppInboundMemorySubject(threadID, currentZaloMsgID)
 	if err != nil {
-		a.logger.Warn("zalo session: could not read thread memory snapshot",
-			"thread", threadID, "error_type", fmt.Sprintf("%T", err))
+		a.logger.Warn("zalo session: could not resolve trusted Memory subject",
+			"thread", threadID, "code", appZaloErrorMemoryRead,
+			"error_type", fmt.Sprintf("%T", err))
+		return store.AppMemorySubject{}
+	}
+	return subject
+}
+
+func (a *api) appLoadZaloMemorySnapshot(threadID, subjectUID string) appZaloMemorySnapshot {
+	var snapshot appZaloMemorySnapshot
+	memory, err := a.st.AppPromptMemoryForSubject(
+		threadID, subjectUID, zaloMemoryLines, time.Now(),
+	)
+	if err != nil {
+		a.logger.Warn("zalo session: could not read Memory snapshot",
+			"thread", threadID, "code", appZaloErrorMemoryRead,
+			"error_type", fmt.Sprintf("%T", err))
 	} else {
-		snapshot.memory = memory
-		snapshot.memoryRevision = revision
+		snapshot.common = memory.Common
+		snapshot.subject = memory.Subject
+		snapshot.commonRevision = memory.CommonRevision
+		snapshot.subjectRevision = memory.SubjectRevision
 		snapshot.memoryOK = true
 	}
 	lessons, revision, err := a.st.AppPromptLessons(zaloLessonLines)
@@ -500,7 +616,7 @@ func (a *api) appInvalidateFailedZaloRecovery(
 func (a *api) appCompleteZaloTurn(threadID string, pending appZaloCompletion) {
 	if _, err := a.st.CompleteZaloCLITurn(
 		threadID, pending.generation, pending.contextTokens, pending.messageCursor,
-		"", 0, 0,
+		pending.memorySubjectUID, pending.memorySubjectRevision, pending.memoryCommonRevision,
 		pending.memoryRevision, pending.lessonsRevision,
 	); err == nil {
 		return

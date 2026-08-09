@@ -49,11 +49,14 @@ type appZaloSessionPromptInput struct {
 }
 
 type appZaloMemoryRefresh struct {
-	Memory          []ipc.ZaloMemory
+	Common          []store.AppPromptMemoryItem
+	Subject         []store.AppPromptMemoryItem
 	Lessons         []ipc.ZaloLesson
-	ReplaceMemory   bool
+	ReplaceCommon   bool
+	ReplaceSubject  bool
 	ReplaceLessons  bool
-	MemoryRevision  int64
+	CommonRevision  int64
+	SubjectRevision int64
 	LessonsRevision int64
 }
 
@@ -191,8 +194,11 @@ type appZaloMemoryRefreshRecord struct {
 }
 
 type appZaloMemoryRefreshItem struct {
-	UID  string `json:"uid,omitempty"`
-	Text string `json:"text"`
+	ID        int64  `json:"id"`
+	UID       string `json:"uid"`
+	MemoryKey string `json:"memory_key"`
+	Category  string `json:"category"`
+	Text      string `json:"text"`
 }
 
 type appZaloLessonRefreshItem struct {
@@ -202,21 +208,30 @@ type appZaloLessonRefreshItem struct {
 }
 
 func appZaloRenderMemoryRefresh(refresh *appZaloMemoryRefresh) string {
-	if refresh == nil || (!refresh.ReplaceMemory && !refresh.ReplaceLessons) {
+	if refresh == nil || (!refresh.ReplaceCommon && !refresh.ReplaceSubject && !refresh.ReplaceLessons) {
 		return ""
 	}
-	lines := make([]string, 0, 2)
-	if refresh.ReplaceMemory {
-		items := make([]appZaloMemoryRefreshItem, 0, len(refresh.Memory))
-		for _, memory := range refresh.Memory {
-			items = append(items, appZaloMemoryRefreshItem{UID: memory.UID, Text: memory.Text})
+	lines := make([]string, 0, 3)
+	appendMemoryScope := func(scope string, revision int64, memory []store.AppPromptMemoryItem) {
+		items := make([]appZaloMemoryRefreshItem, 0, len(memory))
+		for _, item := range memory {
+			items = append(items, appZaloMemoryRefreshItem{
+				ID: item.ID, UID: item.UID, MemoryKey: item.MemoryKey,
+				Category: item.Category, Text: item.Text,
+			})
 		}
 		encoded, err := json.Marshal(appZaloMemoryRefreshRecord{
-			Scope: "thread_memory", Revision: refresh.MemoryRevision, Items: items,
+			Scope: scope, Revision: revision, Items: items,
 		})
 		if err == nil {
 			lines = append(lines, string(encoded))
 		}
+	}
+	if refresh.ReplaceCommon {
+		appendMemoryScope("thread_common", refresh.CommonRevision, refresh.Common)
+	}
+	if refresh.ReplaceSubject {
+		appendMemoryScope("current_subject", refresh.SubjectRevision, refresh.Subject)
 	}
 	if refresh.ReplaceLessons {
 		items := make([]appZaloLessonRefreshItem, 0, len(refresh.Lessons))
