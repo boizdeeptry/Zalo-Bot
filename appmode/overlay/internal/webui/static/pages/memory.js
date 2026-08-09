@@ -287,7 +287,7 @@ function renderMemoryPage(root, state, actions) {
   });
   children.push(live);
   children.push(element("div", { className: "hint memory-boundary", text: "Memory không phải Knowledge Base và không được dùng làm nguồn trích dẫn. Thay đổi có hiệu lực ở lượt Zalo kế tiếp." }));
-  root.replaceChildren(children);
+  root.replaceChildren(...children);
   return live;
 }
 

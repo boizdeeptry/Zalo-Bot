@@ -56,10 +56,6 @@ class TestNode {
 
   #appendValue(value) {
     if (value === null || value === undefined || value === false) return;
-    if (Array.isArray(value)) {
-      for (const nested of value) this.#appendValue(nested);
-      return;
-    }
     if (value instanceof TestDocumentFragment) {
       for (const child of [...value.childNodes]) this.#appendValue(child);
       return;
