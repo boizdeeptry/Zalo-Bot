@@ -76,6 +76,17 @@ type appZaloSessionRunner struct {
 	command appZaloClaudeCommand
 }
 
+// appRunZaloSession is the production-only structured seam. execZaloRunner keeps
+// its existing stateless Run method for compatibility, while appRunZalo detects
+// this narrower method and delegates session execution here.
+func (e execZaloRunner) appRunZaloSession(
+	ctx context.Context,
+	in appZaloSessionRunInput,
+	step func(string),
+) (appZaloRunResult, error) {
+	return (appZaloSessionRunner{cfg: e.cfg}).RunSession(ctx, in, step)
+}
+
 type appZaloSafeRunError struct {
 	code  string
 	match error

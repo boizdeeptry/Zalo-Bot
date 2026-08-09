@@ -131,7 +131,7 @@ Mỗi record hội thoại có `role`, `display_name` và `body`. `role` chỉ d
 
 Mỗi record file có `kind`, `path`, `title`, `readable` và `reason`; `title` cũng được cắt UTF-8 an toàn ở 300 byte. File khách vẫn chỉ là evidence, không phải source. Retrieved KB candidates giữ nguyên biểu diễn citable hiện có và đứng ngoài hai khối untrusted JSONL. Dòng cảnh báo mà `renderRetrieved` sinh từ trường `passage.Warn` không phải nội dung khách và không bị reminder cuối vô hiệu hóa.
 
-Tin do người trực gửi giữa hai lượt Claude nằm sau cursor nên được đưa vào delta. Tin bot mà Claude vừa tạo không bị lặp vì cursor chỉ được nâng sau khi `answerZalo` hoàn tất ghi message/outbox.
+Tin do người trực gửi giữa hai lượt Claude nằm sau cursor nên được đưa vào delta. Cursor là mốc nội dung Claude thực sự đã nhận: bootstrap/rotation/recovery dùng ID lớn nhất trong history đã dựng prompt, còn resume dùng ID của hàng delta cuối trong trang tối đa 100 hàng đã đưa vào prompt. Không đọc `MAX(id)` sau khi Claude chạy, vì transport có thể chèn một inbound mới trong lúc đó và làm cursor nuốt mất tin Claude chưa thấy. Các hàng outbound mà pipeline ghi sau mốc có thể lặp ở delta kế tiếp; lặp an toàn hơn bỏ sót inbound.
 
 Nếu delta trống bất thường, runner đưa câu hỏi hiện tại vào thay vì gọi Claude với prompt rỗng.
 
@@ -160,7 +160,7 @@ Không chờ tới 100% vì mục tiêu là tránh lượt compact hoặc lỗi 
 5. Nếu mapping hợp lệ, đọc message delta sau cursor và dựng delta prompt.
 6. Chạy Claude bằng `--session-id` hoặc `--resume`.
 7. Parse answer và tiếp tục toàn bộ validation, citation, memory, handoff và outbox hiện tại.
-8. Khi `answerZalo` kết thúc thành công về mặt store, nâng message cursor đến ID mới nhất và ghi usage/turn count.
+8. Khi `answerZalo` kết thúc thành công về mặt store, nâng message cursor đến high-water nội dung đã cấp cho Claude trước khi chạy và ghi usage/turn count; không dùng ID mới nhất sau pipeline.
 9. Nếu đã chạm ngưỡng, đánh dấu xoay trước lượt sau; không làm khách đợi thêm một lượt tóm tắt.
 10. Nhả keyed lock.
 
