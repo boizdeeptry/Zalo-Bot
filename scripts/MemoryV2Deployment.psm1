@@ -576,26 +576,33 @@ function Assert-MemoryV2BoundedHealth {
 function New-MemoryV2DeploymentOperations {
   param([Parameter(Mandatory)][string]$PythonPath)
   $python = $PythonPath
+  # GetNewClosure creates a dynamic module. Capture the original module-bound
+  # helper scriptblocks explicitly so private helper resolution survives that boundary.
+  $sqliteTool = ${function:Invoke-MemoryV2SQLiteTool}
+  $sanitizedEnvironment = ${function:Get-MemoryV2SanitizedEnvironment}
+  $nativeChecked = ${function:Invoke-MemoryV2NativeChecked}
+  $processStopped = ${function:Wait-MemoryV2ProcessStopped}
+  $boundedHealth = ${function:Assert-MemoryV2BoundedHealth}
   $operations = @{
     InspectLive = {
       param($db, $expectedSchema)
-      Invoke-MemoryV2SQLiteTool -PythonPath $python -Label 'pre-stop live DB verification' `
+      & $sqliteTool -PythonPath $python -Label 'pre-stop live DB verification' `
         -Arguments @('inspect-live', '--db', $db, '--expected-schema', [string]$expectedSchema)
     }.GetNewClosure()
     StopLive = {
       param($binary, $data, $port)
-      $sanitized = Get-MemoryV2SanitizedEnvironment -DataHome $data -Port $port
-      Invoke-MemoryV2NativeChecked -Label 'live daemon stop' -FilePath $binary `
+      $sanitized = & $sanitizedEnvironment -DataHome $data -Port $port
+      & $nativeChecked -Label 'live daemon stop' -FilePath $binary `
         -Arguments @('daemon', 'stop', '--force') -Environment $sanitized.Values `
         -WorkingDirectory (Split-Path -Parent $binary) | Out-Null
     }.GetNewClosure()
     WaitStopped = {
       param($binary, $port)
-      Wait-MemoryV2ProcessStopped -ExecutablePath $binary -Port $port -TimeoutSeconds 30
+      & $processStopped -ExecutablePath $binary -Port $port -TimeoutSeconds 30
     }.GetNewClosure()
     InspectBackup = {
       param($db, $expectedSchema)
-      Invoke-MemoryV2SQLiteTool -PythonPath $python -Label 'immutable backup verification' `
+      & $sqliteTool -PythonPath $python -Label 'immutable backup verification' `
         -Arguments @('inspect', '--db', $db, '--expected-schema', [string]$expectedSchema)
     }.GetNewClosure()
     StartLive = {
@@ -603,16 +610,16 @@ function New-MemoryV2DeploymentOperations {
       $environment = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
       foreach ($entry in Get-ChildItem Env:) { $environment[$entry.Name] = [string]$entry.Value }
       $wscript = (Get-Command wscript.exe -CommandType Application -ErrorAction Stop).Source
-      Invoke-MemoryV2NativeChecked -Label 'live daemon start' -FilePath $wscript `
+      & $nativeChecked -Label 'live daemon start' -FilePath $wscript `
         -Arguments @('//B', '//Nologo', $scriptPath) -Environment $environment `
         -WorkingDirectory (Split-Path -Parent $scriptPath) -TimeoutSeconds 30 | Out-Null
     }.GetNewClosure()
     AssertPostStart = {
       param($binary, $hash, $data, $port, $expectedSchema)
-      $health = Assert-MemoryV2BoundedHealth -ExecutablePath $binary -ExpectedHash $hash `
+      $health = & $boundedHealth -ExecutablePath $binary -ExpectedHash $hash `
         -Port $port -TimeoutSeconds 30
       $db = Join-Path $data 'agentdc.db'
-      $inspection = Invoke-MemoryV2SQLiteTool -PythonPath $python -Label 'post-start live DB verification' `
+      $inspection = & $sqliteTool -PythonPath $python -Label 'post-start live DB verification' `
         -Arguments @('inspect-live', '--db', $db, '--expected-schema', [string]$expectedSchema)
       if ($inspection.quickCheck -ne 'ok' -or [int]$inspection.schema -ne $expectedSchema) {
         throw 'post-start live DB quick_check/schema failed'
@@ -627,7 +634,7 @@ function New-MemoryV2DeploymentOperations {
     }.GetNewClosure()
     AssertRollbackHealth = {
       param($binary, $hash, $data, $port)
-      Assert-MemoryV2BoundedHealth -ExecutablePath $binary -ExpectedHash $hash `
+      & $boundedHealth -ExecutablePath $binary -ExpectedHash $hash `
         -Port $port -TimeoutSeconds 30
     }.GetNewClosure()
   }

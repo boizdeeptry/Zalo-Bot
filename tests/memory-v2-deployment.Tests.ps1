@@ -41,6 +41,16 @@ function Get-TestHash {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
 }
 
+function Get-FreeLoopbackPort {
+  $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+  try {
+    $listener.Start()
+    return [int]$listener.LocalEndpoint.Port
+  } finally {
+    $listener.Stop()
+  }
+}
+
 function New-ValidManifestFixture {
   param(
     [Parameter(Mandatory)][string]$Root,
@@ -193,6 +203,143 @@ try {
   } -Pattern 'active|live data|retained backup|source' `
     -Message 'Active live data was accepted as a canary copy source'
   Write-Host 'PASS: canary copy is outside live root and scrubs only runtime controls and Zalo credentials.'
+
+  # Exercise the real default operation factory from the normally imported module.
+  # These fixtures are isolated: they never call the live agentdc binary or stop a live process.
+  $defaultData = Join-Path $fixtureRoot 'default-operations\data'
+  $defaultDB = Join-Path $defaultData 'agentdc.db'
+  [IO.Directory]::CreateDirectory($defaultData) | Out-Null
+  $createDbScript = @'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+try:
+    connection.execute("CREATE TABLE app_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute("INSERT INTO app_meta(key, value) VALUES('schema_version', '4')")
+    connection.commit()
+finally:
+    connection.close()
+'@
+  & python -c $createDbScript $defaultDB
+  if ($LASTEXITCODE -ne 0) { throw 'could not create isolated default-operation SQLite fixture' }
+
+  $deploymentModule = Get-Module MemoryV2Deployment
+  $defaultOperations = & $deploymentModule {
+    New-MemoryV2DeploymentOperations -PythonPath 'python'
+  }
+  $expectedOperationNames = @(
+    'InspectLive', 'StopLive', 'WaitStopped', 'InspectBackup', 'StartLive',
+    'AssertPostStart', 'AssertRollbackHealth'
+  )
+  Assert-Equal $defaultOperations.Count $expectedOperationNames.Count `
+    'Default deployment operation count changed unexpectedly'
+
+  $liveInspection = & $defaultOperations.InspectLive $defaultDB 4
+  Assert-Equal $liveInspection.quickCheck 'ok' 'Default InspectLive did not resolve its SQLite helper'
+  Assert-Equal ([int]$liveInspection.schema) 4 'Default InspectLive returned the wrong schema'
+  $backupInspection = & $defaultOperations.InspectBackup $defaultDB 4
+  Assert-Equal $backupInspection.quickCheck 'ok' 'Default InspectBackup did not resolve its SQLite helper'
+  Assert-True ($backupInspection.baselineStable -eq $true) `
+    'Default InspectBackup did not preserve an immutable SQLite baseline'
+
+  $unusedPort = Get-FreeLoopbackPort
+  & $defaultOperations.WaitStopped (Join-Path $fixtureRoot 'missing\agentdc.exe') $unusedPort
+
+  $vbsPath = Join-Path $fixtureRoot 'default-operations\noop.vbs'
+  Write-TestText $vbsPath 'WScript.Quit 0'
+  & $defaultOperations.StartLive $vbsPath
+
+  $failingNativePath = (Get-Command where.exe -CommandType Application -ErrorAction Stop |
+      Select-Object -First 1).Source
+  Assert-ThrowsLike -Action {
+    & $defaultOperations.StopLive $failingNativePath $defaultData $unusedPort
+  } -Pattern 'live daemon stop failed with exit' `
+    -Message 'Default StopLive did not reach its module-bound native helper'
+
+  $healthPort = Get-FreeLoopbackPort
+  $healthReady = Join-Path $fixtureRoot 'default-operations\health.ready'
+  $healthScript = Join-Path $fixtureRoot 'default-operations\health-server.ps1'
+  Write-TestText $healthScript @'
+param([int]$Port, [string]$ReadyPath)
+$ErrorActionPreference = 'Stop'
+$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port)
+try {
+  $listener.Start()
+  [IO.File]::WriteAllText($ReadyPath, 'ready')
+  for ($index = 0; $index -lt 2; $index++) {
+    $client = $listener.AcceptTcpClient()
+    try {
+      $stream = $client.GetStream()
+      $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::ASCII, $false, 1024, $true)
+      while (($line = $reader.ReadLine()) -ne '') {
+        if ($null -eq $line) { break }
+      }
+      $payload = [Text.Encoding]::ASCII.GetBytes(
+        "HTTP/1.1 200 OK`r`nContent-Length: 2`r`nConnection: close`r`n`r`nok"
+      )
+      $stream.Write($payload, 0, $payload.Length)
+      $stream.Flush()
+    } finally {
+      $client.Dispose()
+    }
+  }
+} finally {
+  $listener.Stop()
+}
+'@
+  $pwshPath = (Get-Command pwsh -CommandType Application -ErrorAction Stop |
+      Select-Object -First 1).Source
+  $healthProcess = Start-Process -FilePath $pwshPath -WindowStyle Hidden -PassThru `
+    -ArgumentList @('-NoProfile', '-File', $healthScript, '-Port', [string]$healthPort, '-ReadyPath', $healthReady)
+  try {
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path -LiteralPath $healthReady -PathType Leaf) -and
+        [DateTime]::UtcNow -lt $readyDeadline) {
+      Start-Sleep -Milliseconds 50
+    }
+    Assert-True (Test-Path -LiteralPath $healthReady -PathType Leaf) `
+      'Isolated default-operation health fixture did not start'
+    $pwshHash = Get-TestHash $pwshPath
+    $rollbackHealth = & $defaultOperations.AssertRollbackHealth `
+      $pwshPath $pwshHash $defaultData $healthPort
+    Assert-Equal $rollbackHealth.HTTPStatus 200 `
+      'Default AssertRollbackHealth did not resolve its bounded-health helper'
+    $postStartHealth = & $defaultOperations.AssertPostStart `
+      $pwshPath $pwshHash $defaultData $healthPort 4
+    Assert-Equal $postStartHealth.HTTPStatus 200 `
+      'Default AssertPostStart did not resolve its bounded-health helper'
+    Assert-Equal ([int]$postStartHealth.schema) 4 `
+      'Default AssertPostStart did not resolve its SQLite helper'
+  } finally {
+    if ($healthProcess -and -not $healthProcess.HasExited) {
+      Stop-Process -Id $healthProcess.Id -Force -ErrorAction SilentlyContinue
+      $healthProcess.WaitForExit(5000) | Out-Null
+    }
+  }
+
+  $requiredCaptures = @{
+    InspectLive = @('sqliteTool')
+    StopLive = @('sanitizedEnvironment', 'nativeChecked')
+    WaitStopped = @('processStopped')
+    InspectBackup = @('sqliteTool')
+    StartLive = @('nativeChecked')
+    AssertPostStart = @('boundedHealth', 'sqliteTool')
+    AssertRollbackHealth = @('boundedHealth')
+  }
+  foreach ($operationName in $expectedOperationNames) {
+    Assert-True ($defaultOperations.Contains($operationName)) `
+      "Default deployment operation '$operationName' is missing"
+    $operation = [scriptblock]$defaultOperations[$operationName]
+    foreach ($captureName in $requiredCaptures[$operationName]) {
+      $capturedVariable = $operation.Module.SessionState.PSVariable.Get($captureName)
+      Assert-True ($null -ne $capturedVariable -and $capturedVariable.Value -is [scriptblock]) `
+        "Default operation '$operationName' did not capture '$captureName' as a scriptblock"
+      Assert-Equal $capturedVariable.Value.Module.Name 'MemoryV2Deployment' `
+        "Default operation '$operationName' captured '$captureName' outside the deployment module"
+    }
+  }
+  Write-Host 'PASS: all seven default deployment closures resolve and capture module-private helpers.'
 
   $candidate = Join-Path $fixtureRoot 'candidate\agentdc.exe'
   $transcript = Join-Path $fixtureRoot 'evidence\transcript.json'
