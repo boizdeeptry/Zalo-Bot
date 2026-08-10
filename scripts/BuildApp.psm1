@@ -287,17 +287,20 @@ function Apply-AppSeams {
   $storePath = Join-Path $stagePath 'internal\store\store.go'
   $zaloPath = Join-Path $stagePath 'internal\daemon\zalo.go'
   $dutyPath = Join-Path $stagePath 'internal\daemon\duty.go'
+  $lessonPath = Join-Path $stagePath 'internal\daemon\zalolesson.go'
   $zaloUIPath = Join-Path $stagePath 'internal\webui\static\zalo.js'
 
   $server = [IO.File]::ReadAllText($serverPath)
   $store = [IO.File]::ReadAllText($storePath)
   $zalo = [IO.File]::ReadAllText($zaloPath)
   $duty = [IO.File]::ReadAllText($dutyPath)
+  $lesson = [IO.File]::ReadAllText($lessonPath)
   $zaloUI = [IO.File]::ReadAllText($zaloUIPath)
   $serverNewline = if ($server.Contains("`r`n")) { "`r`n" } else { "`n" }
   $storeNewline = if ($store.Contains("`r`n")) { "`r`n" } else { "`n" }
   $zaloNewline = if ($zalo.Contains("`r`n")) { "`r`n" } else { "`n" }
   $dutyNewline = if ($duty.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $lessonNewline = if ($lesson.Contains("`r`n")) { "`r`n" } else { "`n" }
   $zaloUINewline = if ($zaloUI.Contains("`r`n")) { "`r`n" } else { "`n" }
 
   Assert-SignatureAbsent -Text $server -Signature 'a.registerAppRoutes(mux)' -Label 'route seam'
@@ -309,6 +312,9 @@ function Apply-AppSeams {
   Assert-SignatureAbsent -Text $duty `
     -Signature 'a.appRunZalo(ctx, run, pz, threadID, question, appZaloCurrentMsgID(reply.ReplyQuote), history, found, files, step)' `
     -Label 'session runner seam'
+  Assert-SignatureAbsent -Text $lesson `
+    -Signature 'a.st.CreateAppLesson(lesson)' `
+    -Label 'operator lesson seam'
   Assert-SignatureAbsent -Text $zaloUI `
     -Signature "const requestedThreadID = new URLSearchParams(window.location.search).get('thread')" `
     -Label 'Zalo deep-link declaration seam'
@@ -356,6 +362,42 @@ function Apply-AppSeams {
   $dutyUpdated = Replace-ExactlyOnce -Text $dutyUpdated -Needle $runnerNeedle `
     -Replacement $runnerReplacement -Label 'session runner seam'
 
+  $lessonImportNeedle = "`t" + '"agentdc/internal/ipc"'
+  $lessonImportReplacement = @(
+    $lessonImportNeedle
+    ("`t" + '"agentdc/internal/store"')
+  ) -join $lessonNewline
+  $lessonUpdated = Replace-ExactlyOnce -Text $lesson -Needle $lessonImportNeedle `
+    -Replacement $lessonImportReplacement -Label 'operator lesson import seam'
+
+  $lessonCommentNeedle = @(
+    '// Ghi vào zalo_memory như mọi ghi chú khác, nên nó cũng KHÔNG trích dẫn được — xem chú thích bảng'
+    '// đó. Một bài học là chữ do hệ này tự sinh, tức đúng thứ không được thành nguồn.'
+  ) -join $lessonNewline
+  $lessonCommentReplacement = @(
+    '// Ghi thành bài học có cấu trúc để Portal duyệt được và mọi phiên CLI nhận refresh toàn cục.'
+    '// Đây là quy tắc chất lượng câu trả lời, không phải một sự thật về khách hàng.'
+  ) -join $lessonNewline
+  $lessonUpdated = Replace-ExactlyOnce -Text $lessonUpdated -Needle $lessonCommentNeedle `
+    -Replacement $lessonCommentReplacement -Label 'operator lesson comment seam'
+
+  $legacyLessonNeedle = [regex]::Replace((@'
+	text := "người trực sửa lại: bot nói \"" + clip(strings.TrimSpace(bot.Body), maxLessonPart) +
+		"\" → người trực gửi \"" + clip(strings.TrimSpace(operatorText), maxLessonPart) + "\""
+	if err := a.st.AddZaloMemory(ipc.ZaloMemory{ThreadID: threadID, Text: text}); err != nil {
+'@).TrimEnd([char[]]"`r`n"), '\r?\n', $lessonNewline)
+  $structuredLessonReplacement = [regex]::Replace((@'
+	lesson := store.AppLessonInput{
+		ThreadID: threadID,
+		BotText:  clip(strings.TrimSpace(bot.Body), maxLessonPart),
+		Better:   clip(strings.TrimSpace(operatorText), maxLessonPart),
+		Note:     "người trực sửa lại câu trả lời của bot",
+	}
+	if _, err := a.st.CreateAppLesson(lesson); err != nil {
+'@).TrimEnd([char[]]"`r`n"), '\r?\n', $lessonNewline)
+  $lessonUpdated = Replace-ExactlyOnce -Text $lessonUpdated -Needle $legacyLessonNeedle `
+    -Replacement $structuredLessonReplacement -Label 'operator lesson seam'
+
   $zaloUIDeclarationNeedle = 'let curThread = null;'
   $zaloUIDeclaration = @(
     $zaloUIDeclarationNeedle
@@ -387,6 +429,7 @@ function Apply-AppSeams {
   [IO.File]::WriteAllText($storePath, $storeUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($zaloPath, $zaloUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($dutyPath, $dutyUpdated, $utf8NoBom)
+  [IO.File]::WriteAllText($lessonPath, $lessonUpdated, $utf8NoBom)
   [IO.File]::WriteAllText($zaloUIPath, $zaloUIUpdated, $utf8NoBom)
 }
 
@@ -474,6 +517,9 @@ function Assert-AppPackage {
   Assert-AppPackageBinaryContains -Path $binary -Signature 'app_memory_subject_revisions' -Label 'Memory V2 schema signature'
   Assert-AppPackageBinaryContains -Path $binary -Signature 'memory_ops' -Label 'Memory V2 prompt contract'
   Assert-AppPackageBinaryContains -Path $binary -Signature '/memory/threads/{tid}/{id}/approve' -Label 'Memory V2 proposal API'
+  Assert-AppPackageBinaryContains -Path $binary `
+    -Signature 'người trực sửa lại câu trả lời của bot' `
+    -Label 'structured operator lesson'
 
   Assert-AppPackageSensitiveContentAbsent -Out $outPath
 

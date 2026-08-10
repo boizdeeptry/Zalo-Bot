@@ -172,6 +172,7 @@ function Get-SeamTargetHashes {
       'internal\store\store.go',
       'internal\daemon\zalo.go',
       'internal\daemon\duty.go',
+      'internal\daemon\zalolesson.go',
       'internal\webui\static\zalo.js'
     )) {
     $hashes[$relative] = (Get-FileHash -LiteralPath (Join-Path $Stage $relative) -Algorithm SHA256).Hash
@@ -225,7 +226,9 @@ function Invoke-StagedZaloSessionAcceptance {
   )
 
   $sourceDuty = Join-Path $Repo 'internal\daemon\duty.go'
+  $sourceLesson = Join-Path $Repo 'internal\daemon\zalolesson.go'
   $sourceHashBefore = (Get-FileHash -LiteralPath $sourceDuty -Algorithm SHA256).Hash
+  $sourceLessonHashBefore = (Get-FileHash -LiteralPath $sourceLesson -Algorithm SHA256).Hash
   $sourceStatusBefore = (& git -C $Repo status --short) -join "`n"
   if ($LASTEXITCODE -ne 0) { throw 'Could not read real upstream status before staged acceptance' }
   $stageRoot = Join-Path ([IO.Path]::GetTempPath()) `
@@ -235,15 +238,21 @@ function Invoke-StagedZaloSessionAcceptance {
     $stage = New-AppStage -Repo $Repo -Overlay $Overlay -StageRoot $stageRoot
     Apply-AppSeams -Stage $stage
     $stagedDuty = [IO.File]::ReadAllText((Join-Path $stage 'internal\daemon\duty.go'))
+    $stagedLesson = [IO.File]::ReadAllText((Join-Path $stage 'internal\daemon\zalolesson.go'))
     if ([regex]::Matches($stagedDuty, 'a\.appAnswerZalo\(deps, threadID, question, reply, files\)').Count -ne 1 -or
         [regex]::Matches($stagedDuty, 'a\.appRunZalo\(ctx, run, pz, threadID, question, appZaloCurrentMsgID\(reply\.ReplyQuote\), history, found, files, step\)').Count -ne 1) {
       throw 'Real staged duty.go does not contain both session seams exactly once'
+    }
+    if ([regex]::Matches($stagedLesson, 'a\.st\.CreateAppLesson\(lesson\)').Count -ne 1 -or
+        [regex]::Matches($stagedLesson, 'lesson := store\.AppLessonInput\{').Count -ne 1 -or
+        $stagedLesson -match 'AddZaloMemory') {
+      throw 'Real staged operator rewrite did not replace the legacy Memory seam exactly once'
     }
 
     Push-Location $stage
     try {
       $output = (& go test -count=1 `
-        -run '^TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation$' `
+        -run '^(TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation|TestOperatorRewriteBecomesStructuredGlobalLesson|TestReplyEndpointRecordsTheLessonAndQueuesNextTurnRefresh|TestReplyEndpointKeepsSendingWhenLessonInsertFails)$' `
         -v ./internal/daemon 2>&1) -join "`n"
       $goExit = $LASTEXITCODE
     } finally {
@@ -252,8 +261,15 @@ function Invoke-StagedZaloSessionAcceptance {
     if ($goExit -ne 0) {
       throw "Focused Go acceptance failed in the stitched stage (exit $goExit)`n$output"
     }
-    if ($output -notmatch '--- PASS: TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation') {
-      throw 'Focused Go acceptance was not executed in the stitched stage'
+    foreach ($name in @(
+        'TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation',
+        'TestOperatorRewriteBecomesStructuredGlobalLesson',
+        'TestReplyEndpointRecordsTheLessonAndQueuesNextTurnRefresh',
+        'TestReplyEndpointKeepsSendingWhenLessonInsertFails'
+      )) {
+      if ($output -notmatch ('--- PASS: ' + [regex]::Escape($name))) {
+        throw "Focused Go acceptance '$name' was not executed in the stitched stage"
+      }
     }
   } finally {
     if (Test-Path -LiteralPath $stageRoot) {
@@ -262,9 +278,11 @@ function Invoke-StagedZaloSessionAcceptance {
   }
 
   $sourceHashAfter = (Get-FileHash -LiteralPath $sourceDuty -Algorithm SHA256).Hash
+  $sourceLessonHashAfter = (Get-FileHash -LiteralPath $sourceLesson -Algorithm SHA256).Hash
   $sourceStatusAfter = (& git -C $Repo status --short) -join "`n"
   if ($LASTEXITCODE -ne 0) { throw 'Could not read real upstream status after staged acceptance' }
   Assert-Equal $sourceHashAfter $sourceHashBefore 'Real upstream duty.go changed during staged acceptance'
+  Assert-Equal $sourceLessonHashAfter $sourceLessonHashBefore 'Real upstream zalolesson.go changed during staged acceptance'
   Assert-Equal $sourceStatusAfter $sourceStatusBefore 'Real upstream status changed during staged acceptance'
 }
 
@@ -437,26 +455,29 @@ try {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
   $packageBinary = Join-Path $packageRoot 'app\agentdc.exe'
-  $validPackageBinary = 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions memory_ops /memory/threads/{tid}/{id}/approve'
+  $validPackageBinary = 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions memory_ops /memory/threads/{tid}/{id}/approve người trực sửa lại câu trả lời của bot'
   Write-TestFile $packageBinary "$validPackageBinary`n"
   Assert-AppPackage -Out $packageRoot | Out-Null
 
-  Write-TestFile $packageBinary "fixture app_memory_revisions app_memory_subject_revisions memory_ops`n"
+  Write-TestFile $packageBinary "fixture app_memory_revisions app_memory_subject_revisions memory_ops người trực sửa lại câu trả lời của bot`n"
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'Memory API signature' -Message 'A package missing the Memory API signature was accepted'
-  Write-TestFile $packageBinary "fixture /memory/threads/ app_memory_subject_revisions memory_ops /memory/threads/{tid}/{id}/approve`n"
+  Write-TestFile $packageBinary "fixture /memory/threads/ app_memory_subject_revisions memory_ops /memory/threads/{tid}/{id}/approve người trực sửa lại câu trả lời của bot`n"
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'Memory schema signature' -Message 'A package missing the Memory schema signature was accepted'
   $memoryV2Canary = 'APP_TEST_MEMORY_V2_SIGNATURE_CANARY_6D40B3'
   Assert-PackageRejectsMissingSignatureSafely -Root $packageRoot `
-    -BinaryContent 'fixture /memory/threads/ app_memory_revisions memory_ops /memory/threads/{tid}/{id}/approve' `
+    -BinaryContent 'fixture /memory/threads/ app_memory_revisions memory_ops /memory/threads/{tid}/{id}/approve người trực sửa lại câu trả lời của bot' `
     -Label 'Memory V2 schema signature' -Canary $memoryV2Canary
   Assert-PackageRejectsMissingSignatureSafely -Root $packageRoot `
-    -BinaryContent 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions /memory/threads/{tid}/{id}/approve' `
+    -BinaryContent 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions /memory/threads/{tid}/{id}/approve người trực sửa lại câu trả lời của bot' `
     -Label 'Memory V2 prompt contract' -Canary $memoryV2Canary
   Assert-PackageRejectsMissingSignatureSafely -Root $packageRoot `
-    -BinaryContent 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions memory_ops' `
+    -BinaryContent 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions memory_ops người trực sửa lại câu trả lời của bot' `
     -Label 'Memory V2 proposal API' -Canary $memoryV2Canary
+  Assert-PackageRejectsMissingSignatureSafely -Root $packageRoot `
+    -BinaryContent 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions memory_ops /memory/threads/{tid}/{id}/approve' `
+    -Label 'structured operator lesson' -Canary $memoryV2Canary
   Write-TestFile $packageBinary "$validPackageBinary`n"
 
   $canaryCases = @(
@@ -572,6 +593,24 @@ func trigger() {
 	}()
 }
 '@
+  Write-TestFile (Join-Path $repo 'internal\daemon\zalolesson.go') @'
+package daemon
+
+import (
+	"strings"
+	"agentdc/internal/ipc"
+)
+
+// Ghi vào zalo_memory như mọi ghi chú khác, nên nó cũng KHÔNG trích dẫn được — xem chú thích bảng
+// đó. Một bài học là chữ do hệ này tự sinh, tức đúng thứ không được thành nguồn.
+func (a *api) noteOperatorRewrite(threadID, operatorText string) {
+	text := "người trực sửa lại: bot nói \"" + clip(strings.TrimSpace(bot.Body), maxLessonPart) +
+		"\" → người trực gửi \"" + clip(strings.TrimSpace(operatorText), maxLessonPart) + "\""
+	if err := a.st.AddZaloMemory(ipc.ZaloMemory{ThreadID: threadID, Text: text}); err != nil {
+		return
+	}
+}
+'@
   Write-TestFile (Join-Path $repo 'internal\webui\static\zalo.js') @'
 const el = (id) => document.getElementById(id);
 let curThread = null;
@@ -617,7 +656,9 @@ async function refresh() {
   if ($LASTEXITCODE -ne 0) { throw 'Could not stage fixture files' }
   $statusBefore = (& git -C $repo status --short) -join "`n"
   $sourceDutyPath = Join-Path $repo 'internal\daemon\duty.go'
+  $sourceLessonPath = Join-Path $repo 'internal\daemon\zalolesson.go'
   $sourceDutyHashBefore = (Get-FileHash -LiteralPath $sourceDutyPath -Algorithm SHA256).Hash
+  $sourceLessonHashBefore = (Get-FileHash -LiteralPath $sourceLessonPath -Algorithm SHA256).Hash
 
   $gotStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot $stage
   Assert-Equal $gotStage ([IO.Path]::GetFullPath($stage)) 'Stage path was not normalized'
@@ -641,6 +682,7 @@ async function refresh() {
   $stagedStore = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\store\store.go'))
   $stagedZalo = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\zalo.go'))
   $stagedDuty = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\duty.go'))
+  $stagedLesson = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\daemon\zalolesson.go'))
   $stagedZaloUI = [IO.File]::ReadAllText((Join-Path $gotStage 'internal\webui\static\zalo.js'))
   if ([regex]::Matches($stagedServer, 'a\.registerAppRoutes\(mux\)').Count -ne 1) { throw 'Route seam was not applied exactly once' }
   if ([regex]::Matches($stagedStore, 'migrateApp\(db\)').Count -ne 1) { throw 'Migration seam was not applied exactly once' }
@@ -650,6 +692,11 @@ async function refresh() {
   }
   if ([regex]::Matches($stagedDuty, 'a\.appRunZalo\(ctx, run, pz, threadID, question, appZaloCurrentMsgID\(reply\.ReplyQuote\), history, found, files, step\)').Count -ne 1) {
     throw 'Session runner seam was not applied exactly once'
+  }
+  if ([regex]::Matches($stagedLesson, 'a\.st\.CreateAppLesson\(lesson\)').Count -ne 1 -or
+      [regex]::Matches($stagedLesson, 'lesson := store\.AppLessonInput\{').Count -ne 1 -or
+      $stagedLesson -match 'AddZaloMemory') {
+    throw 'Structured operator lesson seam was not applied exactly once'
   }
   if ([regex]::Matches($stagedZaloUI, [regex]::Escape("const requestedThreadID = new URLSearchParams(window.location.search).get('thread')")).Count -ne 1) {
     throw 'Zalo deep-link declaration seam was not applied exactly once'
@@ -672,8 +719,12 @@ async function refresh() {
   if ($sourceServer -match 'registerAppRoutes') { throw 'Source repo was changed by staging' }
   $sourceDuty = [IO.File]::ReadAllText($sourceDutyPath)
   if ($sourceDuty -match 'appAnswerZalo|appRunZalo') { throw 'Source duty.go was changed by staging' }
+  $sourceLesson = [IO.File]::ReadAllText($sourceLessonPath)
+  if ($sourceLesson -match 'CreateAppLesson') { throw 'Source zalolesson.go was changed by staging' }
   $sourceDutyHashAfter = (Get-FileHash -LiteralPath $sourceDutyPath -Algorithm SHA256).Hash
+  $sourceLessonHashAfter = (Get-FileHash -LiteralPath $sourceLessonPath -Algorithm SHA256).Hash
   Assert-Equal $sourceDutyHashAfter $sourceDutyHashBefore 'Source duty.go hash changed during staging'
+  Assert-Equal $sourceLessonHashAfter $sourceLessonHashBefore 'Source zalolesson.go hash changed during staging'
   $statusAfter = (& git -C $repo status --short) -join "`n"
   Assert-Equal $statusAfter $statusBefore 'Source Git status changed during staging'
 
@@ -728,6 +779,18 @@ async function refresh() {
   Assert-SeamTargetHashes -Stage $missingRunnerStage -Expected $missingRunnerHashes `
     -Message 'A missing session runner marker partially modified the stage'
 
+  $missingLessonStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Thiếu operator lesson')
+  $missingLessonPath = Join-Path $missingLessonStage 'internal\daemon\zalolesson.go'
+  $missingLesson = [IO.File]::ReadAllText($missingLessonPath).Replace(
+    'a.st.AddZaloMemory(ipc.ZaloMemory{ThreadID: threadID, Text: text})',
+    'a.st.LegacyLessonPathRemoved()')
+  [IO.File]::WriteAllText($missingLessonPath, $missingLesson, [Text.UTF8Encoding]::new($false))
+  $missingLessonHashes = Get-SeamTargetHashes -Stage $missingLessonStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingLessonStage } `
+    -Pattern 'operator lesson seam: expected exactly 1 match' -Message 'A missing operator lesson marker was accepted'
+  Assert-SeamTargetHashes -Stage $missingLessonStage -Expected $missingLessonHashes `
+    -Message 'A missing operator lesson marker partially modified the stage'
+
   $missingZaloUIStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Thiếu Zalo UI seam')
   $missingZaloUIPath = Join-Path $missingZaloUIStage 'internal\webui\static\zalo.js'
   $missingZaloUI = [IO.File]::ReadAllText($missingZaloUIPath).Replace('let curThread = null;', 'let selectedThread = null;')
@@ -760,6 +823,15 @@ async function refresh() {
       -Pattern $inserted.Pattern -Message ("An already-inserted session " + $inserted.Name + " seam was accepted")
   }
 
+  $insertedLessonStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Đã chèn operator lesson')
+  $insertedLessonPath = Join-Path $insertedLessonStage 'internal\daemon\zalolesson.go'
+  $insertedLesson = [IO.File]::ReadAllText($insertedLessonPath) +
+    "`na.st.CreateAppLesson(lesson)`n"
+  [IO.File]::WriteAllText($insertedLessonPath, $insertedLesson, [Text.UTF8Encoding]::new($false))
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $insertedLessonStage } `
+    -Pattern 'operator lesson seam: inserted signature already present' `
+    -Message 'An already-inserted operator lesson seam was accepted'
+
   $duplicateWorkflowStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Trùng workflow')
   $duplicateZaloPath = Join-Path $duplicateWorkflowStage 'internal\daemon\zalo.go'
   $duplicateZalo = [IO.File]::ReadAllText($duplicateZaloPath)
@@ -781,7 +853,7 @@ async function refresh() {
     throw 'Launcher does not open the management Portal at /'
   }
 
-  Write-Host 'PASS: staging copies tracked files and applies seven guarded seams.'
+  Write-Host 'PASS: staging copies tracked files and applies eight guarded seams.'
 } finally {
   if (Test-Path -LiteralPath $stageTestRoot) {
     Remove-Item -LiteralPath $stageTestRoot -Recurse -Force
@@ -834,6 +906,29 @@ func incoming() {
   [IO.Directory]::CreateDirectory((Split-Path -Parent $crlfDutyPath)) | Out-Null
   [IO.File]::WriteAllText($crlfDutyPath, $dutyCRLF, [Text.UTF8Encoding]::new($false))
 
+  $lessonCRLF = @(
+    'package daemon'
+    ''
+    'import ('
+    "`t`"strings`""
+    "`t`"agentdc/internal/ipc`""
+    ')'
+    ''
+    '// Ghi vào zalo_memory như mọi ghi chú khác, nên nó cũng KHÔNG trích dẫn được — xem chú thích bảng'
+    '// đó. Một bài học là chữ do hệ này tự sinh, tức đúng thứ không được thành nguồn.'
+    'func (a *api) noteOperatorRewrite(threadID, operatorText string) {'
+    "`ttext := `"người trực sửa lại: bot nói \`"`" + clip(strings.TrimSpace(bot.Body), maxLessonPart) +"
+    "`t`t`"\`" → người trực gửi \`"`" + clip(strings.TrimSpace(operatorText), maxLessonPart) + `"\`"`""
+    "`tif err := a.st.AddZaloMemory(ipc.ZaloMemory{ThreadID: threadID, Text: text}); err != nil {"
+    "`t`treturn"
+    "`t}"
+    '}'
+    ''
+  ) -join "`r`n"
+  $crlfLessonPath = Join-Path $crlfStage 'internal\daemon\zalolesson.go'
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $crlfLessonPath)) | Out-Null
+  [IO.File]::WriteAllText($crlfLessonPath, $lessonCRLF, [Text.UTF8Encoding]::new($false))
+
   $zaloUICRLF = @(
     "const el = (id) => document.getElementById(id);"
     'let curThread = null;'
@@ -856,6 +951,7 @@ func incoming() {
   Apply-AppSeams -Stage $crlfStage
 
   Assert-CRLFUTF8File -Path $crlfDutyPath -ExpectedText $vietnameseComment
+  Assert-CRLFUTF8File -Path $crlfLessonPath -ExpectedText 'CreateAppLesson'
   $stagedCRLFDuty = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($crlfDutyPath))
   if ([regex]::Matches($stagedCRLFDuty, 'a\.appAnswerZalo\(deps, threadID, question, reply, files\)').Count -ne 1) {
     throw 'CRLF fixture is missing the session answer seam'
