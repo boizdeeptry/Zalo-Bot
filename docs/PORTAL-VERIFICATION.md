@@ -50,22 +50,22 @@ Khởi động riêng `app\agentdc.exe daemon` trên port tạm với `AGENTDC_H
 
 Các asset nhúng tại `/`, `/assets/core/router.js` và `/assets/pages/overview.js` có đủ nhãn **Tổng quan**, **Trợ lý AI**, **Tri thức**, **Mô hình** và liên kết **Hội thoại**.
 
-## Kế hoạch smoke Memory V2 — chưa chạy
+## Checklist smoke Memory V2
 
-Sáu hành trình dưới đây là checklist cho lần triển khai Memory V2 sau khi candidate được duyệt; tài liệu này chưa ghi nhận hành trình nào đã chạy hay đã đạt. Chỉ dùng tài khoản/liên hệ thử nghiệm và dữ liệu giả, không dùng tên, số điện thoại, địa chỉ, tình trạng sức khoẻ, thông tin tài chính hoặc bí mật thật. Ảnh chụp và log phải che ID/token và không được chép nguyên prompt, câu trả lời hay nội dung khách hàng.
+Sáu hành trình dưới đây là checklist cho lần triển khai Memory V2 sau khi candidate được duyệt. Phần tự động đã chạy được ghi riêng trong biên bản ngày 2026-08-10; phần cần lượt Zalo thật vẫn để mở. Chỉ dùng tài khoản/liên hệ thử nghiệm và dữ liệu giả, không dùng tên, số điện thoại, địa chỉ, tình trạng sức khoẻ, thông tin tài chính hoặc bí mật thật. Ảnh chụp và log phải che ID/token và không được chép nguyên prompt, câu trả lời hay nội dung khách hàng.
 
-### Thứ tự backup và thay binary bắt buộc — chưa chạy
+### Thứ tự backup và thay binary bắt buộc
 
 Không được sao chép database đang hoạt động. Khi được duyệt triển khai, người vận hành phải thực hiện đúng thứ tự sau và dừng ngay khi một cổng thất bại:
 
-1. Lưu `$ErrorActionPreference`, đặt thành `Stop` trong toàn bộ thao tác rồi luôn khôi phục trong `finally`; vẫn kiểm tra riêng `$LASTEXITCODE` sau mọi native command. Resolve và in đường dẫn tuyệt đối của candidate, live binary, live data, `Start.vbs`, thư mục backup và hai file tạm chính xác `D:\TuvanZalo\app\agentdc.memory-v2.staged.exe` / `agentdc.memory-v2.rollback.exe`. Hai file tạm phải nằm trong live app directory, khác live binary và chưa tồn tại trước khi dừng; mọi collision phải fail trước stop.
+1. Lưu `$ErrorActionPreference`, đặt thành `Stop` trong toàn bộ thao tác rồi luôn khôi phục trong `finally`; vẫn kiểm tra riêng `$LASTEXITCODE` sau mọi native command. Resolve và in đường dẫn tuyệt đối của candidate, live binary, live data, `Start.vbs`, thư mục backup và bốn recovery path chính xác trong `D:\TuvanZalo\app`: `agentdc.memory-v2.staged.exe`, `agentdc.memory-v2.rollback.exe`, `agentdc.memory-v2.replaced-old.exe` và `agentdc.memory-v2.failed-candidate.exe`. Mọi path phải nằm trong live app directory, khác live binary và chưa tồn tại trước khi dừng; mọi collision phải fail trước stop.
 2. Trước khi dừng daemon, tính SHA-256 candidate và so sánh không phân biệt hoa/thường với hash đã duyệt `940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45`; khác một ký tự cũng phải dừng. Chép candidate sang file staged cùng directory và xác minh staged hash cũng bằng hash đã duyệt. Không gọi `Stop.bat` trong runbook unattended vì file đó kết thúc bằng `pause >nul`. Đặt process environment `AGENTDC_HOME=D:\TuvanZalo\data`, `AGENTDC_PORT=8770`, gọi chính xác `D:\TuvanZalo\app\agentdc.exe daemon stop --force`, rồi yêu cầu native exit code bằng 0.
 3. Xác nhận process `agentdc.exe` có executable path đúng `D:\TuvanZalo\app\agentdc.exe` đã kết thúc. Nếu còn process sau timeout, không chép data và không thay binary.
 4. Chỉ sau khi xác nhận daemon đã dừng mới tạo thư mục backup có timestamp.
 5. Chép live `agentdc.exe` và **toàn bộ** `D:\TuvanZalo\data` vào backup; ghi hash binary cũ và đường dẫn bản sao.
 6. Xác nhận `backup\data\agentdc.db` tồn tại, mở **bản backup** bằng SQLite URI `mode=ro`, chạy `PRAGMA quick_check` và đọc `app_meta.schema_version`. Chỉ tiếp tục khi `quick_check` trả `ok` và schema đọc được; không chạy migration hay câu lệnh ghi trên bản backup.
-7. Sau khi mọi bằng chứng backup đạt, xác minh lại staged candidate hash và rollback staging path vẫn chưa tồn tại, đặt cờ `liveMutationAttempted` **ngay trước** thao tác, rồi dùng `[IO.File]::Replace` để thay atomically từ staged file cùng directory sang live binary. Đọc lại hash live binary và chỉ khi bằng hash đã duyệt mới dọn đúng staging path do runbook tạo còn sót (nếu có) rồi khởi động qua `wscript.exe D:\TuvanZalo\Start.vbs` với cửa sổ ẩn.
-8. Nếu `liveMutationAttempted` đã được đặt thì phải rollback bất kể `File.Replace` báo thành công hay lỗi: xác minh lại backup binary bằng hash cũ, chép nó vào rollback staging path cùng directory, xác minh staged rollback hash, rồi atomically `File.Replace` nếu live destination còn tồn tại hoặc `File.Move` nếu bị mất. Chỉ khởi động binary cũ sau khi hash live đã khôi phục đúng. Nếu lỗi xảy ra trước mutation, tuyệt đối không thay binary và chỉ khởi động lại binary cũ khi stop đã làm nó dừng. Mọi lỗi rollback/restart phải terminating và fail-closed; giữ backup cùng staging evidence khi thất bại, rồi khôi phục process environment và `$ErrorActionPreference` trong `finally`.
+7. Sau khi mọi bằng chứng backup đạt, xác minh lại staged candidate hash và ba recovery path còn lại vẫn chưa tồn tại, đặt cờ `liveMutationAttempted` **ngay trước** thao tác, rồi dùng `[IO.File]::Replace(staged, live, replaced-old)` với **backup path không rỗng trong cùng directory**. Runtime trên máy này từ chối `$null`. Đọc lại hash live binary và hash automatic replace backup; chỉ khởi động qua `wscript.exe D:\TuvanZalo\Start.vbs` khi chúng lần lượt bằng candidate hash và old hash.
+8. Nếu `liveMutationAttempted` đã được đặt thì phải rollback bất kể `File.Replace` báo thành công hay lỗi: xác minh lại backup binary bằng hash cũ, chép nó vào rollback staging path cùng directory, xác minh staged rollback hash, rồi atomically `File.Replace(rollback-stage, live, failed-candidate)` với non-empty backup path nếu live destination còn tồn tại hoặc `File.Move` nếu bị mất. Chỉ khởi động binary cũ sau khi hash live đã khôi phục đúng. Nếu lỗi xảy ra trước mutation, tuyệt đối không thay binary và chỉ khởi động lại binary cũ khi stop đã làm nó dừng. Mọi lỗi rollback/restart phải terminating và fail-closed; giữ backup cùng staging evidence khi thất bại, rồi khôi phục process environment và `$ErrorActionPreference` trong `finally`.
 
 Trong nhóm, **Chung cho nhóm** là scope dùng chung cho mọi người trong đúng nhóm đó; mỗi tab thành viên là scope riêng chỉ của người đang chọn. Trạng thái **Đã đồng bộ với phiên Zalo** chỉ có nghĩa phiên đã nhận cả revision chung và revision của đúng thành viên đang chọn. Khi revision chung hoặc revision thành viên đổi, Portal phải hiện rằng Memory sẽ đồng bộ ở lượt nhắn tiếp; đổi người nói phải thay toàn bộ scope thành viên, không cộng dồn Memory của người trước.
 
@@ -83,6 +83,87 @@ Trong nhóm, **Chung cho nhóm** là scope dùng chung cho mọi người trong 
 
 Với mỗi hành trình, biên bản triển khai sau này phải ghi thời gian, candidate SHA-256, contact/thread thử nghiệm, revision trước/sau, kết quả PASS/FAIL và đường dẫn evidence; không thay các mục trên thành PASS nếu chưa thực sự quan sát. Trước khi smoke phải lưu đường dẫn backup, SHA-256 của binary cũ và candidate, kết quả `quick_check`/schema trên bản database được chép sau khi daemon dừng, cùng trạng thái daemon. Nếu bất kỳ hành trình nào thất bại, dừng smoke, giữ nguyên database đã migration và bản backup để chẩn đoán, khôi phục **chỉ** binary cũ theo thủ tục rollback rồi ghi lại hash/trạng thái khởi động; không xoá evidence.
 
+## Triển khai Memory V2 — 2026-08-10
+
+- Nhánh/commit candidate đã duyệt: `feature/portal-m1-foundation` / `861658af89989f389d722637865e90f7ca44c4ea`
+- Thời gian thao tác: 11:38–11:48 ICT
+- Candidate: `D:\TuvanZalo\_artifacts\memory-v2\app\agentdc.exe`
+- Live binary: `D:\TuvanZalo\app\agentdc.exe`
+- Backup sau khi daemon dừng: `D:\TuvanZalo\_backups\memory-v2-20260810-113825`
+
+### Backup và thay executable
+
+| Bằng chứng | Kết quả |
+|---|---|
+| Candidate SHA-256 trước stop | `940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45` — khớp hash đã duyệt |
+| Daemon cũ | PID 18824, executable path đúng `D:\TuvanZalo\app\agentdc.exe`; native stop exit 0 và process biến mất trước khi copy data |
+| Binary cũ / backup binary SHA-256 | `1013F1A2D6F736F7238391B242ABE3BEEDB7B8F6914FCF13E3BA85FDBC384791` — khớp tuyệt đối |
+| Backup DB | `data\agentdc.db`, SHA-256 `68DCE8FCCF2491BE5D1CD7B4C8859ED241F21D5E03F5FDC894856CC4DFD01933`; read-only `PRAGMA quick_check=ok`; schema trước migration = 3 |
+| Live binary sau replace | 20.500.480 byte; SHA-256 `940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45` |
+| Recovery evidence | `rollback-stage-agentdc.exe` và `file-replace-backup-agentdc.exe` trong backup timestamp; mỗi tệp có SHA-256 đúng hash binary cũ |
+
+Lần gọi đầu dùng `File.Replace(source, destination, $null)` dừng trước mutation vì runtime này
+trả `MethodInvocationException` HResult `0x80131501`, inner `ArgumentException` với thông báo
+`The path is empty. (Parameter 'path')` và HResult `0x80070057`. Audit ngay sau lỗi xác nhận live
+binary vẫn mang đúng hash cũ; staged candidate, rollback stage và backup đều còn nguyên nên không
+thực hiện rollback giả.
+
+Compatibility được chứng minh chỉ trên hai bản sao trong
+`C:\Users\manva\AppData\Local\Temp\agentdc-memory-v2-replace-test-20260810-113928737`:
+overload có **backup path không rỗng trong cùng directory** thay atomically, destination nhận đúng
+candidate hash và automatic backup nhận đúng old hash. Live replace sau đó dùng đúng form đã chứng
+minh này. Hai recovery copy được hash-check rồi chuyển nguyên vẹn vào backup timestamp; app directory
+không còn tệp staging/recovery gây collision.
+
+### Trạng thái live sau migration
+
+| Cổng | Kết quả |
+|---|---|
+| Process | PASS — đúng một process, PID 8424, executable path tuyệt đối đúng live binary |
+| `/status` | HTTP 200; version 0.10.0; started_at `2026-08-10T11:40:34.0955246+07:00` |
+| Portal/Zalo shell | `/`, `/zalo`, `/assets/app-main.js`, `/assets/zalo.js`, `/assets/zalo.css` đều HTTP 200 |
+| Memory V2 bundle/API | `/memory`, `/assets/pages/memory.js`, `memory-view.js`, `memory-actions.js`, `/assets/portal.css` đều HTTP 200 |
+| Live DB | read-only `PRAGMA quick_check=ok`; `app_meta.schema_version=4` |
+| Live executable | SHA-256 vẫn đúng candidate đã duyệt sau start và sau smoke |
+
+### Smoke an toàn bằng dữ liệu giả
+
+Không gửi tin ra Zalo và không dùng liên hệ thật. Chính installed binary được chạy thêm trên port 8781
+với home cô lập tại `D:\TuvanZalo\_backups\memory-v2-20260810-113825\smoke-home`; daemon cô lập đã
+dừng sạch sau test. Database evidence cuối có SHA-256
+`358FDCBAC3A0D19DA0E338B65B0636BB8834FCAE03A583885A5247C40DFC72B5`,
+`quick_check=ok` và schema 4.
+
+| Hành trình | Phần tự động đã quan sát | Kết quả |
+|---|---|---|
+| 1. Hai thành viên, không lẫn scope | Scope chung và hai UID giả trả đúng từng tập; A/B không thấy row riêng của nhau; common revision 1, mỗi subject revision 1; session seed chỉ đồng bộ đúng A | PASS |
+| 2. Duyệt replacement | HTTP approve 200; target cũ thành `superseded`, proposal thành `active`, lineage giữ `supersedes_id`; revision A 1→2 và `synced=false` chờ lượt kế | PASS |
+| 3. Từ chối nhạy cảm | HTTP reject 204; pending row bị xoá, không có active row cùng key, revision B giữ nguyên 1 | PASS |
+| 4. Khôi phục rồi ghim | Restore 200 tạo lại expiry và revision 2→3; pin 200 đưa revision 3→4, `pinned=true`, expiry `null` | PASS |
+| 5. Quên lineage, giữ message | DELETE tương đương store lineage operation trả 204; cả hai revision lineage bị xoá vật lý, subject revision 1→2; hai source message giả vẫn còn | PASS cho store/API; parser yêu cầu quên qua Zalo còn chờ lượt thật |
+| 6. Lượt sau không refresh | Hai lần đọc liên tiếp giữ nguyên common/subject revision và sync state; Go gate chạy `TestAppZaloSessionMemoryV2SynchronizesCurrentSpeakerInOneSession` và `TestAppZaloMemoryV2OperationUsesTrustedSubjectAndOneRunnerCall` | PASS tự động; quan sát hai lượt Zalo thật còn chờ người vận hành |
+
+Điều khiển trình duyệt trong Codex đã thử cả `http://127.0.0.1:8770/memory` và
+`http://localhost:8770/memory` nhưng client chặn localhost bằng `ERR_BLOCKED_BY_CLIENT`. Vì vậy biên
+bản **không** đánh dấu quan sát visual hay thao tác click là PASS. HTTP shell/bundle thật đã đạt; phần
+visual và các lượt nhắn Zalo phải được người vận hành kiểm trên tab local đang mở.
+
+### Cổng tự động cuối trước commit
+
+| Lệnh/cổng | Kết quả |
+|---|---|
+| `npm test --prefix appmode` | PASS — 89/89, fail 0 |
+| `run-overlay-go-tests.ps1 -Package all` | PASS — toàn bộ package Go; daemon/store gồm contract speaker-scope, one-runner-call, refresh cursor và no-refresh khi revision không đổi |
+| `tests/build-app.Tests.ps1` | PASS — đúng 10/10 checkpoint top-level |
+| Parse PowerShell runbook | PASS — block hợp lệ; không còn `File.Replace(..., $null)`; cả forward replace và rollback dùng non-empty same-directory backup path |
+| `git diff --check` | PASS |
+
+### Phần còn chờ người vận hành
+
+- [ ] Mở Portal local, xác nhận trực quan tab **Chung cho nhóm**, hai tab thành viên, badge đồng bộ và các nút Duyệt/Từ chối/Khôi phục/Ghim.
+- [ ] Dùng tài khoản/liên hệ Zalo thử nghiệm để quan sát refresh ở lượt kế sau mutation và không refresh ở lượt không đổi tiếp theo.
+- [ ] Xác nhận daemon resume đúng session của một thread thử nghiệm, mỗi lượt chỉ gọi runner một lần; không ghi nội dung khách hàng vào evidence.
+
 ## Real-service smoke: chưa chạy
 
-Milestone 1 chưa đăng nhập tài khoản Zalo thật, chưa khởi động transport thật và chưa gửi tin. Phần smoke với dịch vụ thật được để dành cho milestone tích hợp sau, trên tài khoản thử nghiệm và có người vận hành giám sát.
+Lần triển khai 2026-08-10 không gửi tin, reaction hay file tới bất kỳ tài khoản Zalo nào và không dùng dữ liệu khách hàng làm fixture. Smoke bằng lượt Zalo thật được để dành cho tài khoản thử nghiệm, có người vận hành giám sát; trạng thái transport hiện hữu không được dùng làm bằng chứng rằng sáu hành trình đã chạy.
