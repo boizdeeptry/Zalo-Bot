@@ -5,6 +5,8 @@ out/
 
 # Generated dependencies and transient build output
 node_modules/
+__pycache__/
+*.py[cod]
 *.tmp
 *.partial
 *.log

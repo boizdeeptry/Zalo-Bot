@@ -53,6 +53,51 @@ function Write-TestBytes {
   [IO.File]::WriteAllBytes($Path, $Bytes)
 }
 
+function Assert-MemoryV2DeploymentTooling {
+  $scriptsRoot = Join-Path $PSScriptRoot '..\scripts'
+  $modulePath = Join-Path $scriptsRoot 'MemoryV2Deployment.psm1'
+  $canaryPath = Join-Path $scriptsRoot 'Invoke-MemoryV2Canary.ps1'
+  $deployPath = Join-Path $scriptsRoot 'Invoke-MemoryV2Deploy.ps1'
+  $sqlitePath = Join-Path $scriptsRoot 'memory_v2_sqlite.py'
+  foreach ($path in @($modulePath, $canaryPath, $deployPath, $sqlitePath)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+      throw "Memory V2 deployment tooling is missing '$path'"
+    }
+  }
+  $moduleText = Get-Content -LiteralPath $modulePath -Raw
+  $null = [ScriptBlock]::Create($moduleText)
+  $null = [ScriptBlock]::Create((Get-Content -LiteralPath $canaryPath -Raw))
+  $null = [ScriptBlock]::Create((Get-Content -LiteralPath $deployPath -Raw))
+  $deployStart = $moduleText.IndexOf('function Invoke-MemoryV2Deployment', [StringComparison]::Ordinal)
+  $gateIndex = $moduleText.IndexOf('$null = Test-MemoryV2CanaryManifest', $deployStart, [StringComparison]::Ordinal)
+  $preflightIndex = $moduleText.IndexOf('$liveInspection = & $inspectLive', $deployStart, [StringComparison]::Ordinal)
+  $stageIndex = $moduleText.IndexOf('[IO.File]::Copy($candidate, $staged', $deployStart, [StringComparison]::Ordinal)
+  $stopIndex = $moduleText.IndexOf('& $stopLive', $deployStart, [StringComparison]::Ordinal)
+  if ($deployStart -lt 0 -or $gateIndex -lt 0 -or $preflightIndex -lt 0 -or
+      $stageIndex -lt 0 -or $stopIndex -lt 0 -or $gateIndex -ge $preflightIndex -or
+      $preflightIndex -ge $stageIndex -or $stageIndex -ge $stopIndex) {
+    throw 'Memory V2 deploy manifest/live-schema gates are not mechanically ordered before staging and stop'
+  }
+  $canaryText = Get-Content -LiteralPath $canaryPath -Raw
+  $deployText = Get-Content -LiteralPath $deployPath -Raw
+  foreach ($text in @($canaryText, $deployText)) {
+    if ($text -notmatch 'ExpectedLiveSchema' -or $text -notmatch 'ExpectedTargetSchema') {
+      throw 'Memory V2 executable wrapper lost explicit live/target schema binding'
+    }
+  }
+  if ($moduleText -notmatch 'canary transcript status must be PASS' -or
+      $moduleText -notmatch 'canary source must be a retained backup') {
+    throw 'Memory V2 tooling lost transcript semantics or active-live source rejection'
+  }
+  $sqliteText = Get-Content -LiteralPath $sqlitePath -Raw
+  if ($sqliteText -notmatch 'mode=ro&immutable=1' -or
+      $moduleText -match '\[IO\.File\]::Replace\([^\r\n]*,\s*\$null\s*\)') {
+    throw 'Memory V2 deployment tooling lost immutable SQLite or non-null atomic backup safety'
+  }
+  & python -c 'import ast,pathlib,sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' $sqlitePath
+  if ($LASTEXITCODE -ne 0) { throw 'Memory V2 SQLite helper does not parse' }
+}
+
 function Assert-PackageRejectsCanarySafely {
   param(
     [Parameter(Mandatory)][string]$Root,
@@ -836,4 +881,5 @@ func incoming() {
 $realUpstream = 'C:\Users\manva\OneDrive\Máy tính\agentdc'
 $realOverlay = Join-Path $PSScriptRoot '..\appmode\overlay'
 Invoke-StagedZaloSessionAcceptance -Repo $realUpstream -Overlay $realOverlay
-Write-Host 'PASS: real staged duty compiles both seams and exercises create/resume/isolation through the runner seam.'
+Assert-MemoryV2DeploymentTooling
+Write-Host 'PASS: real staged duty and executable Memory V2 deployment gates parse and preserve ordered safety seams.'

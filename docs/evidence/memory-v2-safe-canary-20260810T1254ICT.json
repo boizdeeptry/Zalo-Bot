@@ -1,0 +1,18 @@
+{
+  "version": "memory-v2-canary/v1",
+  "status": "FAIL",
+  "generatedUtc": "2026-08-10T05:56:27.9058621Z",
+  "port": 8783,
+  "candidate": {
+    "path": "D:\\TuvanZalo\\_artifacts\\memory-v2\\app\\agentdc.exe",
+    "sha256": "940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45"
+  },
+  "stopped": {
+    "processExited": true,
+    "listenerAbsent": true
+  },
+  "evidence": {
+    "transcriptPath": "D:\\TuvanZalo\\_build\\.worktrees\\portal-m1\\docs\\evidence\\memory-v2-safe-canary-20260810T1254ICT.transcript.json",
+    "transcriptSha256": "D42CC1427B57963C6C9DEA64651E0C7ABFB21B2BF2A7910A5AC0F87AD1F833F7"
+  }
+}

@@ -56,16 +56,50 @@ Sáu hành trình dưới đây là checklist cho lần triển khai Memory V2 s
 
 ### Thứ tự backup và thay binary bắt buộc
 
-Không được sao chép database đang hoạt động. Khi được duyệt triển khai, người vận hành phải thực hiện đúng thứ tự sau và dừng ngay khi một cổng thất bại:
+Không được sao chép database đang hoạt động. Hai entry point dưới đây là runbook có hiệu lực; không
+chép lại các đoạn PowerShell thủ công vào shell. Canary phải hoàn tất trước và manifest `PASS` mới,
+đúng candidate/path/hash, schema `3→4`, J1–J6, isolation và clean stop phải được deploy script xác minh
+**trước bất kỳ lệnh stop nào**:
+
+```powershell
+$stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
+$manifest = Join-Path $PWD "docs\evidence\memory-v2-canary-$stamp.json"
+$transcript = Join-Path $PWD "docs\evidence\memory-v2-canary-$stamp.transcript.json"
+
+pwsh -NoProfile -File .\scripts\Invoke-MemoryV2Canary.ps1 `
+  -CandidatePath 'D:\TuvanZalo\_artifacts\memory-v2\app\agentdc.exe' `
+  -ApprovedCandidateHash '940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45' `
+  -SourceHome 'D:\TuvanZalo\_backups\memory-v2-20260810-113825\data' `
+  -CanaryHome (Join-Path ([IO.Path]::GetTempPath()) "agentdc-memory-v2-canary-$stamp") `
+  -LiveRoot 'D:\TuvanZalo' -Port 8784 -ManifestPath $manifest -TranscriptPath $transcript `
+  -ExpectedLiveSchema 3 -ExpectedTargetSchema 4
+if ($LASTEXITCODE -ne 0) { throw 'Memory V2 canary failed' }
+
+pwsh -NoProfile -File .\scripts\Invoke-MemoryV2Deploy.ps1 `
+  -ManifestPath $manifest `
+  -CandidatePath 'D:\TuvanZalo\_artifacts\memory-v2\app\agentdc.exe' `
+  -ApprovedCandidateHash '940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45' `
+  -LiveRoot 'D:\TuvanZalo' -BackupRoot 'D:\TuvanZalo\_backups' -Port 8770 `
+  -ExpectedLiveSchema 3 -ExpectedTargetSchema 4
+if ($LASTEXITCODE -ne 0) { throw 'Memory V2 deployment failed or rolled back' }
+```
+
+Hai giá trị `3 -> 4` trên chỉ ghi lại rollout lịch sử. Live hiện đã ở schema 4 nên manifest cũ **không
+được phép** authorize thêm một deployment: preflight read-only sẽ fail trước staging/`StopLive`. Rollout
+tiếp theo phải tạo canary mới từ retained backup đã dừng của đúng schema live hiện hành, rồi truyền rõ
+schema live và schema target mới; không tái sử dụng manifest 3→4 này.
+
+Hai script cơ học hóa thứ tự sau và dừng ngay khi một cổng thất bại:
 
 1. Lưu `$ErrorActionPreference`, đặt thành `Stop` trong toàn bộ thao tác rồi luôn khôi phục trong `finally`; vẫn kiểm tra riêng `$LASTEXITCODE` sau mọi native command. Resolve và in đường dẫn tuyệt đối của candidate, live binary, live data, `Start.vbs`, thư mục backup và bốn recovery path chính xác trong `D:\TuvanZalo\app`: `agentdc.memory-v2.staged.exe`, `agentdc.memory-v2.rollback.exe`, `agentdc.memory-v2.replaced-old.exe` và `agentdc.memory-v2.failed-candidate.exe`. Mọi path phải nằm trong live app directory, khác live binary và chưa tồn tại trước khi dừng; mọi collision phải fail trước stop.
-2. Trước khi dừng daemon, tính SHA-256 candidate và so sánh không phân biệt hoa/thường với hash đã duyệt `940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45`; khác một ký tự cũng phải dừng. Chép candidate sang file staged cùng directory và xác minh staged hash cũng bằng hash đã duyệt. Không gọi `Stop.bat` trong runbook unattended vì file đó kết thúc bằng `pause >nul`. Đặt process environment `AGENTDC_HOME=D:\TuvanZalo\data`, `AGENTDC_PORT=8770`, gọi chính xác `D:\TuvanZalo\app\agentdc.exe daemon stop --force`, rồi yêu cầu native exit code bằng 0.
+2. Trước khi staging hoặc dừng daemon, tính SHA-256 candidate và so sánh không phân biệt hoa/thường với hash đã duyệt `940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45`; khác một ký tự cũng phải dừng. Dùng read-only WAL-aware inspection trên live DB, yêu cầu `quick_check=ok` và schema bằng `ExpectedLiveSchema`; mismatch phải fail trước `StopLive`. Sau đó mới chép candidate sang file staged cùng directory và xác minh staged hash cũng bằng hash đã duyệt. Không gọi `Stop.bat` trong runbook unattended vì file đó kết thúc bằng `pause >nul`. Đặt process environment `AGENTDC_HOME=D:\TuvanZalo\data`, `AGENTDC_PORT=8770`, gọi chính xác `D:\TuvanZalo\app\agentdc.exe daemon stop --force`, rồi yêu cầu native exit code bằng 0.
 3. Xác nhận process `agentdc.exe` có executable path đúng `D:\TuvanZalo\app\agentdc.exe` đã kết thúc. Nếu còn process sau timeout, không chép data và không thay binary.
 4. Chỉ sau khi xác nhận daemon đã dừng mới tạo thư mục backup có timestamp.
 5. Chép live `agentdc.exe` và **toàn bộ** `D:\TuvanZalo\data` vào backup; ghi hash binary cũ và đường dẫn bản sao.
-6. Xác nhận `backup\data\agentdc.db` tồn tại, mở **bản backup** bằng SQLite URI `mode=ro`, chạy `PRAGMA quick_check` và đọc `app_meta.schema_version`. Chỉ tiếp tục khi `quick_check` trả `ok` và schema đọc được; không chạy migration hay câu lệnh ghi trên bản backup.
+6. Xác nhận `backup\data\agentdc.db` tồn tại, chụp baseline size/hash/mtime của DB/WAL/SHM, mở **bản backup** bằng SQLite URI `mode=ro&immutable=1`, chạy `PRAGMA quick_check` và đọc `app_meta.schema_version`. Chỉ tiếp tục khi `quick_check=ok`, schema bằng chính `ExpectedLiveSchema` đã qua preflight (3 trong rollout lịch sử) và baseline trước/sau giống tuyệt đối; không chạy migration hay câu lệnh ghi trên bản backup.
 7. Sau khi mọi bằng chứng backup đạt, xác minh lại staged candidate hash và ba recovery path còn lại vẫn chưa tồn tại, đặt cờ `liveMutationAttempted` **ngay trước** thao tác, rồi dùng `[IO.File]::Replace(staged, live, replaced-old)` với **backup path không rỗng trong cùng directory**. Runtime trên máy này từ chối `$null`. Đọc lại hash live binary và hash automatic replace backup; chỉ khởi động qua `wscript.exe D:\TuvanZalo\Start.vbs` khi chúng lần lượt bằng candidate hash và old hash.
 8. Nếu `liveMutationAttempted` đã được đặt thì phải rollback bất kể `File.Replace` báo thành công hay lỗi: xác minh lại backup binary bằng hash cũ, chép nó vào rollback staging path cùng directory, xác minh staged rollback hash, rồi atomically `File.Replace(rollback-stage, live, failed-candidate)` với non-empty backup path nếu live destination còn tồn tại hoặc `File.Move` nếu bị mất. Chỉ khởi động binary cũ sau khi hash live đã khôi phục đúng. Nếu lỗi xảy ra trước mutation, tuyệt đối không thay binary và chỉ khởi động lại binary cũ khi stop đã làm nó dừng. Mọi lỗi rollback/restart phải terminating và fail-closed; giữ backup cùng staging evidence khi thất bại, rồi khôi phục process environment và `$ErrorActionPreference` trong `finally`.
+9. Sau start, trong timeout hữu hạn phải đồng thời chứng minh installed hash, đúng executable path của process sở hữu đúng một listener loopback, `/status` HTTP 200 và live DB `quick_check=ok`/schema bằng `ExpectedTargetSchema` (4 trong rollout lịch sử). Bất kỳ nhánh nào thất bại đều đi qua rollback binary atomically bằng backup path cùng directory không rỗng, xác minh old hash, restart old executable và kiểm tra lại exact path/listener/HTTP trong timeout; backup timestamp luôn được giữ.
 
 Trong nhóm, **Chung cho nhóm** là scope dùng chung cho mọi người trong đúng nhóm đó; mỗi tab thành viên là scope riêng chỉ của người đang chọn. Trạng thái **Đã đồng bộ với phiên Zalo** chỉ có nghĩa phiên đã nhận cả revision chung và revision của đúng thành viên đang chọn. Khi revision chung hoặc revision thành viên đổi, Portal phải hiện rằng Memory sẽ đồng bộ ở lượt nhắn tiếp; đổi người nói phải thay toàn bộ scope thành viên, không cộng dồn Memory của người trước.
 
@@ -195,6 +229,70 @@ thể làm cho trình tự 11:40/11:45 trong quá khứ trở thành đúng th�
 Các cổng cuối sau khi bổ sung hard gate cũng đạt: Node `89/89`, Go `./...` toàn bộ package, package
 `10/10`, kiểm tra thứ tự tĩnh xác nhận canary đứng trước Step 8, PowerShell runbook parse được và
 `git diff --check` sạch.
+
+### Quality remediation: gate cơ học và isolation thật — 2026-08-10 12:54–13:00 ICT
+
+Review sau đó phát hiện canary 8782 ở trên vẫn **không đạt isolation**: copied home nằm trong
+`D:\TuvanZalo`, được chép nguyên từ backup nên ban đầu mang cả `daemon.lock`, live `token`,
+`zalo-transport.pid`, `zalo-transport.log` và `zalo\credentials.json`. PID file không còn sau khi
+daemon canary chạy, còn credentials vẫn còn trong home cũ; việc không cấu hình transport và không
+quan sát outbound Zalo không đủ chứng minh process không thể tương tác với phiên/PID đã chép. Vì vậy
+PASS cũ chỉ còn là bằng chứng migration/API; nó không phải bằng chứng canary cô lập an toàn.
+
+Quality fix thêm runbook thực thi và regression suite:
+
+- `scripts\Invoke-MemoryV2Canary.ps1` gọi module để đọc source bằng URI immutable, sao chép home ra
+  ngoài live root, từ chối source là live root/app/data (chỉ nhận retained backup), xóa **chỉ trên bản copy** lock/token/transport PID/log/default credentials, loại
+  toàn bộ `AGENTDC_ZALO_*`, `ZALO_*`, `AGENTDC_TOKEN` và `AGENTDC_URL` khỏi child environment, rồi
+  tự chạy migration/J1–J6/clean stop và xuất manifest + transcript JSON đã lược bỏ bí mật.
+- `scripts\Invoke-MemoryV2Deploy.ps1` bắt buộc validate manifest trước stop: version/PASS/freshness,
+  canonical candidate path/hash, source/target schema đã khai báo, toàn bộ journeys/isolation,
+  process/listener đã dừng và evidence hashes. Transcript đã hash cũng phải parse được, redacted,
+  PASS/đúng port/freshness và đủ unique PASS event source/migration/J1–J6/stop/final. Thiếu hoặc sai một
+  trường thì fail trước mutation.
+- Backup DB được đọc `mode=ro&immutable=1`; DB/WAL/SHM size/hash/mtime trước/sau mỗi lượt đọc phải
+  giống tuyệt đối. Sau start, script kiểm bounded exact process path, listener loopback, `/status`,
+  installed hash và live DB. Mọi lỗi sau mutation chạy full same-directory atomic rollback với backup
+  path không rỗng, verify old hash, restart old executable và bounded health, đồng thời giữ backup.
+
+Lần safe-script đầu trên port 8783 dừng ở assertion J4 sau khi J1–J3 PASS vì response pin hợp lệ bỏ
+field JSON `expires_at` khi nil; harness đã giả định field luôn tồn tại. Cleanup native stop đạt,
+process/listener đều vắng, không phải lỗi sản phẩm và không chạm live. Evidence FAIL được giữ nguyên:
+
+- Manifest `docs/evidence/memory-v2-safe-canary-20260810T1254ICT.json`, SHA-256
+  `D48AAD92D574617C4DA0CD24FC28A1913BD6A98578E8D368939DF41E0DC3EB58`.
+- Transcript cạnh manifest, SHA-256
+  `D42CC1427B57963C6C9DEA64651E0C7ABFB21B2BF2A7910A5AC0F87AD1F833F7`.
+
+Sau regression fix, một canary mới hoàn chỉnh chạy bằng script mới:
+
+| Cổng safe remediation | Kết quả |
+|---|---|
+| Candidate | Canonical path `D:\TuvanZalo\_artifacts\memory-v2\app\agentdc.exe`; SHA-256 `940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45` |
+| Copied home / port | `C:\Users\manva\AppData\Local\Temp\agentdc-memory-v2-safe-canary-20260810T1300ICT`, ngoài `D:\TuvanZalo`; port riêng 8784 |
+| Pre-start isolation | Credential/token/PID/lock/log đã scrub trên copy; transport-related env đã clear; port ban đầu trống; không có Zalo transport PID/credentials sau chạy |
+| Immutable migration | Source/copy DB SHA-256 trước start cùng bằng `68DCE8FCCF2491BE5D1CD7B4C8859ED241F21D5E03F5FDC894856CC4DFD01933`; schema 3/`quick_check=ok` → schema 4/`quick_check=ok`; stable V3 fields/digests bằng nhau |
+| J1–J6 | Cả sáu giá trị trong manifest `true`: scope isolation/sync, approve, reject, restore+pin, lineage delete+message retention, unchanged revision reads |
+| Final canary | Clean stop; không listener/process candidate; final DB schema 4, `quick_check=ok`, SHA-256 `EB03D28385845416BCA3654692F83A0862276098A882D4FB6AC1E65BB9A3B504` |
+| Manifest | `docs/evidence/memory-v2-safe-canary-20260810T1300ICT.json`; SHA-256 `56607B6E793428120940CBF7BD2DCF558791D0FAAD95A554E9D0968D2859FD52` |
+| Transcript | `docs/evidence/memory-v2-safe-canary-20260810T1300ICT.transcript.json`; SHA-256 `E0935E82D0685A2253EE332A6DF9F7FEE334850B7128FD3AB5CA62B2E99F45D4` |
+| Live isolation | Live không stop/replace/restart: PID 8424, exact path, `/status` HTTP 200 và approved executable hash không đổi sau canary |
+
+Safe remediation này sửa assurance/isolation và cơ học hóa mọi lần triển khai tương lai. Nó vẫn
+không thể hồi tố trình tự 11:40/11:45 của deployment ban đầu thành pre-deploy compliant.
+
+### Cổng cuối sau quality remediation
+
+| Lệnh/cổng | Kết quả |
+|---|---|
+| `npm test --prefix appmode` | PASS — 89/89, fail 0 |
+| `run-overlay-go-tests.ps1 -Package all` | PASS — toàn bộ package Go |
+| `tests/build-app.Tests.ps1` | PASS — 10/10 checkpoint; executable Memory V2 gates parse và giữ đúng safety ordering |
+| `tests/memory-v2-deployment.Tests.ps1` | PASS — 4/4 checkpoint: export/parse, outside-root scrub, manifest fail-closed và full rollback/restart health |
+| Parser/static safety | PASS — ba script/module PowerShell parse sạch; Python AST parse sạch; manifest → live-schema preflight → staging đều đứng trước `StopLive`; schema args bắt buộc; không có `File.Replace(..., $null)` |
+| Evidence integrity/redaction | PASS — manifest/transcript hash đúng; manifest PASS qua validator; 17 giá trị secret live được so khớp cục bộ, không giá trị nào xuất hiện trong evidence |
+| Live/canary isolation | PASS — live vẫn PID 8424, exact path/hash, HTTP 200, DB `quick_check=ok`/schema 4; port 8783/8784 đóng và không có process chạy từ candidate path |
+| `git diff --check` | PASS |
 
 ### Phần còn chờ người vận hành
 
