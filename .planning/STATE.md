@@ -16,6 +16,15 @@ history (như CC4). Overlay HEAD `b1ea16c`.
   (core/providers-status.js) cho galleryStatus + picker + note "Chưa kết nối". Spec✅ quality-Pass, Portal 109 xanh.
   LƯU Ý: instance đang chạy (pid 20388) build từ `52bf07d` — CHƯA có fix này; cần rebuild để thấy live (hoãn
   tới rebuild trước-ship / sau-onboarding).
+- **ND-T11 (E2E-found real bug, `406b7a3`) — codex proxy bị CHẶN bởi credential precheck**: router.go:178
+  `appLLMCredential(codex)` trả lỗi "not found" (codex proxy KHÔNG có credential daemon — token ở auth.json)
+  → lượt CHẾT trước adapter → mọi combo→codex escalate "the agent did not finish", llm_attempts RỖNG. Bug có
+  SẴN trên main từ pivot PX5 (precheck chưa miễn cho proxy/CLI). Fix: `appLLMCredential` trả (nil,nil) khi
+  ErrNotFound (provider không-credential đưa nil, adapter tự quyết); vẫn lỗi khi decrypt hỏng. Spec+quality
+  Pass, live-verified DPAPI. **XÁC MINH E2E THẬT (2026-08-10)**: rebuild F:\dist\_verify-nd2 → swap app\ vào
+  _verify-nodefault (giữ data) → gửi tin Zalo → llm_attempts = codex/gpt-5.5 **ok 4.7s**, bot trả lời (turn
+  hoàn tất). "nothing to answer/ask back" là do KB rỗng + persona placeholder (quyết định nội dung, không phải
+  routing). CODEX PROXY GIỜ CHẠY E2E QUA COMBO.
 - **E2E phát hiện lỗ hổng hệ thống → user quyết làm ONBOARDING WIZARD** (option A: terminal-style TRONG Portal,
   gate app tới khi Provider→Combo→chat-thử xong) làm sub-project kế. Xem [[project-zalobot-onboarding-wizard]].
   "Connect xong vẫn im" gốc = chưa có combo active (routing đi qua Combo).
