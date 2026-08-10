@@ -140,14 +140,21 @@ Các kiểm tra trọng tâm gồm
 
 Khởi động riêng `app\agentdc.exe daemon` trên port tạm với `AGENTDC_HOME` cô lập và không khởi động Zalo transport thật. Kết quả:
 
-| Đường dẫn | HTTP |
-|---|---:|
-| `/status` | 200 |
-| `/` | 200 |
-| `/assets/app-main.js` | 200 |
-| `/zalo` | 200 |
+| Đường dẫn | HTTP | Hợp đồng quan sát được |
+|---|---:|---|
+| `/status` | 200 | Daemon cô lập đã sẵn sàng |
+| `/` | 200 | Management shell có `rail`, `main` và nạp `app-main.js` |
+| `/assets/app-main.js` | 200 | Portal controller hiện tại được nhúng |
+| `/assets/core/router.js` | 200 | Router hiện tại được nhúng |
+| `/assets/pages/knowledge.js` | 200 | Trang Knowledge hiện tại được nhúng |
+| `/zalo` | 200 | Zalo conversation shell vẫn được phục vụ |
+| `/assets/pages/overview.js` | 404 | Asset cũ đã được bỏ có chủ đích |
 
-Các asset nhúng tại `/`, `/assets/core/router.js` và `/assets/pages/overview.js` có đủ nhãn **Tổng quan**, **Trợ lý AI**, **Tri thức**, **Mô hình** và liên kết **Hội thoại**.
+Navigation hiện tại trong `core/router.js` mang các nhãn **AI Agents**, **Knowledge**, **Providers**,
+**Combos**, **Memory** và **Conversations**. `TestAppPortalShellAssetsAreEmbedded` ghim
+`pages/overview.js` là asset đã loại bỏ, còn `TestAppPackageServesManagementAssetsAndZalo` ghim các
+management asset và `/zalo` đang được phục vụ; không dùng lại nhãn hoặc asset của shell cũ làm tiêu
+chí smoke.
 
 ## Checklist smoke Memory V2
 
