@@ -1,12 +1,32 @@
 # Planning state
 
-step: execute
-current_topic: cli-models-combo-modal
+step: done
+current_topic:
 current_spec:
-current_plan: .planning/plans/2026-08-08-cli-models-combo-modal.md
-last_updated: 2026-08-08
+current_plan:
+last_updated: 2026-08-10
 
-## Đang làm: CLI models hiện ra + combo model-picker modal (9Router-style) — follow-up sau test
+## SHIPPED 2026-08-10 → main (`43859e4`) — Combos 9Router UI + Codex PROXY pivot + OAuth connect
+
+Nhánh `feat/cli-models-combo-modal` (22 commit, fast-forward `4f48d94`→`43859e4` vào `main`) đã merge local,
+nhánh xoá. Local main giờ ahead origin/main 144 commit — CHƯA push (ship local, không PR). Suite xanh trên
+bản merged (fast-forward → HEAD y hệt commit đã test: Go PASS toàn package, Portal 100/100). Gói cuối:
+F:\dist\_verify-20260808m (7/7 gate, canary "sach", 3177 tệp/121.0MB) đã swap vào live folder, daemon chạy,
+account codex `a45380cc` sống qua swap.
+- **CM1–CM5**: CLI static model populate (Claude Code + auto) · combo model-picker modal auto-save ·
+  live codex model discovery (đọc `models_cache.json`, green-safe) · redesign Combos = card grid + create/edit
+  modal kiểu 9Router (thêm model lúc tạo, toggle active, up/down, copy, delete-guard active/last).
+- **PX1–PX8 (Codex PROXY pivot)**: THAY HẲN CLI codex bằng proxy gọi thẳng `chatgpt.com/backend-api/codex/
+  responses` (Responses API, SSE→text) — token đọc từ auth.json per-account. Badge TRUNG THỰC: Codex (proxy)
+  cảnh báo rủi ro khoá account (amber). Connect = browser-OAuth (authorization_code + PKCE S256, redirect
+  `http://localhost:1455|1457/auth/callback`, account_id từ id_token) THAY device-auth — giống 9Router 1 bước.
+- **2 fix cuối**: status "Đã kết nối" cho provider thuê bao xét THEO ACCOUNT (proxy không có credential); icon
+  hãng chính thức (OpenAI/Claude/Gemini/OpenRouter, SVG trắng nhúng CSP-safe) thay text "CX/CC…".
+- Orphan-dir cleanup (`54bb2ba`, session khác): xoá config dir account khi connect fail.
+- E2E THẬT đã chạy: OAuth-connected account → proxy → "Xin chào" STATUS 200. Xem [[reference-zalobot-codex-proxy]].
+- **CÒN (tùy chọn)**: Claude proxy (đối xứng codex) nếu muốn bỏ luôn CLI Claude. Chưa làm.
+
+## (đã ship) CLI models hiện ra + combo model-picker modal (9Router-style)
 
 Nhánh `feat/cli-models-combo-modal` off main `4f48d94`. User test bản mới thấy 2 lỗ hổng:
 - **A**: Claude Code = 0 model. GỐC: claude-code KHÔNG có adapter (chạy runClaude), mà `handleLLMProviderDiscover`
