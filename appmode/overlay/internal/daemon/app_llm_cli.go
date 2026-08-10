@@ -21,9 +21,9 @@ import (
 type cliDescriptor struct {
 	kind           string // kind của họ provider local_cli. claude-code dùng gạch nối, thống nhất với hàng seeded (migration đã hợp nhất kind cũ claude_code → claude-code).
 	display        string
-	npmPackage     string   // gói cài; rỗng nếu là native exe (claude)
+	npmPackage     string   // gói cài; rỗng nếu là native exe
 	binJS          string   // đường dẫn tương đối tới entry .js trong node_modules; rỗng nếu native
-	nativeBin      string   // tên exe khi là native (claude); rỗng nếu chạy qua node
+	npmBin         string   // đường tương đối tới exe native dưới npm root (A-native); rỗng nếu chạy qua node+binJS
 	subArgs        []string // lệnh con không tương tác: {"exec"} codex, nil cho -p
 	promptViaStdin bool     // true: prompt qua stdin; false: positional arg
 	promptFlag     string   // cờ đứng trước prompt trong argv: "-p" gemini; rỗng = positional (codex)
@@ -82,8 +82,9 @@ var cliDescriptors = map[string]cliDescriptor{
 	},
 	"claude-code": {
 		kind: "claude-code", display: "Claude Code",
-		nativeBin: "claude",
-		subArgs:   nil, promptViaStdin: true, modelFlag: "--model",
+		npmPackage: "@anthropic-ai/claude-code",
+		npmBin:     `@anthropic-ai\claude-code\bin\claude.exe`,
+		subArgs:    nil, promptViaStdin: true, modelFlag: "--model",
 		readOnlyArgs: []string{"--allowed-tools", "Read", "Grep", "Glob", "WebFetch"},
 		bannedArgs:   []string{"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "bypassPermissions", "--permission-mode"},
 		authMethod:   "claude-json", claudeBudget: true,
@@ -207,10 +208,10 @@ func probeGeminiAuth(credPath string) authState {
 	return authLoggedIn
 }
 
-// probeClaudeAuth chạy `claude auth status --json` (native exe) rồi đọc trường loggedIn. Rẻ, chỉ đọc,
-// KHÔNG sinh nội dung. Không dò được (chưa cài / spawn lỗi) → unknown, KHÔNG suy ra loggedOut.
+// probeClaudeAuth chạy `claude auth status --json` (exe native dưới npm root) rồi đọc trường loggedIn.
+// Rẻ, chỉ đọc, KHÔNG sinh nội dung. Không dò được (chưa cài / spawn lỗi) → unknown, KHÔNG suy ra loggedOut.
 func probeClaudeAuth(ctx context.Context, d cliDescriptor, logger *slog.Logger) authState {
-	bin, err := exec.LookPath(d.nativeBin)
+	program, prefixArgs, err := resolveCLIProgram(d)
 	if err != nil {
 		return authUnknown // chưa cài → không biết trạng thái đăng nhập
 	}
@@ -218,7 +219,8 @@ func probeClaudeAuth(ctx context.Context, d cliDescriptor, logger *slog.Logger) 
 	// trình đơn (không có cháu node) nên CommandContext giết-con-trực-tiếp là đủ, không cần killPidTree.
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "auth", "status", "--json").Output()
+	argv := append(append([]string{}, prefixArgs...), "auth", "status", "--json")
+	out, err := exec.CommandContext(ctx, program, argv...).Output()
 	if err != nil {
 		// `claude auth status --json` THOÁT khác 0 khi CHƯA đăng nhập, nhưng vẫn in JSON
 		// {"loggedIn": false} hợp lệ (verify claude 2.1.223). Đọc thân TRƯỚC khi bỏ cuộc: một
@@ -578,18 +580,22 @@ func parseGeminiAnswer(out []byte) string {
 
 // resolveCLIProgram định vị chương trình chạy một vendor CLI.
 //
-//   - native (claude): exec.LookPath tên exe → (path, nil).
-//   - npm (codex/gemini): chạy `node <binJS>`, với binJS nằm dưới npm global root (`npm root -g`).
+//   - npm A-native (claude): exe native dưới npm root (`npm root -g`) → (exe, nil).
+//   - npm node+binJS (codex/gemini): chạy `node <binJS>`, với binJS nằm dưới npm global root.
 //
 // Định vị thật được Task 8 ghim (spawn thật + capture output); ở đây đủ để đường sản xuất dựng
 // được lệnh. Test KHÔNG đi qua đây — a.run seam chặn trước.
 func resolveCLIProgram(d cliDescriptor) (program string, prefixArgs []string, err error) {
-	if d.nativeBin != "" {
-		bin, err := exec.LookPath(d.nativeBin)
+	if d.npmBin != "" {
+		root, err := npmGlobalRoot()
 		if err != nil {
 			return "", nil, err
 		}
-		return bin, nil, nil
+		exe := filepath.Join(root, d.npmBin)
+		if _, err := os.Stat(exe); err != nil {
+			return "", nil, err
+		}
+		return exe, nil, nil
 	}
 	node, err := exec.LookPath("node")
 	if err != nil {

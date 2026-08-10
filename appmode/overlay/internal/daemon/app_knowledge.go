@@ -453,10 +453,10 @@ Xong thì nói ngắn gọn: đã viết những trang nào, bỏ qua tệp nào
 
 func (a *api) runIngest(ctx context.Context, cancel func(), dir string) {
 	defer cancel()
-	bin, err := exec.LookPath("claude")
+	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
 	if err != nil {
-		ingest.step("không thấy claude trên PATH")
-		ingest.finish("chưa cài Claude Code, hoặc chưa đăng nhập. Xem DOC TRUOC.txt")
+		ingest.step("chưa cài Claude Code")
+		ingest.finish("chưa cài Claude Code, hoặc chưa đăng nhập. Bấm Connect Claude trong Portal trước. Xem DOC TRUOC.txt")
 		return
 	}
 	// Quyền GHI, và chỉ trong brain\. Khác hẳn profile của bot trả lời khách, thứ chỉ-đọc.
@@ -470,9 +470,14 @@ func (a *api) runIngest(ctx context.Context, cancel func(), dir string) {
 	args = replaceAllowedTools(args, "Read", "Grep", "Glob", "Write", "Edit")
 	args = append(args, "--add-dir", dir)
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, program, append(append([]string{}, prefixArgs...), args...)...)
 	cmd.Dir = dir
 	cmd.Env = prof.Env(os.Environ())
+	// Dùng login của một account đã kết nối (CLAUDE_CONFIG_DIR) — không thì ingest chạy bằng phiên
+	// mặc định của máy, thường chưa đăng nhập. Merge vào cmd.Env đã có, không ghi đè.
+	if accounts, err := a.st.LLMAccounts(claudeCodeProviderID); err == nil && len(accounts) > 0 {
+		cmd.Env = append(cmd.Env, "CLAUDE_CONFIG_DIR="+accounts[0].ConfigDir)
+	}
 	cmd.Stdin = strings.NewReader(ingestPrompt)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -16,6 +16,18 @@ import (
 	"agentdc/internal/store"
 )
 
+func TestClaudeDescriptorIsNPM(t *testing.T) {
+	d := cliDescriptors["claude-code"]
+	if d.npmPackage != "@anthropic-ai/claude-code" {
+		t.Errorf("npmPackage = %q", d.npmPackage)
+	}
+	if d.npmBin == "" {
+		t.Error("npmBin rỗng; want đường bin\\claude.exe")
+	}
+	// nativeBin đã bị xoá khỏi cliDescriptor (claude-code là descriptor cuối dùng nó) — không còn
+	// trường để assert; việc file compile đã chứng minh không còn nơi nào đọc nativeBin.
+}
+
 func TestCLIRegistryHasThreeVendors(t *testing.T) {
 	got := make([]string, 0, len(cliDescriptors))
 	for kind := range cliDescriptors {
@@ -292,8 +304,8 @@ func TestCheckCLIAuthDispatch(t *testing.T) {
 // TestClaudeAuthLive chạy `claude auth status --json` THẬT qua checkCLIAuth. Skip sạch nếu claude
 // vắng. Máy này claude ĐÃ đăng nhập → loggedIn; nếu máy khác đã logout thì skip thay vì fail giả.
 func TestClaudeAuthLive(t *testing.T) {
-	if _, err := exec.LookPath("claude"); err != nil {
-		t.Skip("claude không có trên PATH")
+	if _, _, err := resolveCLIProgram(cliDescriptors["claude-code"]); err != nil {
+		t.Skip("claude chưa cài qua npm (@anthropic-ai/claude-code vắng ở npm root)")
 	}
 	got := checkCLIAuth(t.Context(), cliDescriptors["claude-code"], "", slog.New(slog.DiscardHandler))
 	switch got {
