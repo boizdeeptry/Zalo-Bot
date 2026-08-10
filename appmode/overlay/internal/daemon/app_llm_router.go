@@ -719,8 +719,14 @@ func (a *api) appLLMAdapters() (map[string]providerAdapter, map[string]bool, err
 // cắt dùng chung sẽ phát ra toàn số 0 từ lượt thứ hai.
 func (a *api) appLLMCredential(providerID string) ([]byte, error) {
 	cipher, err := a.st.LLMCredentialCipher(providerID)
+	if errors.Is(err, store.ErrNotFound) {
+		// Provider không lưu credential (proxy/CLI thuê bao như codex/gemini-cli, hoặc API provider
+		// chưa nhập khoá): trả nil, để adapter tự quyết. Adapter proxy/CLI bỏ qua tham số này; adapter
+		// HTTP nhận nil sẽ tự trả lỗi credential (được ghi telemetry ở nhánh non-fallback của Run).
+		return nil, nil
+	}
 	if err != nil {
-		return nil, err
+		return nil, err // decrypt/unprotect hỏng = credential KHÔNG đọc được → vẫn dừng chuỗi
 	}
 	return unprotectProviderSecret(cipher)
 }

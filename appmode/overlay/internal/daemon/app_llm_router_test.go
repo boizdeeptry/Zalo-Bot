@@ -1139,6 +1139,43 @@ func TestAppLLMRunnerServesACodexOnlyChain(t *testing.T) {
 	}
 }
 
+// TestAppLLMRunnerRunsAdapterWhenNoCredentialStored chốt nửa router của ND-T11: khi Credential trả
+// (nil, nil) — Provider proxy/CLI thuê bao như codex không lưu khoá ở daemon — precheck KHÔNG được
+// dừng chuỗi. Adapter vẫn phải chạy (nó bỏ qua tham số credential) và một lượt thành công vẫn ghi
+// một hàng OK. Trước bản vá, appLLMCredential trả ErrNotFound và Run chết ngay tại precheck, không
+// gọi adapter và không ghi telemetry — đúng triệu chứng quan sát được trên máy thật.
+func TestAppLLMRunnerRunsAdapterWhenNoCredentialStored(t *testing.T) {
+	codex := okAdapter(`{"answer":"codex"}`)
+	claude := okClaude(`{"answer":"claude"}`)
+	f := newRouterFixture(newRoute(entry("codex-1", "gpt-5.4", true)), claude)
+	// Đăng ký adapter NHƯNG không set credential: f.creds.open("codex-1") trả (rỗng, nil), tức
+	// đúng cái appLLMCredential thật giờ trả cho Provider chưa lưu khoá.
+	f.adapters["codex-1"] = codex
+
+	got, err := f.runner(appLLMRunnerConfig{}).Run(t.Context(), "câu hỏi", f.step)
+	if err != nil {
+		t.Fatalf("Run() chuỗi codex không khoá = _, %v; want nil", err)
+	}
+	if got != `{"answer":"codex"}` {
+		t.Errorf("Run() = %q; want %q (adapter chạy dù không có khoá)", got, `{"answer":"codex"}`)
+	}
+	if len(claude.seen()) != 0 {
+		t.Errorf("claude được gọi %d lần; want 0", len(claude.seen()))
+	}
+	calls := codex.seen()
+	if len(calls) != 1 || calls[0].Model != "gpt-5.4" {
+		t.Fatalf("codex-1 nhận %+v; want đúng 1 lượt {gpt-5.4}", calls)
+	}
+	// Adapter vẫn chạy với credential rỗng — không phải bị chặn ở precheck.
+	if len(calls[0].Cred) != 0 {
+		t.Errorf("adapter nhận credential %q; want rỗng khi Provider chưa lưu khoá", calls[0].Cred)
+	}
+	attempts := f.store.recorded()
+	if len(attempts) != 1 || attempts[0].ProviderID != "codex-1" || attempts[0].Outcome != store.LLMAttemptOK {
+		t.Fatalf("telemetry = %+v; want đúng một hàng codex-1/ok", attempts)
+	}
+}
+
 // TestAppLLMRunnerCodexOnlyChainReportsUnavailableWhenItFails: một chuỗi codex-only mà mắt xích
 // duy nhất hỏng KHÔNG được im lặng trả về rỗng — cả chuỗi cạn thì lượt phải nói ra "không khả dụng".
 func TestAppLLMRunnerCodexOnlyChainReportsUnavailableWhenItFails(t *testing.T) {
@@ -1678,10 +1715,76 @@ func TestAppLLMCredentialUnlocksExactlyOneProvider(t *testing.T) {
 	if !bytes.Equal(got, key) {
 		t.Errorf("xoá bản rõ lượt hai làm hỏng lượt một: %q; want %q", got, key)
 	}
-	// Chưa nhập khoá là một lỗi NÓI RA, không phải một lát cắt rỗng gửi đi làm Provider trả 401.
-	if plain, err := a.appLLMCredential("o-2"); err == nil {
-		t.Errorf("appLLMCredential(o-2) khi chưa có khoá = %q, nil; want lỗi", plain)
+	// Chưa nhập khoá KHÔNG còn là lỗi: Provider không lưu credential (proxy/CLI thuê bao, hoặc API
+	// provider chưa nhập khoá) trả (nil, nil) để adapter tự quyết — precheck của Run không dừng chuỗi
+	// nữa. Xem TestAppLLMCredentialTreatsMissingAsNoCredential cho ba nhánh đầy đủ.
+	if plain, err := a.appLLMCredential("o-2"); err != nil || plain != nil {
+		t.Errorf("appLLMCredential(o-2) khi chưa có khoá = %q, %v; want nil, nil", plain, err)
 	}
+}
+
+// TestAppLLMCredentialTreatsMissingAsNoCredential chốt ba nhánh của appLLMCredential sau khi
+// precheck của Run thôi coi "chưa nhập khoá" là lỗi dừng chuỗi (ND-T11: codex proxy bị chặn oan).
+//
+//   (a) Provider chưa lưu credential (proxy/CLI thuê bao, hoặc API chưa nhập khoá) → (nil, nil):
+//       để adapter tự quyết, không dừng chuỗi ở precheck.
+//   (b) Provider có credential → trả đúng bản rõ.
+//   (c) Ciphertext còn đó nhưng KHÔNG mở được → vẫn trả lỗi: một khoá hỏng là lỗi thật, khác hẳn
+//       "chưa nhập khoá", nên nó phải dừng chuỗi chứ không im lặng gửi nil đi.
+func TestAppLLMCredentialTreatsMissingAsNoCredential(t *testing.T) {
+	a := newAppRouteAPI(t)
+	for _, id := range []string{"codex-1", "openai-1", "openai-2"} {
+		if err := a.st.CreateLLMProvider(store.LLMProvider{
+			ID: id, Name: id, Kind: "openai", Enabled: true,
+		}); err != nil {
+			t.Fatalf("CreateLLMProvider(%q) = %v; want nil", id, err)
+		}
+	}
+
+	t.Run("chưa nhập khoá trả nil, nil", func(t *testing.T) {
+		got, err := a.appLLMCredential("codex-1")
+		if err != nil || got != nil {
+			t.Fatalf("appLLMCredential(codex-1) = %q, %v; want nil, nil", got, err)
+		}
+	})
+
+	t.Run("có khoá trả bản rõ", func(t *testing.T) {
+		requireCredentialProtection(t)
+		key := []byte("sk-has-a-key")
+		cipher, err := protectProviderSecret(key)
+		if err != nil {
+			t.Fatalf("protectProviderSecret() = _, %v; want nil", err)
+		}
+		if err := a.st.SetLLMCredentialCipher("openai-1", cipher); err != nil {
+			t.Fatalf("SetLLMCredentialCipher(openai-1) = %v; want nil", err)
+		}
+		got, err := a.appLLMCredential("openai-1")
+		if err != nil {
+			t.Fatalf("appLLMCredential(openai-1) = _, %v; want nil", err)
+		}
+		if !bytes.Equal(got, key) {
+			t.Errorf("appLLMCredential(openai-1) = %q; want %q", got, key)
+		}
+	})
+
+	t.Run("khoá không mở được vẫn dừng", func(t *testing.T) {
+		// Ciphertext không phải blob DPAPI: LLMCredentialCipher trả nó về bình thường (khác rỗng,
+		// không lỗi), rồi unprotectProviderSecret mới hỏng — đúng nhánh "khoá hỏng" chứ không phải
+		// "chưa nhập khoá".
+		if err := a.st.SetLLMCredentialCipher("openai-2", []byte("not a dpapi blob at all")); err != nil {
+			t.Fatalf("SetLLMCredentialCipher(openai-2) = %v; want nil", err)
+		}
+		got, err := a.appLLMCredential("openai-2")
+		if err == nil {
+			t.Fatalf("appLLMCredential(openai-2) khoá hỏng = %q, nil; want lỗi", got)
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			t.Errorf("appLLMCredential(openai-2) = %v; khoá hỏng bị xếp nhầm thành ErrNotFound", err)
+		}
+		if got != nil {
+			t.Errorf("appLLMCredential(openai-2) trả %q kèm lỗi; want nil", got)
+		}
+	})
 }
 
 // --- nghiệm thu xuyên tầng ---
