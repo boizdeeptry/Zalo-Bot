@@ -158,6 +158,44 @@ visual và các lượt nhắn Zalo phải được người vận hành kiểm 
 | Parse PowerShell runbook | PASS — block hợp lệ; không còn `File.Replace(..., $null)`; cả forward replace và rollback dùng non-empty same-directory backup path |
 | `git diff --check` | PASS |
 
+### Sai lệch thứ tự và canary khắc phục — 2026-08-10 12:04–12:10 ICT
+
+Thiết kế mục 14 yêu cầu chạy daemon của candidate trên bản sao data, smoke migration và Memory API
+**trước khi** thay live binary. Trình tự thực tế ban đầu không đạt điều kiện thời gian này: live binary
+được thay và start lúc khoảng 11:40, còn isolated API smoke đầu tiên bắt đầu sau đó, khoảng 11:45.
+Vì vậy deployment ban đầu không được ghi là tuân thủ đầy đủ pre-deploy canary order.
+
+Live vẫn được bảo vệ bởi các cổng độc lập đã chạy trước/sát mutation: candidate hash được pin, Node/Go/
+package gates đạt, daemon cũ dừng trước backup, backup DB schema 3 có `quick_check=ok`, old binary có ba
+bản hash-verified, replacement atomically dùng same-directory backup, và ngay sau start live DB schema 4,
+health cùng Memory assets/API đều đạt. Những điều này giải thích vì sao live không mất dữ liệu và vẫn
+healthy; chúng **không** thay thế hay hồi tố yêu cầu canary phải chạy trước replacement.
+
+Để đóng assurance gap mà không dừng hoặc thay live lần nữa, một canary khắc phục hoàn chỉnh đã chạy
+bằng đúng binary SHA-256 đã duyệt trên port riêng 8782, không cấu hình Zalo transport và không gửi dữ
+liệu ra ngoài:
+
+| Cổng remediation canary | Kết quả |
+|---|---|
+| V3 source | `D:\TuvanZalo\_backups\memory-v2-20260810-113825\data`; immutable URI `mode=ro&immutable=1`; DB SHA-256 `68DCE8FCCF2491BE5D1CD7B4C8859ED241F21D5E03F5FDC894856CC4DFD01933`; `quick_check=ok`, schema 3 |
+| Exact copied home | `D:\TuvanZalo\_backups\memory-v2-20260810-113825\predeploy-remediation-canary-20260810-120449`; DB hash trước start khớp byte-for-byte V3 source; immutable `quick_check=ok`, schema 3 |
+| Candidate migration | PID 10340 trên port 8782; `/status` và `/memory` HTTP 200; stop sạch; bản copy chuyển sang immutable `quick_check=ok`, schema 4; migrated DB SHA-256 trước fixture `D95DE61B55A1C2825FD92173D1FD361930A1909B87CADA82A12A4C71D927C5E6` |
+| V3 preservation | Memory 0 row, lessons 0 row và CLI session mapping 1 row giữ nguyên; canonical session digest trước/sau `027EFE865ABEF8DEF1DFFA127DF700008ABD4A5CCBC97ED3FAD83A1B13ACA2A5` |
+| Memory API restart | PID 11348 trên port 8782; `/`, `/memory`, `memory.js`, `memory-actions.js` HTTP 200 |
+| J1–J6 local | Member/common isolation PASS; approve replacement PASS; reject sensitive pending PASS; restore/pin PASS; physical lineage delete + message retention PASS; repeated revision read stable PASS |
+| Final canary DB | Sau clean stop: immutable `quick_check=ok`, schema 4; SHA-256 `914FB59881EA7A8F7EA93795CBB19CBD82EDAC6B262A07B572EAE1BB174F1124` |
+| Source immutability | V3 source được đọc immutable; DB/WAL/SHM size và mtime baseline không đổi trong toàn bộ remediation canary |
+| Live isolation | Live không bị stop hay replace; vẫn PID 8424, HTTP 200 và approved executable hash sau canary |
+
+Lần gọi API assertion đầu tiên của remediation dừng trước GET vì lỗi ghép tham số PowerShell; không có
+mutation nào xảy ra. Lệnh được sửa rồi chạy lại đầy đủ với các kết quả PASS ở trên. Canary này cung cấp
+bằng chứng migration/API còn thiếu và runbook mới biến nó thành hard gate trước Step 8, nhưng không
+thể làm cho trình tự 11:40/11:45 trong quá khứ trở thành đúng thứ tự.
+
+Các cổng cuối sau khi bổ sung hard gate cũng đạt: Node `89/89`, Go `./...` toàn bộ package, package
+`10/10`, kiểm tra thứ tự tĩnh xác nhận canary đứng trước Step 8, PowerShell runbook parse được và
+`git diff --check` sạch.
+
 ### Phần còn chờ người vận hành
 
 - [ ] Mở Portal local, xác nhận trực quan tab **Chung cho nhóm**, hai tab thành viên, badge đồng bộ và các nút Duyệt/Từ chối/Khôi phục/Ghim.
