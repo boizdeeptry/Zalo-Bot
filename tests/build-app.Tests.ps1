@@ -649,6 +649,21 @@ try {
   foreach ($relative in $required) {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
+  $packageReadme = Join-Path $packageRoot 'README.txt'
+  $validOnboarding = @'
+Nhan doi "Start.vbs". Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.
+
+Lam theo dung thu tu:
+1. Mo trang Providers. Bam Connect cho Claude Code hoac Codex.
+Nut Connect tu dong cai Claude duoc quan ly neu can; khong can cai Claude global thu cong.
+Provider API dung endpoint/API key hien chua co trong Portal (Sap co).
+2. Mo trang Combos. Chon model, tao Combo va kich hoat Combo de tao route dang hoat dong.
+3. Mo trang Zalo. Ket noi bang ma QR.
+
+Khong co Provider da ket noi va route dang hoat dong, bot co y im lang.
+claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
+'@
+  Write-TestFile $packageReadme $validOnboarding
   $packagedNode = Join-Path $packageRoot 'app\node\node.exe'
   $packagedNpmCmd = Join-Path $packageRoot 'app\node\npm.cmd'
   $packagedNpmCLI = Join-Path $packageRoot 'app\node\node_modules\npm\bin\npm-cli.js'
@@ -689,6 +704,66 @@ SET "NPM_CLI_JS=%~dp0\node_modules\npm\bin\npm-cli.js"
   $validPackageBinary = 'fixture ' + ($requiredBinarySignatures -join ' ')
   Write-TestFile $packageBinary "$validPackageBinary`n"
   Assert-AppPackage -Out $packageRoot | Out-Null
+
+  $legacyOnlyOnboarding = @'
+Nhan doi "Start.vbs".
+Sau khoang 4 giay trinh duyet tu mo trang Zalo. Bam Ket noi va quet ma QR.
+MOT LAN DUY NHAT: DANG NHAP CLAUDE
+Day la buoc DUY NHAT khong the bo. Kiem tra bang claude --version.
+'@
+  Write-TestFile $packageReadme $legacyOnlyOnboarding
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'package README' `
+    -Message 'A package carrying the legacy Zalo-and-global-Claude-only onboarding was accepted'
+  foreach ($onboardingCase in @(
+      @{ Missing = 'Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.'; Label = 'management Portal startup guidance' },
+      @{ Missing = '1. Mo trang Providers'; Label = 'Providers guidance' },
+      @{ Missing = 'Bam Connect cho Claude Code hoac Codex'; Label = 'packaged Provider Connect guidance' },
+      @{ Missing = 'Nut Connect tu dong cai Claude duoc quan ly neu can'; Label = 'managed Claude installation guidance' },
+      @{ Missing = 'khong can cai Claude global thu cong'; Label = 'no-global-Claude-install guidance' },
+      @{ Missing = 'Provider API dung endpoint/API key hien chua co trong Portal (Sap co)'; Label = 'unavailable API Provider guidance' },
+      @{ Missing = '2. Mo trang Combos'; Label = 'Combos guidance' },
+      @{ Missing = 'Chon model'; Label = 'model guidance' },
+      @{ Missing = 'route dang hoat dong'; Label = 'active-route guidance' },
+      @{ Missing = '3. Mo trang Zalo'; Label = 'Zalo-last guidance' },
+      @{ Missing = 'bot co y im lang'; Label = 'intentional-silence guidance' },
+      @{ Missing = 'claude --version chi la chan doan tuy chon, khong phai buoc thiet lap'; Label = 'optional CLI-diagnostic guidance' }
+    )) {
+    Write-TestFile $packageReadme $validOnboarding.Replace($onboardingCase.Missing, '')
+    Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+      -Pattern 'package README' `
+      -Message "A package missing $($onboardingCase.Label) was accepted"
+  }
+  $wrongOrderOnboarding = @'
+Nhan doi "Start.vbs". Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.
+
+Lam theo dung thu tu:
+2. Mo trang Combos. Chon model, tao Combo va kich hoat Combo de tao route dang hoat dong.
+1. Mo trang Providers. Bam Connect cho Claude Code hoac Codex.
+Nut Connect tu dong cai Claude duoc quan ly neu can; khong can cai Claude global thu cong.
+Provider API dung endpoint/API key hien chua co trong Portal (Sap co).
+3. Mo trang Zalo. Ket noi bang ma QR.
+
+Khong co Provider da ket noi va route dang hoat dong, bot co y im lang.
+claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
+'@
+  Write-TestFile $packageReadme $wrongOrderOnboarding
+  Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+    -Pattern 'onboarding order' `
+    -Message 'A semantically complete package README with the wrong onboarding order was accepted'
+  foreach ($misleadingGuidance in @(
+      'Cai Claude Code global thu cong truoc khi mo Portal.',
+      'Voi Provider API, nhap endpoint, API key va model trong Portal.'
+    )) {
+    Write-TestFile $packageReadme "$validOnboarding`n$misleadingGuidance`n"
+    Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+      -Pattern 'misleading setup' `
+      -Message "A package README containing misleading setup guidance was accepted: $misleadingGuidance"
+  }
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\launcher\README.txt') `
+    -Destination $packageReadme -Force
+  Assert-AppPackage -Out $packageRoot | Out-Null
+  Write-TestFile $packageReadme $validOnboarding
 
   foreach ($runtimeFile in @('app\node\npm.cmd', 'app\node\node_modules\npm\bin\npm-cli.js')) {
     $runtimePath = Join-Path $packageRoot $runtimeFile
@@ -842,7 +917,7 @@ SET "NPM_CLI_JS=%~dp0\node_modules\npm\bin\npm-cli.js"
   # APP_TEST_ prefix, proving that the dedicated Provider gate is composed into Assert-AppPackage.
   $providerCanary = 'sk-package-must-never-contain-7f36d2'
   foreach ($credentialCase in @(
-      @{ Relative = 'README.txt'; Bytes = [Text.Encoding]::UTF8.GetBytes("guide`n$providerCanary`n"); Hidden = $false },
+      @{ Relative = 'README.txt'; Bytes = [Text.Encoding]::UTF8.GetBytes("$validOnboarding`n$providerCanary`n"); Hidden = $false },
       @{ Relative = 'brain\.claude\settings.local.json.example'; Bytes = [Text.Encoding]::UTF8.GetBytes('{"canary":"' + $providerCanary + '"}'); Hidden = $false },
       @{ Relative = 'app\.env'; Bytes = [Text.Encoding]::UTF8.GetBytes("KEY=$providerCanary`n"); Hidden = $true },
       @{ Relative = 'app\agentdc.exe'; Bytes = [Text.Encoding]::UTF8.GetBytes("$validPackageBinary`n$providerCanary"); Hidden = $false },

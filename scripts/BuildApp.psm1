@@ -1181,6 +1181,65 @@ function Invoke-AppPackagedNpmCmdSmoke {
   }
 }
 
+function Assert-AppPackageOnboarding {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Path)
+
+  try {
+    $readme = [IO.File]::ReadAllText([IO.Path]::GetFullPath($Path))
+  } catch {
+    throw 'package README could not be read'
+  }
+
+  foreach ($staleSignature in @(
+      'Sau khoang 4 giay trinh duyet tu mo trang Zalo.',
+      'Day la buoc DUY NHAT khong the bo',
+      'Neu chon Claude Code, co the cai CLI tai',
+      'Cai Claude Code global thu cong truoc khi mo Portal.',
+      'Voi Provider API, nhap endpoint,',
+      'Voi Provider API, nhap endpoint, API key va model trong Portal.'
+    )) {
+    if ($readme.IndexOf($staleSignature, [StringComparison]::Ordinal) -ge 0) {
+      throw 'package README contains misleading setup guidance'
+    }
+  }
+  $normalizedReadme = [regex]::Replace($readme, '\s+', ' ')
+
+  $required = [ordered]@{
+    'Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.' = 'management Portal startup guidance'
+    '1. Mo trang Providers' = 'Providers guidance'
+    'Bam Connect cho Claude Code hoac Codex' = 'packaged Provider Connect guidance'
+    'Nut Connect tu dong cai Claude duoc quan ly neu can' = 'managed Claude installation guidance'
+    'khong can cai Claude global thu cong' = 'no-global-Claude-install guidance'
+    'Provider API dung endpoint/API key hien chua co trong Portal (Sap co)' = 'unavailable API Provider guidance'
+    '2. Mo trang Combos' = 'Combos guidance'
+    'Chon model' = 'model guidance'
+    'route dang hoat dong' = 'active-route guidance'
+    '3. Mo trang Zalo' = 'Zalo-last guidance'
+    'bot co y im lang' = 'intentional-silence guidance'
+    'claude --version chi la chan doan tuy chon, khong phai buoc thiet lap' = 'optional CLI-diagnostic guidance'
+  }
+  foreach ($entry in $required.GetEnumerator()) {
+    if ($normalizedReadme.IndexOf($entry.Key, [StringComparison]::Ordinal) -lt 0) {
+      throw "package README missing $($entry.Value)"
+    }
+  }
+
+  $previous = -1
+  foreach ($step in @(
+      'Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.',
+      '1. Mo trang Providers',
+      '2. Mo trang Combos',
+      '3. Mo trang Zalo'
+    )) {
+    $current = $normalizedReadme.IndexOf($step, [StringComparison]::Ordinal)
+    if ($current -le $previous) {
+      throw 'package README onboarding order must be Portal, Providers, Combos, then Zalo'
+    }
+    $previous = $current
+  }
+}
+
 function Assert-AppPackage {
   [CmdletBinding()]
   param(
@@ -1209,6 +1268,7 @@ function Assert-AppPackage {
       throw "package missing $relative"
     }
   }
+  Assert-AppPackageOnboarding -Path (Join-Path $outPath 'README.txt')
 
   $credentials = Join-Path $outPath 'data\zalo\credentials.json'
   if (-not $AllowZaloCredentials -and (Test-Path -LiteralPath $credentials -PathType Leaf)) {
