@@ -59,6 +59,11 @@ function Get-AppGoTestSkipPattern {
     'TestPortalUsesModalNotBrowserDialogs'
     'TestAgentPortalNoLongerCarriesZalo'
     'TestModalCallsPassAnObject'
+    # Base test cua upstream engine ma overlay dao nguoc trong stage. No-default: mot bot CHUA cau
+    # hinh provider thi IM (khong con Claude mac dinh), nen loi chao khi nhap nhom KHONG phat cho toi
+    # khi co provider — dung nhu seam runner + appZaloRunner dua moi luot qua chuoi fallback. Base-only
+    # AgentDC (khong seam) van chay va van xanh test nay, nen hanh vi engine goc van co bao phu.
+    'TestJoinGreetsOnceForEveryone'
   )
   $escaped = $names | ForEach-Object { [regex]::Escape($_) }
   return '^(?:' + ($escaped -join '|') + ')$'

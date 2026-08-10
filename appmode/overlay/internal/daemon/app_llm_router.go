@@ -500,32 +500,76 @@ func newLLMAdapter(kind, providerID string, client *http.Client, logger *slog.Lo
 	return nil, false
 }
 
+// silentZaloRunner: chưa cấu hình provider → im. answerZalo nhận ErrZaloSilent và nuốt (không escalate).
+type silentZaloRunner struct{}
+
+func (silentZaloRunner) Run(context.Context, string, func(string)) (string, error) {
+	return "", ErrZaloSilent
+}
+
+// hasAnyConnectedProvider trả lời: người mua đã nối ít nhất một Provider chưa?
+//
+// "Nối" đúng theo cách Portal tính (providers.js): một kind subscription nối = có ít nhất một
+// account đang BẬT; một Provider API nối = đã có credential (CredentialConfigured). Chưa có gì thì
+// bot IM (silentZaloRunner) thay vì rơi về một Claude mặc định — đảo ngược cố ý của "thà trả lời
+// còn hơn im".
+//
+// providerID của một kind subscription CHÍNH LÀ kind (EnsureProviderForKind gieo id = kind), nên
+// LLMAccounts(kind) đọc đúng account của nó — không cần một map kind→providerID riêng.
+//
+// Đọc hỏng ở nhánh nào thì coi nhánh đó "không có": bot im là mặc định an toàn, và một lỗi đọc
+// store không được biến thành "đã nối" để rồi gửi tin của khách đi khi chưa cấu hình gì.
+func (a *api) hasAnyConnectedProvider() bool {
+	for kind := range subscriptionKinds {
+		if accs, err := a.st.LLMAccounts(kind); err == nil {
+			for _, ac := range accs {
+				if ac.Enabled {
+					return true
+				}
+			}
+		}
+	}
+	if provs, err := a.st.LLMProviders(); err == nil {
+		for _, p := range provs {
+			if p.CredentialConfigured {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // appZaloRunner dựng runner cho ĐÚNG một lượt Zalo.
 //
 // Dựng mới mỗi lượt chứ không cất vào api: đó là toàn bộ lý do một lần lưu route có hiệu lực ngay
 // mà không phải mở lại phần mềm. Danh sách Provider cũng đọc lại ở đây, nên một Provider vừa thêm
 // gọi được từ tin nhắn kế tiếp.
 //
-// Không trả về lỗi vì chỗ gọi nó là một tham số của answerZalo. Đọc hỏng thì lượt này đi thẳng
-// Claude Code — đúng hành vi trước khi có định tuyến, và trả lời được vẫn hơn im lặng.
+// Không trả về lỗi vì chỗ gọi nó là một tham số của answerZalo. KHÔNG có Claude mặc định: chưa
+// nối Provider nào, hay đọc route hỏng, thì lượt này IM (silentZaloRunner → ErrZaloSilent, mà
+// answerZalo nuốt) chứ không rơi về base. Đảo ngược cố ý của "thà trả lời còn hơn im".
 //
 // hasNewFiles là tệp của TIN NÀY. Tệp của cả luồng mới là thứ quyết định — xem HasAttachments.
 func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, hasNewFiles bool) zaloRunner {
+	// Chưa nối Provider nào → im, TRƯỚC cả khi đọc route: không có Claude mặc định để rơi về, nên
+	// một bot chưa cấu hình phải lặng thay vì trả lời bằng một login sẵn nào đó của máy này.
+	if !a.hasAnyConnectedProvider() {
+		return silentZaloRunner{}
+	}
 	// Chuỗi rỗng nghĩa là chưa có định tuyến, KHÔNG phải "không còn gì để gọi": router coi rỗng
 	// là lỗi và lượt sẽ chết, nên cửa này phải ở đây chứ không ở trong router. Xảy ra khi lần
-	// gieo lúc khởi động hỏng, và ở đó im lặng bỏ tin của khách là cách hỏng tệ nhất.
+	// gieo lúc khởi động hỏng, và ở đó vẫn im — có Provider nối nhưng chưa có chuỗi để đi.
 	//
 	// Đây là lần đọc route THỨ NHẤT; Run đọc lần nữa để chụp snapshot của lượt. Chúng không đá
 	// nhau: một chuỗi đã có không thể trở lại rỗng (validateLLMRoute từ chối danh sách rỗng, và
-	// DeleteLLMProvider không xoá nổi mắt xích cuối). Bất đối xứng còn lại là cố ý — đọc hỏng ở
-	// đây rơi về base, đọc hỏng trong Run thì giết lượt, vì tới đó đã không còn base để rơi về.
+	// DeleteLLMProvider không xoá nổi mắt xích cuối).
 	snapshot, err := a.st.LLMRoute()
 	if err != nil {
-		a.logger.Error("llm route: không đọc được chuỗi, lượt này đi thẳng Claude Code", "err", err)
-		return base
+		a.logger.Error("llm route: không đọc được chuỗi, chưa cấu hình, bot im", "err", err)
+		return silentZaloRunner{}
 	}
 	if len(snapshot.Entries) == 0 {
-		return base
+		return silentZaloRunner{}
 	}
 	adapters, disabled, err := a.appLLMAdapters()
 	if err != nil {
@@ -573,36 +617,38 @@ func (a *api) threadHasAttachments(threadID string) bool {
 
 // appClaudeRunner là mắt xích cuối chạy đúng model mà route nêu tên, dưới đăng nhập của một account.
 //
-// zc là BẢN SAO (tham số theo giá trị), nên đổi Model/ConfigDir ở đây không chạm tới cấu hình của
-// vòng trực — hai lượt song song trên hai model/account khác nhau vẫn đúng.
+// zc là BẢN SAO (tham số theo giá trị), nên đổi Model/ConfigDir/Program ở đây không chạm tới cấu
+// hình của vòng trực — hai lượt song song trên hai model/account khác nhau vẫn đúng.
 //
-// CÓ account claude-code: chọn một cái theo round-robin (accountSel, cùng selector với codex) và
-// chạy lượt dưới CLAUDE_CONFIG_DIR của nó (zc.ConfigDir → claudeEnv). Luôn dựng execZaloRunner mới,
-// vì đường đăng nhập phải đổi theo account — base là runner cố định một login, không mang được nó.
-//
-// 0 account: giữ NGUYÊN đường cũ. Trùng model (hoặc model rỗng) thì trả base đã tiêm vào — base là
-// chỗ duy nhất duty_test.go tiêm được một runner giả, dựng mới ở đây biến mọi test đó thành lượt gọi
-// tiến trình claude thật. Model rỗng cũng vào nhánh này: validateLLMRoute không cho lưu mắt xích như
-// thế nên đây là hàng sửa tay trong database, và `claude --model ""` là dòng lệnh hỏng — cấu hình
-// đang chạy vẫn trả lời được. Model khác thì dựng execZaloRunner với config mặc định (ConfigDir rỗng).
+// Claude CHỈ chạy khi CÓ account claude-code nối VÀ định vị được exe: chọn một account theo
+// round-robin (accountSel, cùng selector với codex), chạy lượt dưới CLAUDE_CONFIG_DIR của nó
+// (zc.ConfigDir → claudeEnv) và dưới exe claude cài qua npm (resolveCLIProgram → zc.Program). Không
+// có Claude mặc định nữa: 0 account, hoặc account có nhưng exe không định vị được, thì IM
+// (silentZaloRunner) — KHÔNG rơi về base. base giữ lại trong chữ ký cho seam của appZaloRunner/test,
+// dù thân hàm không còn dùng tới.
 //
 // ponytail: penalize-on-rate-limit CHƯA nối cho Claude — runClaude không có bộ phân loại rate-limit
 // (khác cliAdapter của codex), nên đây chỉ round-robin. Cooldown là follow-up khi runClaude phân
 // loại được lỗi 429 của Claude.
 func (a *api) appClaudeRunner(zc zaloConfig, base zaloRunner, model string) zaloRunner {
-	if accounts, err := a.st.LLMAccounts(claudeCodeProviderID); err == nil && len(accounts) > 0 {
-		if acc, ok := accountSel.pick("claude-code", accounts); ok {
-			zc.ConfigDir = acc.ConfigDir
-			if model != "" && model != zc.Model {
-				zc.Model = model
-			}
-			return execZaloRunner{cfg: zc, logger: a.logger}
-		}
+	accounts, err := a.st.LLMAccounts(claudeCodeProviderID)
+	if err != nil || len(accounts) == 0 {
+		return silentZaloRunner{}
 	}
-	if model == "" || model == zc.Model {
-		return base
+	acc, ok := accountSel.pick("claude-code", accounts)
+	if !ok {
+		return silentZaloRunner{}
 	}
-	zc.Model = model
+	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
+	if err != nil {
+		// Account có nhưng binary claude không định vị được → im, không đoán một exe khác.
+		return silentZaloRunner{}
+	}
+	zc.ConfigDir = acc.ConfigDir
+	zc.Program, zc.ProgramPrefixArgs = program, prefixArgs
+	if model != "" && model != zc.Model {
+		zc.Model = model
+	}
 	return execZaloRunner{cfg: zc, logger: a.logger}
 }
 

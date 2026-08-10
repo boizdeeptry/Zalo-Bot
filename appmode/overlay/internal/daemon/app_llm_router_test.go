@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -1182,6 +1184,41 @@ func newAppRouteAPI(t *testing.T) *api {
 	}
 }
 
+// connectClaudeAccount thêm một account claude-code đang BẬT để appZaloRunner qua được cửa
+// hasAnyConnectedProvider — Portal tính "đã nối" = có ít nhất một account bật. Dùng cho các test dây
+// nối chỉ cần vượt cửa im, KHÔNG gọi Run (nên không đụng tới việc định vị exe claude).
+func connectClaudeAccount(t *testing.T, a *api) {
+	t.Helper()
+	if err := a.st.CreateLLMAccount(store.LLMAccount{
+		ID: "acc-gate", ProviderID: "claude-code", Label: "gate", ConfigDir: "gate", Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMAccount(acc-gate) = %v; want nil", err)
+	}
+}
+
+// fakeClaudeExe làm resolveCLIProgram("claude-code") THÀNH CÔNG ở mọi môi trường: ghi một exe giả
+// vào một npm root giả rồi trỏ npmGlobalRoot vào đó. Máy chạy test không cần cài claude qua npm —
+// nhánh account-connected của appClaudeRunner (gọi resolveCLIProgram) vẫn kiểm được. Trả về đường
+// dẫn exe để test khớp với zc.Program.
+//
+// ponytail: gán đè biến gói npmGlobalRoot (sync.OnceValues); an toàn vì các test này không chạy
+// song song và Cleanup khôi phục lại. Nâng cấp: nếu resolveCLIProgram nhận seam qua tham số thì bỏ.
+func fakeClaudeExe(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	exe := filepath.Join(root, cliDescriptors["claude-code"].npmBin)
+	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) = %v; want nil", filepath.Dir(exe), err)
+	}
+	if err := os.WriteFile(exe, []byte("stub"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) = %v; want nil", exe, err)
+	}
+	orig := npmGlobalRoot
+	npmGlobalRoot = func() (string, error) { return root, nil }
+	t.Cleanup(func() { npmGlobalRoot = orig })
+	return exe
+}
+
 // saveClaudeRoute lưu chuỗi một-mắt-xích claude-code/model qua đúng đường ghi Portal dùng.
 func saveClaudeRoute(t *testing.T, a *api, model string) {
 	t.Helper()
@@ -1206,102 +1243,43 @@ func saveRoute(t *testing.T, a *api, entries ...store.LLMRouteEntry) {
 	}
 }
 
-// awaitSignal chờ một TÍN HIỆU, không chờ một khoảng thời gian.
+// Khi CÓ Provider nối VÀ một chuỗi đã lưu, appZaloRunner dựng một *appLLMRunner sống (KHÔNG im) và
+// runner đó đọc route qua store THẬT — nên mỗi lượt thấy chuỗi mới nhất.
 //
-// Hạn giờ ở đây chỉ để lỗi đọc được: runner dựng nhầm một execZaloRunner thì nó đi gọi tiến trình
-// claude thật, và không có nhánh này thì test treo tới hạn 10 phút của go test rồi đổ ra toàn bộ
-// goroutine thay vì một dòng nói đúng chỗ hỏng.
-func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("chờ %s quá 30s; runner không gọi tới base runner đã tiêm vào", what)
-	}
-}
-
-// blockingClaude dừng giữa lượt để test chèn một lần lưu route vào đúng khoảng đó.
-type blockingClaude struct {
-	entered chan struct{}
-	release chan struct{}
-	answer  string
-}
-
-func (c *blockingClaude) Run(ctx context.Context, _ string, _ func(string)) (string, error) {
-	c.entered <- struct{}{}
-	select {
-	case <-c.release:
-		return c.answer, nil
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-}
-
-func TestAppZaloRunnerFollowsTheNewestSavedRoute(t *testing.T) {
+// Tính bất biến snapshot GIỮA lượt (một lần lưu đè giữa chừng không đổi đường đi của lượt đang chạy)
+// được ghim ở tầng router bằng fakeRouteStore + setEntry (xem test dùng newRouterFixture ở trên),
+// nơi mắt xích trả lời fake được TIÊM thẳng. Ở tầng dây nối này, sau khi appClaudeRunner không còn
+// rơi về base, không còn seam nào để một mắt xích claude trả lời trong test — nên ở đây chỉ chứng
+// minh cửa im KHÔNG chặn nhầm một bot đã cấu hình, và runner cầm đúng store để đọc lại route.
+func TestAppZaloRunnerBuildsAChainRunnerWhenConfigured(t *testing.T) {
 	a := newAppRouteAPI(t)
+	connectClaudeAccount(t, a) // qua cửa hasAnyConnectedProvider
 	saveClaudeRoute(t, a, "haiku")
 
-	// zc.Model khớp mắt xích cuối của route A, nên runner GIỮ base này — xem appClaudeRunner. Đó
-	// cũng là phép kiểm: chuyền sai model xuống thì base không được gọi và test dừng ở awaitSignal.
-	inFlight := &blockingClaude{
-		entered: make(chan struct{}, 1), release: make(chan struct{}), answer: "trả lời theo route A",
+	got := a.appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
+	r, ok := got.(*appLLMRunner)
+	if !ok {
+		t.Fatalf("appZaloRunner = %T; want *appLLMRunner (đã nối Provider + có chuỗi)", got)
 	}
-	runner := a.appZaloRunner(zaloConfig{Model: "haiku"}, inFlight, "t1", false)
-
-	done := make(chan error, 1)
-	go func() {
-		got, err := runner.Run(t.Context(), "câu hỏi 1", func(string) {})
-		if err == nil && got != inFlight.answer {
-			err = fmt.Errorf("Run() = %q; want %q", got, inFlight.answer)
-		}
-		done <- err
-	}()
-	awaitSignal(t, inFlight.entered, "lượt đang bay vào Claude Code")
-
-	// Lưu ĐÈ giữa lượt: lượt đang bay đã chụp route A và không được đổi sang B.
-	saveClaudeRoute(t, a, "opus")
-	close(inFlight.release)
-	if err := <-done; err != nil {
-		t.Fatalf("lượt đang bay: %v", err)
-	}
-	status, err := a.st.LLMStatus()
-	if err != nil {
-		t.Fatalf("LLMStatus() = _, %v; want nil", err)
-	}
-	if status.ActiveProviderID != "claude-code" || status.ActiveModelID != "haiku" {
-		t.Errorf("sau lượt đang bay LLMStatus() = %s/%s; want claude-code/haiku (route A)",
-			status.ActiveProviderID, status.ActiveModelID)
-	}
-
-	// Tin tiếp theo đi theo route B, và daemon KHÔNG khởi động lại giữa hai lượt.
-	next := okClaude("trả lời theo route B")
-	got, err := a.appZaloRunner(zaloConfig{Model: "opus"}, next, "t1", false).
-		Run(t.Context(), "câu hỏi 2", func(string) {})
-	if err != nil {
-		t.Fatalf("Run() lượt sau khi lưu route B = _, %v; want nil", err)
-	}
-	if got != "trả lời theo route B" {
-		t.Errorf("Run() lượt sau = %q; want %q", got, "trả lời theo route B")
-	}
-	if status, err = a.st.LLMStatus(); err != nil {
-		t.Fatalf("LLMStatus() = _, %v; want nil", err)
-	}
-	if status.ActiveModelID != "opus" {
-		t.Errorf("sau lượt thứ hai LLMStatus().ActiveModelID = %q; want opus (route B)", status.ActiveModelID)
+	// Cầm đúng store thật: đó là cách một lượt sau thấy được chuỗi vừa lưu mà không cần mở lại
+	// phần mềm — runner KHÔNG chụp một snapshot lúc dựng.
+	if r.cfg.Store != llmRouteStore(a.st) {
+		t.Errorf("appLLMRunner.cfg.Store != a.st; runner phải đọc route qua store thật mỗi lượt")
 	}
 }
 
 // TestAppZaloRunnerKeepsThreadsWithEarlierFilesOffTheAPIChain ghim ranh giới an toàn của tệp.
 //
 // Tin của LƯỢT NÀY không có tệp, nhưng answerZalo gộp tệp của 10 tin gần nhất vào (mergeZaloFiles)
-// và buildConsultPrompt viết đường dẫn TUYỆT ĐỐI cùng tiêu đề khách đặt vào prompt. Cửa chặn tính
-// theo mỗi tin đến sẽ để prompt đó đi ra API: Provider không có ổ đĩa nên trả lời mù — đúng hồi
-// quy mà mergeZaloFiles sinh ra để chữa — và đường dẫn kèm tên người dùng Windows rời khỏi máy.
+// và buildConsultPrompt viết đường dẫn TUYỆT ĐỐI cùng tiêu đề khách đặt vào prompt. Ranh giới an
+// toàn nằm ở cờ HasAttachments của runner: bật thì router chỉ đi mắt xích local_cli (tệp nằm im
+// trên đĩa máy này), tắt thì được đi chuỗi API. Test soi thẳng cờ đó trên *appLLMRunner mà
+// appZaloRunner dựng — KHÔNG gọi Run (mắt xích claude giờ chạy tiến trình thật, không seam fake).
 func TestAppZaloRunnerKeepsThreadsWithEarlierFilesOffTheAPIChain(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		attachments []ipc.ZaloAttachment
-		wantClaude  bool
+		wantAttach  bool
 	}{
 		{"lịch sử có tệp mở được", []ipc.ZaloAttachment{
 			{Kind: "chat.photo", Path: `C:\Users\Admin\.agentdc\zalo-files\anh.jpg`, Title: "đơn thuốc"},
@@ -1313,8 +1291,7 @@ func TestAppZaloRunnerKeepsThreadsWithEarlierFilesOffTheAPIChain(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := newAppRouteAPI(t)
-			// Provider API cố ý CHƯA có khoá: cửa chặn hỏng thì lượt dừng ở bước mở khoá, chứ
-			// không gửi đường dẫn tệp của khách tới một máy chủ thật.
+			connectClaudeAccount(t, a) // qua cửa hasAnyConnectedProvider
 			if err := a.st.CreateLLMProvider(store.LLMProvider{
 				ID: "openai-1", Name: "openai-1", Kind: "openai", Enabled: true,
 			}); err != nil {
@@ -1342,60 +1319,50 @@ func TestAppZaloRunnerKeepsThreadsWithEarlierFilesOffTheAPIChain(t *testing.T) {
 				t.Fatalf("AddZaloMessage(t1) = %v; want nil", err)
 			}
 
-			claude := okClaude("claude đọc được tệp")
-			// hasNewFiles = false: tin của lượt này chỉ có chữ.
-			got, err := a.appZaloRunner(zaloConfig{Model: "haiku"}, claude, "t1", false).
-				Run(t.Context(), "trong hình là gì", func(string) {})
-
-			if !tc.wantClaude {
-				// Không có tệp thì chuỗi API PHẢI được đi vào — và nó dừng ở mắt xích đầu vì
-				// Provider chưa có khoá. Đó là bằng chứng lượt không nhảy thẳng tới Claude Code.
-				if !errors.Is(err, store.ErrNotFound) {
-					t.Fatalf("Run() = %q, %v; want lỗi mở khoá openai-1 (chuỗi API được đi vào)", got, err)
-				}
-				return
+			// hasNewFiles = false: tin của lượt này chỉ có chữ. Cờ phải đến TỪ lịch sử luồng.
+			got := a.appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
+			r, ok := got.(*appLLMRunner)
+			if !ok {
+				t.Fatalf("appZaloRunner = %T; want *appLLMRunner", got)
 			}
-			if err != nil {
-				t.Fatalf("Run() = _, %v; want nil", err)
-			}
-			if got != "claude đọc được tệp" {
-				t.Errorf("Run() = %q; want câu trả lời của Claude Code", got)
-			}
-			status, serr := a.st.LLMStatus()
-			if serr != nil {
-				t.Fatalf("LLMStatus() = _, %v; want nil", serr)
-			}
-			if status.ActiveProviderID != "claude-code" {
-				t.Errorf("LLMStatus().ActiveProviderID = %q; want claude-code", status.ActiveProviderID)
+			if r.cfg.HasAttachments != tc.wantAttach {
+				t.Errorf("cfg.HasAttachments = %v; want %v (tính từ lịch sử luồng qua threadHasAttachments)",
+					r.cfg.HasAttachments, tc.wantAttach)
 			}
 		})
 	}
 }
 
-func TestAppZaloRunnerKeepsAnsweringWithoutASavedRoute(t *testing.T) {
+// Có Provider nối nhưng CHƯA có chuỗi → vẫn IM. Không còn Claude mặc định: có login nhưng chưa có
+// đường đi thì bot lặng chứ không tự đoán một chuỗi. Đây là nhánh empty-entries, khác cửa
+// hasAnyConnectedProvider ở trên (TestAppZaloRunnerSilentWhenNoProvider).
+func TestAppZaloRunnerSilentWithoutASavedRoute(t *testing.T) {
 	a := newAppRouteAPI(t)
-	base := okClaude("trả lời như trước khi có định tuyến")
+	connectClaudeAccount(t, a) // qua cửa hasAnyConnectedProvider, nhưng vẫn chưa có chuỗi
+	base := &fakeClaude{fn: func(context.Context, string) (string, error) {
+		t.Fatal("base KHÔNG được gọi khi chưa có chuỗi")
+		return "", nil
+	}}
 
-	// Chưa gieo chuỗi nào. Router coi chuỗi rỗng là lỗi, nên không có cửa chặn trong
-	// appZaloRunner thì mọi tin của khách rơi vào im lặng cho tới khi có người mở Portal.
+	// Chưa gieo chuỗi nào → snapshot.Entries rỗng → im (silentZaloRunner), KHÔNG rơi về base.
 	got, err := a.appZaloRunner(zaloConfig{Model: "haiku"}, base, "t1", false).
 		Run(t.Context(), "câu hỏi", func(string) {})
-	if err != nil {
-		t.Fatalf("Run() khi chưa có chuỗi = _, %v; want nil", err)
-	}
-	if got != "trả lời như trước khi có định tuyến" {
-		t.Errorf("Run() khi chưa có chuỗi = %q; want câu trả lời của base runner", got)
+	if !errors.Is(err, ErrZaloSilent) {
+		t.Fatalf("Run() khi chưa có chuỗi = %q, %v; want ErrZaloSilent", got, err)
 	}
 }
 
 // Cửa nối giữa hai tầng: router biết bỏ qua Provider đang tắt, nhưng chỉ appZaloRunner mới biết
-// Provider NÀO đang tắt. Kiểm riêng từng tầng thì cả hai xanh trong khi dây nối giữa chúng đứt.
+// Provider NÀO đang tắt (nó tính tập Disabled qua appLLMAdapters). Kiểm riêng từng tầng thì cả hai
+// xanh trong khi dây nối giữa chúng đứt.
 //
-// Test này KHÔNG chạm mạng, và đó chính là thứ khiến nó nói được điều gì đó: openai-1 chưa có
-// khoá, nên nếu cửa tắt không được chuyền xuống, Run dừng ngay ở bước mở khoá và trả về lỗi. Xanh
-// nghĩa là lượt đã bỏ qua mắt xích đó và rơi xuống lưới an toàn.
+// Người trực tắt một Provider KHÔNG đụng chuỗi (đúng thao tác khi khoá lộ): mắt xích openai-1 vẫn
+// mang Enabled = true, nên chỉ có tập Disabled của runner mới chặn được nó lúc chạy. Test soi thẳng
+// cờ đó trên *appLLMRunner — cách router XỬ LÝ Disabled (bỏ qua, đi tiếp) đã có test riêng ở tầng
+// router; ở đây chỉ ghim rằng cờ tới được runner.
 func TestAppZaloRunnerSkipsAProviderTurnedOffAfterTheRouteWasSaved(t *testing.T) {
 	a := newAppRouteAPI(t)
+	connectClaudeAccount(t, a) // qua cửa hasAnyConnectedProvider
 	if err := a.st.CreateLLMProvider(store.LLMProvider{
 		ID: "openai-1", Name: "OpenAI", Kind: "openai", Enabled: true,
 	}); err != nil {
@@ -1415,72 +1382,73 @@ func TestAppZaloRunnerSkipsAProviderTurnedOffAfterTheRouteWasSaved(t *testing.T)
 		store.LLMRouteEntry{ProviderID: "claude-code", ModelID: "haiku", Enabled: true},
 	)
 
-	// Đúng thao tác của người trực khi một khoá bị lộ: tắt Provider, KHÔNG đụng vào chuỗi. Mắt
-	// xích openai-1 vẫn ở đó và vẫn mang Enabled = true.
+	// Tắt Provider, KHÔNG đụng vào chuỗi. Mắt xích openai-1 vẫn ở đó và vẫn mang Enabled = true.
 	if err := a.st.UpdateLLMProvider(store.LLMProvider{
 		ID: "openai-1", Name: "OpenAI", Enabled: false,
 	}); err != nil {
 		t.Fatalf("UpdateLLMProvider(openai-1, enabled=false) = %v; want nil", err)
 	}
 
-	const answer = "trả lời từ lưới an toàn"
-	got, err := a.appZaloRunner(zaloConfig{Model: "haiku"}, okClaude(answer), "t1", false).
-		Run(t.Context(), "câu hỏi", func(string) {})
-	if err != nil {
-		t.Fatalf("Run() sau khi tắt openai-1 = _, %v; want nil (bỏ qua mắt xích, đi tiếp)", err)
+	got := a.appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
+	r, ok := got.(*appLLMRunner)
+	if !ok {
+		t.Fatalf("appZaloRunner = %T; want *appLLMRunner", got)
 	}
-	if got != answer {
-		t.Errorf("Run() sau khi tắt openai-1 = %q; want %q", got, answer)
-	}
-	status, err := a.st.LLMStatus()
-	if err != nil {
-		t.Fatalf("LLMStatus() = _, %v; want nil", err)
-	}
-	if status.ActiveProviderID != "claude-code" {
-		t.Errorf("LLMStatus().ActiveProviderID = %q; want claude-code", status.ActiveProviderID)
-	}
-	if status.Attempts != 1 {
-		t.Errorf("LLMStatus().Attempts = %d; want 1 (Provider đã tắt không sinh lượt gọi nào)",
-			status.Attempts)
+	if !r.cfg.Disabled["openai-1"] {
+		t.Errorf("cfg.Disabled[openai-1] = false; want true (Provider tắt sau khi lưu chuỗi phải được chuyền xuống runner)")
 	}
 }
 
+// TestAppClaudeRunnerCarriesTheRouteModel: có account claude-code + định vị được exe → mỗi lượt
+// dựng execZaloRunner MỚI mang model của route, exe (Program) và ConfigDir của account. Model rỗng
+// hoặc trùng cấu hình đang chạy thì GIỮ zc.Model (`claude --model ""` là dòng lệnh hỏng), nhưng
+// runner vẫn là execZaloRunner chứ KHÔNG còn rơi về base — Claude chạy khi có account, không phụ
+// thuộc model. 0 account → im (xem TestAppClaudeRunnerSilentWhenNoAccount).
 func TestAppClaudeRunnerCarriesTheRouteModel(t *testing.T) {
+	accountSel = newAccountSelector()
+	t.Cleanup(func() { accountSel = newAccountSelector() })
+	exe := fakeClaudeExe(t) // resolveCLIProgram("claude-code") thành công ở mọi máy chạy test
 	a := newAppRouteAPI(t)
+	if err := a.st.CreateLLMAccount(store.LLMAccount{
+		ID: "acc-a", ProviderID: "claude-code", Label: "A", ConfigDir: "cfgA", Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateLLMAccount(acc-a) = %v; want nil", err)
+	}
 	base := okClaude("base")
 	zc := zaloConfig{Model: "haiku", WorkDir: `C:\work`, ThinkingTokens: 512}
 
 	for _, tc := range []struct {
-		name     string
-		model    string
-		wantBase bool
+		name      string
+		model     string
+		wantModel string
 	}{
-		{"model của route trùng cấu hình đang chạy", "haiku", true},
-		{"model của route khác cấu hình đang chạy", "opus", false},
-		// Hàng bị sửa tay trong database: `claude --model ""` là dòng lệnh hỏng, còn cấu hình
-		// đang chạy thì vẫn trả lời được.
-		{"model rỗng giữ cấu hình đang chạy", "", true},
+		{"model của route trùng cấu hình đang chạy", "haiku", "haiku"},
+		{"model của route khác cấu hình đang chạy", "opus", "opus"},
+		// Hàng bị sửa tay trong database: `claude --model ""` là dòng lệnh hỏng, nên giữ zc.Model.
+		{"model rỗng giữ cấu hình đang chạy", "", "haiku"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := a.appClaudeRunner(zc, base, tc.model)
-			if tc.wantBase {
-				// Giữ base là điều kiện để test upstream (duty_test.go) còn tiêm được runner giả:
-				// dựng mới ở đây biến chúng thành lượt gọi tiến trình claude thật.
-				if got != zaloRunner(base) {
-					t.Fatalf("appClaudeRunner(zc, base, %q) = %T; want chính base đã tiêm vào", tc.model, got)
-				}
-				return
-			}
 			fresh, ok := got.(execZaloRunner)
 			if !ok {
-				t.Fatalf("appClaudeRunner(zc, base, %q) = %T; want execZaloRunner", tc.model, got)
+				t.Fatalf("appClaudeRunner(zc, base, %q) = %T; want execZaloRunner (có account claude)", tc.model, got)
 			}
-			if fresh.cfg.Model != tc.model {
+			if fresh.cfg.Model != tc.wantModel {
 				t.Errorf("appClaudeRunner(zc, base, %q).cfg.Model = %q; want %q",
-					tc.model, fresh.cfg.Model, tc.model)
+					tc.model, fresh.cfg.Model, tc.wantModel)
 			}
-			// Chỉ Model đổi: phần còn lại của cấu hình lượt dựng ra dòng lệnh claude, và mất nó
-			// thì lượt chạy sai thư mục hoặc sai hạn suy nghĩ.
+			// Program/ConfigDir đến từ resolveCLIProgram + account đã chọn — mất chúng thì lượt
+			// chạy exe sai hoặc sai đăng nhập.
+			if fresh.cfg.Program != exe {
+				t.Errorf("appClaudeRunner(zc, base, %q).cfg.Program = %q; want %q (exe claude qua npm)",
+					tc.model, fresh.cfg.Program, exe)
+			}
+			if fresh.cfg.ConfigDir != "cfgA" {
+				t.Errorf("appClaudeRunner(zc, base, %q).cfg.ConfigDir = %q; want cfgA (đăng nhập account)",
+					tc.model, fresh.cfg.ConfigDir)
+			}
+			// Phần còn lại của cấu hình lượt dựng ra dòng lệnh claude, mất nó thì lượt chạy sai
+			// thư mục hoặc sai hạn suy nghĩ.
 			if fresh.cfg.WorkDir != zc.WorkDir || fresh.cfg.ThinkingTokens != zc.ThinkingTokens {
 				t.Errorf("appClaudeRunner(zc, base, %q).cfg workdir/thinking = %q/%d; want %q/%d",
 					tc.model, fresh.cfg.WorkDir, fresh.cfg.ThinkingTokens, zc.WorkDir, zc.ThinkingTokens)
@@ -1493,14 +1461,14 @@ func TestAppClaudeRunnerCarriesTheRouteModel(t *testing.T) {
 }
 
 // TestAppClaudeRunnerSelectsAClaudeAccount: khi CÓ account claude-code, mỗi lượt Claude chạy dưới
-// CLAUDE_CONFIG_DIR của một account chọn theo round-robin (accountSel). 0 account thì giữ NGUYÊN
-// đường cũ — base seam của duty_test.go còn tiêm được, và model khác dựng execZaloRunner ConfigDir
-// rỗng (config mặc định).
+// CLAUDE_CONFIG_DIR của một account chọn theo round-robin (accountSel). 0 account thì IM
+// (silentZaloRunner) — không còn Claude mặc định để rơi về.
 func TestAppClaudeRunnerSelectsAClaudeAccount(t *testing.T) {
 	// accountSel là singleton cấp package; reset để thứ tự round-robin bắt đầu từ 0 (A→B→A),
 	// độc lập với các test khác trong gói.
 	accountSel = newAccountSelector()
 	t.Cleanup(func() { accountSel = newAccountSelector() })
+	fakeClaudeExe(t) // resolveCLIProgram("claude-code") thành công ở mọi máy chạy test
 
 	a := newAppRouteAPI(t) // provider "claude-code" đã được migration gieo sẵn.
 	for _, acc := range []store.LLMAccount{
@@ -1514,9 +1482,9 @@ func TestAppClaudeRunnerSelectsAClaudeAccount(t *testing.T) {
 
 	base := okClaude("base")
 	zc := zaloConfig{Model: "haiku"}
-	// Ba lượt liên tiếp: mỗi lượt phải là execZaloRunner MỚI (không phải base), ConfigDir xoay
-	// A→B→A. Model trùng cấu hình đang chạy nên nhánh account VẪN dựng runner mới — account chọn
-	// đường đăng nhập, không phụ thuộc model.
+	// Ba lượt liên tiếp: mỗi lượt phải là execZaloRunner MỚI, ConfigDir xoay A→B→A. Model trùng
+	// cấu hình đang chạy nên nhánh account VẪN dựng runner mới — account chọn đường đăng nhập,
+	// không phụ thuộc model.
 	var dirs []string
 	for i := 0; i < 3; i++ {
 		got := a.appClaudeRunner(zc, base, "haiku")
@@ -1530,24 +1498,48 @@ func TestAppClaudeRunnerSelectsAClaudeAccount(t *testing.T) {
 		t.Errorf("ConfigDir qua 3 lượt = %v; want %v (round-robin)", dirs, want)
 	}
 
-	// 0 account: đường mặc định giữ nguyên. Store riêng để không dính hai account ở trên.
+	// 0 account: IM, KHÔNG rơi về base — mọi model. Store riêng để không dính hai account ở trên.
 	zero := newAppRouteAPI(t)
-	if got := zero.appClaudeRunner(zc, base, "haiku"); got != zaloRunner(base) {
-		t.Errorf("0 account, model trùng: appClaudeRunner = %T; want base đã tiêm vào", got)
+	for _, model := range []string{"haiku", "", "opus"} {
+		if got := zero.appClaudeRunner(zc, base, model); !isSilent(got) {
+			t.Errorf("0 account, model %q: appClaudeRunner = %T; want silentZaloRunner", model, got)
+		}
 	}
-	if got := zero.appClaudeRunner(zc, base, ""); got != zaloRunner(base) {
-		t.Errorf("0 account, model rỗng: appClaudeRunner = %T; want base đã tiêm vào", got)
+}
+
+// isSilent nói một runner có phải tín hiệu im (chưa cấu hình) không.
+func isSilent(r zaloRunner) bool {
+	_, ok := r.(silentZaloRunner)
+	return ok
+}
+
+// TestAppZaloRunnerSilentWhenNoProvider: chưa nối Provider nào (0 account, 0 credential API) thì
+// appZaloRunner trả một runner IM — Run yield ErrZaloSilent — chứ KHÔNG rơi về base. base là runner
+// Claude mặc định của answerZalo, và cả thiết kế "no default" là để nó không được gọi ở đây.
+func TestAppZaloRunnerSilentWhenNoProvider(t *testing.T) {
+	a := newAppRouteAPI(t) // store trống: chỉ có claude-code system provider (không credential, 0 account).
+	base := &fakeClaude{fn: func(context.Context, string) (string, error) {
+		t.Fatal("base KHÔNG được gọi khi chưa nối Provider nào")
+		return "", nil
+	}}
+	r := a.appZaloRunner(zaloConfig{}, base, "thread-1", false)
+	if _, err := r.Run(t.Context(), "hỏi", func(string) {}); !errors.Is(err, ErrZaloSilent) {
+		t.Fatalf("Run() = _, %v; want ErrZaloSilent", err)
 	}
-	got := zero.appClaudeRunner(zc, base, "opus")
-	r, ok := got.(execZaloRunner)
-	if !ok {
-		t.Fatalf("0 account, model khác: appClaudeRunner = %T; want execZaloRunner", got)
-	}
-	if r.cfg.ConfigDir != "" {
-		t.Errorf("0 account: ConfigDir = %q; want \"\" (config mặc định)", r.cfg.ConfigDir)
-	}
-	if r.cfg.Model != "opus" {
-		t.Errorf("0 account, model khác: cfg.Model = %q; want opus", r.cfg.Model)
+}
+
+// TestAppClaudeRunnerSilentWhenNoAccount: 0 account claude-code → im, không rơi về base. Claude chỉ
+// chạy khi có account nối, nên mắt xích cuối của một bot chưa cấu hình là im chứ không phải một
+// login sẵn nào của máy này.
+func TestAppClaudeRunnerSilentWhenNoAccount(t *testing.T) {
+	a := newAppRouteAPI(t)
+	base := &fakeClaude{fn: func(context.Context, string) (string, error) {
+		t.Fatal("base KHÔNG được gọi với 0 account claude")
+		return "", nil
+	}}
+	r := a.appClaudeRunner(zaloConfig{}, base, "opus")
+	if _, err := r.Run(t.Context(), "hỏi", func(string) {}); !errors.Is(err, ErrZaloSilent) {
+		t.Fatalf("Run() = _, %v; want ErrZaloSilent", err)
 	}
 }
 
