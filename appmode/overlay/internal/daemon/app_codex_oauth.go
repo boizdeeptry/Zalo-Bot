@@ -28,9 +28,24 @@ const (
 	codexAuthorizeURL = "https://auth.openai.com/oauth/authorize"
 	// scope có offline_access để nhận refresh_token; hai scope connectors đi kèm luồng codex thật.
 	codexOAuthScope = "openid profile email offline_access api.connectors.read api.connectors.invoke"
-	// đường callback loopback — trùng codex CLI (login\src\server.rs). Port động, chọn lúc chạy.
+	// đường callback loopback — trùng codex CLI (login\src\server.rs).
 	codexRedirectPath = "/auth/callback"
 )
+
+// codexLoopbackPorts: cổng codex ĐÃ ĐĂNG KÝ với OpenAI (ưu tiên 1455, dự phòng 1457) — Hydra chỉ nhận
+// redirect_uri đúng cổng này, không phải cổng ngẫu nhiên. Trùng preferred/fallback của codex CLI.
+var codexLoopbackPorts = []int{1455, 1457}
+
+// bindCodexLoopback mở listener loopback ở một trong các cổng đã đăng ký. Bind 127.0.0.1 (localhost
+// phân giải về đây trên Windows); redirect_uri quảng bá "localhost". Cả hai cổng bận → lỗi rõ ràng.
+func bindCodexLoopback() (net.Listener, error) {
+	for _, port := range codexLoopbackPorts {
+		if ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
+			return ln, nil
+		}
+	}
+	return nil, fmt.Errorf("cổng đăng nhập codex %v đang bận — đóng phiên đăng nhập codex khác rồi thử lại", codexLoopbackPorts)
+}
 
 // codexPKCE sinh cặp PKCE (RFC 7636): verifier ngẫu nhiên (crypto/rand, base64url 43 ký tự — trong
 // khoảng 43..128 mà codex.exe assert) và challenge = base64url(sha256(verifier)), method S256.
@@ -192,12 +207,14 @@ var openBrowser = func(rawURL string, logger *slog.Logger) {
 func startCodexOAuthLogin(ctx context.Context, client *http.Client, configDir string, logger *slog.Logger) (string, func() error, error) {
 	verifier, challenge := codexPKCE()
 	state := codexOAuthState()
-	ln, err := net.Listen("tcp", "127.0.0.1:0") // cổng động, chỉ loopback
+	ln, err := bindCodexLoopback()
 	if err != nil {
-		return "", nil, fmt.Errorf("mở cổng loopback: %w", err)
+		return "", nil, err
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d%s", port, codexRedirectPath)
+	// PHẢI là host "localhost" (KHÔNG phải 127.0.0.1) + cổng đã đăng ký (1455/1457): OpenAI Hydra khớp
+	// redirect_uri của client codex chính xác theo host+port đó, sai host trả authorize_hydra_invalid_request.
+	redirectURI := fmt.Sprintf("http://localhost:%d%s", port, codexRedirectPath)
 	authorizeURL := codexBuildAuthorizeURL(redirectURI, challenge, state)
 
 	codeCh := make(chan string, 1)

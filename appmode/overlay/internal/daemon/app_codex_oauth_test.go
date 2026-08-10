@@ -132,10 +132,12 @@ func TestStartCodexOAuthLoginRoundTrip(t *testing.T) {
 	if state == "" || redirect == "" {
 		t.Fatalf("authorize thiếu state/redirect_uri: %s", authURL)
 	}
-	// Giả trình duyệt gọi callback với code + state đúng.
+	// Giả trình duyệt gọi callback với code + state đúng. Server bind 127.0.0.1 nên gọi thẳng địa chỉ
+	// đó (redirect quảng bá "localhost" — tránh phân giải ::1 làm test flaky).
+	cb := strings.Replace(redirect, "localhost", "127.0.0.1", 1)
 	go func() {
 		time.Sleep(30 * time.Millisecond)
-		if resp, err := http.Get(redirect + "?state=" + url.QueryEscape(state) + "&code=the-code"); err == nil {
+		if resp, err := http.Get(cb + "?state=" + url.QueryEscape(state) + "&code=the-code"); err == nil {
 			_ = resp.Body.Close()
 		}
 	}()
