@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const appSchemaVersion int64 = 4
+const appSchemaVersion int64 = 5
 
 const appFoundationSchema = `
 CREATE TABLE IF NOT EXISTS app_meta (
@@ -39,6 +39,91 @@ CREATE TABLE IF NOT EXISTS app_memory_revisions (
   revision INTEGER NOT NULL,
   PRIMARY KEY(scope, scope_id)
 );
+`
+
+// appLLMSchema adds Provider, model, CLI account, named combo, fallback route,
+// and attempt telemetry capabilities. It intentionally does not advance
+// schema_version: migrateApp owns that write so both capability families become
+// visible as V5 only after every migration step succeeds.
+//
+// No table stores prompts, customer messages, or model responses. Telemetry is
+// restricted to routing and operational metadata.
+const appLLMSchema = `
+CREATE TABLE IF NOT EXISTS llm_providers (
+  id                TEXT PRIMARY KEY,
+  name              TEXT NOT NULL,
+  kind              TEXT NOT NULL,
+  enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  system_provider   INTEGER NOT NULL DEFAULT 0 CHECK (system_provider IN (0, 1)),
+  credential_cipher BLOB NOT NULL DEFAULT x'',
+  last_check_status TEXT NOT NULL DEFAULT '',
+  last_error        TEXT NOT NULL DEFAULT '',
+  last_checked_at   TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS llm_models (
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
+  model_id    TEXT NOT NULL,
+  name        TEXT NOT NULL DEFAULT '',
+  source      TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'discovered')),
+  available   INTEGER NOT NULL DEFAULT 1 CHECK (available IN (0, 1)),
+  PRIMARY KEY (provider_id, model_id)
+);
+
+CREATE TABLE IF NOT EXISTS llm_route_entries (
+  position    INTEGER PRIMARY KEY,
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id),
+  model_id    TEXT NOT NULL,
+  enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS llm_attempts (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_id      TEXT NOT NULL,
+  model_id         TEXT NOT NULL,
+  started_at       TEXT NOT NULL,
+  duration_ms      INTEGER NOT NULL DEFAULT 0,
+  outcome          TEXT NOT NULL CHECK (outcome IN ('ok', 'error')),
+  error_kind       TEXT NOT NULL DEFAULT '',
+  fell_back        INTEGER NOT NULL DEFAULT 0 CHECK (fell_back IN (0, 1)),
+  next_provider_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_llm_attempts_started ON llm_attempts(started_at);
+
+CREATE TABLE IF NOT EXISTS llm_accounts (
+  id          TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
+  label       TEXT NOT NULL,
+  email       TEXT NOT NULL DEFAULT '',
+  config_dir  TEXT NOT NULL,
+  enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  added_at    TEXT NOT NULL DEFAULT ''
+);
+
+INSERT OR IGNORE INTO llm_providers(id, name, kind, enabled, system_provider)
+VALUES ('claude-code', 'Claude Code', 'claude-code', 1, 1);
+INSERT OR IGNORE INTO app_meta(key, value) VALUES ('llm_route_revision', '1');
+
+CREATE TABLE IF NOT EXISTS llm_combos (
+  id       TEXT PRIMARY KEY,
+  name     TEXT NOT NULL,
+  type     TEXT NOT NULL DEFAULT 'fallback' CHECK (type IN ('fallback','round_robin')),
+  active   INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0,1)),
+  revision INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS llm_combo_members (
+  combo_id    TEXT NOT NULL REFERENCES llm_combos(id) ON DELETE CASCADE,
+  position    INTEGER NOT NULL,
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id),
+  model_id    TEXT NOT NULL,
+  enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  PRIMARY KEY (combo_id, position)
+);
+
+UPDATE llm_providers
+SET kind = 'claude-code'
+WHERE id = 'claude-code' AND kind = 'claude_code';
 `
 
 type appColumnMigration struct {
@@ -160,9 +245,15 @@ func migrateApp(db *sql.DB) error {
 			return fmt.Errorf("invalid Portal schema_version %q: version must be non-negative", rawVersion)
 		}
 	}
-	if versionExists && version >= appSchemaVersion {
+	if versionExists && version > appSchemaVersion {
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit Portal foundation migration: %w", err)
+			return fmt.Errorf("commit future Portal schema no-op: %w", err)
+		}
+		return nil
+	}
+	if versionExists && version == appSchemaVersion {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit current Portal schema no-op: %w", err)
 		}
 		return nil
 	}
@@ -170,15 +261,14 @@ func migrateApp(db *sql.DB) error {
 	if _, err := tx.Exec(appFoundationSchema); err != nil {
 		return fmt.Errorf("migrate Portal foundation: %w", err)
 	}
-	if version < 3 {
-		if err := appMigrateMemoryV3(tx); err != nil {
-			return err
-		}
+	if err := appMigrateMemoryV3(tx); err != nil {
+		return fmt.Errorf("migrate Portal Memory V3 capability: %w", err)
 	}
-	if version < 4 {
-		if err := appMigrateMemoryV4(tx); err != nil {
-			return err
-		}
+	if err := appMigrateMemoryV4(tx); err != nil {
+		return fmt.Errorf("migrate Portal Memory V4 capability: %w", err)
+	}
+	if _, err := tx.Exec(appLLMSchema); err != nil {
+		return fmt.Errorf("migrate Portal LLM providers: %w", err)
 	}
 	if !versionExists {
 		if _, err := tx.Exec(
@@ -310,9 +400,14 @@ SELECT 'lessons', '', 1 WHERE EXISTS (SELECT 1 FROM zalo_lessons LIMIT 1)`); err
 }
 
 func appMigrateMemoryV4(tx *sql.Tx) error {
+	addedMemoryColumns := make(map[string]bool)
 	for _, migration := range appV4Columns {
-		if _, err := appEnsureColumn(tx, migration); err != nil {
+		added, err := appEnsureColumn(tx, migration)
+		if err != nil {
 			return err
+		}
+		if added && migration.table == "zalo_memory" {
+			addedMemoryColumns[migration.column] = true
 		}
 	}
 	if _, err := tx.Exec(appMemoryV4Schema); err != nil {
@@ -329,43 +424,52 @@ func appMigrateMemoryV4(tx *sql.Tx) error {
 	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS app_zalo_memory_insert_revision`); err != nil {
 		return fmt.Errorf("drop legacy Zalo memory revision trigger: %w", err)
 	}
-	if _, err := tx.Exec(appMemoryV4Indexes); err != nil {
-		return fmt.Errorf("create Memory V2 indexes: %w", err)
+	if addedMemoryColumns["memory_key"] {
+		if _, err := tx.Exec(`UPDATE zalo_memory
+SET memory_key = 'legacy.' || id
+WHERE memory_key = ''`); err != nil {
+			return fmt.Errorf("backfill Memory V2 keys: %w", err)
+		}
 	}
-	if _, err := tx.Exec(`UPDATE zalo_memory
-SET memory_key = CASE WHEN memory_key = '' THEN 'legacy.' || id ELSE memory_key END,
-    category = CASE WHEN category = '' THEN 'profile' ELSE category END,
-    confidence = 1,
-    status = CASE WHEN status = '' THEN 'active' ELSE status END,
-    last_confirmed_at = CASE
+	if addedMemoryColumns["last_confirmed_at"] {
+		if _, err := tx.Exec(`UPDATE zalo_memory
+SET last_confirmed_at = CASE
       WHEN last_confirmed_at <> '' THEN last_confirmed_at
       WHEN updated_at <> '' THEN updated_at
       ELSE created_at
     END`); err != nil {
-		return fmt.Errorf("backfill Memory V2 metadata: %w", err)
+			return fmt.Errorf("backfill Memory V2 confirmation time: %w", err)
+		}
 	}
-	threadsExist, err := appTableExists(tx, "zalo_threads")
-	if err != nil {
-		return err
-	}
-	if threadsExist {
-		if _, err := tx.Exec(`UPDATE zalo_memory
+	if addedMemoryColumns["memory_key"] {
+		threadsExist, err := appTableExists(tx, "zalo_threads")
+		if err != nil {
+			return err
+		}
+		if threadsExist {
+			if _, err := tx.Exec(`UPDATE zalo_memory
 SET uid = thread_id
 WHERE uid = '' AND EXISTS (
   SELECT 1 FROM zalo_threads t
   WHERE t.id = zalo_memory.thread_id AND t.thread_type = 'user'
 )`); err != nil {
-			return fmt.Errorf("backfill direct-thread Memory subjects: %w", err)
+				return fmt.Errorf("backfill direct-thread Memory subjects: %w", err)
+			}
 		}
 	}
-	expiresAt := ts(time.Now().Add(180 * 24 * time.Hour))
-	if _, err := tx.Exec(`UPDATE zalo_memory
+	if addedMemoryColumns["expires_at"] {
+		expiresAt := ts(time.Now().Add(180 * 24 * time.Hour))
+		if _, err := tx.Exec(`UPDATE zalo_memory
 SET expires_at = CASE WHEN pinned = 1 THEN NULL ELSE ? END`, expiresAt); err != nil {
-		return fmt.Errorf("backfill Memory V2 expiry: %w", err)
+			return fmt.Errorf("backfill Memory V2 expiry: %w", err)
+		}
 	}
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO app_memory_subject_revisions(thread_id, uid, revision)
 SELECT thread_id, uid, 1 FROM zalo_memory WHERE status = 'active' GROUP BY thread_id, uid`); err != nil {
 		return fmt.Errorf("seed subject Memory revisions: %w", err)
+	}
+	if _, err := tx.Exec(appMemoryV4Indexes); err != nil {
+		return fmt.Errorf("create Memory V2 indexes: %w", err)
 	}
 	return nil
 }

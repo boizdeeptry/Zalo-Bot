@@ -35,7 +35,8 @@ test("navigation exposes the legacy menu contract", () => {
           todo: "Nối agent với công cụ ngoài qua MCP: CRM, đơn hàng, tồn kho.",
           href: undefined,
         },
-        { id: "models", icon: "🧩", label: "Models", todo: undefined, href: undefined },
+        { id: "providers", icon: "🔌", label: "Providers", todo: undefined, href: undefined },
+        { id: "combos", icon: "🧩", label: "Combos", todo: undefined, href: undefined },
         {
           id: "memory",
           icon: "🗃",
@@ -104,4 +105,16 @@ test("navigation exposes the legacy menu contract", () => {
       ],
     },
   ]);
+});
+
+test("navigation exposes Providers, Combos, and the real Memory page", () => {
+  const items = NAVIGATION.flatMap(({ items }) => items);
+  const providers = items.find(({ id }) => id === "providers");
+  const combos = items.find(({ id }) => id === "combos");
+  const memory = items.find(({ id }) => id === "memory");
+
+  assert.equal(providers?.label, "Providers");
+  assert.equal(combos?.label, "Combos");
+  assert.equal(memory?.label, "Memory");
+  assert.equal(memory.todo, undefined);
 });

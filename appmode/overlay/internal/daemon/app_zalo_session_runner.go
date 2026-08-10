@@ -44,12 +44,25 @@ type appZaloClaudeCommand func(
 	[]string,
 ) (io.ReadCloser, io.ReadCloser, func() error, error)
 
+// appZaloClaudeStart is the production-shaped process boundary. Unlike the
+// legacy test seam above, it carries the executable selected by the Provider
+// account resolver as an explicit value.
+type appZaloClaudeStart func(
+	context.Context,
+	string,
+	string,
+	[]string,
+	string,
+	[]string,
+) (io.ReadCloser, io.ReadCloser, func() error, error)
+
 // appZaloSessionRunInput describes either a fresh bootstrap or a resume. The
 // caller owns session identity so it can persist every generation atomically.
 // RecoverySessionID is used only for the single allowed resume recovery.
 type appZaloSessionRunInput struct {
 	SessionID         string
 	Prompt            string
+	StatelessPrompt   string
 	Resume            bool
 	RecoverySessionID string
 	BootstrapPrompt   string
@@ -69,11 +82,13 @@ type appZaloRunResult struct {
 	// rotation when this field is false.
 	RecoveryAttempted bool
 	RecoveryCode      string
+	SessionAdvanced   bool
 }
 
 type appZaloSessionRunner struct {
 	cfg     zaloConfig
 	command appZaloClaudeCommand
+	start   appZaloClaudeStart
 }
 
 // appRunZaloSession is the production-only structured seam. execZaloRunner keeps
@@ -84,7 +99,21 @@ func (e execZaloRunner) appRunZaloSession(
 	in appZaloSessionRunInput,
 	step func(string),
 ) (appZaloRunResult, error) {
-	return (appZaloSessionRunner{cfg: e.cfg}).RunSession(ctx, in, step)
+	return e.appRunZaloSessionWithStart(ctx, in, step, nil)
+}
+
+func (e execZaloRunner) appRunZaloSessionWithStart(
+	ctx context.Context,
+	in appZaloSessionRunInput,
+	step func(string),
+	start appZaloClaudeStart,
+) (appZaloRunResult, error) {
+	result, err := (appZaloSessionRunner{cfg: e.cfg, start: start}).RunSession(ctx, in, step)
+	if err != nil {
+		return result, err
+	}
+	result.SessionAdvanced = true
+	return result, nil
 }
 
 type appZaloSafeRunError struct {
@@ -166,17 +195,33 @@ func (r appZaloSessionRunner) runAttempt(
 			return appZaloRunResult{}, appZaloNewRunError(appZaloErrorArgv, nil)
 		}
 	}
+	if len(r.cfg.ProgramPrefixArgs) > 0 {
+		prefixed := make([]string, 0, len(r.cfg.ProgramPrefixArgs)+len(argv))
+		prefixed = append(prefixed, r.cfg.ProgramPrefixArgs...)
+		argv = append(prefixed, argv...)
+	}
 
 	prof := agent.ConsultReadOnly()
 	env := prof.Env(os.Environ())
+	if configDir := strings.TrimSpace(r.cfg.ConfigDir); configDir != "" {
+		env = appZaloSetEnv(env, "CLAUDE_CONFIG_DIR", configDir)
+	}
 	if r.cfg.ThinkingTokens > 0 {
-		env = append(env, "MAX_THINKING_TOKENS="+strconv.Itoa(r.cfg.ThinkingTokens))
+		env = appZaloSetEnv(env, "MAX_THINKING_TOKENS", strconv.Itoa(r.cfg.ThinkingTokens))
 	}
-	command := r.command
-	if command == nil {
-		command = appZaloStartClaude
+	var stdout, stderr io.ReadCloser
+	var wait func() error
+	if r.start != nil {
+		stdout, stderr, wait, err = r.start(
+			ctx, strings.TrimSpace(r.cfg.Program), prompt, argv, r.cfg.WorkDir, env,
+		)
+	} else if r.command != nil {
+		stdout, stderr, wait, err = r.command(ctx, prompt, argv, r.cfg.WorkDir, env)
+	} else {
+		stdout, stderr, wait, err = appZaloStartClaudeProgram(
+			ctx, strings.TrimSpace(r.cfg.Program), prompt, argv, r.cfg.WorkDir, env,
+		)
 	}
-	stdout, stderr, wait, err := command(ctx, prompt, argv, r.cfg.WorkDir, env)
 	if err != nil {
 		appZaloClose(stdout)
 		appZaloClose(stderr)
@@ -220,6 +265,21 @@ func (r appZaloSessionRunner) runAttempt(
 		return appZaloRunResult{}, appZaloNewRunError(appZaloErrorOutput, nil)
 	}
 	return parsed.result, nil
+}
+
+// appZaloSetEnv replaces a process variable instead of appending a duplicate.
+// Environment keys are compared case-insensitively because the packaged app
+// runs on Windows, where inherited key casing is not stable.
+func appZaloSetEnv(env []string, key, value string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, item := range env {
+		name, _, found := strings.Cut(item, "=")
+		if found && strings.EqualFold(name, key) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return append(out, key+"="+value)
 }
 
 // appZaloResumeArgv replaces exactly one adjacent --session-id value generated
@@ -491,10 +551,25 @@ func appZaloStartClaude(
 	workDir string,
 	env []string,
 ) (io.ReadCloser, io.ReadCloser, func() error, error) {
-	prof := agent.ConsultReadOnly()
-	binary, err := exec.LookPath(prof.Binary)
-	if err != nil {
-		return nil, nil, nil, err
+	return appZaloStartClaudeProgram(ctx, "", prompt, argv, workDir, env)
+}
+
+func appZaloStartClaudeProgram(
+	ctx context.Context,
+	program string,
+	prompt string,
+	argv []string,
+	workDir string,
+	env []string,
+) (io.ReadCloser, io.ReadCloser, func() error, error) {
+	binary := strings.TrimSpace(program)
+	if binary == "" {
+		prof := agent.ConsultReadOnly()
+		resolved, err := exec.LookPath(prof.Binary)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		binary = resolved
 	}
 	cmd := exec.CommandContext(ctx, binary, argv...)
 	cmd.Dir = workDir

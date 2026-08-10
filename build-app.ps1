@@ -228,9 +228,11 @@ $phase = 'lắp thư mục gói'
 if (Test-Path -LiteralPath $Out) {
   if ($KeepData) {
     Write-Host '      -KeepData: giu data\ (CHI de thu, khong de ban)' -ForegroundColor Yellow
-    Clear-AppOutput -Out $Out -KeepData
+    Clear-AppOutput -Out $Out -ProtectedRoot @($Repo, $PersonaSource, $PSScriptRoot) `
+      -ExpectedOutIdentity $paths.OutIdentity -KeepData
   } else {
-    Clear-AppOutput -Out $Out
+    Clear-AppOutput -Out $Out -ProtectedRoot @($Repo, $PersonaSource, $PSScriptRoot) `
+      -ExpectedOutIdentity $paths.OutIdentity
   }
 }
 # Bo cuc goc: CHI nhung gi nguoi mua can nhin.
@@ -276,9 +278,30 @@ Invoke-AppCommand -Label 'npm prune' -FilePath $npmExe `
   -Arguments @('--prefix', (Join-Path $Out 'app\transport'), 'prune', '--omit=dev', '--silent') `
   -WorkingDirectory $Out
 
-# node.exe di kem: mot tep, chay don le duoc, khong can trinh cai dat Node.
+# node.exe + npm di kem: khong can trinh cai dat Node tren may nguoi mua.
+#
+# Vi sao KEM CA npm (khong chi node.exe): buoc "Ket noi" codex trong Portal chay
+# `npm install -g @openai/codex` ngay tren may nguoi mua -- va may do co the KHONG
+# cai Node. npm.cmd dung `%~dp0` (tro node.exe + node_modules\npm cung thu muc no)
+# nen chi can dat ca ba canh nhau trong app\node la thanh mot ban node+npm doc lap,
+# di chuyen duoc. run.bat chen app\node len dau PATH, va tro npm_config_prefix vao
+# data\cli, nen runtime tu chua du va `npm root -g` tra dung noi daemon tim codex.js.
+# Rieng thao tac Connect/cai Codex hoac Claude van can ket noi online toi npm registry;
+# viec dong goi npm khong bien mot lan cai package moi thanh thao tac offline.
 $node = (Get-Command node).Source
-Copy-Item -LiteralPath $node -Destination (Join-Path $Out 'app\node') -Force
+$nodeSrcDir = Split-Path -Parent $node
+$nodeOut = Join-Path $Out 'app\node'
+Copy-Item -LiteralPath $node -Destination $nodeOut -Force
+foreach ($shim in 'npm', 'npm.cmd', 'npx', 'npx.cmd') {
+  Copy-Item -LiteralPath (Join-Path $nodeSrcDir $shim) -Destination $nodeOut -Force
+}
+$npmModuleSrc = Join-Path $nodeSrcDir 'node_modules\npm'
+if (-not (Test-Path -LiteralPath $npmModuleSrc -PathType Container)) {
+  throw "thieu node_modules\npm o '$npmModuleSrc' -- ban Node nguon phai kem npm"
+}
+$nodeModulesOut = Join-Path $nodeOut 'node_modules'
+[IO.Directory]::CreateDirectory($nodeModulesOut) | Out-Null
+Copy-Item -LiteralPath $npmModuleSrc -Destination $nodeModulesOut -Recurse -Force
 
 # ------------------------------------------------------- 6. persona chung hoa
 Write-Host '[6/7] persona: thay danh tinh bang cho trong'

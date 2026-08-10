@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -95,9 +96,45 @@ type appZaloMemorySnapshot struct {
 	lessonsOK       bool
 }
 
+type appZaloRunnerFactory func(zaloConfig, zaloRunner, string, bool) zaloRunner
+
+type appZaloAttachmentAwareRunner interface {
+	appWithZaloAttachments(bool) zaloRunner
+}
+
+// appZaloStructuredClaudeAwareRunner marks a captured turn whose pending
+// session delta owns an attachment. Such a turn must reach the structured
+// Claude seam: a stateless local CLI cannot consume its durable delta cursor.
+type appZaloStructuredClaudeAwareRunner interface {
+	appWithZaloStructuredClaudeRequirement(bool) zaloRunner
+}
+
+type appZaloTurnSnapshot struct {
+	history        []ipc.ZaloMessage
+	directFiles    []ipc.ZaloAttachment
+	files          []ipc.ZaloAttachment
+	hasAttachments bool
+	highWater      int64
+	highWaterKnown bool
+	resumeDelta    appZaloResumeDeltaSnapshot
+}
+
+type appZaloResumeDeltaSnapshot struct {
+	delta           []store.ZaloDeltaMessage
+	claudeSessionID string
+	generation      int64
+	messageCursor   int64
+	turnCount       int64
+	highWater       int64
+	known           bool
+	hasBasis        bool
+}
+
 // appZaloStructuredAnswerRunner adapts the upstream single-string runner hook to
-// the overlay's structured session seam. It rebuilds trusted turn inputs from the
-// durable store and deliberately ignores the upstream legacy-Memory prompt.
+// the overlay's structured session seam. It receives the trusted turn snapshot
+// captured inside the thread gate and ignores the upstream legacy-Memory prompt.
+// It intentionally exposes only Run: exposing appRunZaloSession here would let
+// the upstream appRunZalo path bypass Run and rebuild inputs from a later store read.
 type appZaloStructuredAnswerRunner struct {
 	a                *api
 	run              appZaloStructuredRunner
@@ -105,8 +142,12 @@ type appZaloStructuredAnswerRunner struct {
 	threadID         string
 	question         string
 	currentZaloMsgID string
+	history          []ipc.ZaloMessage
+	directFiles      []ipc.ZaloAttachment
 	files            []ipc.ZaloAttachment
-	bootstrapCursor  int64
+	highWater        int64
+	highWaterKnown   bool
+	resumeDelta      appZaloResumeDeltaSnapshot
 }
 
 func (r *appZaloStructuredAnswerRunner) Run(
@@ -114,17 +155,9 @@ func (r *appZaloStructuredAnswerRunner) Run(
 	_ string,
 	step func(string),
 ) (string, error) {
-	history, err := r.a.st.ZaloMessages(r.threadID, zaloHistoryTurns)
-	bootstrapCursor := int64(0)
-	if err != nil {
-		history = nil
-	} else {
-		bootstrapCursor = appZaloHistoryCursor(history)
-		if r.bootstrapCursor < bootstrapCursor {
-			bootstrapCursor = r.bootstrapCursor
-		}
-	}
-	files := mergeZaloFiles(r.files, history)
+	history := appZaloCloneHistory(r.history)
+	directFiles := slices.Clone(r.directFiles)
+	files := slices.Clone(r.files)
 	pz := r.zc
 	pz.Memory = nil
 	if lessons, lessonsErr := r.a.st.ZaloLessons(zaloLessonLines); lessonsErr == nil {
@@ -133,7 +166,7 @@ func (r *appZaloStructuredAnswerRunner) Run(
 	pz.overlayFor = zaloOverlayPath(r.zc.OverlayDir, r.threadID)
 	return r.a.appRunZaloStructured(
 		ctx,
-		r,
+		r.run,
 		pz,
 		r.threadID,
 		r.question,
@@ -141,18 +174,13 @@ func (r *appZaloStructuredAnswerRunner) Run(
 		history,
 		retrieve(r.question, r.zc.KBRoots),
 		files,
+		directFiles,
 		step,
 		"",
-		bootstrapCursor,
+		r.highWater,
+		r.highWaterKnown,
+		r.resumeDelta.clone(),
 	)
-}
-
-func (r *appZaloStructuredAnswerRunner) appRunZaloSession(
-	ctx context.Context,
-	in appZaloSessionRunInput,
-	step func(string),
-) (appZaloRunResult, error) {
-	return r.run.appRunZaloSession(ctx, in, step)
 }
 
 // appAnswerZalo owns the complete per-thread critical section. The timeout is
@@ -164,8 +192,23 @@ func (a *api) appAnswerZalo(
 	reply ipc.ZaloOutboxDraft,
 	files []ipc.ZaloAttachment,
 ) error {
+	return a.appAnswerZaloWithRunnerFactory(
+		deps, threadID, question, reply, files, a.appZaloRunner,
+	)
+}
+
+func (a *api) appAnswerZaloWithRunnerFactory(
+	deps *zaloDeps,
+	threadID, question string,
+	reply ipc.ZaloOutboxDraft,
+	files []ipc.ZaloAttachment,
+	route appZaloRunnerFactory,
+) error {
 	if deps == nil || deps.run == nil {
 		return errors.New("zalo session answer dependencies are required")
+	}
+	if route == nil {
+		return errors.New("zalo session runner factory is required")
 	}
 	if a.st == nil {
 		return errors.New("zalo session store is required")
@@ -183,19 +226,22 @@ func (a *api) appAnswerZalo(
 	defer release()
 
 	carrier := &appZaloCompletionCarrier{}
-	bootstrapCursor, cursorErr := a.st.LatestZaloMessageID(threadID)
-	if cursorErr != nil {
-		a.logger.Warn("zalo session: could not capture conservative bootstrap cursor",
-			"thread", threadID, "err", cursorErr)
-		bootstrapCursor = 0
-	}
 	base := context.WithValue(context.Background(), appZaloCompletionContextKey{}, carrier)
 	ctx, cancel := context.WithTimeout(base, deps.cfg.Timeout)
 	defer cancel()
 	step := func(text string) { a.zlog.add(ipc.ZaloLogStep, threadID, text) }
 
-	run := deps.run
-	if structured, ok := deps.run.(appZaloStructuredRunner); ok {
+	run := route(deps.cfg, deps.run, threadID, len(files) > 0)
+	snapshot := a.appCaptureZaloTurnSnapshot(deps.cfg, threadID, files)
+	if aware, ok := run.(appZaloAttachmentAwareRunner); ok {
+		run = aware.appWithZaloAttachments(snapshot.hasAttachments)
+	}
+	if aware, ok := run.(appZaloStructuredClaudeAwareRunner); ok {
+		run = aware.appWithZaloStructuredClaudeRequirement(
+			appZaloDeltaHasAttachments(snapshot.resumeDelta.delta),
+		)
+	}
+	if structured, ok := run.(appZaloStructuredRunner); ok {
 		run = &appZaloStructuredAnswerRunner{
 			a:                a,
 			run:              structured,
@@ -203,8 +249,12 @@ func (a *api) appAnswerZalo(
 			threadID:         threadID,
 			question:         question,
 			currentZaloMsgID: appZaloCurrentMsgID(reply.ReplyQuote),
-			files:            append([]ipc.ZaloAttachment(nil), files...),
-			bootstrapCursor:  bootstrapCursor,
+			history:          snapshot.history,
+			directFiles:      snapshot.directFiles,
+			files:            snapshot.files,
+			highWater:        snapshot.highWater,
+			highWaterKnown:   snapshot.highWaterKnown,
+			resumeDelta:      snapshot.resumeDelta,
 		}
 	}
 	if err := a.answerZalo(ctx, deps.cfg, run, threadID, question, step, reply, files...); err != nil {
@@ -216,6 +266,161 @@ func (a *api) appAnswerZalo(
 	}
 	a.appCompleteZaloTurn(threadID, pending)
 	return nil
+}
+
+func (a *api) appCaptureZaloTurnSnapshot(
+	zc zaloConfig,
+	threadID string,
+	currentFiles []ipc.ZaloAttachment,
+) appZaloTurnSnapshot {
+	history, err := a.st.ZaloMessages(threadID, zaloHistoryTurns)
+	if err != nil {
+		a.logger.Warn("llm route: không đọc được lịch sử, lượt này đi thẳng local CLI",
+			"thread", threadID, "err", err)
+		return appZaloTurnSnapshot{
+			directFiles: slices.Clone(currentFiles),
+			files:       slices.Clone(currentFiles), hasAttachments: true,
+		}
+	}
+	history = appZaloCloneHistory(history)
+	directFiles := slices.Clone(currentFiles)
+	files := mergeZaloFiles(slices.Clone(directFiles), history)
+	highWater := appZaloHistoryCursor(history)
+	resumeDelta, deltaErr := a.appCaptureZaloResumeDelta(zc, threadID, highWater)
+	if deltaErr != nil {
+		a.logger.Warn("zalo session: could not capture pending delta; cursor will stay conservative",
+			"thread", threadID, "err", deltaErr)
+	}
+	return appZaloTurnSnapshot{
+		history: history, directFiles: directFiles, files: files,
+		hasAttachments: slices.ContainsFunc(files, func(at ipc.ZaloAttachment) bool {
+			return at.Path != ""
+		}) || appZaloDeltaHasAttachments(resumeDelta.delta) || !resumeDelta.known,
+		highWater:      highWater,
+		highWaterKnown: true,
+		resumeDelta:    resumeDelta,
+	}
+}
+
+func appZaloCloneHistory(history []ipc.ZaloMessage) []ipc.ZaloMessage {
+	out := slices.Clone(history)
+	for i := range out {
+		out[i].Attachments = slices.Clone(out[i].Attachments)
+	}
+	return out
+}
+
+func (a *api) appCaptureZaloResumeDelta(
+	zc zaloConfig,
+	threadID string,
+	highWater int64,
+) (appZaloResumeDeltaSnapshot, error) {
+	session, err := a.st.ZaloCLISession(threadID)
+	if errors.Is(err, store.ErrNotFound) {
+		return appZaloResumeDeltaSnapshot{known: true}, nil
+	}
+	if err != nil {
+		return appZaloResumeDeltaSnapshot{}, err
+	}
+	// A fresh or rotating session takes the bounded bootstrap path. Its full
+	// prompt intentionally remains the latest-10 history contract.
+	if session.TurnCount == 0 || appZaloShouldRotate(
+		session, zc.Model, appZaloPromptFingerprint(zc, threadID),
+	) {
+		return appZaloResumeDeltaSnapshot{known: true}, nil
+	}
+	snapshot := appZaloResumeDeltaSnapshot{
+		claudeSessionID: session.ClaudeSessionID,
+		generation:      session.Generation,
+		messageCursor:   session.MessageCursor,
+		turnCount:       session.TurnCount,
+		highWater:       highWater,
+		known:           true,
+		hasBasis:        true,
+	}
+	if highWater <= session.MessageCursor {
+		return snapshot, nil
+	}
+	delta, err := a.st.ZaloMessagesAfter(threadID, session.MessageCursor, 100)
+	if err != nil {
+		return appZaloResumeDeltaSnapshot{}, err
+	}
+	snapshot.delta = appZaloCloneDelta(
+		appZaloDeltaThroughHighWater(delta, highWater),
+	)
+	return snapshot, nil
+}
+
+func (s appZaloResumeDeltaSnapshot) clone() appZaloResumeDeltaSnapshot {
+	s.delta = appZaloCloneDelta(s.delta)
+	return s
+}
+
+func (s appZaloResumeDeltaSnapshot) usableFor(
+	session store.ZaloCLISession,
+	highWater int64,
+) bool {
+	return s.known && s.hasBasis && s.highWater == highWater &&
+		s.claudeSessionID == session.ClaudeSessionID &&
+		s.generation == session.Generation &&
+		s.messageCursor == session.MessageCursor &&
+		s.turnCount == session.TurnCount
+}
+
+func appZaloCloneDelta(delta []store.ZaloDeltaMessage) []store.ZaloDeltaMessage {
+	out := slices.Clone(delta)
+	for i := range out {
+		out[i].Message.Attachments = slices.Clone(out[i].Message.Attachments)
+	}
+	return out
+}
+
+func appZaloDeltaHasAttachments(delta []store.ZaloDeltaMessage) bool {
+	return slices.ContainsFunc(delta, func(item store.ZaloDeltaMessage) bool {
+		return slices.ContainsFunc(item.Message.Attachments, func(file ipc.ZaloAttachment) bool {
+			return file.Path != ""
+		})
+	})
+}
+
+// appZaloMergeRenderedDeltaFiles keeps attachments paired with the durable
+// transcript rows visible in this prompt. Direct files for the current turn stay
+// first. A pinned current inbound row is visible even when it is beyond the
+// bounded contiguous prefix, so its attachments are included without advancing
+// the consumed cursor. No maxZaloFiles cap is applied because consuming a body
+// while omitting its file would split one durable event.
+func appZaloMergeRenderedDeltaFiles(
+	files []ipc.ZaloAttachment,
+	delta []store.ZaloDeltaMessage,
+	consumedCursor int64,
+	currentZaloMsgID string,
+) []ipc.ZaloAttachment {
+	out := slices.Clone(files)
+	seen := make(map[string]struct{}, len(out))
+	for _, file := range out {
+		if file.Path != "" {
+			seen[file.Path] = struct{}{}
+		}
+	}
+	for _, item := range delta {
+		message := item.Message
+		isPinnedCurrent := currentZaloMsgID != "" && message.Direction == ipc.ZaloIn &&
+			message.ZaloMsgID == currentZaloMsgID
+		if item.ID > consumedCursor && !isPinnedCurrent {
+			continue
+		}
+		for _, file := range message.Attachments {
+			if file.Path == "" {
+				continue
+			}
+			if _, exists := seen[file.Path]; exists {
+				continue
+			}
+			seen[file.Path] = struct{}{}
+			out = append(out, file)
+		}
+	}
+	return out
 }
 
 func (a *api) appRunZalo(
@@ -232,9 +437,15 @@ func (a *api) appRunZalo(
 	if !ok {
 		return run.Run(ctx, buildConsultPrompt(zc, question, history, found, files...), step)
 	}
+	highWater := appZaloHistoryCursor(history)
+	resumeDelta, err := a.appCaptureZaloResumeDelta(zc, threadID, highWater)
+	if err != nil {
+		a.logger.Warn("zalo session: could not capture pending delta; cursor will stay conservative",
+			"thread", threadID, "err", err)
+	}
 	return a.appRunZaloStructured(
 		ctx, structured, zc, threadID, question, currentZaloMsgID,
-		history, found, files, step, "", -1,
+		history, found, files, slices.Clone(files), step, "", highWater, true, resumeDelta,
 	)
 }
 
@@ -245,14 +456,16 @@ func (a *api) appRunZaloStructured(
 	threadID, question, currentZaloMsgID string,
 	history []ipc.ZaloMessage,
 	found []passage,
-	files []ipc.ZaloAttachment,
+	files, directFiles []ipc.ZaloAttachment,
 	step func(string),
 	bootstrapOverride string,
-	bootstrapCursorOverride int64,
+	turnHighWater int64,
+	turnHighWaterKnown bool,
+	resumeDelta appZaloResumeDeltaSnapshot,
 ) (string, error) {
 	selection, err := a.appSelectZaloSession(
-		zc, threadID, question, currentZaloMsgID, history, found, files,
-		bootstrapOverride, bootstrapCursorOverride,
+		zc, threadID, question, currentZaloMsgID, history, found, files, directFiles,
+		bootstrapOverride, turnHighWater, turnHighWaterKnown, resumeDelta,
 	)
 	if err != nil {
 		return "", err
@@ -260,6 +473,7 @@ func (a *api) appRunZaloStructured(
 	result, runErr := run.appRunZaloSession(ctx, appZaloSessionRunInput{
 		SessionID:         selection.session.ClaudeSessionID,
 		Prompt:            selection.prompt,
+		StatelessPrompt:   selection.bootstrapPrompt,
 		Resume:            selection.resume,
 		RecoverySessionID: uuid.NewString(),
 		BootstrapPrompt:   selection.bootstrapPrompt,
@@ -269,6 +483,9 @@ func (a *api) appRunZaloStructured(
 		return "", runErr
 	}
 	result.Answer = a.appProcessZaloMemoryAnswer(result.Answer, selection)
+	if !result.SessionAdvanced {
+		return result.Answer, nil
+	}
 
 	recovered := result.Recovered
 	freshRecovery := false
@@ -351,9 +568,11 @@ func (a *api) appSelectZaloSession(
 	threadID, question, currentZaloMsgID string,
 	history []ipc.ZaloMessage,
 	found []passage,
-	files []ipc.ZaloAttachment,
+	files, directFiles []ipc.ZaloAttachment,
 	bootstrapOverride string,
-	bootstrapCursorOverride int64,
+	turnHighWater int64,
+	turnHighWaterKnown bool,
+	resumeDelta appZaloResumeDeltaSnapshot,
 ) (appZaloSessionSelection, error) {
 	_ = bootstrapOverride
 	fingerprint := appZaloPromptFingerprint(zc, threadID)
@@ -365,9 +584,9 @@ func (a *api) appSelectZaloSession(
 	if snapshot.lessonsOK {
 		bootstrapConfig.Lessons = snapshot.lessons
 	}
-	bootstrapCursor := appZaloHistoryCursor(history)
-	if bootstrapCursorOverride >= 0 {
-		bootstrapCursor = bootstrapCursorOverride
+	bootstrapCursor := int64(0)
+	if turnHighWaterKnown {
+		bootstrapCursor = turnHighWater
 	}
 	bootstrap := buildConsultPrompt(bootstrapConfig, question, history, found, files...)
 	if snapshot.memoryOK {
@@ -445,10 +664,14 @@ func (a *api) appSelectZaloSession(
 			return appZaloSessionSelection{}, err
 		}
 	}
+	if session.TurnCount == 0 {
+		return bootstrapSelection(session), nil
+	}
 
-	delta, err := a.st.ZaloMessagesAfter(threadID, session.MessageCursor, 100)
-	if err != nil {
-		return appZaloSessionSelection{}, err
+	var delta []store.ZaloDeltaMessage
+	if turnHighWaterKnown && turnHighWater > session.MessageCursor &&
+		resumeDelta.usableFor(session, turnHighWater) {
+		delta = appZaloCloneDelta(resumeDelta.delta)
 	}
 	refresh := &appZaloMemoryRefresh{}
 	memorySubjectUID := session.MemorySubjectUID
@@ -488,10 +711,25 @@ func (a *api) appSelectZaloSession(
 	if !refresh.ReplaceCommon && !refresh.ReplaceSubject && !refresh.ReplaceLessons {
 		refresh = nil
 	}
-	deltaPrompt := buildAppZaloDeltaPromptResult(appZaloSessionPromptInput{
+	promptInput := appZaloSessionPromptInput{
 		Config: zc, Question: question, CurrentZaloMsgID: currentZaloMsgID,
-		History: history, Delta: delta, Found: found, Files: files, MemoryRefresh: refresh,
-	})
+		History: history, Delta: delta, Found: found,
+		Files: slices.Clone(directFiles), MemoryRefresh: refresh,
+	}
+	// Select the bounded contiguous transcript before deriving its file set. The
+	// files section does not affect transcript selection, so rebuilding with only
+	// consumed (plus pinned-current) row attachments must keep the cursor stable.
+	deltaPrompt := buildAppZaloDeltaPromptResult(promptInput)
+	promptInput.Files = appZaloMergeRenderedDeltaFiles(
+		directFiles, delta, deltaPrompt.ConsumedCursor, currentZaloMsgID,
+	)
+	finalPrompt := buildAppZaloDeltaPromptResult(promptInput)
+	if finalPrompt.ConsumedCursor != deltaPrompt.ConsumedCursor {
+		return appZaloSessionSelection{}, errors.New(
+			"zalo session: delta prompt selection changed while attaching files",
+		)
+	}
+	deltaPrompt = finalPrompt
 	completionCursor := session.MessageCursor
 	if deltaPrompt.ConsumedCursor > completionCursor {
 		completionCursor = deltaPrompt.ConsumedCursor
@@ -506,6 +744,23 @@ func (a *api) appSelectZaloSession(
 		memoryRevision:        session.MemoryRevision, lessonsRevision: lessonsRevision,
 		memoryOK: snapshot.memoryOK, resume: true,
 	}, nil
+}
+
+// appZaloDeltaThroughHighWater keeps the oldest-first durable delta inside the
+// exact message boundary captured with this turn's history and files. IDs are
+// monotonically increasing, so the first row above the bound ends the prefix.
+func appZaloDeltaThroughHighWater(
+	delta []store.ZaloDeltaMessage,
+	highWater int64,
+) []store.ZaloDeltaMessage {
+	end := len(delta)
+	for i, item := range delta {
+		if item.ID > highWater {
+			end = i
+			break
+		}
+	}
+	return slices.Clone(delta[:end])
 }
 
 func (a *api) appResolveZaloMemorySubject(threadID, currentZaloMsgID string) store.AppMemorySubject {

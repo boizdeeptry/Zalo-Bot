@@ -4,9 +4,9 @@
 
 **Trạng thái:** Đã được người dùng xác nhận
 
-**Repository:** `D:\TuvanZalo\_build\.worktrees\portal-m1`
+**Repository:** repo đóng gói Zalo-Bot (xem `README.md` để chuẩn bị máy)
 
-**Nhánh:** `feature/portal-m1-foundation`
+**Nhánh nền:** `feature/portal-m1-foundation`, đã merge vào `main`
 
 ## 1. Bối cảnh
 

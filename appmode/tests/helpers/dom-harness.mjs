@@ -241,7 +241,11 @@ class TestElement extends TestNode {
     if (!this.disabled) this.dispatchEvent({ type: "click" });
   }
 
+  // Một nút disabled KHÔNG nhận được focus trong trình duyệt thật, y như nó không nhận click.
+  // Thiếu cửa chặn này thì mọi phép khẳng định "con trỏ nằm ở đây" đều xanh kể cả khi ngoài đời
+  // con trỏ rơi về <body> — tức là một trạng thái bất khả thi vẫn qua được bài kiểm.
   focus() {
+    if (this.disabled) return;
     if (this.ownerDocument) this.ownerDocument.activeElement = this;
   }
 }

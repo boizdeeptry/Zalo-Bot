@@ -151,10 +151,14 @@ func kbCount(root string) (int, []string) {
 
 // modelChoices là những mô hình cho chọn. Bí danh, KHÔNG id đầy đủ.
 //
-// `claude --model` nhận cả bí danh (`opus`, `sonnet`, `haiku`) và id đầy đủ. Bí danh luôn trỏ về
-// bản mới nhất của dòng đó, nên một tệp cấu hình ghi "sonnet" không hết hạn khi Anthropic ra bản
-// tiếp theo — còn ghi một id đầy đủ thì có, và nó sẽ hỏng lặng lẽ trên máy người mua.
-var modelChoices = []string{"haiku", "sonnet", "opus"}
+// `claude --model` nhận cả bí danh (`opus`, `sonnet`, `haiku`, `fable`) và id đầy đủ. Bí danh luôn
+// trỏ về bản mới nhất của dòng đó, nên một tệp cấu hình ghi "sonnet" không hết hạn khi Anthropic ra
+// bản tiếp theo — còn ghi một id đầy đủ thì có, và nó sẽ hỏng lặng lẽ trên máy người mua.
+//
+// Cùng TẬP với cliDescriptors["claude-code"].modelSeeds (app_llm_cli.go): combo picker gieo từ seeds
+// còn selector /kb đọc từ đây, và cả hai giá trị đều đi vào cùng `claude --model` — lệch nhau là một
+// đường mở ra thứ đường kia từ chối.
+var modelChoices = []string{"haiku", "sonnet", "opus", "fable"}
 
 // modelFile là nơi lựa chọn được ghi: MỘT dòng, trong data\.
 //
@@ -167,6 +171,16 @@ var modelChoices = []string{"haiku", "sonnet", "opus"}
 // hiệu lực từ lần mở phần mềm sau, và đường đi của nó nhìn thấy được từ đầu tới cuối. Đánh đổi
 // đã biết và nói rõ trên trang: KHÔNG có hiệu lực ngay.
 func modelFile(homeDir string) string { return filepath.Join(homeDir, "model.txt") }
+
+// normalizeModelChoice chuẩn hoá rồi đối chiếu với danh sách CHO PHÉP.
+//
+// Một hàm cho cả hai chỗ đọc (PUT /kb/model và lần gieo route lúc khởi động) vì luật là một:
+// giá trị này đi thẳng vào dòng lệnh của claude, nên hai bản chuẩn hoá lệch nhau là một đường
+// nhận được thứ đường kia đã từ chối.
+func normalizeModelChoice(raw string) (string, bool) {
+	m := strings.ToLower(strings.TrimSpace(raw))
+	return m, slices.Contains(modelChoices, m)
+}
 
 func (a *api) handleKBModelGet(w http.ResponseWriter, _ *http.Request) {
 	// Giá trị ĐANG CHẠY lấy từ cấu hình đã nạp, không từ tệp: hai thứ khác nhau đúng trong
@@ -194,10 +208,10 @@ func (a *api) handleKBModelPut(w http.ResponseWriter, r *http.Request) {
 		a.writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	m := strings.ToLower(strings.TrimSpace(req.Model))
 	// Danh sách CHO PHÉP: giá trị này đi thẳng vào dòng lệnh của claude, nên một chuỗi tự do ở
 	// đây là một tham số tự do ở đó.
-	if !slices.Contains(modelChoices, m) {
+	m, ok := normalizeModelChoice(req.Model)
+	if !ok {
 		a.writeErr(w, http.StatusBadRequest, "mô hình không hợp lệ")
 		return
 	}
@@ -439,10 +453,10 @@ Xong thì nói ngắn gọn: đã viết những trang nào, bỏ qua tệp nào
 
 func (a *api) runIngest(ctx context.Context, cancel func(), dir string) {
 	defer cancel()
-	bin, err := exec.LookPath("claude")
+	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
 	if err != nil {
-		ingest.step("không thấy claude trên PATH")
-		ingest.finish("chưa cài Claude Code, hoặc chưa đăng nhập. Xem DOC TRUOC.txt")
+		ingest.step("chưa cài Claude Code")
+		ingest.finish("chưa cài Claude Code, hoặc chưa đăng nhập. Bấm Connect Claude trong Portal trước. Xem DOC TRUOC.txt")
 		return
 	}
 	// Quyền GHI, và chỉ trong brain\. Khác hẳn profile của bot trả lời khách, thứ chỉ-đọc.
@@ -456,9 +470,14 @@ func (a *api) runIngest(ctx context.Context, cancel func(), dir string) {
 	args = replaceAllowedTools(args, "Read", "Grep", "Glob", "Write", "Edit")
 	args = append(args, "--add-dir", dir)
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, program, append(append([]string{}, prefixArgs...), args...)...)
 	cmd.Dir = dir
 	cmd.Env = prof.Env(os.Environ())
+	// Dùng login của một account đã kết nối (CLAUDE_CONFIG_DIR) — không thì ingest chạy bằng phiên
+	// mặc định của máy, thường chưa đăng nhập. Merge vào cmd.Env đã có, không ghi đè.
+	if accounts, err := a.st.LLMAccounts(claudeCodeProviderID); err == nil && len(accounts) > 0 {
+		cmd.Env = append(cmd.Env, "CLAUDE_CONFIG_DIR="+accounts[0].ConfigDir)
+	}
 	cmd.Stdin = strings.NewReader(ingestPrompt)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

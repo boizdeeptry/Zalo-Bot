@@ -23,14 +23,51 @@ import (
 )
 
 type appZaloHookRunner struct {
-	mu          sync.Mutex
-	legacyCalls int
-	inputs      []appZaloSessionRunInput
-	results     []appZaloRunResult
-	errors      []error
-	before      func(int, appZaloSessionRunInput)
-	entered     chan struct{}
-	release     chan struct{}
+	mu            sync.Mutex
+	legacyCalls   int
+	inputs        []appZaloSessionRunInput
+	results       []appZaloRunResult
+	errors        []error
+	before        func(int, appZaloSessionRunInput)
+	afterSnapshot func(int, bool)
+	snapshotCalls int
+	entered       chan struct{}
+	release       chan struct{}
+}
+
+type appZaloStatelessHookRunner struct {
+	mu     sync.Mutex
+	inputs []appZaloSessionRunInput
+	answer string
+}
+
+func (r *appZaloStatelessHookRunner) Run(
+	_ context.Context,
+	_ string,
+	_ func(string),
+) (string, error) {
+	return "legacy", nil
+}
+
+func (r *appZaloStatelessHookRunner) appRunZaloSession(
+	_ context.Context,
+	in appZaloSessionRunInput,
+	_ func(string),
+) (appZaloRunResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inputs = append(r.inputs, in)
+	answer := r.answer
+	if answer == "" {
+		answer = `{"answers":["api"]}`
+	}
+	return appZaloRunResult{Answer: answer}, nil
+}
+
+func (r *appZaloStatelessHookRunner) snapshot() []appZaloSessionRunInput {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]appZaloSessionRunInput(nil), r.inputs...)
 }
 
 func (r *appZaloHookRunner) Run(_ context.Context, _ string, _ func(string)) (string, error) {
@@ -38,6 +75,18 @@ func (r *appZaloHookRunner) Run(_ context.Context, _ string, _ func(string)) (st
 	defer r.mu.Unlock()
 	r.legacyCalls++
 	return "legacy", nil
+}
+
+func (r *appZaloHookRunner) appWithZaloAttachments(hasAttachments bool) zaloRunner {
+	r.mu.Lock()
+	call := r.snapshotCalls
+	r.snapshotCalls++
+	afterSnapshot := r.afterSnapshot
+	r.mu.Unlock()
+	if afterSnapshot != nil {
+		afterSnapshot(call, hasAttachments)
+	}
+	return r
 }
 
 func (r *appZaloHookRunner) appRunZaloSession(
@@ -73,6 +122,9 @@ func (r *appZaloHookRunner) appRunZaloSession(
 	if result.SessionID == "" {
 		result.SessionID = in.SessionID
 	}
+	if err == nil {
+		result.SessionAdvanced = true
+	}
 	return result, err
 }
 
@@ -80,6 +132,22 @@ func (r *appZaloHookRunner) snapshot() ([]appZaloSessionRunInput, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Clone(r.inputs), r.legacyCalls
+}
+
+// appZaloTestAnswer keeps the session-focused tests on the complete gate,
+// answer, and completion path while injecting their deterministic runner at
+// the same point where production composes the live provider route.
+func appZaloTestAnswer(
+	a *api,
+	deps *zaloDeps,
+	threadID, question string,
+	reply ipc.ZaloOutboxDraft,
+	files []ipc.ZaloAttachment,
+) error {
+	return a.appAnswerZaloWithRunnerFactory(
+		deps, threadID, question, reply, files,
+		func(zaloConfig, zaloRunner, string, bool) zaloRunner { return deps.run },
+	)
 }
 
 type appZaloCommandHookRunner struct {
@@ -113,7 +181,9 @@ func (r *appZaloDeadlineHookRunner) appRunZaloSession(
 		hasDeadline:  hasDeadline,
 		timeToExpiry: time.Until(deadline),
 	}
-	return appZaloRunResult{Answer: `{"answers":["second"]}`, SessionID: in.SessionID}, nil
+	return appZaloRunResult{
+		Answer: `{"answers":["second"]}`, SessionID: in.SessionID, SessionAdvanced: true,
+	}, nil
 }
 
 func (r *appZaloCommandHookRunner) Run(_ context.Context, _ string, _ func(string)) (string, error) {
@@ -127,7 +197,11 @@ func (r *appZaloCommandHookRunner) appRunZaloSession(
 	step func(string),
 ) (appZaloRunResult, error) {
 	r.structured++
-	return r.runner.RunSession(ctx, in, step)
+	result, err := r.runner.RunSession(ctx, in, step)
+	if err == nil {
+		result.SessionAdvanced = true
+	}
+	return result, err
 }
 
 func TestAppZaloCurrentMsgIDParsesOnlyTopLevelString(t *testing.T) {
@@ -171,6 +245,812 @@ func TestAppRunZaloLeavesStatelessRunnerUnchanged(t *testing.T) {
 	}
 }
 
+func TestAppZaloVirginSessionStaysFreshAfterStatelessSuccess(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "virgin")
+	run := &appZaloStatelessHookRunner{}
+	for i, msgID := range []string{"msg-1", "msg-2"} {
+		question := fmt.Sprintf("question-%d", i+1)
+		if err := appZaloAddMessage(st, "virgin", ipc.ZaloIn, "khách", question, msgID); err != nil {
+			t.Fatal(err)
+		}
+		history, err := st.ZaloMessages("virgin", zaloHistoryTurns)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.appRunZalo(
+			t.Context(), run, zc, "virgin", question, msgID,
+			history, nil, nil, func(string) {},
+		); err != nil {
+			t.Fatalf("turn %d appRunZalo() error = %v", i+1, err)
+		}
+	}
+
+	inputs := run.snapshot()
+	if len(inputs) != 2 {
+		t.Fatalf("structured calls = %d; want 2", len(inputs))
+	}
+	for i, in := range inputs {
+		if in.Resume {
+			t.Errorf("turn %d Resume = true; virgin Claude session must stay fresh", i+1)
+		}
+		if in.Prompt != in.StatelessPrompt || !strings.Contains(in.StatelessPrompt, "You answer a customer's question") {
+			t.Errorf("turn %d prompts = delta %q / stateless %q; want full bootstrap prompt", i+1, in.Prompt, in.StatelessPrompt)
+		}
+	}
+	session, err := st.ZaloCLISession("virgin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.TurnCount != 0 || session.MessageCursor != 0 {
+		t.Fatalf("virgin session = %+v; stateless successes must not advance Claude state", session)
+	}
+}
+
+func TestAppZaloStatelessSuccessAppliesMemoryWithoutAdvancingSession(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "group")
+	if err := st.UpsertZaloThreadInfo(ipc.ZaloThreadInfo{
+		ID: "group", Name: "Group", ThreadType: ipc.ZaloThreadGroup,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	appZaloAddInboundMessage(t, st, "group", "u-1", "msg-1", "save this")
+	history, err := st.ZaloMessages("group", zaloHistoryTurns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &appZaloStatelessHookRunner{answer: `{"answers":["saved"],"memory_ops":[{"action":"add","memory_key":"profile.occupation","value":"là dược sĩ","category":"profile","confidence":0.95,"target_id":0}]}`}
+
+	answer, err := a.appRunZalo(
+		t.Context(), run, zc, "group", "save this", "msg-1",
+		history, nil, nil, func(string) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(answer, "saved") {
+		t.Fatalf("answer = %q; want successful stateless answer", answer)
+	}
+	detail, err := st.AppThreadMemoryScope("group", "u-1", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Active) != 1 || detail.Active[0].Text != "là dược sĩ" {
+		t.Fatalf("applied Memory = %#v", detail.Active)
+	}
+	session, err := st.ZaloCLISession("group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.TurnCount != 0 || session.MessageCursor != 0 {
+		t.Fatalf("stateless Memory success advanced session = %+v", session)
+	}
+}
+
+func TestAppAnswerZaloBuildsProviderRunnerInsideThreadGate(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "thread")
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", "question", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	base := &appZaloHookRunner{results: []appZaloRunResult{{
+		Answer: `{"answers":["must not run"]}`,
+	}}}
+	routeCalls := 0
+	route := func(gotConfig zaloConfig, gotBase zaloRunner, gotThreadID string, hasNewFiles bool) zaloRunner {
+		routeCalls++
+		if gotConfig.Model != zc.Model || gotBase != base || gotThreadID != "thread" || hasNewFiles {
+			t.Errorf("route args = model %q, base %T, thread %q, files %v",
+				gotConfig.Model, gotBase, gotThreadID, hasNewFiles)
+		}
+		key := appZaloHookGateKey(st, gotThreadID)
+		appZaloProcessThreadGate.mu.Lock()
+		entry := appZaloProcessThreadGate.entries[key]
+		refs := 0
+		if entry != nil {
+			refs = entry.refs
+		}
+		appZaloProcessThreadGate.mu.Unlock()
+		if refs != 1 {
+			t.Errorf("thread gate refs while building provider runner = %d; want 1", refs)
+		}
+		return a.appZaloRunner(gotConfig, gotBase, gotThreadID, hasNewFiles)
+	}
+
+	if err := a.appAnswerZaloWithRunnerFactory(
+		&zaloDeps{cfg: zc, run: base}, "thread", "question", appZaloReply("msg-1"), nil, route,
+	); err != nil {
+		t.Fatalf("appAnswerZalo() error = %v; an unconfigured provider route should stay silent", err)
+	}
+	if routeCalls != 1 {
+		t.Fatalf("provider runner builds = %d; want exactly 1", routeCalls)
+	}
+	inputs, legacyCalls := base.snapshot()
+	if len(inputs) != 0 || legacyCalls != 0 {
+		t.Fatalf("base runner calls = structured %d, legacy %d; want 0/0 after provider routing", len(inputs), legacyCalls)
+	}
+	if _, err := st.ZaloCLISession("thread"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unconfigured provider route created Claude session: %v", err)
+	}
+}
+
+func TestAppAnswerZaloAttachmentSnapshotCannotRaceIntoHTTPPrompt(t *testing.T) {
+	const canaryPath = `C:\Users\Admin\.agentdc\zalo-files\RACE-ATTACHMENT-7d91.pdf`
+	a, st, zc := appZaloHookFixture(t, "thread")
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", "question", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	httpAdapter := okAdapter(`{"answers":[],"clarify":"api must not see this"}`)
+	var cliSeen []string
+	cli := fakeCLI("codex", "codex-1", `{"answers":[],"clarify":"local"}`, &cliSeen)
+	f := newRouterFixture(newRoute(
+		entry("openai-1", "gpt-5-mini", true),
+		entry("codex-1", "gpt-5-codex", true),
+	), okClaude(`{"answers":[],"clarify":"claude"}`)).
+		with("openai-1", "sk-one", httpAdapter).
+		withCLI("codex-1", "", cli)
+	route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+		runner := f.runner(appLLMRunnerConfig{})
+		if err := st.AddZaloMessage(ipc.ZaloMessage{
+			ThreadID: "thread", Direction: ipc.ZaloIn, Author: "khách", Body: "file arrived",
+			Attachments: []ipc.ZaloAttachment{{
+				Kind: "chat.file", Path: canaryPath, Title: "private attachment",
+			}},
+			CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return runner
+	}
+
+	if err := a.appAnswerZaloWithRunnerFactory(
+		&zaloDeps{cfg: zc, run: okClaude("base")},
+		"thread", "question", appZaloReply("msg-1"), nil, route,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls := httpAdapter.seen(); len(calls) != 0 {
+		t.Fatalf("HTTP adapter received attachment-bearing turn: %+v", calls)
+	}
+	if len(cliSeen) != 1 || !strings.Contains(cliSeen[0], canaryPath) {
+		t.Fatalf("local CLI calls = %q; want one attachment-bearing prompt", cliSeen)
+	}
+}
+
+func TestAppAnswerZaloResumeKeepsPostSnapshotAttachmentForNextTurn(t *testing.T) {
+	const (
+		currentBody = "CURRENT-TURN-BODY-7c41"
+		lateBody    = "POST-SNAPSHOT-BODY-a9e2"
+		latePath    = `C:\Users\Admin\.agentdc\zalo-files\POST-SNAPSHOT-FILE-b3d8.pdf`
+	)
+	a, st, zc := appZaloHookFixture(t, "thread")
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", currentBody, "msg-current"); err != nil {
+		t.Fatal(err)
+	}
+	currentHighWater, err := st.LatestZaloMessageID("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+	var lateID int64
+	run := &appZaloHookRunner{
+		results: []appZaloRunResult{
+			{Answer: `{"answers":["current"]}`},
+			{Answer: `{"answers":["queued"]}`},
+		},
+		afterSnapshot: func(call int, hasAttachments bool) {
+			if call != 0 {
+				return
+			}
+			if hasAttachments {
+				t.Error("first captured snapshot unexpectedly contains an attachment")
+			}
+			if addErr := st.AddZaloMessage(ipc.ZaloMessage{
+				ThreadID: "thread", Direction: ipc.ZaloIn, Author: "khách",
+				Body: lateBody, ZaloMsgID: "msg-late", CreatedAt: time.Now(),
+				Attachments: []ipc.ZaloAttachment{{
+					Kind: "chat.file", Path: latePath, Title: "late private file",
+				}},
+			}); addErr != nil {
+				t.Fatalf("insert post-snapshot inbound: %v", addErr)
+			}
+			var readErr error
+			lateID, readErr = st.LatestZaloMessageID("thread")
+			if readErr != nil {
+				t.Fatalf("read post-snapshot high-water: %v", readErr)
+			}
+		},
+	}
+	deps := &zaloDeps{cfg: zc, run: run}
+	if err := appZaloTestAnswer(
+		a, deps, "thread", currentBody, appZaloReply("msg-current"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 1 {
+		t.Fatalf("first structured calls = %d; want 1", len(inputs))
+	}
+	if strings.Contains(inputs[0].Prompt, lateBody) ||
+		strings.Contains(inputs[0].Prompt, jsonForm(t, latePath)) {
+		t.Errorf("current prompt consumed post-snapshot message/file: %s", inputs[0].Prompt)
+	}
+	firstSession, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lateID <= currentHighWater {
+		t.Fatalf("test setup late id = %d; want > captured high-water %d", lateID, currentHighWater)
+	}
+	if firstSession.MessageCursor != currentHighWater {
+		t.Errorf("current completion cursor = %d; want captured high-water %d (late id %d stays queued)",
+			firstSession.MessageCursor, currentHighWater, lateID)
+	}
+	queuedHighWater, err := st.LatestZaloMessageID("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := appZaloTestAnswer(
+		a, deps, "thread", "process queued activity", ipc.ZaloOutboxDraft{}, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ = run.snapshot()
+	if len(inputs) != 2 {
+		t.Fatalf("structured calls = %d; want 2", len(inputs))
+	}
+	if !strings.Contains(inputs[1].Prompt, lateBody) ||
+		!strings.Contains(inputs[1].Prompt, jsonForm(t, latePath)) {
+		t.Errorf("next queued turn did not receive body and file together: %s", inputs[1].Prompt)
+	}
+	secondSession, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondSession.MessageCursor != queuedHighWater || secondSession.MessageCursor < lateID {
+		t.Errorf("next completion cursor = %d; want captured queued high-water %d including message %d",
+			secondSession.MessageCursor, queuedHighWater, lateID)
+	}
+}
+
+func TestAppAnswerZaloUnknownSnapshotHighWaterStaysLocalAndDoesNotAdvance(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "unknown-high-water.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.UpsertZaloThread("thread", "thread"); err != nil {
+		t.Fatal(err)
+	}
+	const pendingBody = "PENDING-WHILE-SNAPSHOT-UNREADABLE-4fd2"
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", pendingBody, "msg-pending"); err != nil {
+		t.Fatal(err)
+	}
+	zc := appZaloHookConfig(t)
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+	// Break only attachment loading. ZaloMessages now fails after reading message rows, while
+	// session state and normal message/outbox writes remain available for the conservative turn.
+	rawDB, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+	if _, err := rawDB.Exec(`DROP TABLE zalo_attachments`); err != nil {
+		t.Fatal(err)
+	}
+
+	a := appZaloAPIWithStore(config.Config{}, st)
+	localOnly := false
+	run := &appZaloHookRunner{
+		results: []appZaloRunResult{{Answer: `{"answers":["safe"]}`}},
+		afterSnapshot: func(_ int, hasAttachments bool) {
+			localOnly = hasAttachments
+		},
+	}
+	if err := appZaloTestAnswer(
+		a, &zaloDeps{cfg: zc, run: run}, "thread", "safe current question",
+		ipc.ZaloOutboxDraft{}, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !localOnly {
+		t.Error("unreadable snapshot did not force local-only attachment routing")
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 1 {
+		t.Fatalf("structured calls = %d; want 1 conservative current-question turn", len(inputs))
+	}
+	if strings.Contains(inputs[0].Prompt, pendingBody) {
+		t.Errorf("unknown-bound prompt guessed pending durable activity: %s", inputs[0].Prompt)
+	}
+	session, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.MessageCursor != 0 {
+		t.Errorf("unknown-bound completion cursor = %d; want unchanged 0", session.MessageCursor)
+	}
+}
+
+func TestAppAnswerZaloResumeKeepsBacklogAttachmentWithItsOldestPendingBody(t *testing.T) {
+	const (
+		oldestBody = "OLDEST-PENDING-BODY-63a1"
+		oldestPath = `C:\Users\Admin\.agentdc\zalo-files\OLDEST-PENDING-FILE-91de.pdf`
+	)
+	a, st, zc := appZaloHookFixture(t, "thread")
+	lastID := int64(0)
+	for i := 1; i <= 11; i++ {
+		message := ipc.ZaloMessage{
+			ThreadID: "thread", Direction: ipc.ZaloIn, Author: "khách",
+			Body: fmt.Sprintf("pending-%02d", i), ZaloMsgID: fmt.Sprintf("pending-%02d", i),
+			CreatedAt: time.Now(),
+		}
+		if i == 1 {
+			message.Body = oldestBody
+			message.Attachments = []ipc.ZaloAttachment{{
+				Kind: "chat.file", Path: oldestPath, Title: "oldest pending private file",
+			}}
+		}
+		if err := st.AddZaloMessage(message); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		lastID, err = st.LatestZaloMessageID("thread")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+	attachmentPolicy := false
+	run := &appZaloHookRunner{
+		results: []appZaloRunResult{{Answer: `{"answers":["processed"]}`}},
+		afterSnapshot: func(_ int, hasAttachments bool) {
+			attachmentPolicy = hasAttachments
+		},
+	}
+	if err := appZaloTestAnswer(
+		a, &zaloDeps{cfg: zc, run: run}, "thread", "pending-11",
+		appZaloReply("pending-11"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 1 {
+		t.Fatalf("structured calls = %d; want 1", len(inputs))
+	}
+	if !strings.Contains(inputs[0].Prompt, oldestBody) {
+		t.Fatalf("resumed prompt omitted oldest pending body: %s", inputs[0].Prompt)
+	}
+	if !strings.Contains(inputs[0].Prompt, jsonForm(t, oldestPath)) {
+		t.Errorf("resumed prompt consumed oldest body without its file path: %s", inputs[0].Prompt)
+	}
+	if !attachmentPolicy {
+		t.Error("pending delta attachment did not enable local-only router policy before execution")
+	}
+	session, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.MessageCursor != lastID {
+		t.Errorf("completion cursor = %d; want bounded pending tail %d", session.MessageCursor, lastID)
+	}
+}
+
+func TestAppAnswerZaloBacklogAttachmentPolicyRunsBeforeHTTPRouter(t *testing.T) {
+	const (
+		oldestBody = "ROUTER-OLDEST-PENDING-BODY-8b62"
+		oldestPath = `C:\Users\Admin\.agentdc\zalo-files\ROUTER-OLDEST-PENDING-FILE-c4a7.pdf`
+	)
+	a, st, zc := appZaloHookFixture(t, "thread")
+	lastID := int64(0)
+	for i := 1; i <= 11; i++ {
+		message := ipc.ZaloMessage{
+			ThreadID: "thread", Direction: ipc.ZaloIn, Author: "khách",
+			Body:      fmt.Sprintf("router-pending-%02d", i),
+			ZaloMsgID: fmt.Sprintf("router-pending-%02d", i), CreatedAt: time.Now(),
+		}
+		if i == 1 {
+			message.Body = oldestBody
+			message.Attachments = []ipc.ZaloAttachment{{
+				Kind: "chat.file", Path: oldestPath, Title: "router oldest private file",
+			}}
+		}
+		if err := st.AddZaloMessage(message); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		lastID, err = st.LatestZaloMessageID("thread")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+	httpAdapter := okAdapter(`{"answers":["http must not run"]}`)
+	claude := &fakeStructuredClaude{answer: `{"answers":["local"]}`}
+	routeFixture := newRouterFixture(newRoute(
+		entry("openai-1", "gpt-5-mini", true),
+		entry("claude-code", "haiku", true),
+	), claude).with("openai-1", "sk-one", httpAdapter)
+	route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+		return routeFixture.runner(appLLMRunnerConfig{})
+	}
+	if err := a.appAnswerZaloWithRunnerFactory(
+		&zaloDeps{cfg: zc, run: okClaude("base")},
+		"thread", "router-pending-11", appZaloReply("router-pending-11"), nil, route,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls := httpAdapter.seen(); len(calls) != 0 {
+		t.Fatalf("HTTP adapter ran before backlog attachment policy: %+v", calls)
+	}
+	inputs, legacyCalls := claude.seen()
+	if legacyCalls != 0 || len(inputs) != 1 {
+		t.Fatalf("Claude calls = structured %d legacy %d; want 1/0", len(inputs), legacyCalls)
+	}
+	if !strings.Contains(inputs[0].Prompt, oldestBody) ||
+		!strings.Contains(inputs[0].Prompt, jsonForm(t, oldestPath)) {
+		t.Errorf("local Claude did not receive oldest body and path together: %s", inputs[0].Prompt)
+	}
+	session, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.MessageCursor != lastID {
+		t.Errorf("completion cursor = %d; want bounded pending tail %d", session.MessageCursor, lastID)
+	}
+}
+
+func TestAppAnswerZaloPendingAttachmentUsesStructuredClaudeThenReleasesNormalRoute(t *testing.T) {
+	const (
+		oldestBody = "STARVATION-OLDEST-PENDING-BODY-4af2"
+		oldestPath = `C:\Users\Admin\.agentdc\zalo-files\STARVATION-OLDEST-PENDING-FILE-77c1.pdf`
+	)
+	a, st, zc := appZaloHookFixture(t, "thread")
+	lastID := appZaloSeedPendingBacklogWithOldestFile(
+		t, st, "thread", "starvation", oldestBody, oldestPath,
+	)
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+	httpAdapter := okAdapter(`{"answers":["normal http"]}`)
+	var codexPrompts []string
+	codex := fakeCLI("codex", "codex-1", `{"answers":["stateless local"]}`, &codexPrompts)
+	claude := &fakeStructuredClaude{answer: `{"answers":["structured backlog"]}`}
+	routeFixture := newRouterFixture(newRoute(
+		entry("openai-1", "gpt-5-mini", true),
+		entry("codex-1", "gpt-5.4", true),
+		entry(claudeCodeProviderID, "haiku", true),
+	), claude).with("openai-1", "sk-one", httpAdapter).
+		withCLI("codex-1", "", codex)
+	route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+		return routeFixture.runner(appLLMRunnerConfig{})
+	}
+
+	if err := a.appAnswerZaloWithRunnerFactory(
+		&zaloDeps{cfg: zc, run: okClaude("base")},
+		"thread", "starvation-pending-11", appZaloReply("starvation-pending-11"), nil, route,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls := httpAdapter.seen(); len(calls) != 0 {
+		t.Errorf("HTTP calls during structured backlog turn = %d; want 0", len(calls))
+	}
+	if len(codexPrompts) != 0 {
+		t.Errorf("stateless local CLI calls during structured backlog turn = %d; want 0", len(codexPrompts))
+	}
+	claudeInputs, legacyCalls := claude.seen()
+	if legacyCalls != 0 || len(claudeInputs) != 1 {
+		t.Errorf("Claude calls after backlog turn = structured %d legacy %d; want 1/0",
+			len(claudeInputs), legacyCalls)
+	} else if !strings.Contains(claudeInputs[0].Prompt, oldestBody) ||
+		!strings.Contains(claudeInputs[0].Prompt, jsonForm(t, oldestPath)) {
+		t.Errorf("structured Claude did not receive pending body and path together: %s",
+			claudeInputs[0].Prompt)
+	}
+	firstSession, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSession.MessageCursor != lastID {
+		t.Errorf("cursor after structured backlog turn = %d; want %d", firstSession.MessageCursor, lastID)
+	}
+
+	if err := a.appAnswerZaloWithRunnerFactory(
+		&zaloDeps{cfg: zc, run: okClaude("base")},
+		"thread", "ordinary follow-up", ipc.ZaloOutboxDraft{}, nil, route,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls := httpAdapter.seen(); len(calls) != 1 {
+		t.Errorf("HTTP calls after ordinary follow-up = %d; want 1", len(calls))
+	}
+	if len(codexPrompts) != 0 {
+		t.Errorf("stateless local CLI calls across both turns = %d; want 0", len(codexPrompts))
+	}
+	claudeInputs, legacyCalls = claude.seen()
+	if legacyCalls != 0 || len(claudeInputs) != 1 {
+		t.Errorf("Claude calls across both turns = structured %d legacy %d; want 1/0",
+			len(claudeInputs), legacyCalls)
+	}
+	secondSession, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondSession.MessageCursor != lastID {
+		t.Errorf("cursor after normal route resumed = %d; want %d", secondSession.MessageCursor, lastID)
+	}
+}
+
+func TestAppAnswerZaloPendingAttachmentFailsClosedWhenClaudeCannotRun(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		claudeEnabled bool
+		claude        zaloRunner
+	}{
+		{name: "route entry disabled", claudeEnabled: false,
+			claude: &fakeStructuredClaude{answer: `{"answers":["must not run"]}`}},
+		{name: "no account or runner unavailable", claudeEnabled: true, claude: silentZaloRunner{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const oldestPath = `C:\Users\Admin\.agentdc\zalo-files\FAIL-CLOSED-PENDING-FILE-1d9e.pdf`
+			a, st, zc := appZaloHookFixture(t, "thread")
+			appZaloSeedPendingBacklogWithOldestFile(
+				t, st, "thread", "fail-closed", "FAIL-CLOSED-PENDING-BODY-0ce4", oldestPath,
+			)
+			appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+			httpAdapter := okAdapter(`{"answers":["http must not run"]}`)
+			var codexPrompts []string
+			codex := fakeCLI("codex", "codex-1", `{"answers":["stateless must not run"]}`, &codexPrompts)
+			routeFixture := newRouterFixture(newRoute(
+				entry("openai-1", "gpt-5-mini", true),
+				entry("codex-1", "gpt-5.4", true),
+				entry(claudeCodeProviderID, "haiku", tc.claudeEnabled),
+			), tc.claude).with("openai-1", "sk-one", httpAdapter).
+				withCLI("codex-1", "", codex)
+			route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+				return routeFixture.runner(appLLMRunnerConfig{})
+			}
+
+			if err := a.appAnswerZaloWithRunnerFactory(
+				&zaloDeps{cfg: zc, run: okClaude("base")},
+				"thread", "fail-closed-pending-11", appZaloReply("fail-closed-pending-11"), nil, route,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if calls := httpAdapter.seen(); len(calls) != 0 {
+				t.Errorf("HTTP calls with unavailable Claude = %d; want 0", len(calls))
+			}
+			if len(codexPrompts) != 0 {
+				t.Errorf("stateless local calls with unavailable Claude = %d; want 0", len(codexPrompts))
+			}
+			session, err := st.ZaloCLISession("thread")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if session.MessageCursor != 0 {
+				t.Errorf("cursor with unavailable Claude = %d; want unchanged 0", session.MessageCursor)
+			}
+		})
+	}
+}
+
+func TestAppAnswerZaloBasisMismatchRejectsDeltaBodyAndDerivedFile(t *testing.T) {
+	const (
+		oldestBody = "MISMATCH-OLDEST-BODY-e832"
+		oldestPath = `C:\Users\Admin\.agentdc\zalo-files\MISMATCH-OLDEST-FILE-2bc7.pdf`
+	)
+	a, st, zc := appZaloHookFixture(t, "thread")
+	appZaloSeedPendingBacklogWithOldestFile(
+		t, st, "thread", "mismatch", oldestBody, oldestPath,
+	)
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+	run := &appZaloHookRunner{
+		results: []appZaloRunResult{{Answer: `{"answers":["basis changed"]}`}},
+		afterSnapshot: func(call int, hasAttachments bool) {
+			if call != 0 {
+				return
+			}
+			if !hasAttachments {
+				t.Error("captured pending attachment did not conservatively force local policy")
+			}
+			current, err := st.ZaloCLISession("thread")
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.ClaudeSessionID = appZaloTestRecoverySessionID
+			current.MessageCursor = 0
+			current.TurnCount = 1
+			if _, err := st.ReplaceZaloCLISession(current.Generation, current); err != nil {
+				t.Fatalf("replace captured session basis: %v", err)
+			}
+		},
+	}
+	if err := appZaloTestAnswer(
+		a, &zaloDeps{cfg: zc, run: run}, "thread", "question after basis change",
+		ipc.ZaloOutboxDraft{}, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 1 {
+		t.Fatalf("structured calls = %d; want 1", len(inputs))
+	}
+	if strings.Contains(inputs[0].Prompt, oldestBody) ||
+		strings.Contains(inputs[0].Prompt, oldestPath) ||
+		strings.Contains(inputs[0].Prompt, jsonForm(t, oldestPath)) {
+		t.Errorf("basis-mismatched delta leaked body/path into prompt: %s", inputs[0].Prompt)
+	}
+	session, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.MessageCursor != 0 {
+		t.Errorf("basis-mismatched completion cursor = %d; want unchanged 0", session.MessageCursor)
+	}
+}
+
+func TestAppAnswerZaloForcedRotationExcludesDeltaDerivedFileFromBootstrap(t *testing.T) {
+	const (
+		oldestBody = "ROTATE-OLDEST-BODY-79f4"
+		oldestPath = `C:\Users\Admin\.agentdc\zalo-files\ROTATE-OLDEST-FILE-14ac.pdf`
+	)
+	a, st, zc := appZaloHookFixture(t, "thread")
+	appZaloSeedPendingBacklogWithOldestFile(
+		t, st, "thread", "rotate", oldestBody, oldestPath,
+	)
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+
+	run := &appZaloHookRunner{
+		results: []appZaloRunResult{{Answer: `{"answers":["rotated"]}`}},
+		afterSnapshot: func(call int, hasAttachments bool) {
+			if call != 0 {
+				return
+			}
+			if !hasAttachments {
+				t.Error("captured pending attachment did not conservatively force local policy")
+			}
+			current, err := st.ZaloCLISession("thread")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.MarkZaloCLISessionForRotation(
+				"thread", current.Generation, "forced-test-rotation",
+			); err != nil {
+				t.Fatalf("mark captured session for rotation: %v", err)
+			}
+		},
+	}
+	if err := appZaloTestAnswer(
+		a, &zaloDeps{cfg: zc, run: run}, "thread", "question after rotation",
+		ipc.ZaloOutboxDraft{}, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 1 {
+		t.Fatalf("structured calls = %d; want 1", len(inputs))
+	}
+	if inputs[0].Resume {
+		t.Error("forced rotation reused captured resume session")
+	}
+	if strings.Contains(inputs[0].Prompt, oldestBody) ||
+		strings.Contains(inputs[0].Prompt, oldestPath) ||
+		strings.Contains(inputs[0].Prompt, jsonForm(t, oldestPath)) {
+		t.Errorf("fresh bootstrap leaked out-of-window delta body/path: %s", inputs[0].Prompt)
+	}
+}
+
+func TestAppAnswerZaloResumePairsSuffixAttachmentOnlyWhenItsBodyIsRendered(t *testing.T) {
+	const (
+		canaryBody = "SUFFIX-CANARY-BODY-5ea9"
+		canaryPath = `C:\Users\Admin\.agentdc\zalo-files\SUFFIX-CANARY-FILE-d731.pdf`
+		pinnedPath = `C:\Users\Admin\.agentdc\zalo-files\CURRENT-PINNED-FILE-70cb.pdf`
+	)
+	a, st, zc := appZaloHookFixture(t, "thread")
+	canaryID := int64(0)
+	currentBody := ""
+	for i := 1; i <= 50; i++ {
+		body := fmt.Sprintf("SUFFIX-ROW-%02d-", i) + strings.Repeat("x", 286)
+		message := ipc.ZaloMessage{
+			ThreadID: "thread", Direction: ipc.ZaloIn, Author: "khách", Body: body,
+			ZaloMsgID: fmt.Sprintf("suffix-%02d", i), CreatedAt: time.Now(),
+		}
+		if i == 49 {
+			message.Body = canaryBody + "-" + strings.Repeat("c", 270)
+			message.Attachments = []ipc.ZaloAttachment{{
+				Kind: "chat.file", Path: canaryPath, Title: "future suffix file",
+			}}
+		}
+		if i == 50 {
+			currentBody = body
+			message.Attachments = []ipc.ZaloAttachment{{
+				Kind: "chat.file", Path: pinnedPath, Title: "current pinned file",
+			}}
+		}
+		if err := st.AddZaloMessage(message); err != nil {
+			t.Fatal(err)
+		}
+		if i == 49 {
+			var err error
+			canaryID, err = st.LatestZaloMessageID("thread")
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+	var attachmentPolicies []bool
+	run := &appZaloHookRunner{
+		results: []appZaloRunResult{
+			{Answer: `{"answers":["first prefix"]}`},
+			{Answer: `{"answers":["suffix consumed"]}`},
+		},
+		afterSnapshot: func(_ int, hasAttachments bool) {
+			attachmentPolicies = append(attachmentPolicies, hasAttachments)
+		},
+	}
+	deps := &zaloDeps{cfg: zc, run: run}
+	if err := appZaloTestAnswer(
+		a, deps, "thread", currentBody, appZaloReply("suffix-50"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 1 {
+		t.Fatalf("first structured calls = %d; want 1", len(inputs))
+	}
+	if strings.Contains(inputs[0].Prompt, canaryBody) {
+		t.Fatalf("test setup failed: first bounded prefix already rendered canary body")
+	}
+	if strings.Contains(inputs[0].Prompt, jsonForm(t, canaryPath)) ||
+		strings.Contains(inputs[0].Prompt, canaryPath) {
+		t.Errorf("first bounded prefix exposed suffix file before its body: %s", inputs[0].Prompt)
+	}
+	if !strings.Contains(inputs[0].Prompt, currentBody) ||
+		!strings.Contains(inputs[0].Prompt, jsonForm(t, pinnedPath)) {
+		t.Errorf("first bounded prefix did not pair pinned current body and file: %s", inputs[0].Prompt)
+	}
+	if len(attachmentPolicies) != 1 || !attachmentPolicies[0] {
+		t.Fatalf("first full-page attachment policy = %v; want [true]", attachmentPolicies)
+	}
+	firstSession, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSession.MessageCursor >= canaryID {
+		t.Fatalf("first cursor = %d; want before suffix canary %d", firstSession.MessageCursor, canaryID)
+	}
+
+	if err := appZaloTestAnswer(
+		a, deps, "thread", "process queued suffix", ipc.ZaloOutboxDraft{}, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ = run.snapshot()
+	if len(inputs) != 2 {
+		t.Fatalf("structured calls = %d; want 2", len(inputs))
+	}
+	if !strings.Contains(inputs[1].Prompt, canaryBody) ||
+		!strings.Contains(inputs[1].Prompt, jsonForm(t, canaryPath)) {
+		t.Errorf("later queued turn did not pair suffix body and file: %s", inputs[1].Prompt)
+	}
+	if len(attachmentPolicies) != 2 || !attachmentPolicies[1] {
+		t.Fatalf("full-page attachment policies = %v; want [true true]", attachmentPolicies)
+	}
+	secondSession, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondSession.MessageCursor < canaryID {
+		t.Errorf("second cursor = %d; want to consume suffix canary %d", secondSession.MessageCursor, canaryID)
+	}
+}
+
 func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "zalo-sessions.db")
 	st, err := store.Open(dbPath)
@@ -203,7 +1083,7 @@ func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t 
 	}}
 	run := &appZaloCommandHookRunner{runner: appZaloSessionRunner{cfg: zc, command: command.run}}
 	deps := &zaloDeps{cfg: zc, run: run}
-	if err := a.appAnswerZalo(deps, "thread-a", threadAFirst, appZaloReply("msg-1"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "thread-a", threadAFirst, appZaloReply("msg-1"), nil); err != nil {
 		t.Fatalf("first appAnswerZalo() error = %v", err)
 	}
 	first, err := st.ZaloCLISession("thread-a")
@@ -236,14 +1116,14 @@ func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := recreated.appAnswerZalo(deps, "thread-a", threadASecond, appZaloReply("msg-2"), nil); err != nil {
+	if err := appZaloTestAnswer(recreated, deps, "thread-a", threadASecond, appZaloReply("msg-2"), nil); err != nil {
 		t.Fatalf("recreated appAnswerZalo() error = %v", err)
 	}
 
 	if err := appZaloAddMessage(st, "thread-b", ipc.ZaloIn, "khách", threadBQuestion, "thread-b-msg"); err != nil {
 		t.Fatal(err)
 	}
-	if err := recreated.appAnswerZalo(deps, "thread-b", threadBQuestion, appZaloReply("thread-b-msg"), nil); err != nil {
+	if err := appZaloTestAnswer(recreated, deps, "thread-b", threadBQuestion, appZaloReply("thread-b-msg"), nil); err != nil {
 		t.Fatalf("other-thread appAnswerZalo() error = %v", err)
 	}
 
@@ -322,7 +1202,7 @@ func TestAppZaloSessionMemoryV2SynchronizesCurrentSpeakerInOneSession(t *testing
 	for i, question := range questions {
 		msgID := fmt.Sprintf("memory-v2-msg-%d", i+1)
 		appZaloAddInboundMessage(t, st, "thread", uids[i], msgID, question)
-		if err := a.appAnswerZalo(deps, "thread", question, appZaloReply(msgID), nil); err != nil {
+		if err := appZaloTestAnswer(a, deps, "thread", question, appZaloReply(msgID), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -398,7 +1278,7 @@ func TestAppZaloMemoryV2SpeakerChangeReadFailureInvalidatesSubjectUntilRefresh(t
 	}}
 	deps := &zaloDeps{cfg: zc, run: run}
 	appZaloAddInboundMessage(t, st, "group", "u-1", "failure-turn-1", "one")
-	if err := a.appAnswerZalo(deps, "group", "one", appZaloReply("failure-turn-1"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "group", "one", appZaloReply("failure-turn-1"), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -419,7 +1299,7 @@ BEGIN SELECT RAISE(ABORT, 'injected speaker Memory read failure'); END`); err !=
 		t.Fatal(err)
 	}
 	appZaloAddInboundMessage(t, st, "group", "u-2", "failure-turn-2", "two")
-	if err := a.appAnswerZalo(deps, "group", "two", appZaloReply("failure-turn-2"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "group", "two", appZaloReply("failure-turn-2"), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -456,7 +1336,7 @@ BEGIN SELECT RAISE(ABORT, 'injected speaker Memory read failure'); END`); err !=
 	}
 
 	appZaloAddInboundMessage(t, st, "group", "u-1", "failure-turn-3", "three")
-	if err := a.appAnswerZalo(deps, "group", "three", appZaloReply("failure-turn-3"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "group", "three", appZaloReply("failure-turn-3"), nil); err != nil {
 		t.Fatal(err)
 	}
 	inputs, legacyCalls := run.snapshot()
@@ -503,7 +1383,7 @@ func TestAppZaloMemoryV2UnreadableSnapshotRecoveryInvalidatesAllCursors(t *testi
 		Answer: `{"answers":["one"]}`,
 	}}}
 	appZaloAddInboundMessage(t, st, "group", "u-1", "recovery-turn-1", "one")
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: initialRun},
 		"group", "one", appZaloReply("recovery-turn-1"), nil,
 	); err != nil {
@@ -547,7 +1427,7 @@ BEGIN SELECT RAISE(ABORT, 'injected recovery Memory read failure'); END`); err !
 		runner: appZaloSessionRunner{cfg: zc, command: command.run},
 	}
 	appZaloAddInboundMessage(t, st, "group", "u-1", "recovery-turn-2", "two")
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: recoveryRun},
 		"group", "two", appZaloReply("recovery-turn-2"), nil,
 	); err != nil {
@@ -594,7 +1474,7 @@ BEGIN SELECT RAISE(ABORT, 'injected recovery Memory read failure'); END`); err !
 		Answer: `{"answers":["three"]}`,
 	}}}
 	appZaloAddInboundMessage(t, st, "group", "u-1", "recovery-turn-3", "three")
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: restoredRun},
 		"group", "three", appZaloReply("recovery-turn-3"), nil,
 	); err != nil {
@@ -640,7 +1520,7 @@ func TestAppZaloMemoryV2BootstrapPlacesContractAfterUntrustedMemory(t *testing.T
 	appZaloCreateMemoryV2(t, st, "group", "u-1", "profile.hostile", hostile, 0)
 	appZaloAddInboundMessage(t, st, "group", "u-1", "bootstrap-current", "question")
 	run := &appZaloHookRunner{results: []appZaloRunResult{{Answer: `{"answers":["answer"]}`}}}
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: run}, "group", "question", appZaloReply("bootstrap-current"), nil,
 	); err != nil {
 		t.Fatal(err)
@@ -685,7 +1565,7 @@ func TestAppZaloMemoryV2KeepsSameUIDIsolatedAcrossGroups(t *testing.T) {
 		{threadID: "group-b", msgID: "current-b"},
 	} {
 		appZaloAddInboundMessage(t, st, turn.threadID, "same-uid", turn.msgID, "question")
-		if err := a.appAnswerZalo(
+		if err := appZaloTestAnswer(a,
 			&zaloDeps{cfg: zc, run: run}, turn.threadID, "question", appZaloReply(turn.msgID), nil,
 		); err != nil {
 			t.Fatal(err)
@@ -721,7 +1601,7 @@ func TestAppZaloMemoryV2RefreshesCommonAndSubjectRevisionsIndependently(t *testi
 	runTurn := func(msgID string) {
 		t.Helper()
 		appZaloAddInboundMessage(t, st, "group", "u-1", msgID, msgID)
-		if err := a.appAnswerZalo(deps, "group", msgID, appZaloReply(msgID), nil); err != nil {
+		if err := appZaloTestAnswer(a, deps, "group", msgID, appZaloReply(msgID), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -761,7 +1641,7 @@ func TestAppZaloMemoryV2DeleteToEmptyIsAuthoritative(t *testing.T) {
 	}}
 	deps := &zaloDeps{cfg: zc, run: run}
 	appZaloAddInboundMessage(t, st, "group", "u-1", "delete-1", "one")
-	if err := a.appAnswerZalo(deps, "group", "one", appZaloReply("delete-1"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "group", "one", appZaloReply("delete-1"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.DeleteAppThreadMemory("group", created.ID, store.AppThreadMemoryInput{
@@ -770,7 +1650,7 @@ func TestAppZaloMemoryV2DeleteToEmptyIsAuthoritative(t *testing.T) {
 		t.Fatal(err)
 	}
 	appZaloAddInboundMessage(t, st, "group", "u-1", "delete-2", "two")
-	if err := a.appAnswerZalo(deps, "group", "two", appZaloReply("delete-2"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "group", "two", appZaloReply("delete-2"), nil); err != nil {
 		t.Fatal(err)
 	}
 	inputs, _ := run.snapshot()
@@ -797,11 +1677,11 @@ func TestAppZaloMemoryV2MissingGroupUIDClearsSubjectAndSkipsPersonalOperations(t
 	}}
 	deps := &zaloDeps{cfg: zc, run: run}
 	appZaloAddInboundMessage(t, st, "group", "u-1", "known", "one")
-	if err := a.appAnswerZalo(deps, "group", "one", appZaloReply("known"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "group", "one", appZaloReply("known"), nil); err != nil {
 		t.Fatal(err)
 	}
 	appZaloAddInboundMessage(t, st, "group", "", "unknown", "two")
-	if err := a.appAnswerZalo(deps, "group", "two", appZaloReply("unknown"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "group", "two", appZaloReply("unknown"), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -852,7 +1732,7 @@ func TestAppZaloMemoryV2MutationDuringRunRemainsPendingForNextTurn(t *testing.T)
 	}
 	deps := &zaloDeps{cfg: zc, run: run}
 	appZaloAddInboundMessage(t, st, "thread", "u-1", "mutation-1", "first")
-	if err := a.appAnswerZalo(deps, "thread", "first", appZaloReply("mutation-1"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "thread", "first", appZaloReply("mutation-1"), nil); err != nil {
 		t.Fatal(err)
 	}
 	first, err := st.ZaloCLISession("thread")
@@ -869,7 +1749,7 @@ func TestAppZaloMemoryV2MutationDuringRunRemainsPendingForNextTurn(t *testing.T)
 	}
 
 	appZaloAddInboundMessage(t, st, "thread", "u-1", "mutation-2", "second")
-	if err := a.appAnswerZalo(deps, "thread", "second", appZaloReply("mutation-2"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "thread", "second", appZaloReply("mutation-2"), nil); err != nil {
 		t.Fatal(err)
 	}
 	inputs, _ := run.snapshot()
@@ -900,7 +1780,7 @@ func TestAppZaloMemoryV2OperationUsesTrustedSubjectAndOneRunnerCall(t *testing.T
 	run := &appZaloHookRunner{results: []appZaloRunResult{{
 		Answer: `{"answers":["saved"],"note":"LEGACY-NOTE-MUST-NOT-SAVE","memory_ops":[{"action":"add","memory_key":"profile.occupation","value":"là dược sĩ","category":"profile","confidence":0.95,"target_id":0}]}`,
 	}}}
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: run}, "group", "save this", appZaloReply("operation-msg"), nil,
 	); err != nil {
 		t.Fatal(err)
@@ -944,7 +1824,7 @@ func TestAppZaloMemoryV2MalformedOperationsPreserveAnswer(t *testing.T) {
 	run := &appZaloHookRunner{results: []appZaloRunResult{{
 		Answer: `{"answers":["safe answer"],"note":"legacy","memory_ops":{"action":"add"}}`,
 	}}}
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: run}, "group", "question", appZaloReply("malformed-msg"), nil,
 	); err != nil {
 		t.Fatal(err)
@@ -1014,7 +1894,7 @@ BEGIN SELECT RAISE(ABORT, 'injected Memory apply failure'); END`); err != nil {
 			a := appZaloAPIWithStore(config.Config{}, st)
 			zc := appZaloHookConfig(t)
 			run := &appZaloHookRunner{results: []appZaloRunResult{{Answer: answer}}}
-			if err := a.appAnswerZalo(
+			if err := appZaloTestAnswer(a,
 				&zaloDeps{cfg: zc, run: run}, "group", "question", appZaloReply("failure-msg"), nil,
 			); err != nil {
 				t.Fatal(err)
@@ -1047,7 +1927,7 @@ func TestAppZaloGlobalLessonRefreshesEveryThreadButMemoryRefreshStaysLocal(t *te
 		if err := appZaloAddMessage(st, threadID, ipc.ZaloIn, "khách", question, msgID); err != nil {
 			t.Fatal(err)
 		}
-		if err := a.appAnswerZalo(deps, threadID, question, appZaloReply(msgID), nil); err != nil {
+		if err := appZaloTestAnswer(a, deps, threadID, question, appZaloReply(msgID), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1106,6 +1986,7 @@ func TestAppRunZaloRotatesAtConfiguredBoundariesWithoutExtraCall(t *testing.T) {
 				Model:             zc.Model,
 				PromptFingerprint: appZaloPromptFingerprint(zc, "thread"),
 				MessageCursor:     7,
+				TurnCount:         1,
 			}
 			tc.mutate(&session, &zc)
 			if _, err := st.CreateZaloCLISession(session); err != nil {
@@ -1170,7 +2051,7 @@ func TestAppAnswerZaloCommitsMeasuredAndEstimatedContextAfterPipeline(t *testing
 				t.Fatal(err)
 			}
 			run := &appZaloHookRunner{results: []appZaloRunResult{tc.result}}
-			if err := a.appAnswerZalo(&zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err != nil {
+			if err := appZaloTestAnswer(a, &zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err != nil {
 				t.Fatal(err)
 			}
 			inputs, _ := run.snapshot()
@@ -1199,7 +2080,7 @@ func TestAppAnswerZaloRecoveryEstimatesTheSuccessfulBootstrapAttempt(t *testing.
 		RecoveryCode:      appZaloErrorResumeNotFound,
 		OutputBytes:       37,
 	}}}
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: run}, "thread", "short delta", appZaloReply("msg-1"), nil,
 	); err != nil {
 		t.Fatal(err)
@@ -1342,7 +2223,7 @@ func TestAppAnswerZaloRunnerFailureEscalatesWithoutAdvancingCursor(t *testing.T)
 		t.Fatal(err)
 	}
 	run := &appZaloHookRunner{errors: []error{appZaloNewRunError(appZaloErrorNetwork, nil)}}
-	if err := a.appAnswerZalo(&zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err != nil {
+	if err := appZaloTestAnswer(a, &zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err != nil {
 		t.Fatalf("normal escalation returned error: %v", err)
 	}
 	got, err := st.ZaloCLISession("thread")
@@ -1370,7 +2251,7 @@ func TestAppAnswerZaloSuccessfulRunnerCompletesNormalValidationEscalation(t *tes
 	run := &appZaloHookRunner{results: []appZaloRunResult{{
 		Answer: "not valid JSON", ContextTokens: 88, UsageMeasured: true,
 	}}}
-	if err := a.appAnswerZalo(&zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err != nil {
+	if err := appZaloTestAnswer(a, &zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err != nil {
 		t.Fatalf("normal validation escalation returned error: %v", err)
 	}
 	got, err := st.ZaloCLISession("thread")
@@ -1408,7 +2289,7 @@ func TestAppAnswerZaloDoesNotConsumeInboundInsertedWhileClaudeRuns(t *testing.T)
 		},
 	}
 	deps := &zaloDeps{cfg: zc, run: run}
-	if err := a.appAnswerZalo(deps, "thread", "first question", appZaloReply("msg-1"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "thread", "first question", appZaloReply("msg-1"), nil); err != nil {
 		t.Fatal(err)
 	}
 	first, err := st.ZaloCLISession("thread")
@@ -1419,7 +2300,7 @@ func TestAppAnswerZaloDoesNotConsumeInboundInsertedWhileClaudeRuns(t *testing.T)
 		t.Fatalf("cursor after interleaved inbound = %d; want pre-run high-water %d", first.MessageCursor, beforeRun)
 	}
 
-	if err := a.appAnswerZalo(deps, "thread", "follow up", ipc.ZaloOutboxDraft{}, nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "thread", "follow up", ipc.ZaloOutboxDraft{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	inputs, _ := run.snapshot()
@@ -1482,7 +2363,7 @@ func TestAppAnswerZaloResumeLeavesRowsBeyondFirstDeltaPagePending(t *testing.T) 
 		{Answer: `{"answers":["second"]}`},
 	}}
 	deps := &zaloDeps{cfg: zc, run: run}
-	if err := a.appAnswerZalo(deps, "thread", "message-105", appZaloReply("message-105"), nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "thread", "message-105", appZaloReply("message-105"), nil); err != nil {
 		t.Fatal(err)
 	}
 	first, err := st.ZaloCLISession("thread")
@@ -1493,7 +2374,7 @@ func TestAppAnswerZaloResumeLeavesRowsBeyondFirstDeltaPagePending(t *testing.T) 
 		t.Fatalf("first resume cursor = %d; want fetched page tail %d",
 			first.MessageCursor, page[len(page)-1].ID)
 	}
-	if err := a.appAnswerZalo(deps, "thread", "follow up", ipc.ZaloOutboxDraft{}, nil); err != nil {
+	if err := appZaloTestAnswer(a, deps, "thread", "follow up", ipc.ZaloOutboxDraft{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	inputs, _ := run.snapshot()
@@ -1536,7 +2417,7 @@ func TestAppAnswerZaloResumeDoesNotAdvanceCursorPastTruncatedDeltaRows(t *testin
 		{Answer: `{"answers":["answer"]}`},
 		{Answer: `{"answers":["follow-up answer"]}`},
 	}}
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: run}, "thread", currentQuestion,
 		appZaloReply("backlog-099"), nil,
 	); err != nil {
@@ -1587,7 +2468,7 @@ func TestAppAnswerZaloResumeDoesNotAdvanceCursorPastTruncatedDeltaRows(t *testin
 	if pending < 0 {
 		t.Fatal("bounded prompt left no pending durable row")
 	}
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: run}, "thread", "follow up", ipc.ZaloOutboxDraft{}, nil,
 	); err != nil {
 		t.Fatal(err)
@@ -1620,7 +2501,7 @@ func TestAppAnswerZaloStoreFailureDoesNotAdvancePendingCompletion(t *testing.T) 
 			}
 		},
 	}
-	if err := a.appAnswerZalo(&zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err == nil {
+	if err := appZaloTestAnswer(a, &zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err == nil {
 		t.Fatal("appAnswerZalo() error = nil after store was closed")
 	}
 
@@ -1671,7 +2552,7 @@ END`); err != nil {
 	run := &appZaloHookRunner{results: []appZaloRunResult{{
 		Answer: `{"answers":["answer"]}`, ContextTokens: 77, UsageMeasured: true,
 	}}}
-	if err := a.appAnswerZalo(
+	if err := appZaloTestAnswer(a,
 		&zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil,
 	); err != nil {
 		t.Fatalf("appAnswerZalo() = %v; answer pipeline should remain successful", err)
@@ -1684,7 +2565,7 @@ END`); err != nil {
 	if !got.RotateBeforeNext || got.LastError != appZaloErrorStateUpdate {
 		t.Fatalf("completion failure session = %+v; want safe rotation marker", got)
 	}
-	if got.TurnCount != 0 || got.MessageCursor != 0 || got.ContextTokens != 0 {
+	if got.TurnCount != 1 || got.MessageCursor != 0 || got.ContextTokens != 0 {
 		t.Fatalf("completion failure advanced session = %+v", got)
 	}
 }
@@ -1702,9 +2583,9 @@ func TestAppAnswerZaloGateSerializesSameStoreAndThreadAcrossAPIs(t *testing.T) {
 	}
 	deps := &zaloDeps{cfg: zc, run: run}
 	errs := make(chan error, 2)
-	go func() { errs <- a.appAnswerZalo(deps, "thread", "first", ipc.ZaloOutboxDraft{}, nil) }()
+	go func() { errs <- appZaloTestAnswer(a, deps, "thread", "first", ipc.ZaloOutboxDraft{}, nil) }()
 	appZaloAwaitHookEntry(t, run.entered)
-	go func() { errs <- otherAPI.appAnswerZalo(deps, "thread", "second", ipc.ZaloOutboxDraft{}, nil) }()
+	go func() { errs <- appZaloTestAnswer(otherAPI, deps, "thread", "second", ipc.ZaloOutboxDraft{}, nil) }()
 	waitForAppZaloThreadGateRefs(t, &appZaloProcessThreadGate, appZaloHookGateKey(st, "thread"), 2)
 	select {
 	case <-run.entered:
@@ -1737,8 +2618,8 @@ func TestAppAnswerZaloGateAllowsDifferentThreadsConcurrently(t *testing.T) {
 	}
 	deps := &zaloDeps{cfg: zc, run: run}
 	errs := make(chan error, 2)
-	go func() { errs <- a.appAnswerZalo(deps, "thread-a", "a", ipc.ZaloOutboxDraft{}, nil) }()
-	go func() { errs <- a.appAnswerZalo(deps, "thread-b", "b", ipc.ZaloOutboxDraft{}, nil) }()
+	go func() { errs <- appZaloTestAnswer(a, deps, "thread-a", "a", ipc.ZaloOutboxDraft{}, nil) }()
+	go func() { errs <- appZaloTestAnswer(a, deps, "thread-b", "b", ipc.ZaloOutboxDraft{}, nil) }()
 	appZaloAwaitHookEntry(t, run.entered)
 	appZaloAwaitHookEntry(t, run.entered)
 	run.release <- struct{}{}
@@ -1761,7 +2642,7 @@ func TestAppAnswerZaloStartsTurnTimeoutAfterGateAcquisition(t *testing.T) {
 	firstConfig.Timeout = time.Second
 	firstErr := make(chan error, 1)
 	go func() {
-		firstErr <- a.appAnswerZalo(
+		firstErr <- appZaloTestAnswer(a,
 			&zaloDeps{cfg: firstConfig, run: first}, "thread", "first", ipc.ZaloOutboxDraft{}, nil,
 		)
 	}()
@@ -1772,7 +2653,7 @@ func TestAppAnswerZaloStartsTurnTimeoutAfterGateAcquisition(t *testing.T) {
 	second := &appZaloDeadlineHookRunner{observed: make(chan appZaloDeadlineObservation, 1)}
 	secondErr := make(chan error, 1)
 	go func() {
-		secondErr <- otherAPI.appAnswerZalo(
+		secondErr <- appZaloTestAnswer(otherAPI,
 			&zaloDeps{cfg: secondConfig, run: second}, "thread", "second", ipc.ZaloOutboxDraft{}, nil,
 		)
 	}()
@@ -1908,7 +2789,7 @@ func TestAppAnswerZaloCompletionCASConflictDoesNotAdvanceAnotherGeneration(t *te
 			}
 		},
 	}
-	if err := a.appAnswerZalo(&zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err != nil {
+	if err := appZaloTestAnswer(a, &zaloDeps{cfg: zc, run: run}, "thread", "question", appZaloReply("msg-1"), nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.ZaloCLISession("thread")
@@ -1962,6 +2843,37 @@ func appZaloAddMessage(st *store.Store, threadID, direction, author, body, msgID
 		ThreadID: threadID, Direction: direction, Author: author, Body: body,
 		ZaloMsgID: msgID, CreatedAt: time.Now(),
 	})
+}
+
+func appZaloSeedPendingBacklogWithOldestFile(
+	t *testing.T,
+	st *store.Store,
+	threadID, prefix, oldestBody, oldestPath string,
+) int64 {
+	t.Helper()
+	lastID := int64(0)
+	for i := 1; i <= 11; i++ {
+		message := ipc.ZaloMessage{
+			ThreadID: threadID, Direction: ipc.ZaloIn, Author: "khách",
+			Body:      fmt.Sprintf("%s-pending-%02d", prefix, i),
+			ZaloMsgID: fmt.Sprintf("%s-pending-%02d", prefix, i), CreatedAt: time.Now(),
+		}
+		if i == 1 {
+			message.Body = oldestBody
+			message.Attachments = []ipc.ZaloAttachment{{
+				Kind: "chat.file", Path: oldestPath, Title: prefix + " oldest private file",
+			}}
+		}
+		if err := st.AddZaloMessage(message); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		lastID, err = st.LatestZaloMessageID(threadID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return lastID
 }
 
 func appZaloAddInboundMessage(
@@ -2038,7 +2950,7 @@ func appZaloCreateHookSession(
 	t.Helper()
 	session, err := st.CreateZaloCLISession(store.ZaloCLISession{
 		ThreadID: threadID, ClaudeSessionID: sessionID, Model: zc.Model,
-		PromptFingerprint: appZaloPromptFingerprint(zc, threadID),
+		PromptFingerprint: appZaloPromptFingerprint(zc, threadID), TurnCount: 1,
 	})
 	if err != nil {
 		t.Fatal(err)

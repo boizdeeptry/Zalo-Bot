@@ -57,9 +57,18 @@ if exist "%ROOT%\data\model.txt" set /p AGENTDC_ZALO_MODEL=<"%ROOT%\data\model.t
 set "AGENTDC_ZALO_WORKDIR=%ROOT%\data\zalo-work"
 set "AGENTDC_ZALO_TRANSPORT=%~dp0transport"
 
-rem node.exe di kem, khong can cai Node. Chen len dau PATH nen no thang ban node
-rem cua may neu may do cai san mot ban khac.
+rem node.exe + npm di kem, khong can cai Node. Chen len dau PATH nen no thang ban
+rem node cua may neu may do cai san mot ban khac.
 set "PATH=%~dp0node;%PATH%"
+
+rem npm cai codex vao dau, va tim lai o dau. HAI dong nay giu ca hai o TRONG goi:
+rem   prefix -> `npm install -g` (buoc "Ket noi" codex trong Portal) cai vao
+rem     data\cli, va `npm root -g` cung tra dung do nen daemon tim thay codex.js.
+rem     data\ ghi duoc (daemon da ghi SQLite vao do); app\node co the chi-doc.
+rem   cache  -> npm khong ghi ra %LocalAppData%\npm-cache ngoai goi. Giu dung loi
+rem     hua "khong dat gi ngoai thu muc nay" -- copy ca goi sang USB van chay.
+set "npm_config_prefix=%ROOT%\data\cli"
+set "npm_config_cache=%ROOT%\data\npm-cache"
 
 rem Mo trinh duyet sau 4 giay. Dong duoi cung CHAN cho toi khi daemon dung, nen
 rem viec mo trinh duyet phai di truoc va o mot tien trinh khac.

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import { createPortalController, loadRoutePage } from "../overlay/internal/webui/static/app-main.js";
 import { ROUTES, createRouteHost } from "../overlay/internal/webui/static/core/router.js";
@@ -69,46 +70,46 @@ function controllerHarness({ loadPage, routeHost } = {}) {
 
 test("a stale route resolving after a newer route never mounts or focuses", async () => {
   const agents = deferred();
-  const models = deferred();
+  const combos = deferred();
   const harness = controllerHarness({
-    loadPage: (route) => ({ agents, models })[route.id].promise,
+    loadPage: (route) => ({ agents, combos })[route.id].promise,
   });
 
   const first = harness.controller.navigate();
-  harness.setHash("#models");
+  harness.setHash("#combos");
   const second = harness.controller.navigate();
-  const modelsPage = page("models");
-  models.resolve(modelsPage);
+  const combosPage = page("combos");
+  combos.resolve(combosPage);
   await second;
   agents.resolve(page("agents"));
   await first;
 
-  assert.deepEqual(harness.mounts, [{ page: modelsPage, routeId: "models" }]);
+  assert.deepEqual(harness.mounts, [{ page: combosPage, routeId: "combos" }]);
   assert.equal(harness.focusCalls.length, 1);
-  assert.deepEqual(harness.navigation, ["agents", "models"]);
+  assert.deepEqual(harness.navigation, ["agents", "combos"]);
   assert.deepEqual(harness.titles, [
     "AI Agents · Trợ lý Zalo",
-    "Models · Trợ lý Zalo",
+    "Combos · Trợ lý Zalo",
   ]);
 });
 
 test("a stale route rejection cannot replace the newer mounted page", async () => {
   const agents = deferred();
-  const models = deferred();
+  const combos = deferred();
   const harness = controllerHarness({
-    loadPage: (route) => ({ agents, models })[route.id].promise,
+    loadPage: (route) => ({ agents, combos })[route.id].promise,
   });
 
   const first = harness.controller.navigate();
-  harness.setHash("#models");
+  harness.setHash("#combos");
   const second = harness.controller.navigate();
-  const modelsPage = page("models");
-  models.resolve(modelsPage);
+  const combosPage = page("combos");
+  combos.resolve(combosPage);
   await second;
   agents.reject(new Error("stale load failed"));
   await first;
 
-  assert.deepEqual(harness.mounts, [{ page: modelsPage, routeId: "models" }]);
+  assert.deepEqual(harness.mounts, [{ page: combosPage, routeId: "combos" }]);
   assert.equal(harness.errors.length, 0);
   assert.equal(harness.reports.length, 0);
 });
@@ -116,7 +117,7 @@ test("a stale route rejection cannot replace the newer mounted page", async () =
 test("cleanup failure cannot hide the current route error or run cleanup twice", async () => {
   let hash = "#agents";
   let cleanupCalls = 0;
-  const routeError = new Error("models failed to load");
+  const routeError = new Error("combos failed to load");
   const rendered = [];
   const reports = [];
   const content = {
@@ -129,7 +130,7 @@ test("cleanup failure cannot hide the current route error or run cleanup twice",
     content,
     getHash: () => hash,
     loadPage: async (route) => {
-      if (route.id === "models") throw routeError;
+      if (route.id === "combos") throw routeError;
       return {
         mount() {
           return {
@@ -150,7 +151,7 @@ test("cleanup failure cannot hide the current route error or run cleanup twice",
   });
 
   await controller.navigate();
-  hash = "#models";
+  hash = "#combos";
   await controller.navigate();
 
   assert.equal(cleanupCalls, 1);
@@ -159,21 +160,47 @@ test("cleanup failure cannot hide the current route error or run cleanup twice",
   assert.match(reports[1][1].message, /agent cleanup failed/);
 });
 
+test("the providers hash lazy-loads the real Providers module", async () => {
+  const mounts = [];
+  const reports = [];
+  const controller = createPortalController({
+    nav: {},
+    content: { replaceChildren() {} },
+    getHash: () => "#providers",
+    routeHost: {
+      mount: (page, context) => mounts.push({ page, routeId: context.routeId }),
+      dispose() {},
+    },
+    renderNavigation() {},
+    renderError: (error) => error,
+    setTitle() {},
+    focusContent() {},
+    reportError: (...args) => reports.push(args),
+  });
+
+  await controller.navigate();
+
+  assert.deepEqual(reports, []);
+  assert.equal(mounts.length, 1);
+  assert.equal(mounts[0].routeId, "providers");
+  assert.equal(typeof mounts[0].page.mount, "function");
+});
+
 test("dispose invalidates pending navigation and disposes the host once", async () => {
-  const models = deferred();
+  const combos = deferred();
   const agentsPage = page("agents");
   const harness = controllerHarness({
     loadPage: (route) => route.id === "agents"
       ? Promise.resolve(agentsPage)
-      : models.promise,
+      : combos.promise,
   });
 
   await harness.controller.navigate();
-  harness.setHash("#models");
+  harness.setHash("#combos");
   const pending = harness.controller.navigate();
   harness.controller.dispose();
   harness.controller.dispose();
-  models.resolve(page("models"));
+  combos.resolve(page("combos"));
   await pending;
 
   assert.deepEqual(harness.mounts, [{ page: agentsPage, routeId: "agents" }]);
@@ -184,4 +211,15 @@ test("dispose invalidates pending navigation and disposes the host once", async 
 test("Memory route lazy-loads the real page module", async () => {
   const page = await loadRoutePage(ROUTES.memory);
   assert.equal(typeof page.mount, "function");
+});
+
+test("keyboard-focused selects retain the shared two-pixel focus indicator", async () => {
+  const css = await readFile(new URL(
+    "../overlay/internal/webui/static/portal.css",
+    import.meta.url,
+  ), "utf8");
+  const selectFocus = css.match(/\.portal-body select:focus-visible\s*\{([^}]*)\}/s)?.[1] ?? "";
+
+  assert.doesNotMatch(selectFocus, /outline\s*:\s*none\b/i);
+  assert.match(css, /\.portal-body :focus-visible\s*\{[^}]*outline\s*:\s*2px\s+solid\s+var\(--live\)/s);
 });

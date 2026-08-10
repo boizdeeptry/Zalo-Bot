@@ -1,34 +1,43 @@
 # Portal Zalo — biên bản xác minh Milestone 1
 
 - Ngày xác minh: 2026-08-05
-- Nguồn AgentDC chỉ đọc: `C:\Users\manva\OneDrive\Máy tính\agentdc`
 - Commit nguồn AgentDC: `84612cc9f0c2491dbd10346269a41378e7633c9b`
 - Nhánh overlay: `feature/portal-m1-foundation`
-- Gói đã xác minh: `C:\Users\manva\AppData\Local\Temp\Kiểm thử Portal M1 final a013`
+
+Biên bản này ghi lại một lần chạy trên máy của người xác minh. Đường dẫn cụ thể của máy đó đã
+được bỏ vì chúng không tái lập được ở nơi khác; xem `README.md` để chuẩn bị máy của bạn.
 
 ## Lệnh checkpoint
 
-Chạy từ repository `_build`/worktree của nhánh overlay:
+Chạy từ gốc repo đóng gói, trên nhánh overlay:
 
 ```powershell
+if ([string]::IsNullOrWhiteSpace($env:ZALOBOT_REPO)) {
+  throw 'Đặt ZALOBOT_REPO tới một checkout AgentDC sạch trước khi chạy checkpoint.'
+}
 pwsh -NoProfile -File .\tests\build-app.Tests.ps1
 
 pwsh -NoProfile -File .\build-app.ps1 `
-  -Repo 'C:\Users\manva\OneDrive\Máy tính\agentdc' `
-  -PersonaSource 'D:\TuvanZalo\brain\reference\persona' `
-  -Out 'C:\Users\manva\AppData\Local\Temp\Kiểm thử Portal M1 final a013'
+  -Repo $env:ZALOBOT_REPO `
+  -PersonaSource $env:ZALOBOT_PERSONA `
+  -Out (Join-Path $env:TEMP 'Kiem thu Portal M1')
 ```
 
-`tests\build-app.Tests.ps1` là hợp đồng checkpoint trực tiếp: script chạy đúng 10 cổng top-level theo kiểu fail-fast, in một dòng `PASS:` cho mỗi cổng và trả exit khác 0 ngay khi có lỗi. Không dùng số lượng test do Pester enumerate làm tiêu chí chấp nhận.
+`tests\build-app.Tests.ps1` là hợp đồng checkpoint trực tiếp: script hiện chạy đúng 11 cổng top-level theo kiểu fail-fast, in một dòng `PASS:` cho mỗi cổng và trả exit khác 0 ngay khi có lỗi. Script nhận `-UpstreamRepo` hoặc `ZALOBOT_REPO`, kiểm tra đó là Git checkout tồn tại và không chứa đường dẫn máy cụ thể. Không dùng số lượng test do Pester enumerate làm tiêu chí chấp nhận.
 
-Lệnh build thứ hai tự chạy checkpoint trước khi tạo binary: bộ Go test với đúng bảy assertion asset cũ được bỏ qua, Portal test, Zalo compile/test/typecheck, build, cắt dependency phát triển và kiểm tra gói cuối.
+Checkout upstream phải sạch cả ngay trước staging lẫn sau acceptance. Repo/output được so bằng physical
+volume identity lấy từ Win32 handle, không chỉ chuỗi path; alias `\\?\`, 8.3, SUBST/reparse hoặc lỗi
+canonicalization đều không được dùng để vượt protected-root gate. `Clear-AppOutput` lặp lại phép kiểm
+physical identity và quét toàn cây reparse ngay trước lần xóa đầu tiên.
+
+Lệnh build thứ hai tự chạy checkpoint trước khi tạo binary: bộ Go test hiện bỏ qua **đúng tám** assertion đã duyệt, sau đó chạy Portal test, Zalo compile/test/typecheck, build, cắt dependency phát triển và kiểm tra gói cuối. Bảng M1 ngay dưới là biên bản lịch sử ngày 2026-08-05, khi danh sách skip lúc đó còn đúng bảy tên; không dùng con số lịch sử đó làm contract hiện tại.
 
 ## Kết quả tự động
 
 | Cổng xác minh | Kết quả |
 |---|---|
-| PowerShell build fixtures | PASS — path có dấu/khoảng trắng, upstream sạch, đúng bảy test được skip, output an toàn, persona, package và overlay seams |
-| Go `test -skip <7 assertion cũ> ./...` | PASS — toàn bộ package có test |
+| PowerShell build fixtures (lịch sử 2026-08-05) | PASS — path có dấu/khoảng trắng, upstream sạch, đúng bảy test lúc đó được skip, output an toàn, persona, package và overlay seams |
+| Go `test -skip <7 assertion cũ> ./...` (lịch sử) | PASS — toàn bộ package có test |
 | Portal `npm test` | PASS — 18/18 |
 | Zalo TypeScript compile | PASS |
 | Zalo transport `npm test` | PASS — 3/3 |
@@ -36,6 +45,96 @@ Lệnh build thứ hai tự chạy checkpoint trước khi tạo binary: bộ Go
 | Package structure | PASS — 1.208 tệp, 93,2 MB; đủ binary, transport, Node, launcher, README và brain |
 | Credential/identity gates | PASS — không có `credentials.json`, không còn chuỗi danh tính khách hàng |
 | Upstream cleanliness | PASS — `git status --short` rỗng trước và sau build |
+
+## Candidate tích hợp Provider + Memory/session — hợp đồng xác minh
+
+Phần này là checklist cho candidate schema V5 đang tích hợp; nó **không** ghi nhận một deployment,
+smoke Zalo thật hoặc kiểm tra thủ công đã hoàn tất. Các biên bản rollout schema 3→4 bên dưới vẫn là
+lịch sử của binary trước và không được dùng để authorize candidate V5.
+
+### Cổng tự động bắt buộc
+
+Chạy trên candidate đã resolve sạch conflict, trước commit/đóng gói:
+
+```powershell
+# Runner checkpoint thật của repo; phải exit 0 và in đủ các PASS fail-fast.
+if ([string]::IsNullOrWhiteSpace($env:ZALOBOT_REPO)) {
+  throw 'Đặt ZALOBOT_REPO tới một checkout AgentDC sạch.'
+}
+pwsh -NoProfile -File .\tests\build-app.Tests.ps1
+
+# Nếu máy có Pester, chạy cùng contract qua Pester và yêu cầu FailedCount = 0.
+$result = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru
+if ($result.FailedCount) { exit 1 }
+
+# Trên disposable stage đã tạo bởi New-AppStage + Apply-AppSeams từ upstream đã pin:
+go test -count=1 -run 'TestAppRoutes|TestMigrateApp|TestAppLLM|TestAppZaloSession' ./internal/daemon ./internal/store
+go test -count=1 -skip '^(?:TestAppJSKnowsTheSessionEndedCloseReason|TestAppJSSendsThePortalMutationHeader|TestPortalReloadedKeyWithLiveSessionReachesTheShell|TestPortalRootServesTheShellWithACookie|TestPortalUsesModalNotBrowserDialogs|TestAgentPortalNoLongerCarriesZalo|TestModalCallsPassAnObject|TestJoinGreetsOnceForEveryone)$' ./...
+```
+
+Skip regex phải khớp **đúng tám tên** trên, có neo đầu/cuối; không wildcard và không được tự động
+nuốt test tương lai có tiền tố/hậu tố gần giống.
+
+### Schema V5: canary cho cả hai lineage V4
+
+Không chạy canary này trên live DB. Tạo hai bản sao SQLite tạm độc lập, giữ nguyên source:
+
+1. **Feature V4 → V5:** fixture có session/Memory V2 (`app_zalo_cli_sessions`,
+   `app_memory_revisions`, `app_memory_subject_revisions`, proposal/lesson provenance). Sau migration,
+   toàn bộ Memory/session row và revision phải giữ nguyên; Provider/model/account/Combo/route capability
+   phải xuất hiện và không có Combo mặc định.
+2. **Main V4 → V5:** fixture có Provider/model/account/Combo/member/route/attempt cùng credential cipher
+   giả. Sau migration, toàn bộ routing/account/Combo row phải giữ nguyên; session/Memory V2 capability
+   phải xuất hiện. Không log hoặc đưa cipher/canary vào evidence.
+3. Cả hai bản sao phải đạt `PRAGMA quick_check=ok`, `app_meta.schema_version=5`; migration V5 lần hai
+   không đổi dữ liệu. Fixture schema tương lai `>5` phải không bị mutation; lỗi muộn phải rollback toàn
+   transaction và giữ version V4.
+
+Các test chuẩn tương ứng gồm `TestMigrateAppFeatureV4ToV5PreservesMemoryAndAddsLLM`,
+`TestMigrateAppMainV4ToV5PreservesRoutingAndAddsMemory`, `TestMigrateAppV5IsIdempotent`,
+`TestMigrateAppMainV4RollsBackOnLateLLMFailure` và `TestMigrateAppSeedsNoDefaultCombo`.
+
+### Provider, no-provider và ranh giới session
+
+- Package binary phải mang đồng thời Memory V2, `/llm/providers`, `/llm/combos`, `llm_providers`,
+  `llm_combos`, `app_zalo_cli_sessions`, `llm_accounts`, `@openai/codex`,
+  `@anthropic-ai/claude-code`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR` và marker no-provider; thiếu một
+  signature phải fail-closed. Runtime đóng gói phải có `app\node\npm.cmd` cùng
+  `app\node\node_modules\npm\bin\npm-cli.js`; checkpoint chạy `node npm-cli.js --version` với timeout,
+  bằng chính `app\node\node.exe` và `npm-cli.js` bên trong candidate — không dùng host Node và không
+  tải mạng. Checkpoint cũng chạy chính packaged `npm.cmd --version` qua bounded `cmd.exe /d /s /c`,
+  yêu cầu shim production-shaped delegate về adjacent packaged node/npm-cli và trả cùng semver.
+  Connect/cài package mới vẫn cần npm registry online. Public Provider credential scanner
+  chỉ nhận package root rồi tự enumerate toàn bộ cây an toàn; caller không thể truyền subset file.
+  Package phải từ
+  chối Zalo credential, mọi canary `APP_TEST_` và Provider canary ở text/config/hidden file/binary;
+  lỗi scan/read không được biến thành PASS và thông báo không được lộ secret.
+- Máy mới không có Combo mặc định. Không Provider hoặc không active route trả `ErrZaloSilent` ở cổng
+  vào và không gọi Claude mặc định; một Claude entry đã cấu hình nhưng terminal không chạy được phải
+  leo thang, không bị hiểu nhầm thành trạng thái chưa cấu hình.
+- Một lượt API/Codex/Gemini stateless nhận **full bootstrap prompt**, trả
+  `SessionAdvanced=false`, không tăng turn/cursor/session Claude. Nếu API lỗi đủ điều kiện fallback,
+  Claude nhận đúng delta/session ID và chỉ một lần chạy thành công mới trả `SessionAdvanced=true` rồi
+  advance session đúng một lần. Virgin session sau stateless success vẫn fresh (`Resume=false`) cho
+  lần Claude đầu tiên.
+- `appAnswerZalo` là một entrypoint duy nhất; Provider route factory được compose đúng một lần **sau**
+  khi đã acquire per-thread gate. Đây là invariant thực, dù source dùng method value
+  `a.appZaloRunner` thay vì một direct call. Gate dùng Go AST parse toàn bộ package production
+  `internal/daemon` (chủ đích loại `_test.go`), bỏ qua comment và từ chối selector/call ở file hoặc
+  function khác, duplicate hoặc route đứng trước `Acquire`. Trước seam, toàn production tree phải có
+  **zero** selector reference và zero direct call `a.appAnswerZalo(...)`; phép replace được guard chính
+  xác mới chèn reference duy nhất dưới dạng direct call, và post-stage acceptance yêu cầu cả hai count
+  bằng một. Vì vậy parenthesized invocation hay capture method value cũng bị từ chối.
+  Attachment-local-only, recovery, rotation và speaker
+  isolation phải tiếp tục xanh.
+
+Các kiểm tra trọng tâm gồm
+`TestAppLLMRunnerStructuredAPISuccessUsesFullPromptWithoutAdvancingSession`,
+`TestAppLLMRunnerStructuredFallbackUsesClaudeDeltaAndAdvancesSession`,
+`TestAppZaloVirginSessionStaysFreshAfterStatelessSuccess`,
+`TestAppAnswerZaloBuildsProviderRunnerInsideThreadGate`, `TestAppZaloRunnerSilentWhenNoProvider` và
+`TestRunClaudeEscalatesWhenTerminalDeclines`. Chỉ ghi PASS/live/manual sau khi chính lệnh hoặc thao tác
+đã được thực hiện và evidence không chứa prompt, response, credential hay dữ liệu khách hàng.
 
 ## Package HTTP smoke
 
@@ -188,7 +287,7 @@ visual và các lượt nhắn Zalo phải được người vận hành kiểm 
 |---|---|
 | `npm test --prefix appmode` | PASS — 89/89, fail 0 |
 | `run-overlay-go-tests.ps1 -Package all` | PASS — toàn bộ package Go; daemon/store gồm contract speaker-scope, one-runner-call, refresh cursor và no-refresh khi revision không đổi |
-| `tests/build-app.Tests.ps1` | PASS — đúng 10/10 checkpoint top-level |
+| `tests/build-app.Tests.ps1` | PASS — đúng 11/11 checkpoint top-level |
 | Parse PowerShell runbook | PASS — block hợp lệ; không còn `File.Replace(..., $null)`; cả forward replace và rollback dùng non-empty same-directory backup path |
 | `git diff --check` | PASS |
 
@@ -353,8 +452,9 @@ Post-deploy độc lập xác nhận live PID 6068, executable path đúng
 CSS/JS thực tế của shell/core/pages đều HTTP 200; bốn recovery path không còn collision.
 
 Các cổng chạy lại sau deploy đều PASS: focused staged Go 4/4 (session seam và ba operator-lesson
-contract), full staged Go theo vetted gate với đúng bảy legacy asset assertion bị supersede, Portal Node
-89/89, deployment 5/5 và package 10/10. Không gửi tin/reaction/file Zalo thật và không dùng dữ liệu
+contract), full staged Go theo vetted gate lịch sử với đúng bảy legacy asset assertion bị supersede, Portal Node
+89/89, deployment 5/5 và package 10/10 ở lần chạy lịch sử đó. Contract hiện tại dùng đúng tám skip.
+Không gửi tin/reaction/file Zalo thật và không dùng dữ liệu
 khách hàng trong canary. Quan sát visual local cùng lượt Zalo thử nghiệm vẫn là phần chờ người vận hành,
 không được đánh dấu PASS trong biên bản này.
 

@@ -7,6 +7,21 @@
 .portal-body input,
 .portal-body textarea,
 .portal-body select { font:inherit; }
+
+/* Select polish: bỏ mũi tên native (sát phải, thô), thay bằng chevron SVG canh lề phải rộng rãi + bo
+   góc mềm. CHỈ áp cho <select> — TÁCH khỏi reset font phía trên; gộp chung sẽ dính cả button/input/
+   checkbox/radio (biến nút thành hộp chevron, làm mất dấu tích/chấm của toggle & radio). */
+.portal-body select {
+  appearance:none; -webkit-appearance:none; -moz-appearance:none;
+  box-sizing:border-box; cursor:pointer; color:var(--ink);
+  border:1px solid var(--line); border-radius:9px; padding:7px 32px 7px 11px;
+  background-color:var(--sunk);
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%239a9aa2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M2.75 4.75 6 8 9.25 4.75'/%3E%3C/svg%3E");
+  background-repeat:no-repeat; background-position:right 11px center; background-size:12px;
+  transition:border-color .15s;
+}
+.portal-body select:hover { border-color:#3a3a42; }
+.portal-body select:focus-visible { border-color:var(--live); }
 .portal-body :focus-visible { outline:2px solid var(--live); outline-offset:2px; }
 
 .portal-body .skip-link {
@@ -29,6 +44,9 @@
 .nav.todo { color:var(--dim); }
 .nav.todo::after { content:'chưa có'; font-size:9.5px; margin-left:auto; color:var(--dim); opacity:.7; }
 #main { flex:1; padding:22px 26px; overflow-y:auto; min-width:0; }
+/* #main chạm mép phải và cao hết viewport, nên outline vẽ ra ngoài chỉ còn thấy
+   cạnh trái -- một sọc xanh không ai đoán được là gì. Vẽ vào trong để ra khung. */
+#main:focus-visible { outline-offset:-2px; }
 .pagehead h1 { font-size:17px; margin:0 0 3px; }
 .sub { color:var(--dim); font-size:12.5px; margin:0 0 20px; }
 .hint { border-left:3px solid var(--line); padding:3px 0 3px 12px; margin:16px 0; font-size:12.5px; color:var(--dim); }
@@ -94,6 +112,202 @@
 [data-agents-overlay] .qr { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-top:10px; }
 [data-agents-overlay] .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0, 0, 0, 0); white-space:nowrap; border:0; }
 
+/* combo model picker — modal đắp lên document.body (kiểu overlay Agents): bấm model để thêm/bỏ, tự
+   lưu. KHÔNG nằm trong vùng combos:begin/end vì modal render NGOÀI .combos-page, trên body. */
+[data-combos-overlay].sheetback { position:fixed; z-index:40; inset:0; display:flex; align-items:center; justify-content:center; padding:22px; background:rgba(9, 12, 16, .58); }
+[data-combos-overlay] .sheet { box-sizing:border-box; width:min(520px, 100%); max-height:calc(100vh - 44px); overflow:auto; border:1px solid var(--line); border-radius:10px; padding:16px; background:var(--panel); box-shadow:0 16px 55px rgba(0, 0, 0, .35); }
+[data-combos-overlay] .sheethead { display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:6px; }
+[data-combos-overlay] .sheethead .st { font-size:15px; font-weight:600; }
+[data-combos-overlay] .pick-hint { font-size:11.5px; color:var(--dim); margin:0 0 12px; }
+[data-combos-overlay] .pick-note { font-size:11.5px; color:var(--dim); margin:0 0 12px; padding:8px 11px; border:1px dashed var(--line); border-radius:9px; }
+[data-combos-overlay] .pick-search { box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:9px; padding:8px 12px; margin:0 0 12px; color:var(--ink); background:var(--sunk); font-size:13px; }
+[data-combos-overlay] .pick-group { margin:0 0 16px; }
+[data-combos-overlay] .pick-group-head { font-size:11.5px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:0 0 7px; }
+[data-combos-overlay] .pick-model { display:flex; align-items:center; gap:10px; width:100%; text-align:left; border:1px solid #26262b; border-radius:9px; padding:9px 11px; margin:0 0 6px; background:#161618; color:var(--ink); font:inherit; cursor:pointer; transition:border-color .15s; }
+[data-combos-overlay] .pick-model:hover { border-color:#3a3a42; }
+[data-combos-overlay] .pick-model.on { border-color:rgba(52,211,153,.45); background:rgba(52,211,153,.10); }
+[data-combos-overlay] .pick-check { width:14px; flex:none; color:#34d399; font-weight:700; }
+[data-combos-overlay] .pick-mname { font-size:13px; font-weight:500; overflow-wrap:anywhere; }
+[data-combos-overlay] .pick-mid { margin-left:auto; padding-left:10px; font-family:ui-monospace, Menlo, monospace; font-size:11.5px; color:#6a6a72; }
+[data-combos-overlay] .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
+
+/* combo Tạo/Sửa — modal đắp lên body (data-combos-modal), tách khỏi picker (data-combos-overlay) để
+   hai lớp lồng nhau không đè z-index/attr của nhau. Sheet dùng lại khung overlay; nội dung modal Sửa
+   là editor .models-page (đã có style ở khối models), modal Tạo là form .cnew bên dưới. */
+[data-combos-modal].sheetback { position:fixed; z-index:40; inset:0; display:flex; align-items:center; justify-content:center; padding:22px; background:rgba(9, 12, 16, .58); }
+[data-combos-modal] .sheet { box-sizing:border-box; width:min(640px, 100%); max-height:calc(100vh - 44px); overflow:auto; border:1px solid var(--line); border-radius:10px; padding:16px; background:var(--panel); box-shadow:0 16px 55px rgba(0, 0, 0, .35); }
+[data-combos-modal] .sheethead { display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:12px; }
+[data-combos-modal] .sheethead .st { font-size:15px; font-weight:600; }
+[data-combos-modal] .cnew { display:flex; flex-direction:column; gap:12px; }
+[data-combos-modal] .cfk { display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--dim); }
+[data-combos-modal] .cfk > span { font-weight:600; }
+[data-combos-modal] .cname-input { box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:9px; padding:8px 12px; color:var(--ink); background:var(--sunk); font:inherit; font-size:13px; }
+[data-combos-modal] .cnew select { width:100%; font-size:13px; }
+[data-combos-modal] .cnew .row { margin:0; }
+[data-combos-modal] .note { font-size:12px; color:var(--dim); }
+[data-combos-modal] .cnew-modelhead { display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:12px; font-weight:600; color:var(--dim); }
+[data-combos-modal] .cnew-models { display:flex; flex-direction:column; gap:6px; }
+[data-combos-modal] .cnew-model { display:flex; align-items:center; justify-content:space-between; gap:10px; border:1px solid #26262b; border-radius:9px; padding:7px 11px; background:#161618; }
+[data-combos-modal] .cnew-model .cchip { border:1px solid #2f2f36; border-radius:999px; padding:3px 10px; font-size:11.5px; background:#1c1c20; color:var(--ink); }
+[data-combos-modal] .cnew .none { padding:12px; color:var(--dim); font-style:italic; font-size:12px; border:1px dashed var(--line); border-radius:9px; text-align:center; }
+
+/* providers:begin — Providers gallery + detail (Task 1–6). Nền tối kiểu 9Router: card #161618,
+   viền #26262b, accent xanh #34d399 thay cho banner đỏ "may be banned" của bản gốc.
+
+   MỌI luật từ đây tới providers:end phải bắt đầu bằng .providers-page.
+   shell.test.mjs đọc đúng khoảng giữa hai dấu này để kiểm, nên đừng xoá cặp dấu — không có
+   chúng thì phép kiểm không còn gì để đọc. */
+.providers-page .pv-search { margin:0 0 16px; max-width:280px; }
+.providers-page .pv-search-input {
+  box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:9px;
+  padding:8px 12px; color:var(--ink); background:var(--sunk); font-size:13px;
+}
+/* Banner cảnh báo "chưa nối provider nào": tông hổ phách/cảnh báo như pv-risk-badge — chưa nối gì
+   thì bot IM với khách, người trực phải thấy ngay. */
+.providers-page .pv-no-provider {
+  border:1px solid rgba(245,180,90,.34); background:rgba(245,180,90,.10); color:#f0c07a;
+  border-radius:10px; padding:12px 15px; margin:0 0 16px; font-size:13px; font-weight:500;
+}
+.providers-page .pv-gallery { display:flex; flex-direction:column; gap:6px; }
+.providers-page .pv-group { margin:0 0 26px; }
+.providers-page .pv-group-head { display:flex; align-items:center; gap:12px; margin:0 0 12px; flex-wrap:wrap; }
+.providers-page .pv-group-head h2 { font-size:13.5px; font-weight:600; color:var(--ink); margin:0; }
+.providers-page .pv-head { display:flex; align-items:center; gap:10px; margin-left:auto; }
+.providers-page .pv-safe-tag {
+  display:inline-flex; align-items:center; gap:6px; color:#34d399; font-size:11.5px;
+  font-weight:500; border:1px solid rgba(52,211,153,.28); background:rgba(52,211,153,.10);
+  border-radius:20px; padding:3px 9px;
+}
+.providers-page .pv-dot { width:6px; height:6px; border-radius:50%; background:#34d399; flex:none; }
+.providers-page .pv-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr)); gap:12px; }
+.providers-page .pv-card {
+  display:flex; align-items:center; gap:12px; padding:14px; border:1px solid #26262b;
+  border-radius:12px; background:#161618; cursor:pointer; width:100%; text-align:left;
+  transition:border-color .15s;
+}
+.providers-page .pv-card:hover { border-color:#3a3a42; }
+/* Logo provider: hộp bo góc màu thương hiệu + icon HÃNG (SVG trắng, nhúng data-URI — CSP chặn ảnh
+   ngoài). Icon simple-icons cho Claude/Gemini/OpenRouter; OpenAI dùng logomark chính thức (đã bị gỡ
+   khỏi simple-icons theo yêu cầu hãng). codex↦OpenAI, claude-code↦Claude — cùng gia đình hãng. */
+.providers-page .pv-logo {
+  width:38px; height:38px; border-radius:9px; flex:none;
+  background-repeat:no-repeat; background-position:center; background-size:58%;
+}
+.providers-page .pv-logo.lg { width:44px; height:44px; border-radius:11px; background-size:56%; }
+.providers-page .pv-logo-codex, .providers-page .pv-logo-openai { background-image:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20viewBox%3D'0%200%2024%2024'%20fill%3D'%23fff'%3E%3Cpath%20d%3D'M22.2819%209.8211a5.9847%205.9847%200%200%200-.5157-4.9108%206.0462%206.0462%200%200%200-6.5098-2.9A6.0651%206.0651%200%200%200%204.9807%204.1818a5.9847%205.9847%200%200%200-3.9977%202.9%206.0462%206.0462%200%200%200%20.7427%207.0966%205.98%205.98%200%200%200%20.511%204.9107%206.051%206.051%200%200%200%206.5146%202.9001A5.9847%205.9847%200%200%200%2013.2599%2024a6.0557%206.0557%200%200%200%205.7718-4.2058%205.9894%205.9894%200%200%200%203.9977-2.9001%206.0557%206.0557%200%200%200-.7475-7.0729zm-9.022%2012.6081a4.4755%204.4755%200%200%201-2.8764-1.0408l.1419-.0804%204.7783-2.7582a.7948.7948%200%200%200%20.3927-.6813v-6.7369l2.02%201.1686a.071.071%200%200%201%20.038.052v5.5826a4.504%204.504%200%200%201-4.4945%204.4944zm-9.6607-4.1254a4.4708%204.4708%200%200%201-.5346-3.0137l.1419.0852%204.783%202.7582a.7712.7712%200%200%200%20.7806%200l5.8428-3.3685v2.3324a.0804.0804%200%200%201-.0332.0615L9.74%2019.9502a4.4992%204.4992%200%200%201-6.1408-1.6464zM2.3408%207.8956a4.485%204.485%200%200%201%202.3655-1.9728V11.6a.7664.7664%200%200%200%20.3879.6765l5.8144%203.3543-2.0201%201.1685a.0757.0757%200%200%201-.071%200l-4.8303-2.7865A4.504%204.504%200%200%201%202.3408%207.872zm16.5963%203.8558L13.1038%208.364%2015.1192%207.2a.0757.0757%200%200%201%20.071%200l4.8303%202.7913a4.4944%204.4944%200%200%201-.6765%208.1042v-5.6772a.79.79%200%200%200-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759%200%200%200-.7854%200L9.409%209.2297V6.8974a.0662.0662%200%200%201%20.0284-.0615l4.8303-2.7866a4.4992%204.4992%200%200%201%206.6802%204.66zM8.3065%2012.863l-2.02-1.1638a.0804.0804%200%200%201-.038-.0567V6.0742a4.4992%204.4992%200%200%201%207.3757-3.4537l-.142.0805L8.704%205.459a.7948.7948%200%200%200-.3927.6813zm1.0976-2.3654l2.602-1.4998%202.6069%201.4998v2.9994l-2.5974%201.4997-2.6067-1.4997Z'%2F%3E%3C%2Fsvg%3E"); }
+.providers-page .pv-logo-claude-code, .providers-page .pv-logo-anthropic { background-image:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20viewBox%3D'0%200%2024%2024'%20fill%3D'%23fff'%3E%3Cpath%20d%3D'm4.7144%2015.9555%204.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608%201.5179.1032%202.2767.1578%201.6514.0972%202.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973%209.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686%201.9064%201.4754%202.4893%201.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335%206.6997%200l.9957.1336.419.3642.6192%201.4147%201.0018%202.2282%201.5543%203.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853%201.8517-.5586%202.9021-.3643%201.9429h.2125l.2429-.2429.9835-1.3053%201.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759%201.1293-.34%201.1657-1.0625%201.3478-.8804%201.1414-1.2628%201.7-.7893%201.36.0729.1093.1882-.0183%202.8535-.607%201.5421-.2794%201.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607%201.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929%201.0686%202.0035%201.8092%202.5075%202.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496%202.3436%203.5214.1214%201.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38%2017.959l-1.1414-1.9428-.1397.079-.674%207.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328%201.9672-2.1796%202.9446-1.7243%201.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889%202.386-3.0357%201.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385%204.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429%201.9064-1.3114Z'%2F%3E%3C%2Fsvg%3E"); }
+.providers-page .pv-logo-gemini { background-image:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20viewBox%3D'0%200%2024%2024'%20fill%3D'%23fff'%3E%3Cpath%20d%3D'M11.04%2019.32Q12%2021.51%2012%2024q0-2.49.93-4.68.96-2.19%202.58-3.81t3.81-2.55Q21.51%2012%2024%2012q-2.49%200-4.68-.93a12.3%2012.3%200%200%201-3.81-2.58%2012.3%2012.3%200%200%201-2.58-3.81Q12%202.49%2012%200q0%202.49-.96%204.68-.93%202.19-2.55%203.81a12.3%2012.3%200%200%201-3.81%202.58Q2.49%2012%200%2012q2.49%200%204.68.96%202.19.93%203.81%202.55t2.55%203.81'%2F%3E%3C%2Fsvg%3E"); }
+.providers-page .pv-logo-openrouter { background-image:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20viewBox%3D'0%200%2024%2024'%20fill%3D'%23fff'%3E%3Cpath%20d%3D'M16.778%201.844v1.919q-.569-.026-1.138-.032-.708-.008-1.415.037c-1.93.126-4.023.728-6.149%202.237-2.911%202.066-2.731%201.95-4.14%202.75-.396.223-1.342.574-2.185.798-.841.225-1.753.333-1.751.333v4.229s.768.108%201.61.333c.842.224%201.789.575%202.185.799%201.41.798%201.228.683%204.14%202.75%202.126%201.509%204.22%202.11%206.148%202.236.88.058%201.716.041%202.555.005v1.918l7.222-4.168-7.222-4.17v2.176c-.86.038-1.611.065-2.278.021-1.364-.09-2.417-.357-3.979-1.465-2.244-1.593-2.866-2.027-3.68-2.508.889-.518%201.449-.906%203.822-2.59%201.56-1.109%202.614-1.377%203.978-1.466.667-.044%201.418-.017%202.278.02v2.176L24%206.014Z'%2F%3E%3C%2Fsvg%3E"); }
+.providers-page .pv-logo-codex { background-color:#0f7a63; }
+.providers-page .pv-logo-openai { background-color:#10a37f; }
+.providers-page .pv-logo-claude-code, .providers-page .pv-logo-anthropic { background-color:#c8613b; }
+.providers-page .pv-logo-gemini { background-color:#3f6ff5; }
+.providers-page .pv-logo-openrouter { background-color:#6b6ef0; }
+.providers-page .pv-meta { min-width:0; }
+.providers-page .pv-name { display:block; font-size:14px; font-weight:600; color:var(--ink); }
+.providers-page .pv-status { display:block; font-size:12px; margin-top:3px; }
+.providers-page .pv-status.on { color:#34d399; }
+.providers-page .pv-status.off { color:#74747c; }
+.providers-page .pv-btn {
+  font:inherit; font-size:12.5px; padding:6px 12px; border-radius:8px; cursor:pointer;
+  background:#171719; border:1px solid #2f2f35; color:#c6c6cc;
+}
+.providers-page .pv-btn:hover:not(:disabled) { border-color:#3a3a42; }
+.providers-page .pv-btn:disabled { opacity:.5; cursor:default; }
+.providers-page .pv-btn.primary { background:#16a34a; border-color:#16a34a; color:#fff; font-weight:500; }
+.providers-page .pv-btn.primary:hover:not(:disabled) { filter:brightness(1.08); }
+.providers-page .pv-panel .pv-btn { margin-top:14px; }
+
+.providers-page .pv-detail { max-width:860px; }
+.providers-page .pv-back {
+  display:inline-flex; align-items:center; gap:6px; border:0; background:none; padding:0;
+  color:var(--dim); font:inherit; font-size:13px; cursor:pointer; margin:0 0 16px;
+}
+.providers-page .pv-back:hover { color:var(--ink); }
+.providers-page .pv-detail-head { display:flex; align-items:center; gap:13px; margin:0 0 16px; }
+.providers-page .pv-detail-head .pv-name { font-size:20px; }
+.providers-page .pv-sub { font-size:12.5px; color:var(--dim); }
+.providers-page .pv-safe-badge {
+  display:flex; align-items:center; gap:10px; border:1px solid rgba(52,211,153,.30);
+  background:rgba(52,211,153,.08); color:#7fe9c2; border-radius:10px; padding:12px 14px;
+  margin:0 0 20px; font-size:13px;
+}
+/* Provider chạy PROXY: tông hổ phách/cảnh báo (không xanh) — nói thật có rủi ro khoá tài khoản. */
+.providers-page .pv-risk-badge {
+  display:flex; align-items:center; gap:10px; border:1px solid rgba(245,180,90,.34);
+  background:rgba(245,180,90,.09); color:#f0c07a; border-radius:10px; padding:12px 14px;
+  margin:0 0 20px; font-size:13px;
+}
+.providers-page .pv-panel {
+  border:1px solid #24242a; border-radius:12px; padding:16px 18px; margin:0 0 16px;
+  background:var(--panel);
+}
+.providers-page .pv-panel-head { display:flex; align-items:center; justify-content:space-between; margin:0 0 14px; }
+.providers-page .pv-panel-head h3 { font-size:14px; font-weight:600; margin:0; }
+.providers-page .pv-conn-row,
+.providers-page .pv-conn-empty { font-size:12.5px; color:var(--dim); padding:4px 0; }
+.providers-page .pv-conn-empty { font-style:italic; }
+.providers-page .pv-model-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:10px; }
+.providers-page .pv-model {
+  background:#17171a; border:1px solid #26262b; border-radius:9px; padding:9px 11px;
+  display:flex; flex-direction:column; gap:2px;
+}
+.providers-page .pv-mid { font-family:ui-monospace, Menlo, monospace; font-size:12.5px; color:#dcdce0; }
+.providers-page .pv-mname { font-size:10.5px; color:#6a6a72; }
+/* Danh sách tài khoản (multi-account) + nút xoá. */
+.providers-page .pv-account-list { display:flex; flex-direction:column; gap:8px; }
+.providers-page .pv-account {
+  display:flex; align-items:center; gap:10px;
+  background:#17171a; border:1px solid #26262b; border-radius:9px; padding:9px 12px;
+}
+.providers-page .pv-account-label { font-size:13px; font-weight:600; color:var(--ink); }
+.providers-page .pv-account-email { font-size:11.5px; color:var(--dim); }
+.providers-page .pv-account-status { font-size:11px; }
+.providers-page .pv-account-status.on { color:#34d399; }
+.providers-page .pv-account-status.off { color:#74747c; }
+.providers-page .pv-account .pv-btn { margin:0 0 0 auto; padding:5px 10px; }
+.providers-page .pv-btn.danger { border-color:#b4453a; color:#f0a89f; background:transparent; }
+.providers-page .pv-btn.danger:hover:not(:disabled) { border-color:#d05648; color:#fff; background:#b4453a; }
+/* Panel kết nối in-Portal: ô nhập tên, trạng thái từng pha, link đăng nhập. */
+.providers-page .pv-connect { margin-top:14px; border-top:1px solid #24242a; padding-top:14px; }
+.providers-page .pv-connect-prompt { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.providers-page .pv-connect-label {
+  flex:1; min-width:160px; background:#141417; border:1px solid #2a2a30; border-radius:8px;
+  padding:8px 11px; color:var(--ink); font-size:13px;
+}
+.providers-page .pv-connect .pv-btn { margin-top:0; }
+.providers-page .pv-connect-status { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.providers-page .pv-connect-message { font-size:12.5px; color:var(--dim); }
+.providers-page .pv-connect-code { display:flex; align-items:center; gap:8px; }
+.providers-page .pv-connect-code-label { font-size:12px; color:var(--dim); }
+.providers-page .pv-connect-code-value {
+  font-family:ui-monospace, Menlo, monospace; font-size:15px; font-weight:600; letter-spacing:1px;
+  color:var(--ink); background:#141417; border:1px solid #2a2a30; border-radius:7px; padding:4px 10px;
+  user-select:all;
+}
+.providers-page .pv-connect-hint { font-size:12px; color:var(--dim); margin-top:10px; }
+.providers-page .pv-connect-hint a { color:var(--ink); text-decoration:underline; }
+/* Thanh tiến trình theo pha: crawl tới trần 85% khi đang cài, nhảy 90% lúc chờ đăng nhập, 100% khi
+   xong. Đỏ-mờ + tắt transition khi lỗi/huỷ (đứng yên, không giả bận). */
+.providers-page .pv-connect-live { display:flex; flex-direction:column; gap:9px; width:100%; }
+.providers-page .pv-progress-wrap { display:flex; flex-direction:column; gap:5px; width:100%; }
+.providers-page .pv-progress {
+  height:7px; border-radius:999px; background:#17171b; border:1px solid #2a2a30; overflow:hidden;
+}
+.providers-page .pv-progress-fill {
+  height:100%; width:0; border-radius:inherit;
+  background:linear-gradient(90deg, #3f6ff5, #6f8dff); transition:width .45s ease-out;
+}
+.providers-page .pv-progress--error .pv-progress-fill { background:#b4453a; transition:none; }
+.providers-page .pv-progress-row { display:flex; align-items:center; gap:8px; font-size:11.5px; }
+.providers-page .pv-progress-pct { font-weight:600; color:var(--ink); }
+.providers-page .pv-progress-elapsed { color:var(--dim); }
+.providers-page .pv-connect-log {
+  font:11.5px/1.5 ui-monospace, Consolas, monospace; color:var(--dim);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%;
+}
+/* providers:end */
+
 .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
 .card {
   border:1px solid var(--line); border-radius:9px; padding:13px 17px; min-width:132px;
@@ -112,25 +326,92 @@
 #drop .small { font-size:11.5px; color:var(--dim); }
 
 .row { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin:16px 0; }
-.models-page .picks { display:flex; flex-direction:column; gap:9px; max-width:560px; }
-.models-page .pick {
-  display:flex; gap:12px; align-items:flex-start; text-align:left; width:100%;
-  padding:13px 15px; border-radius:9px; cursor:pointer; font:inherit; color:inherit;
-  background:var(--panel); border:1px solid var(--line);
+
+/* models:begin — Member-editor dùng lại cho trang Combos: mỗi hàng là một mắt xích Provider/model
+   trong một combo. Giữ nguyên tên lớp .models-page để trang Combos dùng lại nguyên khối CSS này.
+
+   MỌI luật từ đây tới models:end phải bắt đầu bằng .models-page để không rò ra trang khác. */
+.models-page .chainstatus { font-size:12.5px; color:var(--dim); margin:14px 0 0; }
+.models-page .chainstatus:empty { display:none; }
+.models-page .facts { border:1px solid var(--line); border-radius:8px; overflow:hidden; margin:12px 0; background:var(--panel); }
+.models-page .fact {
+  display:grid; grid-template-columns:2.4em minmax(0, 1fr) auto auto;
+  gap:6px 12px; align-items:center; padding:11px; border-bottom:1px solid var(--line);
+  font-size:12.5px;
 }
-.models-page .pick:hover { border-color:var(--dim); }
-.models-page .pick.on { border-color:var(--live); background:rgba(63,199,127,.07); }
-.models-page .pick .dot {
-  width:15px; height:15px; border-radius:50%; border:2px solid var(--line);
-  flex:0 0 15px; margin-top:2px;
+.models-page .fact:last-child { border-bottom:0; }
+.models-page .fp { display:flex; flex-direction:column; gap:2px; font-weight:600; }
+.models-page .fc { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.models-page .fc.check { flex-direction:row; align-items:center; gap:7px; }
+.models-page .fk { font-size:11px; color:var(--dim); }
+.models-page .fc select { width:100%; font-size:12.5px; }
+.models-page .fb { display:flex; gap:6px; justify-content:flex-end; }
+.models-page .fb .btn { min-width:3.4em; text-align:center; justify-content:center; }
+.models-page .fc.check { justify-content:flex-start; white-space:nowrap; }
+/* "đang chạy": huy hiệu viên bo tròn + chấm accent (thay vì chữ xanh trần dưới số cho gọn/đẹp). */
+.models-page .live:empty { display:none; }
+.models-page .live:not(:empty) {
+  display:inline-flex; align-items:center; gap:5px; align-self:flex-start; white-space:nowrap;
+  padding:2px 8px 2px 7px; border-radius:999px; font-size:10px; font-weight:600; line-height:1.5;
+  color:var(--live); background:rgba(52, 211, 153, .12); border:1px solid rgba(52, 211, 153, .32);
 }
-.models-page .pick.on .dot { border-color:var(--live); background:var(--live); box-shadow:inset 0 0 0 3px var(--panel); }
-.models-page .pick .nm { font-weight:600; font-size:13.5px; }
-.models-page .pick .ds { font-size:12px; color:var(--dim); margin-top:2px; }
-.models-page .pick .tag {
-  margin-left:auto; font-size:10px; color:var(--dim); border:1px solid var(--line);
-  border-radius:5px; padding:2px 6px; white-space:nowrap;
+.models-page .live:not(:empty)::before {
+  content:""; width:6px; height:6px; border-radius:50%; background:var(--live); flex:none;
 }
+/* Nền xanh mờ cho HÀNG đang chạy — tách nó khỏi các mắt xích nghỉ. */
+.models-page .fact:has(.live:not(:empty)) { background:rgba(52, 211, 153, .05); }
+/* Nút dời bị khoá phải TRÔNG rõ là khoá (mắt xích đầu không Lên được, cuối không Xuống được). */
+.models-page .fb .btn:disabled { opacity:.38; cursor:default; }
+.models-page .mv { font-size:12.5px; color:var(--ink); overflow-wrap:anywhere; }
+.models-page .fn { grid-column:1 / -1; color:var(--dim); font-size:11.5px; }
+.models-page .fn:empty { display:none; }
+.models-page .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
+.models-page .reslot:empty { display:none; }
+/* models:end */
+
+/* combos:begin — Trang Combos kiểu 9Router: một lưới THẺ, mỗi combo là một .ccard (tên + chip model
+   + ô chọn kiểu + Nhân bản/Sửa model/Xoá + chấm "đang dùng"). Modal Tạo/Sửa render NGOÀI .combos-page
+   (trên body, xem [data-combos-modal]). Mọi luật từ đây tới combos:end bắt đầu bằng .combos-page. */
+.combos-page .ctop { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin:0 0 16px; }
+.combos-page .ctop > .note { font-size:12px; color:var(--dim); }
+
+.combos-page .ccards {
+  display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:12px;
+}
+.combos-page .ccard {
+  display:flex; flex-direction:column; gap:11px; padding:14px;
+  border:1px solid #26262b; border-radius:11px; background:#161618;
+}
+/* Combo đang dùng: viền + quầng accent, tách khỏi các combo nghỉ. */
+.combos-page .ccard.on { border-color:rgba(52,211,153,.45); box-shadow:inset 0 0 0 1px rgba(52,211,153,.18); }
+.combos-page .ccard-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+.combos-page .cname { font-size:14.5px; font-weight:600; overflow-wrap:anywhere; }
+
+.combos-page .cactive {
+  display:inline-flex; align-items:center; gap:6px; flex:none;
+  color:var(--dim); font-size:11.5px; white-space:nowrap; cursor:pointer;
+}
+.combos-page .cactive:has(input:checked) { color:var(--live); font-weight:600; }
+
+/* Chip model: viên bo tròn provider·model; mắt xích tắt thì mờ + gạch ngang. */
+.combos-page .cchips { display:flex; flex-wrap:wrap; gap:6px; min-height:24px; }
+.combos-page .cchip {
+  display:inline-flex; align-items:center; border:1px solid #2f2f36; border-radius:999px;
+  padding:3px 10px; font-size:11.5px; background:#1c1c20; color:var(--ink);
+}
+.combos-page .cchip.off { opacity:.5; text-decoration:line-through; }
+
+.combos-page .ccard-foot {
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  flex-wrap:wrap; margin-top:auto;
+}
+.combos-page .cfk { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; color:var(--dim); }
+.combos-page .ctype-sel { font-size:12px; }
+.combos-page .cacts { display:flex; gap:6px; flex-wrap:wrap; }
+
+.combos-page .none { padding:11px; color:var(--dim); font-style:italic; font-size:12.5px; }
+/* combos:end */
+
 .cols { display:flex; gap:16px; flex-wrap:wrap; }
 .cols > div { flex:1 1 264px; min-width:0; }
 .cols h3 {
@@ -324,8 +605,27 @@
   #main { padding:18px 16px 40px; overflow:visible; }
   .cards,
   .cols { display:grid; grid-template-columns:1fr; }
-  [data-agents-overlay].sheetback { padding:12px; }
-  [data-agents-overlay] .sheet {
+  .combos-page .ccards { grid-template-columns:1fr; }
+  [data-agents-overlay].sheetback,
+  [data-combos-overlay].sheetback,
+  [data-combos-modal].sheetback { padding:12px; }
+  [data-agents-overlay] .sheet,
+  [data-combos-overlay] .sheet,
+  [data-combos-modal] .sheet {
     width:100%; height:auto; max-height:calc(100vh - 24px); border-radius:8px;
   }
+  /* providers:begin — cùng luật phạm vi như khối trên.
+     Lưới card/model không còn chỗ ở bề ngang điện thoại; xuống một cột. */
+  .providers-page .pv-grid,
+  .providers-page .pv-model-grid { grid-template-columns:1fr; }
+  .providers-page .pv-group-head { flex-wrap:wrap; }
+  .providers-page .pv-head { margin-left:0; }
+  /* providers:end */
+  /* models:begin — cùng luật phạm vi như khối trên.
+
+     Năm cột xếp dọc thành một; nhãn "Provider"/"Model"/"Bật" của từng ô là thứ duy nhất còn nói
+     được ô đó là gì khi hàng đã mất hàng tiêu đề ngầm của bố cục lưới. */
+  .models-page .fact { grid-template-columns:1fr; gap:7px; }
+  .models-page .fp { flex-direction:row; gap:8px; align-items:baseline; }
+  /* models:end */
 }
