@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -349,6 +350,259 @@ func TestConnectCancelStopsLoginAndPolls(t *testing.T) {
 	}
 }
 
+type cancelCleanupGateRunner struct {
+	fakeRunner
+	mu         sync.Mutex
+	installRun int
+	entered    chan struct{}
+	cancelSeen chan struct{}
+	release    chan struct{}
+}
+
+func (r *cancelCleanupGateRunner) install(ctx context.Context, _ string, onLine func(string)) error {
+	r.mu.Lock()
+	r.installRun++
+	run := r.installRun
+	r.mu.Unlock()
+	if run != 1 {
+		return nil
+	}
+	if onLine != nil {
+		onLine("blocked cleanup")
+	}
+	close(r.entered)
+	<-ctx.Done()
+	close(r.cancelSeen)
+	<-r.release
+	return ctx.Err()
+}
+
+func TestConnectCanceledJobKeepsGlobalSlotUntilRunnerCleanupReturns(t *testing.T) {
+	r := &cancelCleanupGateRunner{
+		fakeRunner: fakeRunner{
+			installed: false, loginURL: "https://x", auth: authLoggedIn,
+		},
+		entered: make(chan struct{}), cancelSeen: make(chan struct{}), release: make(chan struct{}),
+	}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	nextID := 0
+	m.newID = func() string {
+		nextID++
+		return fmt.Sprintf("acc%d", nextID)
+	}
+	if _, err := m.start("codex", "first"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	firstJob := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first install did not enter")
+	}
+	if _, err := m.start("codex", "same-kind duplicate"); err != nil {
+		t.Fatalf("same-kind start while install is gated = %v; want current job", err)
+	}
+	r.mu.Lock()
+	installRuns := r.installRun
+	r.mu.Unlock()
+	if installRuns != 1 {
+		t.Fatalf("same-kind start launched %d installs; want exactly 1", installRuns)
+	}
+	if !m.cancel("codex") {
+		t.Fatal("cancel returned false")
+	}
+	select {
+	case <-r.cancelSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner did not observe cancellation")
+	}
+	if st, _ := m.status("codex"); st.Phase != phaseCanceled {
+		t.Fatalf("visible phase while cleanup is blocked = %q; want canceled", st.Phase)
+	}
+
+	_, secondErr := m.start("codex", "second")
+	close(r.release)
+	if !errors.Is(secondErr, errConnectBusy) {
+		t.Fatalf("start while canceled runner still owned slot = %v; want errConnectBusy", secondErr)
+	}
+	select {
+	case <-firstJob.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled install job did not finish after runner cleanup returned")
+	}
+	if st := firstJob.snapshot(); st.Phase != phaseCanceled {
+		t.Fatalf("canceled install final phase = %q; want canceled", st.Phase)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, err := m.start("codex", "after cleanup")
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errConnectBusy) {
+			t.Fatalf("start after runner cleanup = %v; want nil", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("global connect slot stayed busy after runner cleanup")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	firstDir := filepath.Join(m.dataDir, "accounts", "codex", "acc1")
+	if _, err := os.Stat(firstDir); !os.IsNotExist(err) {
+		t.Fatalf("first job cleanup did not remove %q before slot release: %v", firstDir, err)
+	}
+	if st := waitPhase(t, m, "codex", phaseConnected); st.Phase != phaseConnected {
+		t.Fatalf("phase after slot release = %q; want connected", st.Phase)
+	}
+}
+
+type loginWaitGateRunner struct {
+	fakeRunner
+	mu           sync.Mutex
+	loginRuns    int
+	waitEntered  chan struct{}
+	cancelSeen   chan struct{}
+	release      chan struct{}
+	waitReturned chan struct{}
+}
+
+func (r *loginWaitGateRunner) login(ctx context.Context, kind, configDir string) (string, string, func() error, error) {
+	r.mu.Lock()
+	r.loginRuns++
+	run := r.loginRuns
+	r.mu.Unlock()
+	if run != 1 {
+		return r.fakeRunner.login(ctx, kind, configDir)
+	}
+	r.lastCfgDir = configDir
+	return "https://auth.example/login", "AAAA-BBBBB", func() error {
+		close(r.waitEntered)
+		<-ctx.Done()
+		close(r.cancelSeen)
+		<-r.release
+		close(r.waitReturned)
+		return ctx.Err()
+	}, nil
+}
+
+func TestConnectLoginWaitKeepsGlobalSlotUntilItReturns(t *testing.T) {
+	r := &loginWaitGateRunner{
+		fakeRunner:  fakeRunner{installed: true, auth: authLoggedOut},
+		waitEntered: make(chan struct{}), cancelSeen: make(chan struct{}),
+		release: make(chan struct{}), waitReturned: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(r.release) }) }
+	t.Cleanup(release)
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	nextID := 0
+	m.newID = func() string {
+		nextID++
+		return fmt.Sprintf("acc%d", nextID)
+	}
+	if _, err := m.start("codex", "first"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	firstJob := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.waitEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login wait callback did not start")
+	}
+	if !m.cancel("codex") {
+		t.Fatal("cancel returned false")
+	}
+	select {
+	case <-r.cancelSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login wait callback did not observe cancellation")
+	}
+	if st, _ := m.status("codex"); st.Phase != phaseCanceled {
+		t.Fatalf("visible phase while login wait cleanup is blocked = %q; want canceled", st.Phase)
+	}
+	select {
+	case <-firstJob.done:
+		t.Fatal("connect job released its slot before login wait callback returned")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := m.start("claude-code", "second"); !errors.Is(err, errConnectBusy) {
+		t.Fatalf("cross-kind start while login wait cleanup is blocked = %v; want errConnectBusy", err)
+	}
+	if _, err := os.Stat(firstJob.configDir); err != nil {
+		t.Fatalf("config dir was cleaned before login wait callback returned: %v", err)
+	}
+
+	release()
+	select {
+	case <-r.waitReturned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login wait callback did not return after release")
+	}
+	select {
+	case <-firstJob.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("connect job did not release its slot after login wait callback returned")
+	}
+	if _, err := os.Stat(firstJob.configDir); !os.IsNotExist(err) {
+		t.Fatalf("config dir still exists after joined login cleanup: %v", err)
+	}
+	if _, err := m.start("claude-code", "second"); err != nil {
+		t.Fatalf("cross-kind start after joined login cleanup = %v; want nil", err)
+	}
+	m.cancel("claude-code")
+}
+
+type cancelDuringLoginRunner struct {
+	fakeRunner
+	entered chan struct{}
+}
+
+func (r *cancelDuringLoginRunner) login(ctx context.Context, _, configDir string) (string, string, func() error, error) {
+	r.lastCfgDir = configDir
+	close(r.entered)
+	<-ctx.Done()
+	return "", "", nil, ctx.Err()
+}
+
+func TestConnectCancelDuringSynchronousLoginStaysCanceled(t *testing.T) {
+	r := &cancelDuringLoginRunner{
+		fakeRunner: fakeRunner{installed: true, auth: authLoggedOut},
+		entered:    make(chan struct{}),
+	}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	if _, err := m.start("codex", "cancel during login"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("synchronous login did not enter")
+	}
+	if !m.cancel("codex") {
+		t.Fatal("cancel returned false")
+	}
+	select {
+	case <-job.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("connect job did not finish after synchronous login observed cancellation")
+	}
+	st := job.snapshot()
+	if st.Phase != phaseCanceled {
+		t.Fatalf("final phase after synchronous login cancellation = %q; want canceled", st.Phase)
+	}
+	if st.Error != "" {
+		t.Fatalf("final error after synchronous login cancellation = %q; want empty", st.Error)
+	}
+}
+
 // TestConnectPollingCarriesLoginURLAndCode proves login's device-auth code (not just the URL)
 // reaches connectState. The happy-path fake flips authLoggedIn immediately, so the state never
 // sits in polling long enough to observe LoginURL/Code — this test holds auth at loggedOut so the
@@ -524,6 +778,180 @@ func TestConnectInstallStreamsLive(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("install did not return after the process exited")
+	}
+}
+
+func TestConnectInstallCancelKillsProcessTreeAndClosesPipe(t *testing.T) {
+	switch runtime.GOOS {
+	case "windows", "aix", "darwin", "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "solaris":
+	default:
+		t.Skip("managed process containment has no descendant guarantee on this platform")
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required for the install process-tree regression")
+	}
+	dir := t.TempDir()
+	rootPIDFile := filepath.Join(dir, "root.pid")
+	childPIDFile := filepath.Join(dir, "child.pid")
+	script := filepath.Join(dir, "install-tree.js")
+	js := `const {spawn}=require("child_process");const fs=require("fs");` +
+		`fs.writeFileSync(process.argv[2],String(process.pid));` +
+		`const code='require("fs").writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1e9)';` +
+		`const detached=process.platform==="win32";` +
+		`const child=spawn(process.execPath,["-e",code,process.argv[3]],{stdio:"inherit",detached});` +
+		`if(detached)child.unref();console.log("install tree ready");setInterval(()=>{},1e9);`
+	if err := os.WriteFile(script, []byte(js), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalCommand := installNPMCommand
+	if runtime.GOOS == "windows" {
+		binDir := t.TempDir()
+		npmScript := "@echo off\r\n\"%CONNECT_TEST_NODE%\" \"%CONNECT_TEST_SCRIPT%\" \"%CONNECT_TEST_ROOT_PID%\" \"%CONNECT_TEST_CHILD_PID%\"\r\n"
+		if err := os.WriteFile(filepath.Join(binDir, "npm.cmd"), []byte(npmScript), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("CONNECT_TEST_NODE", node)
+		t.Setenv("CONNECT_TEST_SCRIPT", script)
+		t.Setenv("CONNECT_TEST_ROOT_PID", rootPIDFile)
+		t.Setenv("CONNECT_TEST_CHILD_PID", childPIDFile)
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		installNPMCommand = func(context.Context, string) *exec.Cmd {
+			return exec.Command("npm", "install", "-g", "ignored")
+		}
+	} else {
+		installNPMCommand = func(context.Context, string) *exec.Cmd {
+			return exec.Command(node, script, rootPIDFile, childPIDFile)
+		}
+	}
+	t.Cleanup(func() { installNPMCommand = originalCommand })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- (&defaultConnectRunner{logger: slog.New(slog.DiscardHandler)}).install(
+			ctx, "codex", func(string) {},
+		)
+	}()
+	rootPID := readGrandchildPID(t, rootPIDFile)
+	childPID := readGrandchildPID(t, childPIDFile)
+	cleanup := func() {
+		_ = killPidTree(rootPID, "connect-install-test-cleanup", slog.New(slog.DiscardHandler))
+		_ = killPidTree(childPID, "connect-install-test-cleanup", slog.New(slog.DiscardHandler))
+	}
+	t.Cleanup(cleanup)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("install cancellation error = %v; want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		_, rootAlive := processStart(rootPID)
+		_, childAlive := processStart(childPID)
+		cleanup()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
+		t.Fatalf("install did not return after cancellation; root alive=%v descendant alive=%v (pipe remained open)",
+			rootAlive, childAlive)
+	}
+	if stillAlive(rootPID, 3*time.Second) {
+		t.Errorf("install root %d survived cancellation", rootPID)
+	}
+	if stillAlive(childPID, 3*time.Second) {
+		t.Errorf("install descendant %d survived cancellation", childPID)
+	}
+}
+
+func TestConnectInstallRootExitClosesLifetimeAndInheritedPipe(t *testing.T) {
+	switch runtime.GOOS {
+	case "windows", "aix", "darwin", "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "solaris":
+	default:
+		t.Skip("managed process containment has no descendant guarantee on this platform")
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required for the install root-exit regression")
+	}
+	dir := t.TempDir()
+	rootPIDFile := filepath.Join(dir, "root.pid")
+	childPIDFile := filepath.Join(dir, "child.pid")
+	childReadyFile := filepath.Join(dir, "child.ready")
+	script := filepath.Join(dir, "install-root-exit.js")
+	js := `const {spawn}=require("child_process");const fs=require("fs");` +
+		`fs.writeFileSync(process.argv[2],String(process.pid));` +
+		`const code='const fs=require("fs");fs.writeFileSync(process.argv[1],String(process.pid));fs.writeFileSync(process.argv[2],"ready");setInterval(()=>{},1e9)';` +
+		`const detached=process.platform==="win32";` +
+		`const child=spawn(process.execPath,["-e",code,process.argv[3],process.argv[4]],{stdio:"inherit",detached});` +
+		`if(detached)child.unref();` +
+		`const exitWhenChildReady=()=>{if(fs.existsSync(process.argv[4])){console.log("root exiting normally");process.exit(0)}setTimeout(exitWhenChildReady,10)};exitWhenChildReady();`
+	if err := os.WriteFile(script, []byte(js), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalCommand := installNPMCommand
+	if runtime.GOOS == "windows" {
+		binDir := t.TempDir()
+		npmScript := "@echo off\r\n\"%CONNECT_TEST_NODE%\" \"%CONNECT_TEST_SCRIPT%\" \"%CONNECT_TEST_ROOT_PID%\" \"%CONNECT_TEST_CHILD_PID%\" \"%CONNECT_TEST_CHILD_READY%\"\r\n"
+		if err := os.WriteFile(filepath.Join(binDir, "npm.cmd"), []byte(npmScript), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("CONNECT_TEST_NODE", node)
+		t.Setenv("CONNECT_TEST_SCRIPT", script)
+		t.Setenv("CONNECT_TEST_ROOT_PID", rootPIDFile)
+		t.Setenv("CONNECT_TEST_CHILD_PID", childPIDFile)
+		t.Setenv("CONNECT_TEST_CHILD_READY", childReadyFile)
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		installNPMCommand = func(context.Context, string) *exec.Cmd {
+			return exec.Command("npm", "install", "-g", "ignored")
+		}
+	} else {
+		installNPMCommand = func(context.Context, string) *exec.Cmd {
+			return exec.Command(node, script, rootPIDFile, childPIDFile, childReadyFile)
+		}
+	}
+	t.Cleanup(func() { installNPMCommand = originalCommand })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (&defaultConnectRunner{logger: slog.New(slog.DiscardHandler)}).install(
+			t.Context(), "codex", func(string) {},
+		)
+	}()
+	rootPID := readGrandchildPID(t, rootPIDFile)
+	childPID := readGrandchildPID(t, childPIDFile)
+	cleanup := func() {
+		_ = killPidTree(rootPID, "connect-install-root-exit-test-cleanup", slog.New(slog.DiscardHandler))
+		_ = killPidTree(childPID, "connect-install-root-exit-test-cleanup", slog.New(slog.DiscardHandler))
+	}
+	t.Cleanup(cleanup)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("install after normal root exit = %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		_, rootAlive := processStart(rootPID)
+		_, childAlive := processStart(childPID)
+		cleanup()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
+		t.Fatalf("install did not return after normal root exit; root alive=%v descendant alive=%v (pipe remained open)",
+			rootAlive, childAlive)
+	}
+	if stillAlive(rootPID, 3*time.Second) {
+		t.Errorf("install root %d survived normal completion", rootPID)
+	}
+	if stillAlive(childPID, 3*time.Second) {
+		t.Errorf("install descendant %d survived normal root completion", childPID)
 	}
 }
 

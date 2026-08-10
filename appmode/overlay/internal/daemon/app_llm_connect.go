@@ -82,6 +82,7 @@ type connectJob struct {
 	configDir string
 	label     string
 	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 func (j *connectJob) set(mut func(*connectState)) { j.mu.Lock(); defer j.mu.Unlock(); mut(&j.state) }
@@ -110,11 +111,17 @@ func (m *connectManager) start(kind, label string) (connectState, error) {
 	if m.job != nil {
 		cur := m.job.snapshot()
 		terminal := cur.Phase == phaseConnected || cur.Phase == phaseError || cur.Phase == phaseCanceled
-		if m.jobKind == kind && !terminal {
-			m.mu.Unlock()
-			return cur, nil // same kind already running — return current, not an error
+		finished := false
+		select {
+		case <-m.job.done:
+			finished = true
+		default:
 		}
-		if m.jobKind != kind && !terminal {
+		if !finished {
+			if m.jobKind == kind && !terminal {
+				m.mu.Unlock()
+				return cur, nil // same kind already running — return current, not an error
+			}
 			m.mu.Unlock()
 			return connectState{}, errConnectBusy
 		}
@@ -130,7 +137,7 @@ func (m *connectManager) start(kind, label string) (connectState, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &connectJob{
 		state:     connectState{Kind: kind, Phase: phaseDetecting},
-		accountID: id, configDir: dir, label: label, cancel: cancel,
+		accountID: id, configDir: dir, label: label, cancel: cancel, done: make(chan struct{}),
 	}
 	m.job = job
 	m.jobKind = kind
@@ -171,6 +178,10 @@ func (m *connectManager) fail(job *connectJob, kind, userMsg string, cause error
 }
 
 func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) {
+	// done closes LAST, after process cancellation and config-dir cleanup. A canceled Portal phase is
+	// visible immediately, but start() must keep the process-global slot until this goroutine owns no
+	// remaining process, pipe, or filesystem cleanup.
+	defer close(job.done)
 	// start() created job.configDir before OAuth ran. Only the success path (connected=true) writes
 	// auth.json into it and records an account row; every terminal non-success (detect/install/login
 	// fail, timeout, cancel) leaves it empty and unreferenced. Remove it on non-success so failed
@@ -185,7 +196,16 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 			m.logger.Warn("connect: remove orphan config dir", "kind", kind, "dir", job.configDir, "err", err)
 		}
 	}()
-	defer job.cancel() // cancel ctx on EVERY return path — unblocks the wait() goroutine below
+	var loginWaitDone <-chan error
+	defer func() {
+		// Cancel on EVERY return path, then join the login callback before config cleanup and done.
+		// The callback owns the login process (or OAuth server); fire-and-forget would release the
+		// process-global connect slot while that resource was still shutting down.
+		job.cancel()
+		if loginWaitDone != nil {
+			<-loginWaitDone
+		}
+	}()
 	installed, err := m.runner.detect(kind)
 	if err != nil {
 		m.fail(job, kind, "không kiểm được CLI: "+err.Error(), err)
@@ -196,6 +216,10 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 		if err := m.runner.install(ctx, kind, func(line string) {
 			job.set(func(s *connectState) { s.Message = line })
 		}); err != nil {
+			if ctx.Err() != nil {
+				job.set(func(s *connectState) { s.Phase = phaseCanceled })
+				return
+			}
 			m.fail(job, kind, "cài thất bại", err)
 			return
 		}
@@ -203,6 +227,10 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	job.set(func(s *connectState) { s.Phase = phaseAwaitingLogin; s.Message = "" })
 	loginURL, code, wait, err := m.runner.login(ctx, kind, job.configDir)
 	if err != nil {
+		if ctx.Err() != nil {
+			job.set(func(s *connectState) { s.Phase = phaseCanceled })
+			return
+		}
 		m.fail(job, kind, "không mở được đăng nhập", err)
 		return
 	}
@@ -219,7 +247,9 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	}
 	loginCtx, stop := context.WithTimeout(ctx, timeout)
 	defer stop()
-	go func() { _ = wait() }() // exits when loginCtx/ctx done (default runner kills the tree via ctx)
+	waitResult := make(chan error, 1)
+	loginWaitDone = waitResult
+	go func() { waitResult <- wait() }()
 	job.set(func(s *connectState) { s.Phase = phasePolling })
 	tick := time.NewTicker(poll)
 	defer tick.Stop()
@@ -303,8 +333,8 @@ func newDefaultConnectRunner(l *slog.Logger) *defaultConnectRunner {
 // seam: real npm isn't assumed present in the test env, so TestConnectInstallStreamsLive swaps in a
 // helper-process command to exercise install()'s live pipe-scan streaming portably. Production never
 // reassigns it.
-var installNPMCommand = func(ctx context.Context, pkg string) *exec.Cmd {
-	return exec.CommandContext(ctx, "npm", "install", "-g", pkg)
+var installNPMCommand = func(_ context.Context, pkg string) *exec.Cmd {
+	return exec.Command("npm", "install", "-g", pkg)
 }
 
 func (d *defaultConnectRunner) detect(kind string) (bool, error) {
@@ -322,10 +352,10 @@ func (d *defaultConnectRunner) detect(kind string) (bool, error) {
 
 // install runs npm and streams its combined output to onLine LIVE — each line fires as npm emits
 // it, not after exit — so run()'s onLine → connectState.Message updates during the (long) download
-// and the Portal poll shows progress instead of a frozen panel. An io.Pipe carries stdout+stderr:
-// a single goroutine Waits and closes the write end, the main goroutine scans the read end to EOF,
-// then collects the wait result. That's race-free (one writer via exec's copy, one reader here) —
-// unlike sharing a bytes.Buffer between exec's copy goroutine and a concurrent reader.
+// and the Portal poll shows progress instead of a frozen panel. An OS pipe carries stdout+stderr
+// directly (no exec copy goroutine): one goroutine Waits for the root, then closes the managed
+// lifetime so inherited descendant writers die and the main goroutine can scan through EOF. This
+// separates root completion from pipe EOF without double-Wait or a shared-buffer race.
 //
 // NOTE npm suppresses its TTY progress bar in a non-TTY pipe, so live lines are sparse during the
 // download — that's expected; the frontend's crawling bar + elapsed timer carry the "it's working"
@@ -341,30 +371,68 @@ func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine 
 	if pkg == "" {
 		return fmt.Errorf("connect install: kind %q không cài qua npm", kind)
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("connect install: npm canceled: %w", err)
+	}
 	cmd := installNPMCommand(ctx, pkg)
-	pr, pw := io.Pipe()
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("connect install: output pipe: %w", err)
+	}
 	cmd.Stdout = pw
 	cmd.Stderr = pw // npm writes progress to stderr; fold into the same stream
-	if err := cmd.Start(); err != nil {
+	process, err := startManagedCLIProcess(cmd, d.logger)
+	if err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
 		return fmt.Errorf("connect install: start npm: %w", err)
 	}
-	waitErr := make(chan error, 1)
-	go func() { e := cmd.Wait(); pw.Close(); waitErr <- e }()
+	rootWait := make(chan error, 1)
+	go func() {
+		rootWait <- cmd.Wait()
+	}()
+	if err := pw.Close(); err != nil {
+		_ = process.terminate()
+		<-rootWait
+		_ = process.close()
+		_ = pr.Close()
+		return fmt.Errorf("connect install: close parent output pipe: %w", err)
+	}
+	lifetimeDone := make(chan error, 1)
+	go func() {
+		var waitErr error
+		select {
+		case <-ctx.Done():
+			if err := process.terminate(); err != nil && d.logger != nil {
+				d.logger.Warn("connect install: terminate npm process tree", "err", err)
+			}
+			waitErr = <-rootWait
+		case waitErr = <-rootWait:
+		}
+		if closeErr := process.close(); closeErr != nil && d.logger != nil {
+			d.logger.Warn("connect install: close npm process lifetime", "err", closeErr)
+		}
+		lifetimeDone <- waitErr
+	}()
+	defer pr.Close()
 	sc := bufio.NewScanner(pr)
 	for sc.Scan() {
 		if onLine != nil {
 			onLine(sc.Text())
 		}
 	}
-	// A scan error (e.g. a >64KB line with no newline → bufio.ErrTooLong) exits the loop while the
-	// exec copy goroutine may still be blocked writing to pw. Drain to EOF so that write completes
-	// and cmd.Wait can return — otherwise <-waitErr blocks forever (ctx-cancel can't rescue an
-	// in-process io.Pipe write). npm -g lines are short so this is unreachable in practice, but the
-	// old bounded-buffer code merely truncated; this keeps install() unable to hang on any input.
+	// A scan error (e.g. a >64KB line with no newline → bufio.ErrTooLong) stops consuming the OS
+	// pipe while the root or a descendant may still be blocked writing. Drain until the lifetime
+	// watcher closes the remaining writers; otherwise output backpressure could keep the root from
+	// exiting. npm -g lines are short, but the old bounded-buffer code merely truncated them.
 	if sc.Err() != nil {
 		_, _ = io.Copy(io.Discard, pr)
 	}
-	if err := <-waitErr; err != nil {
+	err = <-lifetimeDone
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("connect install: npm canceled: %w", ctxErr)
+	}
+	if err != nil {
 		return fmt.Errorf("connect install: npm exit: %w", err)
 	}
 	return nil
