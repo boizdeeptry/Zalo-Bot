@@ -1,13 +1,22 @@
 # Planning state
 
-step: execute
+step: ship
 current_topic: no-default-claude-npm
 current_spec: .planning/specs/2026-08-10-no-default-claude-npm-design.md
 current_plan: .planning/plans/2026-08-10-no-default-claude-npm.md
 last_updated: 2026-08-10
 
-Nhánh `feat/no-default-claude-npm` off main `ccc3ac8`. Execute subagent-driven. Base AgentDC changes (T2/T3)
-commit thẳng vào AgentDC history (như CC4 `b666721`). T1 = spike gate; T9 = NEEDS-LOGIN checkpoint.
+Nhánh `feat/no-default-claude-npm` off main `ccc3ac8`. Execute subagent-driven XONG — T1–T8 code + review sạch,
+final whole-branch integration review bắt 1 lỗi thật (ErrZaloSilent rò qua runClaude → bot đã-cấu-hình nuốt
+im thay vì leo thang) → fix `92b0e98`. Full build gate XANH 7/7, canary sạch, F:\dist\_verify-nodefault
+(3177 tệp/121MB). Base AgentDC: 2 commit `3f224e9`(ErrZaloSilent)+`e05a13c`(zaloConfig.Program) ở lại AgentDC
+history (như CC4). Overlay HEAD `92b0e98`.
+- **CÒN (checkpoint NEEDS-LOGIN, hành động USER trước /ship):** chạy F:\dist\_verify-nodefault → xác nhận fresh
+  data IM + banner "chưa kết nối"; bấm Connect Claude (OAuth thật) → npm i -g @anthropic-ai/claude-code tự chạy
+  → account hiện → consult trả lời qua bin\claude.exe (A-native, chạy thẳng PE, không hop node → không mồ côi).
+- **Cơ chế chốt (T1 spike): A-native-direct-exe** — claude npm cài binary native thật vào
+  `<npm root>\@anthropic-ai\claude-code\bin\claude.exe` (287MB, postinstall copy); resolveCLIProgram trỏ thẳng
+  exe (prefixArgs=nil). KHÔNG dùng cli-wrapper.cjs (fallback --ignore-scripts, có hop+orphan). Xem [[reference-claude-code-npm-distribution]].
 
 ## Đang làm: No-default provider + Claude auto-install qua npm bundled (spec DUYỆT → /plan)
 
