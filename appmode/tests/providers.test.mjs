@@ -68,6 +68,16 @@ test("an added provider shows connected-ish status, an unlisted one shows not co
   assert.match(text(codex), /Chưa kết nối/);
 });
 
+test("a subscription provider with a connected account shows Đã kết nối, not credential-gated", async (t) => {
+  const { main } = mountPage(t, listWith([CODEX_CONNECTED]));
+  await flush();
+  const codex = cards(main).find((c) => cardName(c) === "OpenAI Codex");
+  const status = find(codex, (n) => hasClass(n, "pv-status"));
+  // codex-proxy có 0 credential nhưng CÓ account → phải "Đã kết nối" (không rơi về "Chưa kết nối").
+  assert.ok(hasClass(status, "on"), "codex with an enabled account must read as connected");
+  assert.match(text(status), /Đã kết nối/);
+});
+
 test("typing in the search box filters cards by name", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();

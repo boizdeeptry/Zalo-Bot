@@ -79,6 +79,17 @@ function galleryStatus(entry, byKind) {
   const p = byKind.get(entry.kind);
   if (!p) return { cls: "off", label: "Chưa kết nối" };
   if (p.credential_unreadable) return { cls: "off", label: "Cần đăng nhập lại" };
+  // Gói thuê bao (codex/claude): "đã kết nối" = CÓ TÀI KHOẢN đăng nhập, KHÔNG phải credential — chúng
+  // chạy proxy/CLI bằng phiên riêng của account, không có credential đi qua daemon. Trước đây xét
+  // credential_configured nên codex-proxy (không credential) luôn hiện "Chưa kết nối" dù đã có account.
+  if (entry.group === "subscription") {
+    const accounts = Array.isArray(p.accounts) ? p.accounts.filter((a) => a.enabled !== false) : [];
+    if (accounts.length) {
+      return { cls: "on", label: accounts.length > 1 ? `Đã kết nối · ${accounts.length} tài khoản` : "Đã kết nối" };
+    }
+    if (p.system) return { cls: "on", label: "Sẵn sàng" }; // claude-code: lưới mặc định của máy, vẫn trả lời được
+    return { cls: "off", label: "Chưa kết nối" };
+  }
   if (p.last_check_status === "ok") return { cls: "on", label: "Đã kết nối" };
   if (p.system) return { cls: "on", label: "Sẵn sàng" };
   if (!p.credential_configured) return { cls: "off", label: "Chưa kết nối" };
@@ -88,7 +99,7 @@ function card(entry, byKind, onOpen) {
   const st = galleryStatus(entry, byKind);
   return element("button", { className: "pv-card",
     attributes: { type: "button", "aria-label": `Mở ${entry.name}` }, on: { click() { onOpen(entry.kind); } } },
-    element("span", { className: "pv-logo", attributes: { style: `background:${entry.logoColor}` }, text: entry.prefix.toUpperCase() }),
+    element("span", { className: `pv-logo pv-logo-${entry.kind}`, attributes: { "aria-hidden": "true" } }),
     element("span", { className: "pv-meta" },
       element("span", { className: "pv-name", text: entry.name }),
       element("span", { className: `pv-status ${st.cls}`, text: st.label })),
@@ -141,7 +152,7 @@ function detailHead(entry, byKind) {
   const p = byKind.get(entry.kind);
   const count = p && Array.isArray(p.models) ? `${p.models.length} model` : "0 kết nối";
   return element("div", { className: "pv-detail-head" },
-    element("span", { className: "pv-logo lg", attributes: { style: `background:${entry.logoColor}` }, text: entry.prefix.toUpperCase() }),
+    element("span", { className: `pv-logo lg pv-logo-${entry.kind}`, attributes: { "aria-hidden": "true" } }),
     element("div", {}, element("div", { className: "pv-name", text: entry.name }),
       element("div", { className: "pv-sub", text: count })),
   );
