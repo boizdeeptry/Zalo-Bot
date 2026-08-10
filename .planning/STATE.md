@@ -1,10 +1,13 @@
 # Planning state
 
-step: research
+step: execute
 current_topic: no-default-claude-npm
 current_spec: .planning/specs/2026-08-10-no-default-claude-npm-design.md
-current_plan:
+current_plan: .planning/plans/2026-08-10-no-default-claude-npm.md
 last_updated: 2026-08-10
+
+Nhánh `feat/no-default-claude-npm` off main `ccc3ac8`. Execute subagent-driven. Base AgentDC changes (T2/T3)
+commit thẳng vào AgentDC history (như CC4 `b666721`). T1 = spike gate; T9 = NEEDS-LOGIN checkpoint.
 
 ## Đang làm: No-default provider + Claude auto-install qua npm bundled (spec DUYỆT → /plan)
 
