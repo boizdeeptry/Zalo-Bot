@@ -453,8 +453,13 @@ Xong thì nói ngắn gọn: đã viết những trang nào, bỏ qua tệp nào
 
 func (a *api) runIngest(ctx context.Context, cancel func(), dir string) {
 	defer cancel()
-	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
+	program, prefixArgs, err := resolveCLIProgramContext(ctx, cliDescriptors["claude-code"])
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			ingest.step("đã huỷ")
+			ingest.finish("đã huỷ")
+			return
+		}
 		ingest.step("chưa cài Claude Code")
 		ingest.finish("chưa cài Claude Code, hoặc chưa đăng nhập. Bấm Connect Claude trong Portal trước. Xem DOC TRUOC.txt")
 		return

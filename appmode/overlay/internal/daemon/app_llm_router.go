@@ -57,6 +57,14 @@ type appLLMRunnerConfig struct {
 	// Luôn có mặt: appZaloRunner luôn tiêm nó (validateLLMRoute chỉ đòi mắt xích cuối đang bật —
 	// chuỗi không kết thúc bằng Claude Code vẫn hợp lệ), nên router không cần nhánh "nếu không còn gì".
 	Claude func(model string) zaloRunner
+	// ClaudeForSession resolves the terminal Claude runner before session
+	// selection. The current binding is advisory: implementations reuse it only
+	// while that account remains enabled, otherwise choosing a replacement.
+	ClaudeForSession func(
+		ctx context.Context,
+		model string,
+		current *store.ZaloCLISession,
+	) (zaloRunner, appZaloClaudeBinding)
 	// Disabled là id của những Provider API đang TẮT, và nó là công tắc ngắt SỐNG.
 	//
 	// Cờ Enabled trên mắt xích route không thay được nó: hợp lệ hoá chỉ chạy lúc LƯU chuỗi, nên
@@ -89,6 +97,28 @@ type appLLMRunner struct {
 type appLLMRouteInput struct {
 	statelessPrompt string
 	structured      *appZaloSessionRunInput
+}
+
+type appZaloClaudeBindingState uint8
+
+const (
+	appZaloClaudeBindingUnresolved appZaloClaudeBindingState = iota
+	appZaloClaudeBindingUnavailable
+	appZaloClaudeBindingSelected
+)
+
+type appZaloClaudeBinding struct {
+	State     appZaloClaudeBindingState
+	AccountID string
+	ConfigDir string
+	Model     string
+}
+
+type appZaloSessionRouteResolver interface {
+	appResolveZaloSessionRoute(
+		ctx context.Context,
+		current *store.ZaloCLISession,
+	) (zaloRunner, appZaloClaudeBinding)
 }
 
 var (
@@ -146,6 +176,24 @@ func (r *appLLMRunner) appWithZaloStructuredClaudeRequirement(required bool) zal
 	cloned := *r
 	cloned.cfg.RequiresStructuredClaude = required
 	return &cloned
+}
+
+func (r *appLLMRunner) appResolveZaloSessionRoute(
+	ctx context.Context,
+	current *store.ZaloCLISession,
+) (zaloRunner, appZaloClaudeBinding) {
+	entry, ok := findClaudeEntry(r.cfg.Route.Entries)
+	if !ok || r.cfg.ClaudeForSession == nil {
+		return r, appZaloClaudeBinding{}
+	}
+	claude, binding := r.cfg.ClaudeForSession(ctx, entry.ModelID, current)
+	if binding.Model == "" {
+		binding.Model = entry.ModelID
+	}
+	cloned := *r
+	cloned.cfg.Claude = func(string) zaloRunner { return claude }
+	cloned.cfg.ClaudeForSession = nil
+	return &cloned, binding
 }
 
 // run is the single route-policy loop used by both the legacy stateless seam
@@ -655,11 +703,18 @@ func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, has
 		return silentZaloRunner{}
 	}
 	return newAppLLMRunner(appLLMRunnerConfig{
-		Route:      snapshot,
-		Store:      a.st,
-		Adapters:   adapters,
-		Disabled:   disabled,
-		Claude:     func(model string) zaloRunner { return a.appClaudeRunner(zc, base, model) },
+		Route:    snapshot,
+		Store:    a.st,
+		Adapters: adapters,
+		Disabled: disabled,
+		Claude:   func(model string) zaloRunner { return a.appClaudeRunner(zc, base, model) },
+		ClaudeForSession: func(
+			ctx context.Context,
+			model string,
+			current *store.ZaloCLISession,
+		) (zaloRunner, appZaloClaudeBinding) {
+			return a.appClaudeRunnerForSession(ctx, zc, model, current)
+		},
 		Credential: a.appLLMCredential,
 		// Tệp của tin hiện tại đã biết trước khi dựng runner. Tệp lịch sử được chụp đúng một lần
 		// ngay sau đó trong appAnswerZalo và áp qua appWithZaloAttachments; cùng snapshot ấy dựng
@@ -685,25 +740,45 @@ func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, has
 // (khác cliAdapter của codex), nên đây chỉ round-robin. Cooldown là follow-up khi runClaude phân
 // loại được lỗi 429 của Claude.
 func (a *api) appClaudeRunner(zc zaloConfig, base zaloRunner, model string) zaloRunner {
+	_ = base
+	runner, _ := a.appClaudeRunnerForSession(context.Background(), zc, model, nil)
+	return runner
+}
+
+func (a *api) appClaudeRunnerForSession(
+	ctx context.Context,
+	zc zaloConfig,
+	model string,
+	current *store.ZaloCLISession,
+) (zaloRunner, appZaloClaudeBinding) {
 	accounts, err := a.st.LLMAccounts(claudeCodeProviderID)
-	if err != nil || len(accounts) == 0 {
-		return silentZaloRunner{}
-	}
-	acc, ok := accountSel.pick("claude-code", accounts)
-	if !ok {
-		return silentZaloRunner{}
-	}
-	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
 	if err != nil {
-		// Account có nhưng binary claude không định vị được → im, không đoán một exe khác.
-		return silentZaloRunner{}
+		return silentZaloRunner{}, appZaloClaudeBinding{}
+	}
+	if len(accounts) == 0 {
+		return silentZaloRunner{}, appZaloClaudeBinding{State: appZaloClaudeBindingUnavailable}
+	}
+	acc, ok := appSelectClaudeAccountForSession(accountSel, accounts, current)
+	if !ok {
+		return silentZaloRunner{}, appZaloClaudeBinding{State: appZaloClaudeBindingUnavailable}
 	}
 	zc.ConfigDir = acc.ConfigDir
-	zc.Program, zc.ProgramPrefixArgs = program, prefixArgs
 	if model != "" && model != zc.Model {
 		zc.Model = model
 	}
-	return execZaloRunner{cfg: zc, logger: a.logger}
+	binding := appZaloClaudeBinding{
+		State:     appZaloClaudeBindingSelected,
+		AccountID: acc.ID,
+		ConfigDir: acc.ConfigDir,
+		Model:     zc.Model,
+	}
+	program, prefixArgs, err := resolveCLIProgramContext(ctx, cliDescriptors["claude-code"])
+	if err != nil {
+		// Account có nhưng binary claude không định vị được → im, không đoán một exe khác.
+		return silentZaloRunner{}, binding
+	}
+	zc.Program, zc.ProgramPrefixArgs = program, prefixArgs
+	return execZaloRunner{cfg: zc, logger: a.logger}, binding
 }
 
 // appLLMAdapters dựng adapter cho mọi Provider API đang lưu, khoá theo id, kèm tập những id đang

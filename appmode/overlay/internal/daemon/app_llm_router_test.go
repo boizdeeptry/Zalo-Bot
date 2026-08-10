@@ -1390,13 +1390,9 @@ func connectClaudeAccount(t *testing.T, a *api) {
 	}
 }
 
-// fakeClaudeExe làm resolveCLIProgram("claude-code") THÀNH CÔNG ở mọi môi trường: ghi một exe giả
-// vào một npm root giả rồi trỏ npmGlobalRoot vào đó. Máy chạy test không cần cài claude qua npm —
-// nhánh account-connected của appClaudeRunner (gọi resolveCLIProgram) vẫn kiểm được. Trả về đường
-// dẫn exe để test khớp với zc.Program.
-//
-// ponytail: gán đè biến gói npmGlobalRoot (sync.OnceValues); an toàn vì các test này không chạy
-// song song và Cleanup khôi phục lại. Nâng cấp: nếu resolveCLIProgram nhận seam qua tham số thì bỏ.
+// fakeClaudeExe làm resolveCLIProgramContext("claude-code") THÀNH CÔNG ở mọi môi trường: ghi một
+// exe giả vào một npm root giả rồi đặt success cache vào root đó. Máy chạy test không cần cài
+// claude qua npm. Trả về đường dẫn exe để test khớp với zc.Program.
 func fakeClaudeExe(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -1407,9 +1403,15 @@ func fakeClaudeExe(t *testing.T) string {
 	if err := os.WriteFile(exe, []byte("stub"), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s) = %v; want nil", exe, err)
 	}
-	orig := npmGlobalRoot
-	npmGlobalRoot = func() (string, error) { return root, nil }
-	t.Cleanup(func() { npmGlobalRoot = orig })
+	npmRootCache.mu.Lock()
+	originalCachedRoot := npmRootCache.root
+	npmRootCache.root = root
+	npmRootCache.mu.Unlock()
+	t.Cleanup(func() {
+		npmRootCache.mu.Lock()
+		npmRootCache.root = originalCachedRoot
+		npmRootCache.mu.Unlock()
+	})
 	return exe
 }
 
@@ -1861,6 +1863,40 @@ func TestAppClaudeRunnerSelectsAClaudeAccount(t *testing.T) {
 		if got := zero.appClaudeRunner(zc, base, model); !isSilent(got) {
 			t.Errorf("0 account, model %q: appClaudeRunner = %T; want silentZaloRunner", model, got)
 		}
+	}
+}
+
+func TestAppClaudeRunnerForSessionReusesBindingUntilAccountLoss(t *testing.T) {
+	accountSel = newAccountSelector()
+	t.Cleanup(func() { accountSel = newAccountSelector() })
+	fakeClaudeExe(t)
+	a := newAppRouteAPI(t)
+	for _, account := range []store.LLMAccount{
+		{ID: "account-a", ProviderID: claudeCodeProviderID, Label: "A", ConfigDir: "config-a", Enabled: true},
+		{ID: "account-b", ProviderID: claudeCodeProviderID, Label: "B", ConfigDir: "config-b", Enabled: true},
+	} {
+		if err := a.st.CreateLLMAccount(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, first := a.appClaudeRunnerForSession(t.Context(), zaloConfig{Model: "sonnet"}, "haiku", nil)
+	current := &store.ZaloCLISession{
+		ClaudeAccountID: first.AccountID,
+		ClaudeConfigDir: first.ConfigDir,
+	}
+	_, resumed := a.appClaudeRunnerForSession(t.Context(), zaloConfig{Model: "sonnet"}, "haiku", current)
+	_, otherThread := a.appClaudeRunnerForSession(t.Context(), zaloConfig{Model: "sonnet"}, "haiku", nil)
+	if first.AccountID != "account-a" || resumed != first || otherThread.AccountID != "account-b" {
+		t.Fatalf("bindings = first %+v resumed %+v other %+v; want A, same A, then B",
+			first, resumed, otherThread)
+	}
+	if err := a.st.DeleteLLMAccount("account-a"); err != nil {
+		t.Fatal(err)
+	}
+	_, afterLoss := a.appClaudeRunnerForSession(t.Context(), zaloConfig{Model: "sonnet"}, "opus", current)
+	if afterLoss.AccountID != "account-b" || afterLoss.ConfigDir != "config-b" || afterLoss.Model != "opus" {
+		t.Fatalf("binding after account loss = %+v; want account-b/config-b/opus", afterLoss)
 	}
 }
 

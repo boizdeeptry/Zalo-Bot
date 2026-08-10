@@ -8,10 +8,11 @@ Claude per-thread sessions, speaker-scoped Memory, Portal behavior, data, or pac
 
 **TDD mode:** yes — confirmed by the user on 2026-08-10.
 
-**Architecture:** The integration produces schema V5 through capability-aware migration from both V4
-lineages. Zalo answer orchestration prepares both a full stateless prompt and a structured Claude
-session input; Provider routing chooses the execution engine, while only a successful structured
-Claude turn advances session state.
+**Architecture:** The integration produces schema V6 through capability-aware migration from both V4
+lineages and an explicit V5→V6 affinity migration. Zalo answer orchestration prepares both a full
+stateless prompt and a structured Claude session input; Provider routing chooses the execution
+engine, while only a successful structured Claude turn advances state. Claude transcript mappings
+are bound to account/config/model and rotate to a fresh UUID when that affinity changes.
 
 **Tech stack:** Go daemon overlay, SQLite, vanilla JavaScript Portal, Node built-in test runner,
 PowerShell/Pester build gates, Windows DPAPI and local CLI adapters.
@@ -223,7 +224,7 @@ focused RED tests.
   Expected: these conflicts disappear from `git diff --name-only --diff-filter=U`. Commit is deferred
   to Task 6 because the merge transaction is still open.
 
-### Task 2: Build a schema V5 bridge for both V4 lineages
+### Task 2: Build a schema V6 bridge for both V4 lineages and V5 affinity state
 
 **Files:**
 
@@ -231,8 +232,9 @@ focused RED tests.
 - Modify: `appmode/overlay/internal/store/app_schema_test.go`
 
 **Public behavior to verify:** Opening either a Feature V4 or Main V4 database atomically produces
-the complete V5 schema without losing Memory, session, Provider, account, Combo, route or telemetry
-data.
+the complete V6 schema without losing Memory, session, Provider, account, Combo, route or telemetry
+data. Opening V5 adds `claude_account_id` and `claude_config_dir` without changing the persisted
+session UUID, generation, turn count or cursor.
 
 - [ ] **Step 1: Resolve the test file to a valid union and add failing upgrade fixtures**
 
@@ -246,28 +248,29 @@ data.
   (`git show :3:appmode/overlay/internal/store/app_schema_test.go`). Add public migration tests:
 
   ```go
-  func TestMigrateAppFeatureV4ToV5PreservesMemoryAndAddsLLM(t *testing.T) {
+  func TestMigrateAppFeatureV4ToV6PreservesMemoryAndAddsLLM(t *testing.T) {
       db := openFeatureV4Fixture(t)
       mustMigrateApp(t, db)
-      requireSchemaVersion(t, db, 5)
+      requireSchemaVersion(t, db, 6)
       requireTable(t, db, "app_memory_subject_revisions")
       requireTable(t, db, "llm_providers")
       requireTable(t, db, "llm_combos")
       requireFeatureFixtureRows(t, db)
   }
 
-  func TestMigrateAppMainV4ToV5PreservesRoutingAndAddsMemory(t *testing.T) {
+  func TestMigrateAppMainV4ToV6PreservesRoutingAndAddsMemory(t *testing.T) {
       db := openMainV4Fixture(t)
       mustMigrateApp(t, db)
-      requireSchemaVersion(t, db, 5)
+      requireSchemaVersion(t, db, 6)
       requireTable(t, db, "app_zalo_cli_sessions")
       requireTable(t, db, "app_memory_subject_revisions")
       requireMainFixtureRows(t, db)
   }
   ```
 
-  Also add `TestMigrateAppV5IsIdempotent` and `TestMigrateAppFutureVersionIsUntouched`. Fixtures must
-  insert one representative row for every data family they claim to preserve.
+  Also add `TestMigrateAppV5ToV6AddsClaudeBindingWithoutChangingSession`,
+  `TestMigrateAppV6IsIdempotent` and `TestMigrateAppFutureVersionIsUntouched`. Fixtures must insert
+  one representative row for every data family they claim to preserve.
 
 - [ ] **Step 2: Run focused store tests and confirm RED for missing capabilities**
 
@@ -275,18 +278,18 @@ data.
 
   ```powershell
   Invoke-MergeOverlayGoTest -Package store `
-    -Run 'TestMigrateApp(FeatureV4|MainV4|V5|Future)'
+    -Run 'TestMigrateApp(FeatureV4ToV6|MainV4ToV6|V5ToV6|V6IsIdempotent|FutureVersion)'
   ```
 
   Expected RED on the feature-side schema: Feature V4 lacks `llm_providers`/`llm_combos`; Main V4
   returns early at version 4 and lacks Memory/session capabilities.
 
-- [ ] **Step 3: Implement the minimum atomic V5 bridge**
+- [ ] **Step 3: Implement the minimum atomic V6 bridge**
 
   The implementation must have one version owner and no version update inside `appLLMSchema`:
 
   ```go
-  const appSchemaVersion int64 = 5
+  const appSchemaVersion int64 = 6
 
   func migrateApp(db *sql.DB) error {
       tx, err := db.Begin()
@@ -310,8 +313,10 @@ data.
   Preserve feature validation for malformed/negative versions. `appMigrateMemoryV3/V4` must remain
   idempotent via table/column/trigger inspection. Bring main's LLM schema verbatim except for its
   embedded `UPDATE app_meta SET value = '4' WHERE key = 'schema_version'`; preserve no-default Combo
-  behavior and the idempotent
-  `claude_code` → `claude-code` normalization.
+  behavior and the idempotent `claude_code` → `claude-code` normalization. Add capability-driven
+  `claude_account_id TEXT NOT NULL DEFAULT ''` and `claude_config_dir TEXT NOT NULL DEFAULT ''`
+  columns before the single final `schema_version=6` write. A V5 row keeps its existing UUID and
+  counters during migration; runtime affinity resolution performs any required rotation.
 
 - [ ] **Step 4: Verify GREEN and regression coverage**
 
@@ -348,7 +353,8 @@ data.
 
 **Public behavior to verify:** API/CLI stateless answers receive a complete prompt without advancing
 Claude state; fallback to Claude creates/resumes the right thread session and advances it exactly
-once.
+once. The session is sticky to its Claude account/config/model, and a binding change creates a new
+UUID before Claude runs.
 
 - [ ] **Step 1: Add failing structured-routing tests**
 
@@ -359,6 +365,8 @@ once.
   func TestAppLLMRunnerStructuredFallbackUsesClaudeDeltaAndAdvancesSession(t *testing.T)
   func TestAppZaloVirginSessionStaysFreshAfterStatelessSuccess(t *testing.T)
   func TestAppAnswerZaloBuildsProviderRunnerInsideThreadGate(t *testing.T)
+  func TestAppAnswerZaloBindsClaudeAccountToThreadSessionBeforeSelection(t *testing.T)
+  func TestAppAnswerZaloRotatesWhenRoutedClaudeModelChanges(t *testing.T)
   ```
 
   The API fake must record its received prompt and return a valid answer. The Claude fake must record
@@ -378,7 +386,7 @@ once.
 
   ```powershell
   Invoke-MergeOverlayGoTest -Package daemon `
-    -Run 'TestApp(LLMRunnerStructured|ZaloVirgin|AnswerZaloBuildsProvider)'
+    -Run 'TestApp(LLMRunnerStructured|ZaloVirgin|AnswerZaloBuildsProvider|AnswerZaloBindsClaude|AnswerZaloRotatesWhenRoutedClaudeModel)'
   ```
 
   Expected RED: `appLLMRunner` does not implement `appZaloStructuredRunner`, stateless/full prompt is
@@ -453,7 +461,9 @@ once.
 
   In session selection, run rotation/fingerprint checks first, then return `bootstrapSelection(session)`
   whenever `session.TurnCount == 0`. This guarantees `Resume=false` until Claude has actually created
-  the transcript.
+  the transcript. Resolve Claude before selection and persist `claude_account_id`,
+  `claude_config_dir` and routed `model`; if any affinity component differs, CAS-replace the mapping
+  with `uuid.NewString()`, reset it to a fresh bootstrap and never resume the prior transcript.
 
 - [ ] **Step 6: Verify GREEN plus existing safety regressions**
 
@@ -585,7 +595,7 @@ skip list narrow.
   Assert-Equal $answerCalls 1 'single answer entrypoint'
   Assert-Equal $routeCalls 1 'single provider route composition'
   Assert-True ($hook -match 'SessionAdvanced') 'stateless turns must not complete Claude state'
-  Assert-True ($schema -match 'appSchemaVersion int64 = 5') 'package must target schema V5'
+  Assert-True ($schema -match 'appSchemaVersion int64 = 6') 'package must target schema V6'
   Assert-True ($schema -match 'llm_combos') 'package must contain Combo schema'
   Assert-True ($schema -match 'app_memory_subject_revisions') 'package must contain Memory V2 schema'
   ```
@@ -615,6 +625,8 @@ skip list narrow.
 
   - `Assert-NoProviderCredential` and its export/call sites;
   - provider/Combo package signatures;
+  - session affinity package signatures `claude_account_id` and `claude_config_dir`, each with a
+    positive binary fixture and an independent missing-signature rejection case;
   - CLI/provider credential protections;
   - no-default routing assertions;
   - exact reviewed upstream skip entry for `TestJoinGreetsOnceForEveryone`.
@@ -647,8 +659,8 @@ skip list narrow.
 
 - [ ] **Step 5: Update verification documentation and stage the build checkpoint**
 
-  Document schema V5 dual-lineage canary, Provider/no-provider checks and session fallback checks in
-  `PORTAL-VERIFICATION.md`. Then:
+  Document schema V6 dual-lineage plus V5→V6 affinity canaries, Provider/no-provider checks, account/
+  config/model UUID-rotation checks and session fallback checks in `PORTAL-VERIFICATION.md`. Then:
 
   ```powershell
   git add -- scripts/BuildApp.psm1 tests/build-app.Tests.ps1 build-app.ps1 `
@@ -742,17 +754,19 @@ or Important issue.
   ```
 
   Expected: build and package assertion exit `0`; the artifact is under `%TEMP%`, not
-  `D:\TuvanZalo`.
+  `D:\TuvanZalo`. `Assert-AppPackage` must prove the binary contains both `claude_account_id` and
+  `claude_config_dir` in addition to the existing Memory, Provider, account and CLI signatures.
 
 - [ ] **Step 2: Re-run dual-lineage migration tests against file-backed fixtures**
 
   ```powershell
   pwsh -NoProfile -File .\tests\run-overlay-go-tests.ps1 -Package store `
-    -Run 'TestMigrateApp(FeatureV4|MainV4|V5|Future)'
+    -Run 'TestMigrateApp(FeatureV4ToV6|MainV4ToV6|V5ToV6|V6IsIdempotent|FutureVersion)'
   ```
 
   Expected: every fixture passes and source fixture hashes/row assertions remain unchanged except for
-  the copied DB's intended V5 additions.
+  the copied DB's intended V6 additions. The V5 copy gains only the two affinity columns and version
+  advance; its existing session UUID/generation/turn/cursor values remain intact.
 
 - [ ] **Step 3: Run deployment contract tests without deploying**
 
@@ -770,7 +784,8 @@ or Important issue.
 
   ```text
   DESCRIPTION: Integrated pinned main Provider/Account/Combo routing with per-thread Claude sessions
-               and speaker-scoped Memory V2 through schema V5 and a session-aware route contract.
+               and speaker-scoped Memory V2 through schema V6, including V5→V6 affinity migration,
+               account/config/model binding and fresh-UUID rotation before cross-affinity resume.
   PLAN_OR_REQUIREMENTS: .planning/plans/2026-08-10-main-memory-v2-integration.md
   BASE_SHA: 1904427
   HEAD_SHA: the exact value printed by `git rev-parse HEAD` immediately before dispatch

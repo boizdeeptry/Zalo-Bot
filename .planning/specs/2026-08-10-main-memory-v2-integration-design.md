@@ -58,12 +58,12 @@ bot có thể bỏ qua Provider routing hay bỏ qua session/Memory mà vẫn co
 
 ## 4. Các phương án đã cân nhắc
 
-### A. Schema bridge V5 và router có contract session-aware — chọn
+### A. Schema bridge V6 và router có contract session-aware — chọn
 
-Merge main vào một integration branch. Tạo schema đích V5 có cả hai capability và migration nhận
-biết hình dạng thực thay vì tin tuyệt đối vào số version. Mở rộng routing để nhận đồng thời prompt
-stateless đầy đủ và input session có cấu trúc; API/CLI stateless dùng prompt đầy đủ, Claude Code dùng
-session input.
+Merge main vào một integration branch. Tạo schema đích V6 có cả hai capability, bổ sung affinity
+Claude từ V5 và migration nhận biết hình dạng thực thay vì tin tuyệt đối vào số version. Mở rộng
+routing để nhận đồng thời prompt stateless đầy đủ và input session có cấu trúc; API/CLI stateless dùng
+prompt đầy đủ, Claude Code dùng session input đã khóa theo account/config/model.
 
 Ưu điểm: giữ trọn hai hệ tính năng, không làm API giả stateful, không mất resume khi fallback tới
 Claude và tạo được regression tests rõ ràng. Nhược điểm: cần refactor nhỏ ở runner contract và bộ
@@ -172,12 +172,21 @@ bootstrap với `Resume=false`. Vì vậy:
 Nếu API lỗi và fallback tới Claude trong cùng lượt, router chuyển sang structured Claude với đúng
 input đã chuẩn bị và chỉ Claude success mới advance session.
 
-### 5.5. Schema đích V5 có capability detection
+Mỗi mapping Claude được ràng buộc bằng bộ ba `claude_account_id`, `claude_config_dir` và `model`.
+Binding phải được resolve trước khi chọn session và được lưu cùng mapping. Nếu account bị mất/tắt,
+config directory đổi hoặc routed model đổi, lượt Claude kế tiếp phải CAS-replace generation, tạo UUID
+mới, dùng bootstrap fresh với `Resume=false` và tuyệt đối không resume transcript cũ dưới affinity
+mới. API success vẫn có thể lưu binding đã resolve để lượt fallback nhất quán, nhưng không được tăng
+turn/cursor hay giả rằng transcript Claude đã tồn tại.
 
-`appSchemaVersion` tăng thành 5. Schema đích gồm:
+### 5.5. Schema đích V6 có capability detection
+
+`appSchemaVersion` là 6. Schema đích gồm:
 
 - session và Memory V2 tables/columns/indexes/triggers từ feature;
 - Provider/model/route/attempt/account/combo tables từ main;
+- `app_zalo_cli_sessions.claude_account_id` và `claude_config_dir` để khóa transcript theo đúng
+  Claude account/config directory; `model` hiện hữu hoàn tất affinity ba thành phần;
 - no-default behavior của main: không seed active combo mặc định;
 - `claude-code` system Provider vẫn được tạo idempotently để Portal có thể kết nối, nhưng bot không
   route cho tới khi người dùng tạo và kích hoạt Combo hợp lệ.
@@ -185,21 +194,25 @@ input đã chuẩn bị và chỉ Claude success mới advance session.
 Migration nằm trong một transaction và tuân theo thứ tự:
 
 1. Đọc/validate `app_meta.schema_version`; version âm hoặc không parse được vẫn fail closed.
-2. Nếu version lớn hơn 5, không sửa schema hay hạ version.
+2. Nếu version lớn hơn 6, không sửa schema hay hạ version.
 3. Tạo foundation tables idempotently.
 4. Chạy Memory V3/V4 capability migration bằng kiểm tra table/column/trigger thực tế, kể cả khi số
    version hiện tại đã là 4.
 5. Tạo LLM/Combo schema idempotently; tách câu cập nhật `schema_version` khỏi SQL schema của main.
-6. Chỉ sau khi mọi capability thành công mới ghi `schema_version=5` và commit.
+6. Bổ sung idempotently hai cột affinity Claude cho mọi lineage còn thiếu chúng.
+7. Chỉ sau khi mọi capability thành công mới ghi `schema_version=6` và commit.
 
 Đường nâng cấp bắt buộc:
 
-- Fresh/upstream DB không có `app_meta` → V5 đầy đủ.
-- Legacy V1/V2/V3 → V5 đầy đủ và giữ dữ liệu cũ.
-- Feature V4 → thêm Provider/Account/Combo, giữ session/Memory và revisions.
-- Main V4 → thêm session/Memory V2, giữ Provider/account/combo/route/telemetry.
-- V5 chạy migration lần hai không đổi dữ liệu người dùng.
-- Future version lớn hơn 5 được giữ nguyên, không bị downgrade.
+- Fresh/upstream DB không có `app_meta` → V6 đầy đủ.
+- Legacy V1/V2/V3 → V6 đầy đủ và giữ dữ liệu cũ.
+- Feature V4 → V6: thêm Provider/Account/Combo và affinity, giữ session/Memory và revisions.
+- Main V4 → V6: thêm session/Memory V2 và affinity, giữ Provider/account/combo/route/telemetry.
+- V5 → V6: thêm `claude_account_id`/`claude_config_dir` mặc định rỗng, không đổi UUID, generation,
+  turn count hoặc cursor trong migration; lần resolve Claude sau đó xoay sang UUID mới trước khi dùng
+  binding account/config/model, nên transcript V5 không bị resume qua affinity chưa biết.
+- V6 chạy migration lần hai không đổi dữ liệu người dùng.
+- Future version lớn hơn 6 được giữ nguyên, không bị downgrade.
 
 ### 5.6. Portal và API
 
@@ -230,7 +243,7 @@ call site. Bộ gate hợp nhất phải giữ:
 - no-default/provider credential protections;
 - overlay cleanliness;
 - package secret scanning;
-- Memory/session/provider binary signatures;
+- Memory/session/provider binary signatures, gồm `claude_account_id` và `claude_config_dir`;
 - vetted Go skip list, không mở rộng regex để che test mới;
 - canary, copied-data smoke test và rollback evidence.
 
@@ -248,8 +261,10 @@ call site. Bộ gate hợp nhất phải giữ:
 
 ## 7. Đơn vị thay đổi dự kiến
 
-- `appmode/overlay/internal/store/app_schema.go`: schema V5 và bridge migration.
-- `appmode/overlay/internal/store/app_schema_test.go`: fixture cho hai biến thể V4 và idempotence.
+- `appmode/overlay/internal/store/app_schema.go`: schema V6, bridge hai biến thể V4 và migration affinity
+  V5→V6.
+- `appmode/overlay/internal/store/app_schema_test.go`: fixture cho hai biến thể V4, V5→V6 và
+  idempotence V6.
 - `appmode/overlay/internal/daemon/app_zalo_session_runner.go`: structured/stateless prompt contract và
   session advancement result.
 - `appmode/overlay/internal/daemon/app_zalo_session_hook.go`: route composition, virgin-session rule
@@ -272,10 +287,16 @@ bất biến công khai đã nêu ở trên.
 
 ### 8.1. Migration
 
-- Viết fixture Feature V4 và chứng minh test đỏ vì thiếu LLM tables trước khi có V5 bridge.
+- Viết fixture Feature V4 và chứng minh test đỏ vì thiếu LLM tables trước khi có V6 bridge.
 - Viết fixture Main V4 và chứng minh test đỏ vì thiếu Memory/session capability.
+- Viết fixture V5 và chứng minh V5→V6 thêm hai cột affinity mà không đổi mapping/counter hiện hữu.
 - Kiểm tra dữ liệu mẫu ở cả hai phía còn nguyên sau upgrade.
-- Kiểm tra fresh, V1–V3, idempotent second open, rollback khi một capability fail và future version.
+- Kiểm tra fresh, V1–V3, idempotent V6 second open, rollback khi một capability fail và future version.
+
+Các regression chuẩn là `TestMigrateAppFeatureV4ToV6PreservesMemoryAndAddsLLM`,
+`TestMigrateAppMainV4ToV6PreservesRoutingAndAddsMemory`,
+`TestMigrateAppV5ToV6AddsClaudeBindingWithoutChangingSession`, `TestMigrateAppV6IsIdempotent` và
+`TestMigrateAppFutureVersionIsUntouched`.
 
 ### 8.2. Routing và session
 
@@ -283,6 +304,9 @@ bất biến công khai đã nêu ở trên.
 - Nhiều API success liên tiếp giữ session virgin; Claude đầu tiên dùng fresh `--session-id`.
 - API temporary failure → Claude structured fallback dùng đúng session input và advance một lần.
 - Claude resume success/recovery/rotation giữ regression behavior hiện có.
+- `TestAppAnswerZaloBindsClaudeAccountToThreadSessionBeforeSelection` khóa account/config theo thread,
+  failover account tạo UUID mới; `TestAppAnswerZaloRotatesWhenRoutedClaudeModelChanges` khóa model và
+  chứng minh model đổi không resume UUID cũ.
 - No provider/no active combo vẫn silent; configured terminal failure vẫn escalation.
 - Attachment chỉ đi local CLI và không chạm HTTP adapter.
 - Provider response có valid/invalid `memory_ops` giữ policy và answer sanitization hiện tại.
@@ -308,7 +332,8 @@ bất biến công khai đã nêu ở trên.
 ## 9. Tiêu chí chấp nhận
 
 - Merge không còn conflict marker và integration branch chứa cả lịch sử main lẫn feature.
-- Database từ cả hai loại V4 mở được, nâng thành V5 và giữ dữ liệu/cấu hình.
+- Database từ cả hai loại V4 mở được, nâng thành V6 và giữ dữ liệu/cấu hình; V5 nâng V6 giữ nguyên
+  mapping cho tới khi runtime resolve affinity và xoay UUID an toàn.
 - Providers, Accounts, Combos, route telemetry, Session và Memory Center cùng hoạt động.
 - API Provider luôn nhận prompt đầy đủ; Claude Code vẫn resume theo người/nhóm và xoay context đúng.
 - Stateless response không advance Claude cursor; fallback tới Claude advance đúng một lần.
@@ -336,7 +361,7 @@ bất biến công khai đã nêu ở trên.
 - **Hai V4 cùng số:** capability detection và hai fixture upgrade độc lập; không branch chỉ theo số.
 - **Auto-merge UI hợp dòng nhưng sai lifecycle:** chạy full DOM/navigation tests và E2E ba trang.
 - **Build seam drift do upstream mới:** exact-once + whole-tree call-site assertions fail closed.
-- **Migration thành công nhưng binary cũ không đọc V5:** rollout luôn backup và không tự downgrade;
+- **Migration thành công nhưng binary cũ không đọc V6:** rollout luôn backup và không tự downgrade;
   deploy chỉ sau explicit approval.
 - **Provider main tiếp tục thay đổi trong lúc tích hợp:** khóa target tại `b6606d3`; update main lần nữa
   phải mô phỏng merge và verification lại, không lặng lẽ kéo thêm commit vào giữa plan.

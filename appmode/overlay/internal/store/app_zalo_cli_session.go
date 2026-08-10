@@ -18,6 +18,8 @@ var ErrZaloCLISessionConflict = errors.New("zalo CLI session generation conflict
 type ZaloCLISession struct {
 	ThreadID              string
 	ClaudeSessionID       string
+	ClaudeAccountID       string
+	ClaudeConfigDir       string
 	Model                 string
 	PromptFingerprint     string
 	LastError             string
@@ -45,7 +47,8 @@ const zaloCLISessionColumns = `thread_id, claude_session_id, generation, model,
 prompt_fingerprint, context_tokens, turn_count, message_cursor,
 rotate_before_next, last_error, created_at, updated_at,
 memory_revision, lessons_revision, memory_subject_uid,
-memory_subject_revision, memory_common_revision`
+memory_subject_revision, memory_common_revision, claude_account_id,
+claude_config_dir`
 
 type zaloCLISessionScanner interface {
 	Scan(dest ...any) error
@@ -73,6 +76,8 @@ func scanZaloCLISession(row zaloCLISessionScanner) (ZaloCLISession, error) {
 		&session.MemorySubjectUID,
 		&session.MemorySubjectRevision,
 		&session.MemoryCommonRevision,
+		&session.ClaudeAccountID,
+		&session.ClaudeConfigDir,
 	); err != nil {
 		return ZaloCLISession{}, err
 	}
@@ -109,7 +114,8 @@ func (s *Store) CreateZaloCLISession(next ZaloCLISession) (ZaloCLISession, error
 thread_id, claude_session_id, generation, model, prompt_fingerprint,
 context_tokens, turn_count, message_cursor, rotate_before_next, last_error,
 created_at, updated_at, memory_revision, lessons_revision, memory_subject_uid,
-memory_subject_revision, memory_common_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+memory_subject_revision, memory_common_revision, claude_account_id,
+claude_config_dir) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		next.ThreadID,
 		next.ClaudeSessionID,
 		int64(1),
@@ -127,6 +133,8 @@ memory_subject_revision, memory_common_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,
 		next.MemorySubjectUID,
 		next.MemorySubjectRevision,
 		next.MemoryCommonRevision,
+		next.ClaudeAccountID,
+		next.ClaudeConfigDir,
 	)
 	if err != nil {
 		return ZaloCLISession{}, fmt.Errorf("create Zalo CLI session %s: %w", next.ThreadID, err)
@@ -140,7 +148,8 @@ func (s *Store) ReplaceZaloCLISession(expectedGeneration int64, next ZaloCLISess
 claude_session_id = ?, generation = generation + 1, model = ?, prompt_fingerprint = ?,
 context_tokens = ?, turn_count = ?, message_cursor = MAX(message_cursor, ?), rotate_before_next = ?,
 last_error = ?, updated_at = ?, memory_revision = ?, lessons_revision = ?,
-memory_subject_uid = '', memory_subject_revision = 0, memory_common_revision = 0
+memory_subject_uid = '', memory_subject_revision = 0, memory_common_revision = 0,
+claude_account_id = ?, claude_config_dir = ?
 WHERE thread_id = ? AND generation = ?`,
 		next.ClaudeSessionID,
 		next.Model,
@@ -153,6 +162,8 @@ WHERE thread_id = ? AND generation = ?`,
 		ts(time.Now()),
 		next.MemoryRevision,
 		next.LessonsRevision,
+		next.ClaudeAccountID,
+		next.ClaudeConfigDir,
 		next.ThreadID,
 		expectedGeneration,
 	)

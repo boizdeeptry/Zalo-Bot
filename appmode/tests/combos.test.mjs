@@ -452,6 +452,45 @@ test("the picker offers a connected subscription provider's models and drops the
   assert.equal(pickNote(picker), null, "no note when every enabled provider is connected");
 });
 
+test("the picker excludes a disabled but connected API provider", async (t) => {
+  const providers = {
+    kinds: [],
+    providers: [{
+      id: "openai-off", name: "OpenAI nghỉ", kind: "openai", enabled: false, system: false,
+      credential_configured: true, credential_unreadable: false,
+      models: [{ model_id: "gpt-5", name: "GPT-5", source: "discovered", available: true }],
+    }],
+  };
+  const { main } = await mounted(t, comboAPI({ providers }));
+  const modal = openEdit(main, 0);
+  button(modal, "Thêm model").click();
+
+  const picker = overlay();
+  assert.deepEqual(pickGroups(picker).map(text), []);
+  assert.equal(pickRows(picker).length, 0);
+  assert.equal(pickNote(picker), null, "a disabled provider is omitted without a connection warning");
+});
+
+test("the picker excludes a disabled but connected subscription provider", async (t) => {
+  const providers = {
+    kinds: [],
+    providers: [{
+      id: "codex-off", name: "Codex nghỉ", kind: "codex", enabled: false, system: false,
+      credential_configured: false, credential_unreadable: false,
+      accounts: [{ id: "a1", label: "Tài khoản 1", email: "", enabled: true }],
+      models: [{ model_id: "gpt-5-codex", name: "GPT-5 Codex", source: "manual", available: true }],
+    }],
+  };
+  const { main } = await mounted(t, comboAPI({ providers }));
+  const modal = openEdit(main, 0);
+  button(modal, "Thêm model").click();
+
+  const picker = overlay();
+  assert.deepEqual(pickGroups(picker).map(text), []);
+  assert.equal(pickRows(picker).length, 0);
+  assert.equal(pickNote(picker), null, "a disabled provider is omitted without a connection warning");
+});
+
 test("typing in the picker search filters the visible models", async (t) => {
   const { main } = await mounted(t);
   const modal = openEdit(main, 0);

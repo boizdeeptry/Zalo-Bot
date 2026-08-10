@@ -1232,6 +1232,10 @@ function Assert-AppPackage {
   Assert-AppPackageBinaryContains -Path $binary -Signature 'CODEX_HOME' -Label 'Codex account isolation signature'
   Assert-AppPackageBinaryContains -Path $binary `
     -Signature 'app_zalo_cli_sessions' -Label 'Zalo session schema signature'
+  Assert-AppPackageBinaryContains -Path $binary `
+    -Signature 'claude_account_id' -Label 'Zalo session Claude account binding signature'
+  Assert-AppPackageBinaryContains -Path $binary `
+    -Signature 'claude_config_dir' -Label 'Zalo session Claude config binding signature'
   Assert-AppPackageBinaryContains -Path $binary -Signature 'llm_accounts' -Label 'LLM account schema signature'
   Assert-AppPackageBinaryContains -Path $binary `
     -Signature '@anthropic-ai/claude-code' -Label 'Claude CLI package signature'

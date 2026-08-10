@@ -46,11 +46,13 @@ Lệnh build thứ hai tự chạy checkpoint trước khi tạo binary: bộ Go
 | Credential/identity gates | PASS — không có `credentials.json`, không còn chuỗi danh tính khách hàng |
 | Upstream cleanliness | PASS — `git status --short` rỗng trước và sau build |
 
-## Candidate tích hợp Provider + Memory/session — hợp đồng xác minh
+## Candidate tích hợp Provider + Memory/session — hợp đồng xác minh V6
 
-Phần này là checklist cho candidate schema V5 đang tích hợp; nó **không** ghi nhận một deployment,
-smoke Zalo thật hoặc kiểm tra thủ công đã hoàn tất. Các biên bản rollout schema 3→4 bên dưới vẫn là
-lịch sử của binary trước và không được dùng để authorize candidate V5.
+Phần này là checklist có hiệu lực cho candidate schema V6 đang tích hợp; nó **không** ghi nhận một
+deployment, smoke Zalo thật hoặc kiểm tra thủ công đã hoàn tất. Contract/artifact V5 nào đã từng được
+build hoặc xác minh chỉ là evidence lịch sử, nay **obsolete và được V6 thay thế**: không sửa lại
+version/hash/kết quả đã quan sát của nó và không dùng nó để authorize V6. Các biên bản rollout schema
+3→4 bên dưới cũng vẫn là lịch sử của binary trước và không được dùng để authorize candidate V6.
 
 ### Cổng tự động bắt buộc
 
@@ -68,38 +70,48 @@ $result = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru
 if ($result.FailedCount) { exit 1 }
 
 # Trên disposable stage đã tạo bởi New-AppStage + Apply-AppSeams từ upstream đã pin:
-go test -count=1 -run 'TestAppRoutes|TestMigrateApp|TestAppLLM|TestAppZaloSession' ./internal/daemon ./internal/store
+go test -count=1 -run '^(TestMigrateAppFeatureV4ToV6PreservesMemoryAndAddsLLM|TestMigrateAppMainV4ToV6PreservesRoutingAndAddsMemory|TestMigrateAppV5ToV6AddsClaudeBindingWithoutChangingSession|TestMigrateAppV6IsIdempotent|TestMigrateAppFutureVersionIsUntouched)$' ./internal/store
+go test -count=1 -run '^(TestAppLLMRunnerStructuredAPISuccessUsesFullPromptWithoutAdvancingSession|TestAppLLMRunnerStructuredFallbackUsesClaudeDeltaAndAdvancesSession|TestAppZaloVirginSessionStaysFreshAfterStatelessSuccess|TestAppAnswerZaloBuildsProviderRunnerInsideThreadGate|TestAppAnswerZaloBindsClaudeAccountToThreadSessionBeforeSelection|TestAppAnswerZaloRotatesWhenRoutedClaudeModelChanges|TestAppZaloRunnerSilentWhenNoProvider|TestRunClaudeEscalatesWhenTerminalDeclines)$' ./internal/daemon
 go test -count=1 -skip '^(?:TestAppJSKnowsTheSessionEndedCloseReason|TestAppJSSendsThePortalMutationHeader|TestPortalReloadedKeyWithLiveSessionReachesTheShell|TestPortalRootServesTheShellWithACookie|TestPortalUsesModalNotBrowserDialogs|TestAgentPortalNoLongerCarriesZalo|TestModalCallsPassAnObject|TestJoinGreetsOnceForEveryone)$' ./...
 ```
 
 Skip regex phải khớp **đúng tám tên** trên, có neo đầu/cuối; không wildcard và không được tự động
 nuốt test tương lai có tiền tố/hậu tố gần giống.
 
-### Schema V5: canary cho cả hai lineage V4
+### Schema V6: canary cho hai lineage V4 và migration affinity V5→V6
 
-Không chạy canary này trên live DB. Tạo hai bản sao SQLite tạm độc lập, giữ nguyên source:
+Không chạy canary này trên live DB. Tạo ba bản sao SQLite tạm độc lập, giữ nguyên source:
 
-1. **Feature V4 → V5:** fixture có session/Memory V2 (`app_zalo_cli_sessions`,
+1. **Feature V4 → V6:** fixture có session/Memory V2 (`app_zalo_cli_sessions`,
    `app_memory_revisions`, `app_memory_subject_revisions`, proposal/lesson provenance). Sau migration,
    toàn bộ Memory/session row và revision phải giữ nguyên; Provider/model/account/Combo/route capability
    phải xuất hiện và không có Combo mặc định.
-2. **Main V4 → V5:** fixture có Provider/model/account/Combo/member/route/attempt cùng credential cipher
+2. **Main V4 → V6:** fixture có Provider/model/account/Combo/member/route/attempt cùng credential cipher
    giả. Sau migration, toàn bộ routing/account/Combo row phải giữ nguyên; session/Memory V2 capability
    phải xuất hiện. Không log hoặc đưa cipher/canary vào evidence.
-3. Cả hai bản sao phải đạt `PRAGMA quick_check=ok`, `app_meta.schema_version=5`; migration V5 lần hai
-   không đổi dữ liệu. Fixture schema tương lai `>5` phải không bị mutation; lỗi muộn phải rollback toàn
-   transaction và giữ version V4.
+3. **V5 → V6:** fixture có mapping session V5 hiện hữu. Migration chỉ thêm
+   `claude_account_id TEXT NOT NULL DEFAULT ''` và `claude_config_dir TEXT NOT NULL DEFAULT ''`, giữ
+   nguyên UUID, generation, turn count và cursor. Khi runtime resolve account/config/model ở lượt
+   Claude kế tiếp, affinity chưa biết hoặc đã đổi phải tạo UUID mới với `Resume=false` trước khi gọi
+   Claude; không resume transcript cũ dưới binding mới.
+4. Cả ba bản sao phải đạt `PRAGMA quick_check=ok`, `app_meta.schema_version=6`; migration V6 lần hai
+   không đổi dữ liệu. Fixture schema tương lai `>6` phải không bị mutation; lỗi muộn phải rollback toàn
+   transaction và giữ version V4/V5 tương ứng.
 
-Các test chuẩn tương ứng gồm `TestMigrateAppFeatureV4ToV5PreservesMemoryAndAddsLLM`,
-`TestMigrateAppMainV4ToV5PreservesRoutingAndAddsMemory`, `TestMigrateAppV5IsIdempotent`,
-`TestMigrateAppMainV4RollsBackOnLateLLMFailure` và `TestMigrateAppSeedsNoDefaultCombo`.
+Các test chuẩn tương ứng gồm `TestMigrateAppFeatureV4ToV6PreservesMemoryAndAddsLLM`,
+`TestMigrateAppMainV4ToV6PreservesRoutingAndAddsMemory`,
+`TestMigrateAppV5ToV6AddsClaudeBindingWithoutChangingSession`, `TestMigrateAppV6IsIdempotent`,
+`TestMigrateAppFutureVersionIsUntouched`, `TestMigrateAppMainV4RollsBackOnLateLLMFailure` và
+`TestMigrateAppSeedsNoDefaultCombo`.
 
 ### Provider, no-provider và ranh giới session
 
 - Package binary phải mang đồng thời Memory V2, `/llm/providers`, `/llm/combos`, `llm_providers`,
   `llm_combos`, `app_zalo_cli_sessions`, `llm_accounts`, `@openai/codex`,
-  `@anthropic-ai/claude-code`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR` và marker no-provider; thiếu một
-  signature phải fail-closed. Runtime đóng gói phải có `app\node\npm.cmd` cùng
+  `@anthropic-ai/claude-code`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `claude_account_id`,
+  `claude_config_dir` và marker no-provider; thiếu một signature phải fail-closed. Fixture dương phải
+  chứa cả hai marker affinity và mỗi marker phải có một negative rejection test riêng. Runtime đóng
+  gói phải có `app\node\npm.cmd` cùng
   `app\node\node_modules\npm\bin\npm-cli.js`; checkpoint chạy `node npm-cli.js --version` với timeout,
   bằng chính `app\node\node.exe` và `npm-cli.js` bên trong candidate — không dùng host Node và không
   tải mạng. Checkpoint cũng chạy chính packaged `npm.cmd --version` qua bounded `cmd.exe /d /s /c`,
@@ -117,6 +129,10 @@ Các test chuẩn tương ứng gồm `TestMigrateAppFeatureV4ToV5PreservesMemor
   Claude nhận đúng delta/session ID và chỉ một lần chạy thành công mới trả `SessionAdvanced=true` rồi
   advance session đúng một lần. Virgin session sau stateless success vẫn fresh (`Resume=false`) cho
   lần Claude đầu tiên.
+- Claude route phải resolve và lưu binding `claude_account_id` + `claude_config_dir` + `model` trước
+  session selection. Cùng thread/account/config/model mới được resume cùng UUID; account mất/tắt,
+  config directory đổi hoặc routed model đổi phải CAS-rotate sang UUID mới, bootstrap fresh và
+  `Resume=false` trước khi gọi Claude.
 - `appAnswerZalo` là một entrypoint duy nhất; Provider route factory được compose đúng một lần **sau**
   khi đã acquire per-thread gate. Đây là invariant thực, dù source dùng method value
   `a.appZaloRunner` thay vì một direct call. Gate dùng Go AST parse toàn bộ package production
@@ -132,13 +148,19 @@ Các kiểm tra trọng tâm gồm
 `TestAppLLMRunnerStructuredAPISuccessUsesFullPromptWithoutAdvancingSession`,
 `TestAppLLMRunnerStructuredFallbackUsesClaudeDeltaAndAdvancesSession`,
 `TestAppZaloVirginSessionStaysFreshAfterStatelessSuccess`,
-`TestAppAnswerZaloBuildsProviderRunnerInsideThreadGate`, `TestAppZaloRunnerSilentWhenNoProvider` và
+`TestAppAnswerZaloBuildsProviderRunnerInsideThreadGate`,
+`TestAppAnswerZaloBindsClaudeAccountToThreadSessionBeforeSelection`,
+`TestAppAnswerZaloRotatesWhenRoutedClaudeModelChanges`, `TestAppZaloRunnerSilentWhenNoProvider` và
 `TestRunClaudeEscalatesWhenTerminalDeclines`. Chỉ ghi PASS/live/manual sau khi chính lệnh hoặc thao tác
 đã được thực hiện và evidence không chứa prompt, response, credential hay dữ liệu khách hàng.
 
-## Package HTTP smoke
+## Package HTTP smoke V6
 
-Khởi động riêng `app\agentdc.exe daemon` trên port tạm với `AGENTDC_HOME` cô lập và không khởi động Zalo transport thật. Kết quả:
+Chỉ sau khi isolated artifact đã qua `Assert-AppPackage` (bao gồm hai marker affinity), khởi động riêng
+`app\agentdc.exe daemon` trên port tạm với `AGENTDC_HOME` fresh/cô lập và không khởi động Zalo
+transport thật. Trước khi ghi PASS phải xác nhận fresh DB có `app_meta.schema_version=6`,
+`claude_account_id`, `claude_config_dir`, rồi kiểm các endpoint dưới đây. Đây là smoke cho candidate
+V6; chưa chạy thì giữ trạng thái chờ, không kế thừa PASS từ artifact V5 hay rollout lịch sử.
 
 | Đường dẫn | HTTP | Hợp đồng quan sát được |
 |---|---:|---|

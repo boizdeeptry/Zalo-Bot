@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -164,6 +165,46 @@ type appZaloDeadlineObservation struct {
 	err          error
 	hasDeadline  bool
 	timeToExpiry time.Duration
+}
+
+type appZaloAffinityCall struct {
+	accountID string
+	model     string
+	input     appZaloSessionRunInput
+}
+
+type appZaloAffinityRunner struct {
+	mu        *sync.Mutex
+	calls     *[]appZaloAffinityCall
+	accountID string
+	model     string
+}
+
+func (r *appZaloAffinityRunner) Run(
+	_ context.Context,
+	_ string,
+	_ func(string),
+) (string, error) {
+	return `{"answers":["legacy"]}`, nil
+}
+
+func (r *appZaloAffinityRunner) appRunZaloSession(
+	_ context.Context,
+	in appZaloSessionRunInput,
+	_ func(string),
+) (appZaloRunResult, error) {
+	r.mu.Lock()
+	*r.calls = append(*r.calls, appZaloAffinityCall{
+		accountID: r.accountID,
+		model:     r.model,
+		input:     in,
+	})
+	r.mu.Unlock()
+	return appZaloRunResult{
+		Answer:          `{"answers":["affinity"]}`,
+		SessionID:       in.SessionID,
+		SessionAdvanced: true,
+	}, nil
 }
 
 func (r *appZaloDeadlineHookRunner) Run(_ context.Context, _ string, _ func(string)) (string, error) {
@@ -369,6 +410,101 @@ func TestAppAnswerZaloBuildsProviderRunnerInsideThreadGate(t *testing.T) {
 	}
 	if _, err := st.ZaloCLISession("thread"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("unconfigured provider route created Claude session: %v", err)
+	}
+}
+
+func TestAppRunZaloCallerCancellationStopsHangingNPMDiscovery(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "thread")
+	connectClaudeAccount(t, a)
+	saveClaudeRoute(t, a, "haiku")
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", "question", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	npmRootCache.mu.Lock()
+	originalCachedRoot := npmRootCache.root
+	npmRootCache.root = ""
+	npmRootCache.mu.Unlock()
+	t.Cleanup(func() {
+		npmRootCache.mu.Lock()
+		npmRootCache.root = originalCachedRoot
+		npmRootCache.mu.Unlock()
+	})
+
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "npm-started")
+	releasePath := filepath.Join(t.TempDir(), "release-npm")
+	root := filepath.Join(t.TempDir(), "npm-root")
+	claudePath := filepath.Join(root, cliDescriptors["claude-code"].npmBin)
+	if err := os.MkdirAll(filepath.Dir(claudePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(claudePath, []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	npmName := "npm"
+	npmScript := "#!/bin/sh\n" +
+		": > \"$NPM_TEST_MARKER\"\n" +
+		"while [ ! -f \"$NPM_TEST_RELEASE\" ]; do sleep 0.02; done\n" +
+		"printf '%s\\n' \"$NPM_TEST_ROOT\"\n"
+	if runtime.GOOS == "windows" {
+		npmName = "npm.cmd"
+		npmScript = "@echo off\r\n" +
+			"type nul > \"%NPM_TEST_MARKER%\"\r\n" +
+			":wait\r\n" +
+			"if exist \"%NPM_TEST_RELEASE%\" goto ready\r\n" +
+			"\"%SystemRoot%\\System32\\ping.exe\" -n 1 -w 20 127.0.0.1 >nul\r\n" +
+			"goto wait\r\n" +
+			":ready\r\n" +
+			"echo %NPM_TEST_ROOT%\r\n"
+	}
+	if err := os.WriteFile(filepath.Join(binDir, npmName), []byte(npmScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NPM_TEST_MARKER", marker)
+	t.Setenv("NPM_TEST_RELEASE", releasePath)
+	t.Setenv("NPM_TEST_ROOT", root)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	release := func() { _ = os.WriteFile(releasePath, []byte("release"), 0o600) }
+	defer release()
+
+	history, err := st.ZaloMessages("thread", zaloHistoryTurns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := a.appRunZalo(
+			ctx, a.appZaloRunner(zc, silentZaloRunner{}, "thread", false), zc,
+			"thread", "question", "msg-1", history, nil, nil, func(string) {},
+		)
+		done <- runErr
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			release()
+			t.Fatal("npm discovery did not start within 3s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		release()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("Zalo caller cancellation did not stop hanging npm discovery within 1s")
 	}
 }
 
@@ -835,6 +971,461 @@ func TestAppAnswerZaloPendingAttachmentFailsClosedWhenClaudeCannotRun(t *testing
 				t.Errorf("cursor with unavailable Claude = %d; want unchanged 0", session.MessageCursor)
 			}
 		})
+	}
+}
+
+func TestAppAnswerZaloResolvedClaudeBindingKeepsAPISuccessStateless(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "thread")
+	apiAdapter := okAdapter(`{"answers":["api"]}`)
+	var callsMu sync.Mutex
+	var calls []appZaloAffinityCall
+	route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+		return newAppLLMRunner(appLLMRunnerConfig{
+			Route: newRoute(
+				entry("openai-1", "gpt-5-mini", true),
+				entry(claudeCodeProviderID, "haiku", true),
+			),
+			Store:    st,
+			Adapters: map[string]providerAdapter{"openai-1": apiAdapter},
+			Claude: func(string) zaloRunner {
+				t.Fatal("structured route selected Claude after session selection")
+				return silentZaloRunner{}
+			},
+			ClaudeForSession: func(_ context.Context, model string, _ *store.ZaloCLISession) (zaloRunner, appZaloClaudeBinding) {
+				return &appZaloAffinityRunner{
+						mu: &callsMu, calls: &calls, accountID: "account-a", model: model,
+					}, appZaloClaudeBinding{
+						State:     appZaloClaudeBindingSelected,
+						AccountID: "account-a", ConfigDir: "config-a", Model: model,
+					}
+			},
+			Credential: func(string) ([]byte, error) { return []byte("credential"), nil },
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+	}
+
+	if err := a.appAnswerZaloWithRunnerFactory(
+		&zaloDeps{cfg: zc, run: okClaude("base")},
+		"thread", "api should answer", ipc.ZaloOutboxDraft{}, nil, route,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(apiAdapter.seen()); got != 1 {
+		t.Fatalf("API calls = %d; want 1", got)
+	}
+	callsMu.Lock()
+	claudeCalls := len(calls)
+	callsMu.Unlock()
+	if claudeCalls != 0 {
+		t.Fatalf("Claude calls after API success = %d; want 0", claudeCalls)
+	}
+	session, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.TurnCount != 0 || session.ClaudeAccountID != "account-a" ||
+		session.ClaudeConfigDir != "config-a" || session.Model != "haiku" {
+		t.Fatalf("stateless API session state = %+v; want unadvanced account-a/config-a/haiku binding", session)
+	}
+}
+
+func TestAppAnswerZaloDiscoveryFailurePreservesSelectedClaudeBindingAndSession(t *testing.T) {
+	accountSel = newAccountSelector()
+	t.Cleanup(func() { accountSel = newAccountSelector() })
+	a, st, zc := appZaloHookFixture(t, "thread")
+	zc.Model = "haiku"
+	if err := st.CreateLLMAccount(store.LLMAccount{
+		ID: "account-a", ProviderID: claudeCodeProviderID,
+		Label: "A", ConfigDir: "config-a", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.CreateZaloCLISession(store.ZaloCLISession{
+		ThreadID: "thread", ClaudeSessionID: "55555555-5555-4555-8555-555555555555",
+		Model: "haiku", PromptFingerprint: appZaloPromptFingerprint(zc, "thread"),
+		ClaudeAccountID: "account-a", ClaudeConfigDir: "config-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", "question", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	npmRootCache.mu.Lock()
+	originalCachedRoot := npmRootCache.root
+	npmRootCache.root = t.TempDir() // A successful npm lookup root with no Claude executable.
+	npmRootCache.mu.Unlock()
+	t.Cleanup(func() {
+		npmRootCache.mu.Lock()
+		npmRootCache.root = originalCachedRoot
+		npmRootCache.mu.Unlock()
+	})
+
+	apiAdapter := okAdapter(`{"answers":["api"]}`)
+	var resolvedBinding appZaloClaudeBinding
+	route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+		return newAppLLMRunner(appLLMRunnerConfig{
+			Route: newRoute(
+				entry("openai-1", "gpt-5-mini", true),
+				entry(claudeCodeProviderID, "haiku", true),
+			),
+			Store:    st,
+			Adapters: map[string]providerAdapter{"openai-1": apiAdapter},
+			Claude: func(string) zaloRunner {
+				t.Fatal("structured route selected unresolved Claude after API success")
+				return silentZaloRunner{}
+			},
+			ClaudeForSession: func(
+				ctx context.Context,
+				model string,
+				current *store.ZaloCLISession,
+			) (zaloRunner, appZaloClaudeBinding) {
+				runner, binding := a.appClaudeRunnerForSession(ctx, zc, model, current)
+				resolvedBinding = binding
+				return runner, binding
+			},
+			Credential: func(string) ([]byte, error) { return []byte("credential"), nil },
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+	}
+
+	if err := a.appAnswerZaloWithRunnerFactory(
+		&zaloDeps{cfg: zc, run: okClaude("base")},
+		"thread", "api should answer", ipc.ZaloOutboxDraft{}, nil, route,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(apiAdapter.seen()); got != 1 {
+		t.Fatalf("API calls = %d; want 1 despite unavailable Claude executable", got)
+	}
+	wantBinding := appZaloClaudeBinding{
+		State:     appZaloClaudeBindingSelected,
+		AccountID: "account-a", ConfigDir: "config-a", Model: "haiku",
+	}
+	if resolvedBinding != wantBinding {
+		t.Errorf("binding after Claude discovery failure = %+v; want %+v", resolvedBinding, wantBinding)
+	}
+	after, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ClaudeSessionID != before.ClaudeSessionID || after.Generation != before.Generation ||
+		after.ClaudeAccountID != before.ClaudeAccountID ||
+		after.ClaudeConfigDir != before.ClaudeConfigDir || after.Model != before.Model {
+		t.Fatalf("session changed after discovery failure: before %+v after %+v", before, after)
+	}
+}
+
+func TestAppAnswerZaloBindsClaudeAccountToThreadSessionBeforeSelection(t *testing.T) {
+	accountSel = newAccountSelector()
+	t.Cleanup(func() { accountSel = newAccountSelector() })
+	a, st, zc := appZaloHookFixture(t, "thread-a", "thread-b")
+	for _, account := range []store.LLMAccount{
+		{ID: "account-a", ProviderID: claudeCodeProviderID, Label: "A", ConfigDir: "config-a", Enabled: true},
+		{ID: "account-b", ProviderID: claudeCodeProviderID, Label: "B", ConfigDir: "config-b", Enabled: true},
+	} {
+		if err := st.CreateLLMAccount(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var callsMu sync.Mutex
+	var calls []appZaloAffinityCall
+	route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+		return newAppLLMRunner(appLLMRunnerConfig{
+			Route: newRoute(entry(claudeCodeProviderID, "haiku", true)),
+			Store: st,
+			Claude: func(string) zaloRunner {
+				t.Fatal("structured route selected Claude after session selection")
+				return silentZaloRunner{}
+			},
+			ClaudeForSession: func(_ context.Context, model string, current *store.ZaloCLISession) (zaloRunner, appZaloClaudeBinding) {
+				accounts, err := st.LLMAccounts(claudeCodeProviderID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				account, ok := appSelectClaudeAccountForSession(accountSel, accounts, current)
+				if !ok {
+					return silentZaloRunner{}, appZaloClaudeBinding{
+						State: appZaloClaudeBindingUnavailable,
+					}
+				}
+				return &appZaloAffinityRunner{
+						mu: &callsMu, calls: &calls, accountID: account.ID, model: model,
+					}, appZaloClaudeBinding{
+						State:     appZaloClaudeBindingSelected,
+						AccountID: account.ID, ConfigDir: account.ConfigDir, Model: model,
+					}
+			},
+			Credential: func(string) ([]byte, error) { return nil, nil },
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+	}
+	runTurn := func(threadID, question string) {
+		t.Helper()
+		if err := a.appAnswerZaloWithRunnerFactory(
+			&zaloDeps{cfg: zc, run: okClaude("base")},
+			threadID, question, ipc.ZaloOutboxDraft{}, nil, route,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runTurn("thread-a", "a-1")
+	runTurn("thread-a", "a-2")
+	runTurn("thread-b", "b-1")
+	beforeLoss, err := st.ZaloCLISession("thread-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteLLMAccount("account-a"); err != nil {
+		t.Fatal(err)
+	}
+	runTurn("thread-a", "a-3 after account loss")
+
+	callsMu.Lock()
+	gotCalls := slices.Clone(calls)
+	callsMu.Unlock()
+	if len(gotCalls) != 4 {
+		t.Fatalf("Claude calls = %d; want 4", len(gotCalls))
+	}
+	if got := []string{gotCalls[0].accountID, gotCalls[1].accountID, gotCalls[2].accountID, gotCalls[3].accountID}; !slices.Equal(got, []string{"account-a", "account-a", "account-b", "account-b"}) {
+		t.Fatalf("Claude accounts = %v; want thread-sticky [account-a account-a account-b], then failover to B", got)
+	}
+	if gotCalls[0].input.SessionID != gotCalls[1].input.SessionID || !gotCalls[1].input.Resume {
+		t.Fatalf("thread-a sessions = %q then %q (resume %v); want one resumed UUID",
+			gotCalls[0].input.SessionID, gotCalls[1].input.SessionID, gotCalls[1].input.Resume)
+	}
+	if gotCalls[2].input.SessionID == gotCalls[0].input.SessionID {
+		t.Fatal("different threads shared one Claude session UUID")
+	}
+	if gotCalls[3].input.SessionID == beforeLoss.ClaudeSessionID || gotCalls[3].input.Resume {
+		t.Fatalf("account loss reused UUID %q (resume %v)", gotCalls[3].input.SessionID, gotCalls[3].input.Resume)
+	}
+	for threadID, wantAccount := range map[string]string{"thread-a": "account-b", "thread-b": "account-b"} {
+		session, err := st.ZaloCLISession(threadID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if session.ClaudeAccountID != wantAccount || session.ClaudeConfigDir != "config-"+strings.TrimPrefix(wantAccount, "account-") {
+			t.Errorf("%s binding = %q/%q; want %q/config-%s", threadID,
+				session.ClaudeAccountID, session.ClaudeConfigDir, wantAccount,
+				strings.TrimPrefix(wantAccount, "account-"))
+		}
+	}
+}
+
+func TestAppAnswerZaloNoEnabledAccountInvalidatesBindingBeforeSameAccountReturns(t *testing.T) {
+	accountSel = newAccountSelector()
+	t.Cleanup(func() { accountSel = newAccountSelector() })
+	a, st, zc := appZaloHookFixture(t, "thread")
+	zc.Model = "haiku"
+	account := store.LLMAccount{
+		ID: "account-a", ProviderID: claudeCodeProviderID,
+		Label: "A", ConfigDir: "config-a", Enabled: true,
+	}
+	if err := st.CreateLLMAccount(account); err != nil {
+		t.Fatal(err)
+	}
+	npmRootCache.mu.Lock()
+	originalCachedRoot := npmRootCache.root
+	npmRootCache.root = t.TempDir() // Resolve quickly with no Claude executable.
+	npmRootCache.mu.Unlock()
+	t.Cleanup(func() {
+		npmRootCache.mu.Lock()
+		npmRootCache.root = originalCachedRoot
+		npmRootCache.mu.Unlock()
+	})
+
+	apiShouldAnswer := false
+	apiAdapter := &fakeAdapter{fn: func(context.Context, llmRequest) (llmResponse, error) {
+		if apiShouldAnswer {
+			return llmResponse{Text: `{"answers":["api"]}`}, nil
+		}
+		return llmResponse{}, newLLMError(llmErrorUpstream, nil, "force Claude fallback")
+	}}
+	var callsMu sync.Mutex
+	var calls []appZaloAffinityCall
+	route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+		return newAppLLMRunner(appLLMRunnerConfig{
+			Route: newRoute(
+				entry("openai-1", "gpt-5-mini", true),
+				entry(claudeCodeProviderID, "haiku", true),
+			),
+			Store:    st,
+			Adapters: map[string]providerAdapter{"openai-1": apiAdapter},
+			Claude: func(string) zaloRunner {
+				t.Fatal("structured route selected Claude before affinity resolution")
+				return silentZaloRunner{}
+			},
+			ClaudeForSession: func(
+				ctx context.Context,
+				model string,
+				current *store.ZaloCLISession,
+			) (zaloRunner, appZaloClaudeBinding) {
+				runner, binding := a.appClaudeRunnerForSession(ctx, zc, model, current)
+				if binding.State != appZaloClaudeBindingSelected {
+					return runner, binding
+				}
+				return &appZaloAffinityRunner{
+					mu: &callsMu, calls: &calls, accountID: binding.AccountID, model: binding.Model,
+				}, binding
+			},
+			Credential: func(string) ([]byte, error) { return []byte("credential"), nil },
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+	}
+	runTurn := func(question string) {
+		t.Helper()
+		if err := a.appAnswerZaloWithRunnerFactory(
+			&zaloDeps{cfg: zc, run: okClaude("base")},
+			"thread", question, ipc.ZaloOutboxDraft{}, nil, route,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runTurn("first under A")
+	first, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ClaudeAccountID != account.ID || first.ClaudeConfigDir != account.ConfigDir {
+		t.Fatalf("first binding = %q/%q; want %q/%q",
+			first.ClaudeAccountID, first.ClaudeConfigDir, account.ID, account.ConfigDir)
+	}
+
+	if err := st.DeleteLLMAccount(account.ID); err != nil {
+		t.Fatal(err)
+	}
+	apiShouldAnswer = true
+	runTurn("no enabled Claude account")
+	invalidated, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invalidated.Generation != first.Generation+1 ||
+		invalidated.ClaudeSessionID == first.ClaudeSessionID ||
+		invalidated.ClaudeAccountID != "" || invalidated.ClaudeConfigDir != "" {
+		t.Fatalf("session was not invalidated without an enabled account: first %+v invalidated %+v",
+			first, invalidated)
+	}
+	if invalidated.TurnCount != 0 || invalidated.MessageCursor != 0 {
+		t.Fatalf("stateless API success advanced invalidated session: %+v", invalidated)
+	}
+	if got := len(apiAdapter.seen()); got != 2 {
+		t.Fatalf("API calls through no-account turn = %d; want failed first call plus successful stateless call", got)
+	}
+
+	if err := st.CreateLLMAccount(account); err != nil {
+		t.Fatal(err)
+	}
+	apiShouldAnswer = false
+	runTurn("A restored")
+	restored, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callsMu.Lock()
+	gotCalls := slices.Clone(calls)
+	callsMu.Unlock()
+	if len(gotCalls) != 2 {
+		t.Fatalf("Claude calls = %d; want first A and restored A", len(gotCalls))
+	}
+	if gotCalls[1].input.Resume || gotCalls[1].input.SessionID == gotCalls[0].input.SessionID {
+		t.Fatalf("restored A resumed stale UUID %q (resume %v); first UUID %q",
+			gotCalls[1].input.SessionID, gotCalls[1].input.Resume, gotCalls[0].input.SessionID)
+	}
+	if restored.Generation != invalidated.Generation+1 ||
+		restored.ClaudeSessionID != gotCalls[1].input.SessionID ||
+		restored.ClaudeAccountID != account.ID || restored.ClaudeConfigDir != account.ConfigDir {
+		t.Fatalf("restored A session = %+v; want fresh generation after %+v", restored, invalidated)
+	}
+}
+
+func TestAppAnswerZaloRotatesWhenRoutedClaudeModelChanges(t *testing.T) {
+	accountSel = newAccountSelector()
+	t.Cleanup(func() { accountSel = newAccountSelector() })
+	a, st, zc := appZaloHookFixture(t, "thread")
+	if err := st.CreateLLMAccount(store.LLMAccount{
+		ID: "account-a", ProviderID: claudeCodeProviderID,
+		Label: "A", ConfigDir: "config-a", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var callsMu sync.Mutex
+	var calls []appZaloAffinityCall
+	routeModel := "haiku"
+	route := func(zaloConfig, zaloRunner, string, bool) zaloRunner {
+		model := routeModel
+		return newAppLLMRunner(appLLMRunnerConfig{
+			Route: newRoute(entry(claudeCodeProviderID, model, true)), Store: st,
+			Claude: func(string) zaloRunner {
+				t.Fatal("structured route selected Claude after session selection")
+				return silentZaloRunner{}
+			},
+			ClaudeForSession: func(_ context.Context, model string, current *store.ZaloCLISession) (zaloRunner, appZaloClaudeBinding) {
+				account, ok := appSelectClaudeAccountForSession(accountSel, []store.LLMAccount{{
+					ID: "account-a", ProviderID: claudeCodeProviderID,
+					Label: "A", ConfigDir: "config-a", Enabled: true,
+				}}, current)
+				if !ok {
+					return silentZaloRunner{}, appZaloClaudeBinding{
+						State: appZaloClaudeBindingUnavailable,
+					}
+				}
+				return &appZaloAffinityRunner{
+						mu: &callsMu, calls: &calls, accountID: account.ID, model: model,
+					}, appZaloClaudeBinding{
+						State:     appZaloClaudeBindingSelected,
+						AccountID: account.ID, ConfigDir: account.ConfigDir, Model: model,
+					}
+			},
+			Credential: func(string) ([]byte, error) { return nil, nil },
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+	}
+	runTurn := func(question string) {
+		t.Helper()
+		if err := a.appAnswerZaloWithRunnerFactory(
+			&zaloDeps{cfg: zc, run: okClaude("base")},
+			"thread", question, ipc.ZaloOutboxDraft{}, nil, route,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runTurn("first")
+	first, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeModel = "opus"
+	runTurn("second")
+	second, err := st.ZaloCLISession("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callsMu.Lock()
+	gotCalls := slices.Clone(calls)
+	callsMu.Unlock()
+	if len(gotCalls) != 2 {
+		t.Fatalf("Claude calls = %d; want 2", len(gotCalls))
+	}
+	if gotCalls[0].model != "haiku" || gotCalls[1].model != "opus" {
+		t.Fatalf("routed models = %q then %q; want haiku then opus", gotCalls[0].model, gotCalls[1].model)
+	}
+	if first.ClaudeSessionID == second.ClaudeSessionID || gotCalls[1].input.Resume {
+		t.Fatalf("route model change reused UUID %q (resume %v)", second.ClaudeSessionID, gotCalls[1].input.Resume)
+	}
+	effective := zc
+	effective.Model = "opus"
+	if second.Model != "opus" || second.PromptFingerprint != appZaloPromptFingerprint(effective, "thread") {
+		t.Fatalf("persisted routed identity = model %q fingerprint %q; want opus/%q",
+			second.Model, second.PromptFingerprint, appZaloPromptFingerprint(effective, "thread"))
 	}
 }
 
@@ -2755,7 +3346,9 @@ func TestAppReloadZaloSessionAfterConflictRejectsKnownStaleWinner(t *testing.T) 
 			if _, err := st.CreateZaloCLISession(session); err != nil {
 				t.Fatal(err)
 			}
-			got, err := a.appReloadZaloSessionAfterConflict(zc, "thread", session.PromptFingerprint)
+			got, err := a.appReloadZaloSessionAfterConflict(
+				zc, "thread", session.PromptFingerprint, appZaloClaudeBinding{},
+			)
 			if tc.wantError {
 				if err == nil || err.Error() != appZaloErrorStateUpdate {
 					t.Fatalf("reload stale winner error = %v; want safe %q", err, appZaloErrorStateUpdate)

@@ -1,11 +1,16 @@
 package store
 
 import (
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"modernc.org/sqlite"
 )
 
 // newLLMStore mở qua Open chứ không ghép *Store bằng tay: Open là đường DUY NHẤT
@@ -305,6 +310,119 @@ func TestLLMDeleteProviderBlockedWhileRouted(t *testing.T) {
 	}
 	if len(models) != 0 {
 		t.Errorf("LLMModels(%q) after provider delete = %v; want empty", "openai-1", models)
+	}
+}
+
+func TestDeleteLLMProviderSerializesReferenceCheckWithComboReplace(t *testing.T) {
+	// View + scalar function tạo đúng interleaving gây lỗi, không dựa vào sleep:
+	// Delete dừng giữa lúc đọc references; một Store thứ hai ghi combo rồi mới cho Delete đi tiếp.
+	// WAL cho writer commit trong khi lượt đọc cũ còn mở, giống đúng khe check-then-delete trước đây.
+	pauseFunction := fmt.Sprintf("test_pause_llm_provider_reference_check_%d", time.Now().UnixNano())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var pauseOnce sync.Once
+	if err := sqlite.RegisterScalarFunction(pauseFunction, 0,
+		func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error) {
+			pauseOnce.Do(func() {
+				close(entered)
+				<-release
+			})
+			return "__test_pause_provider__", nil
+		}); err != nil {
+		t.Fatalf("register SQLite pause function: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "llm-delete-race.db")
+	deleter, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open(deleter) = %v", err)
+	}
+	t.Cleanup(func() { deleter.Close() })
+	writer, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open(writer) = %v", err)
+	}
+	t.Cleanup(func() { writer.Close() })
+
+	addAPIProvider(t, deleter, "openai-race", "gpt-race", true)
+	combo, err := deleter.CreateLLMCombo("Race", "fallback")
+	if err != nil {
+		t.Fatalf("CreateLLMCombo() = %v", err)
+	}
+
+	// Đưa scalar function vào nhánh UNION không tạo member thật. Query theo provider_id buộc gọi
+	// function, còn các query theo combo_id bỏ được nhánh sentinel. Trigger giữ nguyên hợp đồng ghi
+	// của ReplaceLLMComboMembers qua view.
+	for _, statement := range []string{
+		`ALTER TABLE llm_combo_members RENAME TO llm_combo_members_real`,
+		fmt.Sprintf(`CREATE VIEW llm_combo_members AS
+SELECT combo_id, position, provider_id, model_id, enabled FROM llm_combo_members_real
+UNION ALL
+SELECT '__test_pause_combo__', 0, %s(), '__test_pause_model__', 0`, pauseFunction),
+		`CREATE TRIGGER test_llm_combo_members_insert
+INSTEAD OF INSERT ON llm_combo_members
+BEGIN
+  INSERT INTO llm_combo_members_real(combo_id, position, provider_id, model_id, enabled)
+  VALUES(NEW.combo_id, NEW.position, NEW.provider_id, NEW.model_id, NEW.enabled);
+END`,
+		`CREATE TRIGGER test_llm_combo_members_delete
+INSTEAD OF DELETE ON llm_combo_members
+BEGIN
+  DELETE FROM llm_combo_members_real
+  WHERE combo_id = OLD.combo_id AND position = OLD.position;
+END`,
+	} {
+		if _, err := deleter.db.Exec(statement); err != nil {
+			t.Fatalf("install deterministic interleaving seam: %v", err)
+		}
+	}
+	// Nếu Delete đã giữ write lock, lượt Replace đối đầu phải trả SQLITE_BUSY ngay để test có thể
+	// nhả Delete mà không dùng timing. Trước bản sửa, Delete chỉ giữ read snapshot nên Replace thành công.
+	if _, err := writer.db.Exec(`PRAGMA busy_timeout = 0`); err != nil {
+		t.Fatalf("set writer busy timeout: %v", err)
+	}
+
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- deleter.DeleteLLMProvider("openai-race") }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("DeleteLLMProvider did not reach the controlled reference check")
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+
+	replaceDone := make(chan error, 1)
+	go func() {
+		_, replaceErr := writer.ReplaceLLMComboMembers(combo.ID, combo.Revision, combo.Type,
+			[]LLMRouteEntry{{ProviderID: "openai-race", ModelID: "gpt-race", Enabled: true}})
+		replaceDone <- replaceErr
+	}()
+	replaceErr := <-replaceDone
+	close(release)
+	released = true
+	deleteErr := <-deleteDone
+
+	if deleteErr == nil && replaceErr == nil {
+		t.Errorf("DeleteLLMProvider and ReplaceLLMComboMembers both succeeded; want one serialized loser")
+	}
+	if replaceErr == nil && !errors.Is(deleteErr, ErrLLMProviderInUse) {
+		t.Errorf("DeleteLLMProvider after successful Replace = %v; want ErrLLMProviderInUse", deleteErr)
+	}
+	var orphans int
+	if err := deleter.db.QueryRow(`
+SELECT COUNT(*)
+FROM llm_combo_members_real AS member
+LEFT JOIN llm_providers AS provider ON provider.id = member.provider_id
+WHERE provider.id IS NULL`).Scan(&orphans); err != nil {
+		t.Fatalf("count orphan combo members: %v", err)
+	}
+	if orphans != 0 {
+		t.Fatalf("orphan combo members = %d; want 0", orphans)
 	}
 }
 

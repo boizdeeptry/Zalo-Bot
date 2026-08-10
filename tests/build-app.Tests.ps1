@@ -304,7 +304,7 @@ package daemon
     }
     $appSchema = [IO.File]::ReadAllText((Join-Path $stage 'internal\store\app_schema.go'))
     foreach ($signature in @(
-        'const appSchemaVersion int64 = 5',
+        'const appSchemaVersion int64 = 6',
         'llm_combos',
         'app_memory_subject_revisions'
       )) {
@@ -679,6 +679,8 @@ SET "NPM_CLI_JS=%~dp0\node_modules\npm\bin\npm-cli.js"
     '@openai/codex',
     'CODEX_HOME',
     'app_zalo_cli_sessions',
+    'claude_account_id',
+    'claude_config_dir',
     'llm_accounts',
     '@anthropic-ai/claude-code',
     'CLAUDE_CONFIG_DIR',
@@ -765,6 +767,8 @@ SET "NPM_CLI_JS=%~dp0\node_modules\npm\bin\npm-cli.js"
   }
   foreach ($signatureCase in @(
       @{ Signature = 'app_zalo_cli_sessions'; Label = 'Zalo session schema signature' },
+      @{ Signature = 'claude_account_id'; Label = 'Zalo session Claude account binding signature' },
+      @{ Signature = 'claude_config_dir'; Label = 'Zalo session Claude config binding signature' },
       @{ Signature = 'llm_accounts'; Label = 'LLM account schema signature' },
       @{ Signature = '@anthropic-ai/claude-code'; Label = 'Claude CLI package signature' },
       @{ Signature = 'CLAUDE_CONFIG_DIR'; Label = 'Claude account isolation signature' },

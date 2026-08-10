@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // stubClient trả một *http.Client mà mọi request đi qua fn — test HTTP không chạm mạng.
@@ -218,6 +220,22 @@ func TestWriteCodexTokensPreservesOtherFields(t *testing.T) {
 	}
 }
 
+func TestWriteCodexTokensLeavesUnrelatedFixedTempFileUntouched(t *testing.T) {
+	dir := codexAuthFixture(t, "old")
+	fixedTemp := codexAuthPath(dir) + ".tmp"
+	const canary = "unrelated-writer-canary"
+	if err := os.WriteFile(fixedTemp, []byte(canary), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCodexTokens(dir, codexTokens{AccessToken: "new"}, "2026-08-10"); err != nil {
+		t.Fatalf("writeCodexTokens = %v", err)
+	}
+	got, err := os.ReadFile(fixedTemp)
+	if err != nil || string(got) != canary {
+		t.Errorf("pre-existing auth.json.tmp = %q, %v; want unrelated canary untouched", got, err)
+	}
+}
+
 // TestCodexProxyGenerateRefreshesOn401 ghim đường lõi: access hết hạn (401) → refresh → ghi lại
 // auth.json → thử lại thành công. Đúng ba lượt gọi: responses(401) → oauth/token → responses(200).
 func TestCodexProxyGenerateRefreshesOn401(t *testing.T) {
@@ -253,6 +271,111 @@ func TestCodexProxyGenerateRefreshesOn401(t *testing.T) {
 	rt, err := readCodexTokens(dir)
 	if err != nil || rt.AccessToken != "at-fresh" {
 		t.Fatalf("auth.json access = %q err=%v; want at-fresh (đã ghi lại sau refresh)", rt.AccessToken, err)
+	}
+}
+
+func TestCodexProxyGenerateConcurrent401RefreshesOncePerConfigDir(t *testing.T) {
+	const workers = 2
+	dir := codexAuthFixture(t, "at-expired")
+	var mu sync.Mutex
+	expiredCalls := 0
+	refreshCalls := 0
+	freshCalls := 0
+	bothExpired := make(chan struct{})
+	client := stubClient(func(req *http.Request) (*http.Response, error) {
+		auth := req.Header.Get("Authorization")
+		switch {
+		case req.URL.String() == codexBackendURL && auth == "Bearer at-expired":
+			mu.Lock()
+			expiredCalls++
+			if expiredCalls == workers {
+				close(bothExpired)
+			}
+			mu.Unlock()
+			select {
+			case <-bothExpired:
+				return httpResp(http.StatusUnauthorized, `{"error":"expired"}`), nil
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		case req.URL.String() == codexTokenURL:
+			mu.Lock()
+			refreshCalls++
+			mu.Unlock()
+			return httpResp(http.StatusOK,
+				`{"access_token":"at-fresh","refresh_token":"rt-fresh"}`), nil
+		case req.URL.String() == codexBackendURL && auth == "Bearer at-fresh":
+			mu.Lock()
+			freshCalls++
+			mu.Unlock()
+			return httpResp(http.StatusOK, codexSSEFixture), nil
+		default:
+			return nil, fmt.Errorf("unexpected call %s auth=%s", req.URL, auth)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	results := make(chan error, workers)
+	for range workers {
+		go func() {
+			text, status, err := codexProxyGenerate(ctx, client, dir, "gpt-5.4-mini", "hi")
+			if err == nil && (status != http.StatusOK || text != "Xin chào") {
+				err = fmt.Errorf("result text=%q status=%d", text, status)
+			}
+			results <- err
+		}()
+	}
+	for range workers {
+		if err := <-results; err != nil {
+			t.Errorf("concurrent generate = %v; want success", err)
+		}
+	}
+	mu.Lock()
+	gotExpired, gotRefresh, gotFresh := expiredCalls, refreshCalls, freshCalls
+	mu.Unlock()
+	if gotExpired != workers || gotRefresh != 1 || gotFresh != workers {
+		t.Errorf("calls expired/refresh/fresh = %d/%d/%d; want %d/1/%d",
+			gotExpired, gotRefresh, gotFresh, workers, workers)
+	}
+	persisted, err := readCodexTokens(dir)
+	if err != nil || persisted.AccessToken != "at-fresh" || persisted.RefreshToken != "rt-fresh" {
+		t.Errorf("persisted tokens = %+v, %v; want fresh durable token", persisted, err)
+	}
+}
+
+func TestCodexProxyGenerateSurfacesRefreshPersistenceFailure(t *testing.T) {
+	dir := codexAuthFixture(t, "at-expired")
+	authPath := codexAuthPath(dir)
+	freshCalls := 0
+	client := stubClient(func(req *http.Request) (*http.Response, error) {
+		auth := req.Header.Get("Authorization")
+		switch {
+		case req.URL.String() == codexBackendURL && auth == "Bearer at-expired":
+			return httpResp(http.StatusUnauthorized, `{"error":"expired"}`), nil
+		case req.URL.String() == codexTokenURL:
+			if err := os.Remove(authPath); err != nil {
+				return nil, fmt.Errorf("remove auth fixture: %w", err)
+			}
+			if err := os.Mkdir(authPath, 0o700); err != nil {
+				return nil, fmt.Errorf("replace auth with directory: %w", err)
+			}
+			return httpResp(http.StatusOK,
+				`{"access_token":"at-fresh","refresh_token":"rt-fresh"}`), nil
+		case req.URL.String() == codexBackendURL && auth == "Bearer at-fresh":
+			freshCalls++
+			return httpResp(http.StatusOK, codexSSEFixture), nil
+		default:
+			return nil, fmt.Errorf("unexpected call %s auth=%s", req.URL, auth)
+		}
+	})
+
+	text, status, err := codexProxyGenerate(t.Context(), client, dir, "gpt-5.4-mini", "hi")
+	if err == nil {
+		t.Fatalf("generate with unpersistable refresh = %q/%d, nil; want persistence error", text, status)
+	}
+	if freshCalls != 0 {
+		t.Errorf("fresh backend retries after persistence failure = %d; want 0", freshCalls)
 	}
 }
 

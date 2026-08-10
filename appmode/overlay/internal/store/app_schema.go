@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const appSchemaVersion int64 = 5
+const appSchemaVersion int64 = 6
 
 const appFoundationSchema = `
 CREATE TABLE IF NOT EXISTS app_meta (
@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS app_meta (
 CREATE TABLE IF NOT EXISTS app_zalo_cli_sessions (
   thread_id          TEXT PRIMARY KEY,
   claude_session_id  TEXT NOT NULL,
+  claude_account_id  TEXT NOT NULL DEFAULT '',
+  claude_config_dir  TEXT NOT NULL DEFAULT '',
   generation         INTEGER NOT NULL,
   model              TEXT NOT NULL,
   prompt_fingerprint TEXT NOT NULL,
@@ -43,8 +45,8 @@ CREATE TABLE IF NOT EXISTS app_memory_revisions (
 
 // appLLMSchema adds Provider, model, CLI account, named combo, fallback route,
 // and attempt telemetry capabilities. It intentionally does not advance
-// schema_version: migrateApp owns that write so both capability families become
-// visible as V5 only after every migration step succeeds.
+// schema_version: migrateApp owns that write so all capability families become
+// visible at the current version only after every migration step succeeds.
 //
 // No table stores prompts, customer messages, or model responses. Telemetry is
 // restricted to routing and operational metadata.
@@ -157,6 +159,11 @@ var appV4Columns = []appColumnMigration{
 	{table: "app_zalo_cli_sessions", column: "memory_common_revision", definition: "INTEGER NOT NULL DEFAULT 0"},
 }
 
+var appV6Columns = []appColumnMigration{
+	{table: "app_zalo_cli_sessions", column: "claude_account_id", definition: "TEXT NOT NULL DEFAULT ''"},
+	{table: "app_zalo_cli_sessions", column: "claude_config_dir", definition: "TEXT NOT NULL DEFAULT ''"},
+}
+
 const appMemoryV4Schema = `
 CREATE TABLE IF NOT EXISTS app_memory_subject_revisions (
   thread_id TEXT NOT NULL,
@@ -267,6 +274,9 @@ func migrateApp(db *sql.DB) error {
 	if err := appMigrateMemoryV4(tx); err != nil {
 		return fmt.Errorf("migrate Portal Memory V4 capability: %w", err)
 	}
+	if err := appMigrateZaloSessionV6(tx); err != nil {
+		return fmt.Errorf("migrate Portal Zalo session V6 capability: %w", err)
+	}
 	if _, err := tx.Exec(appLLMSchema); err != nil {
 		return fmt.Errorf("migrate Portal LLM providers: %w", err)
 	}
@@ -287,6 +297,15 @@ func migrateApp(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit Portal foundation migration: %w", err)
+	}
+	return nil
+}
+
+func appMigrateZaloSessionV6(tx *sql.Tx) error {
+	for _, migration := range appV6Columns {
+		if _, err := appEnsureColumn(tx, migration); err != nil {
+			return err
+		}
 	}
 	return nil
 }

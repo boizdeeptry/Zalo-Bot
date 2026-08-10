@@ -225,19 +225,14 @@ WHERE id = ?`, p.Name, boolInt(p.Enabled), p.LastCheckStatus, p.LastError,
 }
 
 func (s *Store) DeleteLLMProvider(id string) error {
-	// Route giờ là combo: đếm tham chiếu trên llm_combo_members (mọi combo, không chỉ combo
-	// active) vì một combo đang tắt vẫn có thể được bật lại sau, và xoá Provider nó trỏ tới
-	// để lại một chuỗi cụt.
-	var referenced int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM llm_combo_members WHERE provider_id = ?`, id).Scan(&referenced); err != nil {
-		return fmt.Errorf("check llm provider %s route references: %w", id, err)
-	}
-	if referenced > 0 {
-		return fmt.Errorf("delete llm provider %s: %w", id, ErrLLMProviderInUse)
-	}
 	return s.inLLMTx(fmt.Sprintf("delete llm provider %s", id), func(tx *sql.Tx) error {
-		res, err := tx.Exec(`DELETE FROM llm_providers WHERE id = ?`, id)
+		// Route giờ là combo: chặn tham chiếu trên MỌI combo, không chỉ combo active. Gộp điều kiện
+		// và DELETE vào cùng một write statement để ReplaceLLMComboMembers không thể chèn member
+		// vào khe giữa lần kiểm tra và lần xoá khi foreign_keys đang tắt.
+		res, err := tx.Exec(`
+DELETE FROM llm_providers
+WHERE id = ?
+  AND NOT EXISTS (SELECT 1 FROM llm_combo_members WHERE provider_id = ?)`, id, id)
 		if err != nil {
 			return err
 		}
@@ -248,6 +243,18 @@ func (s *Store) DeleteLLMProvider(id string) error {
 			return err
 		}
 		if changed == 0 {
+			// Cold path: phân biệt id không tồn tại với Provider đang được combo giữ để giữ nguyên
+			// sentinel của API. Lần đọc này nằm sau conditional DELETE trong cùng transaction; nó
+			// chỉ giải thích kết quả, không quyết định việc xoá nên không mở lại khe đua.
+			var referenced int
+			if err := tx.QueryRow(
+				`SELECT EXISTS(SELECT 1 FROM llm_combo_members WHERE provider_id = ?)`, id).
+				Scan(&referenced); err != nil {
+				return fmt.Errorf("check route references: %w", err)
+			}
+			if referenced == 1 {
+				return ErrLLMProviderInUse
+			}
 			return ErrNotFound
 		}
 		// ON DELETE CASCADE không chạy vì SQLite mặc định tắt khoá ngoại, nên model và account mồ

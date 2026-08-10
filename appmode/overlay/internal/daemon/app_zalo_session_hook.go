@@ -148,6 +148,7 @@ type appZaloStructuredAnswerRunner struct {
 	highWater        int64
 	highWaterKnown   bool
 	resumeDelta      appZaloResumeDeltaSnapshot
+	claudeBinding    appZaloClaudeBinding
 }
 
 func (r *appZaloStructuredAnswerRunner) Run(
@@ -180,6 +181,7 @@ func (r *appZaloStructuredAnswerRunner) Run(
 		r.highWater,
 		r.highWaterKnown,
 		r.resumeDelta.clone(),
+		r.claudeBinding,
 	)
 }
 
@@ -232,7 +234,15 @@ func (a *api) appAnswerZaloWithRunnerFactory(
 	step := func(text string) { a.zlog.add(ipc.ZaloLogStep, threadID, text) }
 
 	run := route(deps.cfg, deps.run, threadID, len(files) > 0)
-	snapshot := a.appCaptureZaloTurnSnapshot(deps.cfg, threadID, files)
+	effectiveConfig := deps.cfg
+	var binding appZaloClaudeBinding
+	run, effectiveConfig, binding, err = a.appResolveZaloSessionRoute(
+		ctx, run, effectiveConfig, threadID,
+	)
+	if err != nil {
+		return err
+	}
+	snapshot := a.appCaptureZaloTurnSnapshot(effectiveConfig, threadID, files)
 	if aware, ok := run.(appZaloAttachmentAwareRunner); ok {
 		run = aware.appWithZaloAttachments(snapshot.hasAttachments)
 	}
@@ -245,7 +255,7 @@ func (a *api) appAnswerZaloWithRunnerFactory(
 		run = &appZaloStructuredAnswerRunner{
 			a:                a,
 			run:              structured,
-			zc:               deps.cfg,
+			zc:               effectiveConfig,
 			threadID:         threadID,
 			question:         question,
 			currentZaloMsgID: appZaloCurrentMsgID(reply.ReplyQuote),
@@ -255,6 +265,7 @@ func (a *api) appAnswerZaloWithRunnerFactory(
 			highWater:        snapshot.highWater,
 			highWaterKnown:   snapshot.highWaterKnown,
 			resumeDelta:      snapshot.resumeDelta,
+			claudeBinding:    binding,
 		}
 	}
 	if err := a.answerZalo(ctx, deps.cfg, run, threadID, question, step, reply, files...); err != nil {
@@ -266,6 +277,30 @@ func (a *api) appAnswerZaloWithRunnerFactory(
 	}
 	a.appCompleteZaloTurn(threadID, pending)
 	return nil
+}
+
+func (a *api) appResolveZaloSessionRoute(
+	ctx context.Context,
+	run zaloRunner,
+	zc zaloConfig,
+	threadID string,
+) (zaloRunner, zaloConfig, appZaloClaudeBinding, error) {
+	resolver, ok := run.(appZaloSessionRouteResolver)
+	if !ok {
+		return run, zc, appZaloClaudeBinding{}, nil
+	}
+	var current *store.ZaloCLISession
+	session, err := a.st.ZaloCLISession(threadID)
+	if err == nil {
+		current = &session
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, zc, appZaloClaudeBinding{}, err
+	}
+	resolved, binding := resolver.appResolveZaloSessionRoute(ctx, current)
+	if binding.Model != "" {
+		zc.Model = binding.Model
+	}
+	return resolved, zc, binding, nil
 }
 
 func (a *api) appCaptureZaloTurnSnapshot(
@@ -433,6 +468,12 @@ func (a *api) appRunZalo(
 	files []ipc.ZaloAttachment,
 	step func(string),
 ) (string, error) {
+	var binding appZaloClaudeBinding
+	var err error
+	run, zc, binding, err = a.appResolveZaloSessionRoute(ctx, run, zc, threadID)
+	if err != nil {
+		return "", err
+	}
 	structured, ok := run.(appZaloStructuredRunner)
 	if !ok {
 		return run.Run(ctx, buildConsultPrompt(zc, question, history, found, files...), step)
@@ -446,6 +487,7 @@ func (a *api) appRunZalo(
 	return a.appRunZaloStructured(
 		ctx, structured, zc, threadID, question, currentZaloMsgID,
 		history, found, files, slices.Clone(files), step, "", highWater, true, resumeDelta,
+		binding,
 	)
 }
 
@@ -462,10 +504,11 @@ func (a *api) appRunZaloStructured(
 	turnHighWater int64,
 	turnHighWaterKnown bool,
 	resumeDelta appZaloResumeDeltaSnapshot,
+	claudeBinding appZaloClaudeBinding,
 ) (string, error) {
 	selection, err := a.appSelectZaloSession(
 		zc, threadID, question, currentZaloMsgID, history, found, files, directFiles,
-		bootstrapOverride, turnHighWater, turnHighWaterKnown, resumeDelta,
+		bootstrapOverride, turnHighWater, turnHighWaterKnown, resumeDelta, claudeBinding,
 	)
 	if err != nil {
 		return "", err
@@ -573,6 +616,7 @@ func (a *api) appSelectZaloSession(
 	turnHighWater int64,
 	turnHighWaterKnown bool,
 	resumeDelta appZaloResumeDeltaSnapshot,
+	claudeBinding appZaloClaudeBinding,
 ) (appZaloSessionSelection, error) {
 	_ = bootstrapOverride
 	fingerprint := appZaloPromptFingerprint(zc, threadID)
@@ -625,13 +669,17 @@ func (a *api) appSelectZaloSession(
 		created, createErr := a.st.CreateZaloCLISession(store.ZaloCLISession{
 			ThreadID: threadID, ClaudeSessionID: uuid.NewString(), Model: zc.Model,
 			PromptFingerprint: fingerprint,
+			ClaudeAccountID:   claudeBinding.AccountID,
+			ClaudeConfigDir:   claudeBinding.ConfigDir,
 		})
 		if createErr == nil {
 			return bootstrapSelection(created), nil
 		}
 		// Another process may have inserted the mapping. Reload once and never
 		// overwrite the generation it won.
-		session, err = a.appReloadZaloSessionAfterConflict(zc, threadID, fingerprint)
+		session, err = a.appReloadZaloSessionAfterConflict(
+			zc, threadID, fingerprint, claudeBinding,
+		)
 		if err != nil {
 			return appZaloSessionSelection{}, err
 		}
@@ -639,11 +687,14 @@ func (a *api) appSelectZaloSession(
 		return appZaloSessionSelection{}, err
 	}
 
-	if appZaloShouldRotate(session, zc.Model, fingerprint) {
+	if appZaloShouldRotate(session, zc.Model, fingerprint) ||
+		appZaloClaudeBindingChanged(session, claudeBinding) {
 		next := session
 		next.ClaudeSessionID = uuid.NewString()
 		next.Model = zc.Model
 		next.PromptFingerprint = fingerprint
+		next.ClaudeAccountID = claudeBinding.AccountID
+		next.ClaudeConfigDir = claudeBinding.ConfigDir
 		next.ContextTokens = 0
 		next.TurnCount = 0
 		next.MemoryRevision = 0
@@ -659,7 +710,9 @@ func (a *api) appSelectZaloSession(
 		}
 		// A concurrent generation is authoritative. Reload exactly once and use
 		// it without attempting another replacement.
-		session, err = a.appReloadZaloSessionAfterConflict(zc, threadID, fingerprint)
+		session, err = a.appReloadZaloSessionAfterConflict(
+			zc, threadID, fingerprint, claudeBinding,
+		)
 		if err != nil {
 			return appZaloSessionSelection{}, err
 		}
@@ -838,15 +891,32 @@ func (a *api) appReplaceRecoveredZaloSession(
 func (a *api) appReloadZaloSessionAfterConflict(
 	zc zaloConfig,
 	threadID, fingerprint string,
+	claudeBinding appZaloClaudeBinding,
 ) (store.ZaloCLISession, error) {
 	session, err := a.st.ZaloCLISession(threadID)
 	if err != nil {
 		return store.ZaloCLISession{}, err
 	}
-	if appZaloShouldRotate(session, zc.Model, fingerprint) {
+	if appZaloShouldRotate(session, zc.Model, fingerprint) ||
+		appZaloClaudeBindingChanged(session, claudeBinding) {
 		return store.ZaloCLISession{}, errAppZaloSessionStateUpdate
 	}
 	return session, nil
+}
+
+func appZaloClaudeBindingChanged(
+	session store.ZaloCLISession,
+	binding appZaloClaudeBinding,
+) bool {
+	switch binding.State {
+	case appZaloClaudeBindingUnavailable:
+		return session.ClaudeAccountID != "" || session.ClaudeConfigDir != ""
+	case appZaloClaudeBindingSelected:
+		return session.ClaudeAccountID != binding.AccountID ||
+			session.ClaudeConfigDir != binding.ConfigDir
+	default:
+		return false
+	}
 }
 
 func (a *api) appInvalidateFailedZaloRecovery(

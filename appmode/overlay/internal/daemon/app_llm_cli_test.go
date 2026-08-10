@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -110,49 +111,6 @@ func TestCodexPromptStartingWithDashIsShieldedFromClap(t *testing.T) {
 	if argv[len(argv)-1] != "--dangerously-bypass-approvals-and-sandbox" {
 		t.Fatalf("argv %v: prompt phải là phần tử cuối, sau `--`", argv)
 	}
-}
-
-// TestCLIRunKillsTheWholeTreeOnCancel chứng minh huỷ ctx giết CẢ CÂY node→cháu, không để mồ côi.
-// Nếu chỉ giết con trực tiếp (exec.CommandContext / cmd.Process.Kill) thì node chết nhưng CHÁU sống
-// tiếp — đúng bug Task 5. Test bắt pid CHÁU (không phải node) rồi khẳng định pid đó chết sau huỷ.
-func TestCLIRunKillsTheWholeTreeOnCancel(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node không có trên PATH")
-	}
-	dir := t.TempDir()
-	script := filepath.Join(dir, "tree.js")
-	pidFile := filepath.Join(dir, "child.pid")
-	// node đẻ một tiến trình CHÁU ngủ vô hạn, DETACHED + unref → cháu SỐNG SÓT khi node chết (mồ côi
-	// thật, đúng bug node→codex→[con] Task 5). Không detached thì Windows kéo cháu chết theo node và
-	// test thành vô nghĩa: cả giết-cây lẫn giết-con-trực-tiếp đều trông như nhau. Pid cháu ghi ra FILE
-	// vì runCLIProcess chiếm stdout/stderr và trên đường huỷ không trả chúng ra.
-	js := `const {spawn}=require("child_process");const fs=require("fs");` +
-		`const c=spawn(process.execPath,["-e","setInterval(()=>{},1e9)"],{stdio:"ignore",detached:true});` +
-		`c.unref();` +
-		`fs.writeFileSync(process.argv[2],String(c.pid));` +
-		`setInterval(()=>{},1e9);`
-	if err := os.WriteFile(script, []byte(js), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	// Goroutine thoát khi runCLIProcess trả về (sau cancel → killPidTree → cmd.Wait trả về).
-	go func() {
-		defer close(done)
-		_, _ = runCLIProcess(ctx, exec.Command(node, script, pidFile), nil, nil, slog.New(slog.DiscardHandler))
-	}()
-
-	grandchild := readGrandchildPID(t, pidFile)
-	// Dọn rác dù test có fail (ví dụ khi CHÁU mồ côi còn sống): killPidTree trên pid đã chết trả nil.
-	t.Cleanup(func() { _ = killPidTree(grandchild, "test-cleanup", slog.New(slog.DiscardHandler)) })
-
-	cancel()
-	if stillAlive(grandchild, 3*time.Second) {
-		t.Fatalf("tiến trình cháu %d còn sống sau huỷ — cây bị mồ côi", grandchild)
-	}
-	<-done // đảm bảo runCLIProcess (và cmd.Wait bên trong) đã kết thúc trước khi test rời đi
 }
 
 // TestClassifyCLIError chốt việc ánh xạ output CLI về taxonomy: hết hạn mức → rate_limit (đi tiếp),
@@ -400,6 +358,18 @@ func TestCLIAdapterGenerateFeedsClaudePromptViaStdin(t *testing.T) {
 	}
 }
 
+func TestCLIAdapterGeneratePreservesCancellationDuringProgramDiscovery(t *testing.T) {
+	a := newCLIAdapter(
+		cliDescriptors["claude-code"], "claude-code", slog.New(slog.DiscardHandler),
+	)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := a.Generate(ctx, llmRequest{Model: "sonnet", Prompt: "câu hỏi"}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Generate() discovery error = %v; want context.Canceled", err)
+	}
+}
+
 // TestCLIAdapterGenerateClassifiesExitWithoutLeakingStderr: một *cliExit được phân loại theo
 // stderr, nhưng thân stderr KHÔNG BAO GIỜ vào thông báo lỗi (hợp đồng che).
 func TestCLIAdapterGenerateClassifiesExitWithoutLeakingStderr(t *testing.T) {
@@ -621,19 +591,146 @@ func readGrandchildPID(t *testing.T, pidFile string) int {
 	return 0
 }
 
-// stillAlive poll xem pid còn là tiến trình sống trên Windows không. Tái dùng processStart
-// (procid_windows.go): OpenProcess thất bại (ok=false) nghĩa là pid đã biến mất. Poll ngắn hợp lệ
-// vì đây là tiến trình NGOẠI (cháu do node đẻ, không phải con của test) — không channel nào để đợi
-// cái chết của nó, khác hẳn time.Sleep dùng để đồng bộ.
+// stillAlive poll xem pid còn ĐANG CHẠY không. Chỉ OpenProcess thành công là chưa đủ: Windows giữ
+// process object đã terminate khi vẫn còn handle tham chiếu tới nó. Helper theo nền tảng dùng
+// WaitForSingleObject trên Windows để phân biệt running với terminated-but-not-yet-reaped.
 func stillAlive(pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
-		if _, ok := processStart(pid); !ok {
-			return false // tiến trình đã biến mất
+		if !cliTestProcessRunning(pid) {
+			return false
 		}
 		if time.Now().After(deadline) {
 			return true // vẫn mở được sau timeout → coi như còn sống
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+type hangingNPMDiscovery struct {
+	markerPath  string
+	releasePath string
+}
+
+func newHangingNPMDiscovery(t *testing.T) *hangingNPMDiscovery {
+	t.Helper()
+	npmRootCache.mu.Lock()
+	originalCachedRoot := npmRootCache.root
+	npmRootCache.root = ""
+	npmRootCache.mu.Unlock()
+	t.Cleanup(func() {
+		npmRootCache.mu.Lock()
+		npmRootCache.root = originalCachedRoot
+		npmRootCache.mu.Unlock()
+	})
+
+	binDir := t.TempDir()
+	fixture := &hangingNPMDiscovery{
+		markerPath:  filepath.Join(t.TempDir(), "first-started"),
+		releasePath: filepath.Join(t.TempDir(), "release-first"),
+	}
+	root := filepath.Join(t.TempDir(), "npm-root")
+	for _, d := range []cliDescriptor{cliDescriptors["claude-code"], cliDescriptors["gemini-cli"]} {
+		binPath := d.npmBin
+		if binPath == "" {
+			binPath = d.binJS
+		}
+		path := filepath.Join(root, binPath)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		stub := []byte("not an executable")
+		if runtime.GOOS != "windows" {
+			stub = []byte("#!/bin/sh\nexit 1\n")
+		}
+		if err := os.WriteFile(path, stub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	npmName := "npm"
+	npmScript := "#!/bin/sh\n" +
+		"if [ ! -f \"$NPM_TEST_MARKER\" ]; then\n" +
+		"  : > \"$NPM_TEST_MARKER\"\n" +
+		"  while [ ! -f \"$NPM_TEST_RELEASE\" ]; do sleep 0.02; done\n" +
+		"fi\n" +
+		"printf '%s\\n' \"$NPM_TEST_ROOT\"\n"
+	if runtime.GOOS == "windows" {
+		npmName = "npm.cmd"
+		npmScript = "@echo off\r\n" +
+			"if exist \"%NPM_TEST_MARKER%\" goto ready\r\n" +
+			"type nul > \"%NPM_TEST_MARKER%\"\r\n" +
+			":wait\r\n" +
+			"if exist \"%NPM_TEST_RELEASE%\" goto ready\r\n" +
+			"\"%SystemRoot%\\System32\\ping.exe\" -n 1 -w 20 127.0.0.1 >nul\r\n" +
+			"goto wait\r\n" +
+			":ready\r\n" +
+			"echo %NPM_TEST_ROOT%\r\n"
+	}
+	if err := os.WriteFile(filepath.Join(binDir, npmName), []byte(npmScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NPM_TEST_MARKER", fixture.markerPath)
+	t.Setenv("NPM_TEST_RELEASE", fixture.releasePath)
+	t.Setenv("NPM_TEST_ROOT", root)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Cleanup(fixture.release)
+	return fixture
+}
+
+func (f *hangingNPMDiscovery) waitStarted(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(f.markerPath); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			f.release()
+			t.Fatal("npm discovery did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (f *hangingNPMDiscovery) release() {
+	_ = os.WriteFile(f.releasePath, []byte("release"), 0o600)
+}
+
+func TestNPMRootDiscoveryHonorsCancellationAndDoesNotBlockLaterCallers(t *testing.T) {
+	fixture := newHangingNPMDiscovery(t)
+
+	firstCtx, cancelFirst := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancelFirst()
+	firstDone := make(chan authState, 1)
+	go func() {
+		firstDone <- probeClaudeAuth(firstCtx, cliDescriptors["claude-code"], slog.New(slog.DiscardHandler))
+	}()
+	fixture.waitStarted(t)
+
+	secondCtx, cancelSecond := context.WithTimeout(t.Context(), time.Second)
+	defer cancelSecond()
+	secondDone := make(chan authState, 1)
+	go func() {
+		secondDone <- probeClaudeAuth(secondCtx, cliDescriptors["claude-code"], slog.New(slog.DiscardHandler))
+	}()
+
+	failure := ""
+	select {
+	case <-secondDone:
+	case <-time.After(1500 * time.Millisecond):
+		failure = "later npm discovery was blocked by the hung first call"
+		fixture.release()
+	}
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		if failure == "" {
+			failure = "first npm discovery ignored its canceled context"
+		}
+		fixture.release()
+	}
+	if failure != "" {
+		t.Fatal(failure)
 	}
 }

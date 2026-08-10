@@ -456,7 +456,7 @@ func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string
 	if !ok {
 		return "", "", nil, fmt.Errorf("connect login: kind không phải subscription: %q", kind)
 	}
-	program, prefixArgs, err := resolveCLIProgram(desc)
+	program, prefixArgs, err := resolveCLIProgramContext(ctx, desc)
 	if err != nil {
 		return "", "", nil, fmt.Errorf("connect login: resolve %s: %w", kind, err)
 	}
@@ -521,7 +521,7 @@ func (d *defaultConnectRunner) login(ctx context.Context, kind, configDir string
 // CommandContext, which would orphan claude's grandchildren), reap-before-read-stderr, and a
 // timeout that kills+reaps if the URL never appears.
 func (d *defaultConnectRunner) loginClaude(ctx context.Context, configDir string) (string, string, func() error, error) {
-	program, prefixArgs, err := resolveCLIProgram(cliDescriptors["claude-code"])
+	program, prefixArgs, err := resolveCLIProgramContext(ctx, cliDescriptors["claude-code"])
 	if err != nil {
 		return "", "", nil, fmt.Errorf("connect login: resolve claude-code: %w", err)
 	}

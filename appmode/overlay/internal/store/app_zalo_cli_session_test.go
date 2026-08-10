@@ -19,6 +19,8 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 	user, err := s.CreateZaloCLISession(ZaloCLISession{
 		ThreadID:          "user-1",
 		ClaudeSessionID:   "claude-user-1",
+		ClaudeAccountID:   "account-a",
+		ClaudeConfigDir:   "config-a",
 		Generation:        77,
 		Model:             "claude-haiku",
 		PromptFingerprint: "persona-v1",
@@ -37,6 +39,8 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 	group, err := s.CreateZaloCLISession(ZaloCLISession{
 		ThreadID:              "group-1",
 		ClaudeSessionID:       "session-1",
+		ClaudeAccountID:       "account-group",
+		ClaudeConfigDir:       "config-group",
 		Model:                 "sonnet",
 		PromptFingerprint:     "v2",
 		MemorySubjectUID:      "user-1",
@@ -53,6 +57,8 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 
 	next := user
 	next.ClaudeSessionID = "claude-user-2"
+	next.ClaudeAccountID = "account-b"
+	next.ClaudeConfigDir = "config-b"
 	next.Model = "claude-sonnet"
 	next.PromptFingerprint = "persona-v2"
 	next.ContextTokens = 0
@@ -68,8 +74,9 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 		t.Fatalf("ReplaceZaloCLISession: %v", err)
 	}
 	if replaced.Generation != 2 || replaced.ClaudeSessionID != "claude-user-2" || replaced.MessageCursor != 7 ||
+		replaced.ClaudeAccountID != "account-b" || replaced.ClaudeConfigDir != "config-b" ||
 		replaced.MemorySubjectUID != "" || replaced.MemorySubjectRevision != 0 || replaced.MemoryCommonRevision != 0 {
-		t.Fatalf("replaced session = %#v; want generation 2, claude-user-2, cursor still 7, Memory cursors reset", replaced)
+		t.Fatalf("replaced session = %#v; want generation 2, claude-user-2 on account-b/config-b, cursor still 7, Memory cursors reset", replaced)
 	}
 
 	unchangedGroup, err := s.ZaloCLISession("group-1")
@@ -77,6 +84,7 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 		t.Fatalf("ZaloCLISession(group): %v", err)
 	}
 	if unchangedGroup.Generation != 1 || unchangedGroup.ClaudeSessionID != "session-1" ||
+		unchangedGroup.ClaudeAccountID != "account-group" || unchangedGroup.ClaudeConfigDir != "config-group" ||
 		unchangedGroup.MemorySubjectUID != "user-1" || unchangedGroup.MemorySubjectRevision != 7 ||
 		unchangedGroup.MemoryCommonRevision != 3 {
 		t.Fatalf("group session changed with user session: %#v", unchangedGroup)
@@ -87,6 +95,7 @@ func TestZaloCLISessionLifecycleIsIndependentPerThread(t *testing.T) {
 		t.Fatalf("CompleteZaloCLITurn(first): %v", err)
 	}
 	if completed.ContextTokens != 8_192 || completed.TurnCount != 1 || completed.MessageCursor != 12 ||
+		completed.ClaudeAccountID != "account-b" || completed.ClaudeConfigDir != "config-b" ||
 		completed.MemorySubjectUID != "subject-1" || completed.MemorySubjectRevision != 6 ||
 		completed.MemoryCommonRevision != 4 || completed.MemoryRevision != 5 || completed.LessonsRevision != 3 {
 		t.Fatalf("completed session = %#v; want tokens=8192 turn=1 cursor=12 Memory cursors=subject-1/6/4 revisions=5/3", completed)

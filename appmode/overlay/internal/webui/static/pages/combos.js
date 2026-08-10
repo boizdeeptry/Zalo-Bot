@@ -369,19 +369,21 @@ export function createComboEditor({
 }
 
 // openModelPicker mở modal chọn model kiểu 9Router (data-combos-overlay): liệt kê model của các
-// Provider ĐÃ KẾT NỐI (nhóm theo Provider) + ô tìm; bấm một model để thêm/bỏ. Tách khỏi editor để CẢ
+// Provider ĐANG BẬT + ĐÃ KẾT NỐI (nhóm theo Provider) + ô tìm; bấm một model để thêm/bỏ. Tách khỏi editor để CẢ
 // editor (Sửa model) LẪN modal Tạo combo dùng chung một picker. Trả { close }.
-//   providers  danh sách Provider (chỉ lấy provider ĐÃ KẾT NỐI + có models — xem isProviderConnected).
+//   providers  danh sách Provider (chỉ lấy provider ĐANG BẬT + ĐÃ KẾT NỐI + có models).
 //   isMember(providerID, modelID) → bool: model đã có trong bản nháp của bên gọi chưa.
 //   toggle(providerID, modelID): thêm/bỏ — bên gọi tự cập nhật bản nháp (editor tự lưu, Tạo combo thì chưa).
 //   hint: dòng gợi ý dưới tiêu đề (editor "tự lưu"; Tạo combo thì không).
 //   onClose(): gọi khi picker đóng, để bên gọi dọn handle.
 function openModelPicker({ providers = [], isMember, toggle, hint = "Bấm để thêm, bấm lại để bỏ.", onClose = () => {} } = {}) {
   const hasModels = (provider) => Array.isArray(provider.models) && provider.models.length;
-  // CHỈ Provider đã kết nối mới cho chọn model: `enabled` chỉ nghĩa là hàng đăng ký/bật, KHÔNG phải
-  // người mua đã nối — một claude-code hệ thống (enabled, 0 account) sẽ chào model seed rồi khi bot
-  // route tới lại IM. isProviderConnected là cùng luật với nhãn trang Providers + Go.
-  const pickable = providers.filter((provider) => isProviderConnected(provider) && hasModels(provider));
+  // CHỈ Provider đang bật + đã kết nối mới cho chọn model: một claude-code hệ thống (enabled, 0
+  // account) sẽ chào model seed rồi khi bot route tới lại IM; một Provider đã tắt thì cũng không được
+  // thêm vào route mới dù credential/account còn nối. isProviderConnected là cùng luật với nhãn trang
+  // Providers + Go.
+  const pickable = providers.filter((provider) => provider.enabled
+    && isProviderConnected(provider) && hasModels(provider));
   // Provider ĐANG BẬT + có model nhưng CHƯA nối (bị lọc khỏi pickable): nêu tên để người dùng biết vì
   // sao model của nó không có ở đây, thay vì lặng lẽ giấu. Hàng đã tắt (enabled=false) thì không nhắc.
   const unconnected = providers.filter((provider) => provider.enabled

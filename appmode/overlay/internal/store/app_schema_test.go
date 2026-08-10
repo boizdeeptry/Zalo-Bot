@@ -266,6 +266,109 @@ INSERT INTO app_memory_subject_revisions(thread_id, uid, revision)
 	)
 }
 
+// createProductionV5Fixture models an installed V5 database, where the memory/session
+// feature family and the provider/account/route feature family already coexist. V6 may
+// add only the two Claude binding columns; every pre-existing row must survive verbatim.
+func createProductionV5Fixture(t *testing.T, db *sql.DB) {
+	t.Helper()
+	createFeatureV4Fixture(t, db)
+	execAppFixture(t, db,
+		`CREATE TABLE llm_providers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  system_provider INTEGER NOT NULL DEFAULT 0 CHECK (system_provider IN (0, 1)),
+  credential_cipher BLOB NOT NULL DEFAULT x'',
+  last_check_status TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  last_checked_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE llm_models (
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
+  model_id TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'discovered')),
+  available INTEGER NOT NULL DEFAULT 1 CHECK (available IN (0, 1)),
+  PRIMARY KEY (provider_id, model_id)
+);
+CREATE TABLE llm_route_entries (
+  position INTEGER PRIMARY KEY,
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id),
+  model_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
+);
+CREATE TABLE llm_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  outcome TEXT NOT NULL CHECK (outcome IN ('ok', 'error')),
+  error_kind TEXT NOT NULL DEFAULT '',
+  fell_back INTEGER NOT NULL DEFAULT 0 CHECK (fell_back IN (0, 1)),
+  next_provider_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_llm_attempts_started ON llm_attempts(started_at);
+CREATE TABLE llm_accounts (
+  id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  email TEXT NOT NULL DEFAULT '',
+  config_dir TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  added_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE llm_combos (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'fallback' CHECK (type IN ('fallback','round_robin')),
+  active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0,1)),
+  revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE llm_combo_members (
+  combo_id TEXT NOT NULL REFERENCES llm_combos(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  provider_id TEXT NOT NULL REFERENCES llm_providers(id),
+  model_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  PRIMARY KEY (combo_id, position)
+);`,
+		`UPDATE app_meta SET value = '5' WHERE key = 'schema_version';
+INSERT INTO app_meta(key, value) VALUES ('llm_route_revision', '31');
+INSERT INTO zalo_messages(id, thread_id, direction, body, created_at)
+  VALUES (61, 'feature-user', 'in', 'feature message', '2026-08-08T04:30:00Z');
+INSERT INTO llm_providers(
+  id, name, kind, enabled, system_provider, credential_cipher,
+  last_check_status, last_error, last_checked_at
+) VALUES
+  ('claude-code', 'Claude Code V5', 'claude-code', 1, 1, x'CAFE', 'ok', '', '2026-08-08T05:00:00Z'),
+  ('provider-v5', 'Provider V5', 'openai-compatible', 1, 0, x'BEEF', 'error', 'timeout', '2026-08-08T05:01:00Z');
+INSERT INTO llm_models(provider_id, model_id, name, source, available)
+  VALUES ('provider-v5', 'model-v5', 'Model V5', 'discovered', 1),
+    ('claude-code', 'haiku', 'Claude Haiku', 'manual', 1);
+INSERT INTO llm_route_entries(position, provider_id, model_id, enabled)
+  VALUES (0, 'provider-v5', 'model-v5', 1), (1, 'claude-code', 'haiku', 1);
+INSERT INTO llm_attempts(
+  id, provider_id, model_id, started_at, duration_ms, outcome,
+  error_kind, fell_back, next_provider_id
+) VALUES (
+  81, 'provider-v5', 'model-v5', '2026-08-08T05:02:00Z', 317,
+  'error', 'timeout', 1, 'claude-code'
+);
+INSERT INTO llm_accounts(id, provider_id, label, email, config_dir, enabled, added_at)
+  VALUES ('account-v5', 'provider-v5', 'V5 account', 'v5@example.test',
+    'D:/provider-v5', 1, '2026-08-08T05:03:00Z'),
+    ('account-claude-v5', 'claude-code', 'Claude V5', 'claude@example.test',
+    'D:/claude-v5', 1, '2026-08-08T05:04:00Z');
+INSERT INTO llm_combos(id, name, type, active, revision)
+  VALUES ('combo-v5', 'V5 fallback', 'fallback', 1, 7);
+INSERT INTO llm_combo_members(combo_id, position, provider_id, model_id, enabled)
+  VALUES ('combo-v5', 0, 'provider-v5', 'model-v5', 1),
+    ('combo-v5', 1, 'claude-code', 'haiku', 1);`,
+	)
+}
+
 func createMainV4Fixture(t *testing.T, db *sql.DB) {
 	t.Helper()
 	execAppFixture(t, db,
@@ -446,7 +549,64 @@ func mainV4DataSnapshot(t *testing.T, db *sql.DB) map[string]string {
 	return snapshot
 }
 
-func TestMigrateAppFeatureV4ToV5PreservesMemoryAndAddsLLM(t *testing.T) {
+func productionV5DataSnapshot(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	snapshot := mainV4DataSnapshot(t, db)
+	queries := map[string]string{
+		"app_meta": `SELECT COALESCE(group_concat(row_value, char(10)), '') FROM (
+  SELECT quote(key) || '|' || quote(value) AS row_value
+  FROM app_meta WHERE key <> 'schema_version' ORDER BY key
+)`,
+		"zalo_threads": `SELECT COALESCE(group_concat(row_value, char(10)), '') FROM (
+  SELECT quote(id) || '|' || quote(thread_type) AS row_value FROM zalo_threads ORDER BY id
+)`,
+		"zalo_messages": `SELECT COALESCE(group_concat(row_value, char(10)), '') FROM (
+  SELECT quote(id) || '|' || quote(thread_id) || '|' || quote(direction) || '|' ||
+    quote(body) || '|' || quote(created_at) AS row_value FROM zalo_messages ORDER BY id
+)`,
+		"zalo_memory_full": `SELECT COALESCE(group_concat(row_value, char(10)), '') FROM (
+  SELECT quote(id) || '|' || quote(thread_id) || '|' || quote(uid) || '|' || quote(text) || '|' ||
+    quote(created_at) || '|' || quote(pinned) || '|' || quote(source) || '|' ||
+    quote(source_message_id) || '|' || quote(updated_at) || '|' || quote(memory_key) || '|' ||
+    quote(category) || '|' || quote(confidence) || '|' || quote(status) || '|' ||
+    quote(proposal_action) || '|' || quote(supersedes_id) || '|' ||
+    quote(last_confirmed_at) || '|' || quote(expires_at) AS row_value
+  FROM zalo_memory ORDER BY id
+)`,
+		"zalo_lessons": `SELECT COALESCE(group_concat(row_value, char(10)), '') FROM (
+  SELECT quote(id) || '|' || quote(thread_id) || '|' || quote(bot_text) || '|' ||
+    quote(better) || '|' || quote(note) || '|' || quote(created_at) || '|' ||
+    quote(pinned) || '|' || quote(updated_at) AS row_value FROM zalo_lessons ORDER BY id
+)`,
+		"app_zalo_cli_sessions": `SELECT COALESCE(group_concat(row_value, char(10)), '') FROM (
+  SELECT quote(thread_id) || '|' || quote(claude_session_id) || '|' || quote(generation) || '|' ||
+    quote(model) || '|' || quote(prompt_fingerprint) || '|' || quote(context_tokens) || '|' ||
+    quote(turn_count) || '|' || quote(message_cursor) || '|' || quote(rotate_before_next) || '|' ||
+    quote(last_error) || '|' || quote(created_at) || '|' || quote(updated_at) || '|' ||
+    quote(memory_revision) || '|' || quote(lessons_revision) || '|' ||
+    quote(memory_subject_uid) || '|' || quote(memory_subject_revision) || '|' ||
+    quote(memory_common_revision) AS row_value FROM app_zalo_cli_sessions ORDER BY thread_id
+)`,
+		"app_memory_revisions": `SELECT COALESCE(group_concat(row_value, char(10)), '') FROM (
+  SELECT quote(scope) || '|' || quote(scope_id) || '|' || quote(revision) AS row_value
+  FROM app_memory_revisions ORDER BY scope, scope_id
+)`,
+		"app_memory_subject_revisions": `SELECT COALESCE(group_concat(row_value, char(10)), '') FROM (
+  SELECT quote(thread_id) || '|' || quote(uid) || '|' || quote(revision) AS row_value
+  FROM app_memory_subject_revisions ORDER BY thread_id, uid
+)`,
+	}
+	for table, query := range queries {
+		var value string
+		if err := db.QueryRow(query).Scan(&value); err != nil {
+			t.Fatalf("snapshot %s: %v", table, err)
+		}
+		snapshot[table] = value
+	}
+	return snapshot
+}
+
+func TestMigrateAppFeatureV4ToV6PreservesMemoryAndAddsLLM(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -457,8 +617,8 @@ func TestMigrateAppFeatureV4ToV5PreservesMemoryAndAddsLLM(t *testing.T) {
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "5" {
-		t.Fatalf("schema_version = %q; want 5", got)
+	if got := appSchemaVersionForTest(t, db); got != "6" {
+		t.Fatalf("schema_version = %q; want 6", got)
 	}
 	for _, table := range []string{
 		"llm_providers", "llm_models", "llm_route_entries", "llm_attempts",
@@ -562,7 +722,7 @@ WHERE id = 'claude-code'`).Scan(&kind, &systemProvider); err != nil {
 	}
 }
 
-func TestMigrateAppMainV4ToV5PreservesRoutingAndAddsMemory(t *testing.T) {
+func TestMigrateAppMainV4ToV6PreservesRoutingAndAddsMemory(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -573,8 +733,8 @@ func TestMigrateAppMainV4ToV5PreservesRoutingAndAddsMemory(t *testing.T) {
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "5" {
-		t.Fatalf("schema_version = %q; want 5", got)
+	if got := appSchemaVersionForTest(t, db); got != "6" {
+		t.Fatalf("schema_version = %q; want 6", got)
 	}
 	for _, table := range []string{
 		"app_zalo_cli_sessions", "app_memory_revisions", "app_memory_subject_revisions",
@@ -760,7 +920,7 @@ END;`,
 	}
 }
 
-func TestMigrateAppV5IsIdempotent(t *testing.T) {
+func TestMigrateAppV6IsIdempotent(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -834,19 +994,94 @@ WHERE thread_id = 'feature-user' AND uid = 'feature-user'`).Scan(&secondSubjectR
 	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'llm_route_revision'`).Scan(&routeRevision); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "5" {
-		t.Fatalf("schema_version = %q; want 5", got)
+	if got := appSchemaVersionForTest(t, db); got != "6" {
+		t.Fatalf("schema_version = %q; want 6", got)
 	}
 	if secondSQLiteSchemaVersion != firstSQLiteSchemaVersion || secondObjectCount != firstObjectCount ||
 		secondMemoryCount != firstMemoryCount || secondThreadRevision != firstThreadRevision ||
 		secondSubjectRevision != firstSubjectRevision || secondExpiry != firstExpiry ||
 		providerName != "Claude Code edited" || routeRevision != "23" {
-		t.Fatalf("second migration changed V5 state: SQLite %d->%d objects %d->%d memory %d->%d thread revision %d->%d subject revision %d->%d expiry %q->%q provider %q route revision %q",
+		t.Fatalf("second migration changed V6 state: SQLite %d->%d objects %d->%d memory %d->%d thread revision %d->%d subject revision %d->%d expiry %q->%q provider %q route revision %q",
 			firstSQLiteSchemaVersion, secondSQLiteSchemaVersion, firstObjectCount, secondObjectCount,
 			firstMemoryCount, secondMemoryCount, firstThreadRevision, secondThreadRevision,
 			firstSubjectRevision, secondSubjectRevision, firstExpiry, secondExpiry,
 			providerName, routeRevision)
 	}
+}
+
+func TestMigrateAppV5ToV6AddsClaudeBindingWithoutChangingSession(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createProductionV5Fixture(t, db)
+	wantData := productionV5DataSnapshot(t, db)
+
+	if err := migrateApp(db); err != nil {
+		t.Fatal(err)
+	}
+	if got := appSchemaVersionForTest(t, db); got != "6" {
+		t.Fatalf("schema_version = %q; want 6", got)
+	}
+	columns := appTableColumns(t, db, "app_zalo_cli_sessions")
+	for _, column := range []string{"claude_account_id", "claude_config_dir"} {
+		if !slices.Contains(columns, column) {
+			t.Errorf("app_zalo_cli_sessions is missing V6 column %s", column)
+		}
+	}
+	gotData := productionV5DataSnapshot(t, db)
+	for table, want := range wantData {
+		if got := gotData[table]; got != want {
+			t.Errorf("%s changed during V5-to-V6 migration:\n got %q\nwant %q", table, got, want)
+		}
+	}
+	assertBlankBinding := func(stage string) {
+		t.Helper()
+		var accountID, configDir string
+		if err := db.QueryRow(`SELECT claude_account_id, claude_config_dir
+FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
+			&accountID, &configDir,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if accountID != "" || configDir != "" {
+			t.Errorf("%s Claude binding = %q/%q; want empty/empty", stage, accountID, configDir)
+		}
+	}
+	assertBlankBinding("first migration")
+
+	var firstSQLiteSchemaVersion, firstObjectCount int
+	if err := db.QueryRow(`PRAGMA schema_version`).Scan(&firstSQLiteSchemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master`).Scan(&firstObjectCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateApp(db); err != nil {
+		t.Fatalf("second migrateApp: %v", err)
+	}
+	if got := appSchemaVersionForTest(t, db); got != "6" {
+		t.Fatalf("schema_version after second migration = %q; want 6", got)
+	}
+	var secondSQLiteSchemaVersion, secondObjectCount int
+	if err := db.QueryRow(`PRAGMA schema_version`).Scan(&secondSQLiteSchemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master`).Scan(&secondObjectCount); err != nil {
+		t.Fatal(err)
+	}
+	if secondSQLiteSchemaVersion != firstSQLiteSchemaVersion || secondObjectCount != firstObjectCount {
+		t.Errorf("second migration changed schema: SQLite %d->%d objects %d->%d",
+			firstSQLiteSchemaVersion, secondSQLiteSchemaVersion, firstObjectCount, secondObjectCount)
+	}
+	secondData := productionV5DataSnapshot(t, db)
+	for table, want := range gotData {
+		if got := secondData[table]; got != want {
+			t.Errorf("%s changed during second V6 migration:\n got %q\nwant %q", table, got, want)
+		}
+	}
+	assertBlankBinding("second migration")
 }
 
 func TestMigrateAppAdvancesSchemaVersionMonotonically(t *testing.T) {
@@ -857,9 +1092,10 @@ func TestMigrateAppAdvancesSchemaVersionMonotonically(t *testing.T) {
 		want       string
 		wantErr    bool
 	}{
-		{name: "missing metadata", want: "5"},
-		{name: "older metadata", seed: "2", insertSeed: true, want: "5"},
-		{name: "current metadata", seed: "5", insertSeed: true, want: "5"},
+		{name: "missing metadata", want: "6"},
+		{name: "older metadata", seed: "2", insertSeed: true, want: "6"},
+		{name: "previous metadata", seed: "5", insertSeed: true, want: "6"},
+		{name: "current metadata", seed: "6", insertSeed: true, want: "6"},
 		{name: "newer metadata", seed: "7", insertSeed: true, want: "7"},
 		{name: "malformed metadata", seed: "future", insertSeed: true, want: "future", wantErr: true},
 		{name: "negative metadata", seed: "-1", insertSeed: true, want: "-1", wantErr: true},
@@ -915,7 +1151,8 @@ func TestMigrateAppCreatesContentFreeZaloCLISessionSchema(t *testing.T) {
 
 	columns := appTableColumns(t, db, "app_zalo_cli_sessions")
 	want := []string{
-		"thread_id", "claude_session_id", "generation", "model", "prompt_fingerprint",
+		"thread_id", "claude_session_id", "claude_account_id", "claude_config_dir",
+		"generation", "model", "prompt_fingerprint",
 		"context_tokens", "turn_count", "message_cursor", "rotate_before_next",
 		"last_error", "created_at", "updated_at", "memory_revision", "lessons_revision",
 		"memory_subject_uid", "memory_subject_revision", "memory_common_revision",
@@ -1266,7 +1503,7 @@ func TestMigrateAppUnifiesClaudeKind(t *testing.T) {
 		t.Fatal(err)
 	}
 	if kind != "claude-code" {
-		t.Errorf("claude-code kind after V4-to-V5 migration = %q; want claude-code", kind)
+		t.Errorf("claude-code kind after V4-to-V6 migration = %q; want claude-code", kind)
 	}
 }
 
@@ -1287,7 +1524,7 @@ func TestMigrateAppSeedsNoDefaultCombo(t *testing.T) {
 	if combos != 0 {
 		t.Errorf("combos after migration = %d; want 0", combos)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "5" {
-		t.Errorf("schema_version = %q; want 5", got)
+	if got := appSchemaVersionForTest(t, db); got != "6" {
+		t.Errorf("schema_version = %q; want 6", got)
 	}
 }

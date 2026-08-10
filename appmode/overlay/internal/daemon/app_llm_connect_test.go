@@ -61,6 +61,54 @@ func TestScanClaudeLoginURL(t *testing.T) {
 	}
 }
 
+func TestConnectLoginCancelsHangingNPMDiscovery(t *testing.T) {
+	fixture := newHangingNPMDiscovery(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	configDir := t.TempDir()
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := (&defaultConnectRunner{}).login(ctx, "claude-code", configDir)
+		done <- err
+	}()
+	fixture.waitStarted(t)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("login error = %v; want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		fixture.release()
+		<-done
+		t.Fatal("login did not cancel while npm discovery was hanging")
+	}
+}
+
+func TestConnectLoginClaudePreservesDeadlineDuringHangingNPMDiscovery(t *testing.T) {
+	fixture := newHangingNPMDiscovery(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	configDir := t.TempDir()
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := (&defaultConnectRunner{}).loginClaude(ctx, configDir)
+		done <- err
+	}()
+	fixture.waitStarted(t)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("loginClaude error = %v; want context.DeadlineExceeded", err)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		fixture.release()
+		<-done
+		t.Fatal("loginClaude did not honor its deadline while npm discovery was hanging")
+	}
+}
+
 // TestClaudeEmailFromJSON pins the parser that sets the account label: the real `claude auth status
 // --json` shape yields the email, and malformed JSON yields "" (account falls back to job.label).
 func TestClaudeEmailFromJSON(t *testing.T) {
