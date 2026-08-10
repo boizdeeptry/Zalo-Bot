@@ -119,6 +119,7 @@
 [data-combos-overlay] .sheethead { display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:6px; }
 [data-combos-overlay] .sheethead .st { font-size:15px; font-weight:600; }
 [data-combos-overlay] .pick-hint { font-size:11.5px; color:var(--dim); margin:0 0 12px; }
+[data-combos-overlay] .pick-note { font-size:11.5px; color:var(--dim); margin:0 0 12px; padding:8px 11px; border:1px dashed var(--line); border-radius:9px; }
 [data-combos-overlay] .pick-search { box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:9px; padding:8px 12px; margin:0 0 12px; color:var(--ink); background:var(--sunk); font-size:13px; }
 [data-combos-overlay] .pick-group { margin:0 0 16px; }
 [data-combos-overlay] .pick-group-head { font-size:11.5px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:0 0 7px; }

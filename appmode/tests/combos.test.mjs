@@ -36,6 +36,7 @@ const pickGroups = (root) => findAll(root, (node) => hasClass(node, "pick-group-
 const pickSearch = (root) => find(root, (node) => node.tagName === "INPUT");
 const pickRow = (root, name) => find(root, (node) => hasClass(node, "pick-model")
   && text(node).includes(name));
+const pickNote = (root) => find(root, (node) => hasClass(node, "pick-note"));
 
 const putCalls = (calls) => calls
   .filter((call) => /^\/llm\/combos\/[^/]+$/.test(call.path) && call.options.method === "PUT")
@@ -81,8 +82,10 @@ const PROVIDERS = {
       models: [{ model_id: "haiku", name: "Haiku", source: "manual", available: true }],
     },
     {
+      // Chưa nối (API, chưa có credential) + đã tắt → bị loại khỏi picker và KHÔNG nằm trong ghi chú
+      // (hàng đã tắt thì không nhắc). Chứng minh bộ lọc mới xét "đã nối", không phải "enabled".
       id: "anthropic-off", name: "Anthropic nghỉ", kind: "anthropic", enabled: false, system: false,
-      credential_configured: true, credential_unreadable: false,
+      credential_configured: false, credential_unreadable: false,
       models: [{ model_id: "claude-4", name: "Claude 4", source: "discovered", available: true }],
     },
   ],
@@ -406,16 +409,47 @@ test("opening a non-active combo's edit modal shows its members without a runnin
 
 // --- model picker modal (lồng trong modal Sửa model) ---
 
-test("opening the picker lists every connected provider's models grouped by provider", async (t) => {
+test("the picker offers only connected providers' models and names the unconnected ones", async (t) => {
   const { main } = await mounted(t);
   const modal = openEdit(main, 0);
   button(modal, "Thêm model").click();
 
   const picker = overlay();
   assert.ok(picker, "the Thêm model button must open the picker overlay");
-  // Chỉ Provider đang bật + có model: OpenAI chính, Gemini, Claude Code. Anthropic nghỉ bị loại.
-  assert.deepEqual(pickGroups(picker).map(text), ["OpenAI chính", "Gemini", "Claude Code"]);
-  assert.equal(pickRows(picker).length, 4);
+  // CHỈ Provider đã kết nối + có model: OpenAI chính, Gemini. claude-code (thuê bao hệ thống, 0
+  // account) CHƯA nối → bị loại dù enabled=1 — đúng lỗi no-default cần chặn (không chào model seed
+  // của một provider bot không route tới được). anthropic-off (chưa credential + đã tắt) cũng bị loại.
+  assert.deepEqual(pickGroups(picker).map(text), ["OpenAI chính", "Gemini"]);
+  assert.equal(pickRows(picker).length, 3);
+  // Ghi chú nêu tên Provider bật-nhưng-chưa-nối để người dùng biết vì sao model của nó vắng mặt.
+  const note = pickNote(picker);
+  assert.ok(note, "an unconnected enabled provider must be named in a note");
+  assert.match(text(note), /Chưa kết nối:\s*Claude Code/);
+  assert.match(text(note), /Providers/);
+  // anthropic-off đã tắt → không bị nhắc trong ghi chú.
+  assert.equal(text(note).includes("Anthropic"), false);
+});
+
+test("the picker offers a connected subscription provider's models and drops the note when all are connected", async (t) => {
+  // Thuê bao codex CÓ account đang bật (0 credential) → ĐÃ nối → model của nó chọn được. Không có
+  // provider bật-mà-chưa-nối nào khác → không hiện ghi chú.
+  const providers = {
+    kinds: [],
+    providers: [{
+      id: "codex", name: "OpenAI Codex", kind: "codex", enabled: true, system: false,
+      credential_configured: false, credential_unreadable: false,
+      accounts: [{ id: "a1", label: "Tài khoản 1", email: "", enabled: true }],
+      models: [{ model_id: "gpt-5-codex", name: "GPT-5 Codex", source: "manual", available: true }],
+    }],
+  };
+  const { main } = await mounted(t, comboAPI({ providers }));
+  const modal = openEdit(main, 0);
+  button(modal, "Thêm model").click();
+
+  const picker = overlay();
+  assert.deepEqual(pickGroups(picker).map(text), ["OpenAI Codex"]);
+  assert.ok(pickRow(picker, "GPT-5 Codex"), "a connected subscription provider's model is pickable");
+  assert.equal(pickNote(picker), null, "no note when every enabled provider is connected");
 });
 
 test("typing in the picker search filters the visible models", async (t) => {

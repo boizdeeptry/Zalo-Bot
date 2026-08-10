@@ -1,4 +1,5 @@
 import { requestJSON } from "../core/api.js";
+import { isProviderConnected } from "../core/providers-status.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
 
 export const PROVIDER_CATALOG = [
@@ -78,24 +79,27 @@ export function createProviderService(request = requestJSON) {
 function galleryStatus(entry, byKind) {
   const p = byKind.get(entry.kind);
   if (!p) return { cls: "off", label: "Chưa kết nối" };
-  if (p.credential_unreadable) return { cls: "off", label: "Cần đăng nhập lại" };
+  // Boolean "đã nối" đến TỪ helper dùng chung (cùng luật với picker Combos + hasAnyConnectedProvider
+  // bên Go); các nhánh dưới chỉ chọn NHÃN, không tự quyết on/off — để nhãn và picker không trôi khỏi nhau.
+  const cls = isProviderConnected(p) ? "on" : "off";
+  if (p.credential_unreadable) return { cls, label: "Cần đăng nhập lại" };
   // Gói thuê bao (codex/claude): "đã kết nối" = CÓ TÀI KHOẢN đăng nhập, KHÔNG phải credential — chúng
-  // chạy proxy/CLI bằng phiên riêng của account, không có credential đi qua daemon. Trước đây xét
-  // credential_configured nên codex-proxy (không credential) luôn hiện "Chưa kết nối" dù đã có account.
+  // chạy proxy/CLI bằng phiên riêng của account, không có credential đi qua daemon. Nhánh này chỉ dựng
+  // NHÃN (đếm số tài khoản); cls đã do isProviderConnected quyết.
   if (entry.group === "subscription") {
     const accounts = Array.isArray(p.accounts) ? p.accounts.filter((a) => a.enabled !== false) : [];
     if (accounts.length) {
-      return { cls: "on", label: accounts.length > 1 ? `Đã kết nối · ${accounts.length} tài khoản` : "Đã kết nối" };
+      return { cls, label: accounts.length > 1 ? `Đã kết nối · ${accounts.length} tài khoản` : "Đã kết nối" };
     }
     // KHÔNG có nhánh p.system "Sẵn sàng" ở đây: dưới no-default, một claude-code hệ thống mà 0 account
-    // đăng nhập KHÔNG trả lời được — nó im. "Đã nối" = có account bật (cùng luật hasAnyConnectedProvider
-    // bên Go), nên 0 account = "Chưa kết nối", không phải một nhãn xanh gây hiểu nhầm.
-    return { cls: "off", label: "Chưa kết nối" };
+    // đăng nhập KHÔNG trả lời được — nó im. "Đã nối" = có account bật, nên 0 account = "Chưa kết nối",
+    // không phải một nhãn xanh gây hiểu nhầm.
+    return { cls, label: "Chưa kết nối" };
   }
-  if (p.last_check_status === "ok") return { cls: "on", label: "Đã kết nối" };
-  if (p.system) return { cls: "on", label: "Sẵn sàng" };
-  if (!p.credential_configured) return { cls: "off", label: "Chưa kết nối" };
-  return { cls: "on", label: "Đã thêm" };
+  if (p.last_check_status === "ok") return { cls, label: "Đã kết nối" };
+  if (p.system) return { cls, label: "Sẵn sàng" };
+  if (!p.credential_configured) return { cls, label: "Chưa kết nối" };
+  return { cls, label: "Đã thêm" };
 }
 function card(entry, byKind, onOpen) {
   const st = galleryStatus(entry, byKind);
