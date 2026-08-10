@@ -44,27 +44,49 @@ function overviewFixture() {
 }
 
 function detailFixture(threadID = "thread-a") {
+  const memories = threadID === "thread-a" ? [
+    {
+      id: 7, thread_id: threadID, uid: threadID, memory_key: "profile.delivery",
+      text: "Nhận hàng buổi sáng", category: "preference", confidence: 0.96,
+      status: "active", pinned: true,
+      source: "agent", source_message_id: 21, source_preview: "Em nhận hàng buổi sáng",
+      expires_at: "2026-12-31T00:00:00Z",
+      created_at: "2026-08-09T07:00:00Z", updated_at: "2026-08-09T07:00:00Z",
+    },
+    {
+      id: 6, thread_id: threadID, uid: threadID, memory_key: "profile.reply-style",
+      text: "Ưu tiên trả lời ngắn", category: "preference", confidence: 1,
+      status: "active", pinned: false,
+      source: "operator", source_message_id: 0, source_preview: "",
+      expires_at: null,
+      created_at: "2026-08-08T07:00:00Z", updated_at: "2026-08-08T07:00:00Z",
+    },
+  ] : [];
   return {
     thread: {
       id: threadID,
       name: threadID === "thread-a" ? "Chị Lan" : "Nhóm Đại lý",
+      thread_type: threadID === "thread-a" ? "user" : "group",
       memory_count: threadID === "thread-a" ? 2 : 0,
       pinned_count: threadID === "thread-a" ? 1 : 0,
     },
+    selected_uid: threadID === "thread-a" ? threadID : "",
+    members: threadID === "thread-a"
+      ? [{ uid: threadID, name: "Chị Lan", avatar: "", active: 2, pending: 0, expired: 0 }]
+      : [],
+    common: { active: 0, pending: 0, expired: 0 },
+    common_revision: 0,
+    subject_revision: threadID === "thread-a" ? 4 : 0,
+    synced_common_revision: 0,
+    synced_subject_revision: threadID === "thread-a" ? 3 : 0,
+    session_subject_uid: threadID === "thread-a" ? threadID : "",
+    synced: threadID !== "thread-a",
+    active: memories,
+    pending: [],
+    expired: [],
     revision: threadID === "thread-a" ? 4 : 0,
     synced_revision: threadID === "thread-a" ? 3 : 0,
-    memories: threadID === "thread-a" ? [
-      {
-        id: 7, thread_id: threadID, text: "Nhận hàng buổi sáng", pinned: true,
-        source: "agent", source_message_id: 21, source_preview: "Em nhận hàng buổi sáng",
-        created_at: "2026-08-09T07:00:00Z", updated_at: "2026-08-09T07:00:00Z",
-      },
-      {
-        id: 6, thread_id: threadID, text: "Ưu tiên trả lời ngắn", pinned: false,
-        source: "operator", source_message_id: 0, source_preview: "",
-        created_at: "2026-08-08T07:00:00Z", updated_at: "2026-08-08T07:00:00Z",
-      },
-    ] : [],
+    memories,
   };
 }
 
@@ -80,7 +102,7 @@ function lessonFixture() {
   };
 }
 
-test("memory service encodes filters and uses exact read endpoints", async () => {
+test("memory service encodes filters and member scope using exact read endpoints", async () => {
   const calls = [];
   const service = createMemoryService(async (path, options) => {
     calls.push({ path, options });
@@ -89,11 +111,13 @@ test("memory service encodes filters and uses exact read endpoints", async () =>
 
   await service.overview({ query: "chị Lan & Minh", pinned: true });
   await service.thread("group/a?b");
+  await service.thread("group/a?b", "u/1?x");
   await service.lessons({ query: "ngắn hơn", pinned: false });
 
   assert.equal(calls[0].path, "/memory?q=ch%E1%BB%8B+Lan+%26+Minh&pinned=true");
   assert.equal(calls[1].path, "/memory/threads/group%2Fa%3Fb");
-  assert.equal(calls[2].path, "/memory/lessons?q=ng%E1%BA%AFn+h%C6%A1n");
+  assert.equal(calls[2].path, "/memory/threads/group%2Fa%3Fb?uid=u%2F1%3Fx");
+  assert.equal(calls[3].path, "/memory/lessons?q=ng%E1%BA%AFn+h%C6%A1n");
   assert.ok(calls.every(({ options }) => options === undefined));
 });
 
@@ -158,7 +182,7 @@ test("Memory page renders legacy metrics, semantic tabs, thread detail and prove
   assert.match(text(main), /Chị Lan/);
   assert.match(text(main), /Nhận hàng buổi sáng/);
   assert.match(text(main), /Nguồn: tin nhắn “Em nhận hàng buổi sáng”/);
-  assert.match(text(main), /Sẽ đồng bộ ở lượt Zalo kế tiếp · revision 4/);
+  assert.match(text(main), /sẽ đồng bộ khi người này nhắn tiếp · revision 4/);
   const open = find(main, (node) => node.tagName === "A" && text(node) === "Mở hội thoại");
   assert.equal(open.getAttribute("href"), "/zalo?thread=thread-a");
   assert.ok(find(main, (node) => node.getAttribute?.("aria-live") === "polite"));

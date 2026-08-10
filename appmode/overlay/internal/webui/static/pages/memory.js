@@ -1,5 +1,6 @@
 import { requestJSON } from "../core/api.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
+import { memberSelector, memorySections } from "./memory-view.js";
 
 const SEARCH_DELAY_MS = 250;
 
@@ -16,7 +17,12 @@ export function createMemoryService(request = requestJSON) {
   if (typeof request !== "function") throw new TypeError("Memory service requires an API request function");
   return Object.freeze({
     overview: (filters) => request(`/memory${filterQuery(filters)}`),
-    thread: (threadID) => request(`/memory/threads/${encodeURIComponent(threadID)}`),
+    thread: (threadID, uid = "") => {
+      const query = new URLSearchParams();
+      if (uid) query.set("uid", uid);
+      const suffix = query.toString();
+      return request(`/memory/threads/${encodeURIComponent(threadID)}${suffix ? `?${suffix}` : ""}`);
+    },
     lessons: (filters) => request(`/memory/lessons${filterQuery(filters)}`),
     createThread: (threadID, body) => request(`/memory/threads/${encodeURIComponent(threadID)}`, { method: "POST", body }),
     updateThread: (threadID, id, body) => request(`/memory/threads/${encodeURIComponent(threadID)}/${id}`, { method: "PUT", body }),
@@ -40,14 +46,6 @@ function formatDate(value) {
   return date.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit" });
 }
 
-function sourceText(memory) {
-  if (memory?.source === "agent" && memory.source_preview) {
-    return `Nguồn: tin nhắn “${memory.source_preview}”`;
-  }
-  if (memory?.source === "operator") return "Nguồn: người trực thêm";
-  return "Nguồn: dữ liệu cũ, chưa có tin gốc đáng tin";
-}
-
 function emptyState(title, body) {
   return element("div", { className: "memory-empty" },
     element("div", { className: "memory-empty-title", text: title }),
@@ -66,21 +64,6 @@ function actionButton(label, onClick, { disabled = false, destructive = false } 
   return button;
 }
 
-function memoryCard(memory, actions, pending) {
-  return element("article", { className: "memory-entry" },
-    element("div", { className: "memory-pin", attributes: { "aria-hidden": "true" }, text: memory.pinned ? "★" : "" }),
-    element("div", { className: "memory-entry-body" },
-      element("div", { className: "memory-entry-text", text: memory.text }),
-      element("div", { className: "memory-entry-meta", text: `${formatDate(memory.updated_at || memory.created_at)} · ${sourceText(memory)}` }),
-      element("div", { className: "memory-entry-actions" },
-        actionButton(memory.pinned ? "Bỏ ghim" : "Ghim", (opener) => actions.pinThread(memory, opener), { disabled: pending }),
-        actionButton("Sửa", (opener) => actions.editThread(memory, opener), { disabled: pending }),
-        actionButton("Xoá", (opener) => actions.deleteThread(memory, opener), { disabled: pending, destructive: true }),
-      ),
-    ),
-  );
-}
-
 function threadRow(thread, selected, onSelect) {
   const count = Number(thread.memory_count || 0);
   return element("button", {
@@ -96,6 +79,28 @@ function threadRow(thread, selected, onSelect) {
   );
 }
 
+function focusedMemberTab(root) {
+  const active = document.activeElement;
+  if (!active?.classList?.contains("memory-member-tab")) return null;
+  let current = active;
+  while (current && current !== root) current = current.parentNode;
+  if (current !== root) return null;
+  return { uid: active.getAttribute("data-subject-uid") || "" };
+}
+
+function findMemberTab(root, uid) {
+  const nodes = [root];
+  while (nodes.length) {
+    const node = nodes.shift();
+    if (node?.classList?.contains("memory-member-tab") &&
+        (node.getAttribute("data-subject-uid") || "") === uid) {
+      return node;
+    }
+    nodes.push(...(node?.childNodes || []));
+  }
+  return null;
+}
+
 function threadDetail(state, actions) {
   if (state.detailLoading && !state.detail) {
     return element("div", { className: "memory-detail", text: "Đang đọc ghi chú…" });
@@ -107,11 +112,20 @@ function threadDetail(state, actions) {
     );
   }
   const thread = detail.thread || {};
-  const synchronized = Number(detail.synced_revision || 0) >= Number(detail.revision || 0);
-  const syncText = synchronized
-    ? `Đã đồng bộ vào session · revision ${Number(detail.revision || 0)}`
-    : `Sẽ đồng bộ ở lượt Zalo kế tiếp · revision ${Number(detail.revision || 0)}`;
-  const memories = Array.isArray(detail.memories) ? detail.memories : [];
+  const detailUID = typeof detail.selected_uid === "string" ? detail.selected_uid : state.selectedSubjectUID;
+  const changingScope = state.detailLoading && detailUID !== state.selectedSubjectUID;
+  const synchronized = !changingScope && (Object.hasOwn(detail, "synced")
+    ? Boolean(detail.synced)
+    : Number(detail.synced_revision || 0) >= Number(detail.revision || 0));
+  const syncText = changingScope
+    ? "Đang kiểm tra trạng thái đồng bộ…"
+    : synchronized
+      ? `Đã đồng bộ với phiên Zalo · revision ${Number(detail.revision || 0)}`
+      : `Memory này sẽ đồng bộ khi người này nhắn tiếp · revision ${Number(detail.revision || 0)}`;
+  const selector = memberSelector(detail, state.selectedSubjectUID, actions.selectSubject);
+  const activeTab = selector
+    ? Array.from(selector.children).find((tab) => tab.getAttribute("aria-selected") === "true")
+    : null;
   return element("section", { className: "memory-detail", attributes: { "aria-label": `Ghi chú của ${thread.name || thread.id}` } },
     element("div", { className: "memory-detail-head" },
       element("div", {},
@@ -124,9 +138,17 @@ function threadDetail(state, actions) {
         text: "Mở hội thoại",
       }),
     ),
-    memories.length
-      ? element("div", { className: "memory-entries" }, memories.map((memory) => memoryCard(memory, actions, state.pending)))
-      : emptyState("Chưa có ghi chú cho hội thoại này", "Bấm Thêm ghi chú để lưu điều cần nhớ cho riêng người hoặc nhóm này."),
+    selector,
+    element("div", {
+      className: "memory-subject-panel",
+      attributes: {
+        id: "memory-subject-panel",
+        role: "tabpanel",
+        "aria-labelledby": activeTab?.id,
+      },
+    }, changingScope
+      ? element("div", { className: "memory-scope-loading", text: "Đang đọc ghi chú cho phạm vi đã chọn…" })
+      : memorySections(detail, actions, state.pending)),
   );
 }
 
@@ -214,6 +236,11 @@ function pinnedField({ id, label, checked = false }) {
 function safeMutationMessage(error) {
   const message = typeof error?.message === "string" ? error.message.trim() : "";
   return message || "Không thể cập nhật Memory. Vui lòng thử lại.";
+}
+
+function safeReadError(error) {
+  const message = typeof error?.message === "string" ? error.message.trim() : "";
+  return new Error(message || "Không thể đọc Memory. Vui lòng thử lại.");
 }
 
 function renderMemoryPage(root, state, actions) {
@@ -304,7 +331,7 @@ export function createMemoryPage({
       const state = {
         tab: "threads", query: "", pinned: false,
         overview: null, detail: null, lessons: null,
-        selectedThreadID: "", loading: true, detailLoading: false, lessonsLoading: false,
+        selectedThreadID: "", selectedSubjectUID: "", loading: true, detailLoading: false, lessonsLoading: false,
         error: null, message: "", pending: false, disposed: false,
       };
       let overviewRevision = 0;
@@ -315,10 +342,16 @@ export function createMemoryPage({
       let searchTimer = null;
       let liveRegion = null;
       let activeDialog = null;
+      let requestedMemberFocus = null;
       container.append(root);
 
       const render = () => {
-        if (!state.disposed) liveRegion = renderMemoryPage(root, state, actions);
+        if (state.disposed) return;
+        const preservedFocus = focusedMemberTab(root);
+        const focus = requestedMemberFocus || preservedFocus;
+        requestedMemberFocus = null;
+        liveRegion = renderMemoryPage(root, state, actions);
+        if (focus) findMemberTab(root, focus.uid)?.focus();
       };
 
       const announce = (message) => {
@@ -326,18 +359,28 @@ export function createMemoryPage({
         if (liveRegion) liveRegion.textContent = message;
       };
 
-      async function loadDetail(threadID) {
+      async function loadDetail(threadID, uid = state.selectedSubjectUID) {
         const revision = ++detailRevision;
+        const currentThread = state.detail?.thread;
+        const requestUID = currentThread?.id === threadID && currentThread.thread_type === "user"
+          ? ""
+          : uid;
         state.detailLoading = true;
         render();
         try {
-          const detail = await service.thread(threadID);
-          if (state.disposed || revision !== detailRevision || threadID !== state.selectedThreadID) return;
+          const detail = await service.thread(threadID, requestUID);
+          if (state.disposed || revision !== detailRevision || threadID !== state.selectedThreadID || uid !== state.selectedSubjectUID) return;
           state.detail = detail;
+          state.selectedSubjectUID = typeof detail?.selected_uid === "string" ? detail.selected_uid : uid;
           state.error = null;
         } catch (error) {
           if (state.disposed || revision !== detailRevision || error?.name === "AbortError") return;
-          state.error = error;
+          const previousUID = typeof state.detail?.selected_uid === "string"
+            ? state.detail.selected_uid
+            : state.selectedSubjectUID;
+          if (focusedMemberTab(root)) requestedMemberFocus = { uid: previousUID };
+          state.selectedSubjectUID = previousUID;
+          state.error = safeReadError(error);
         } finally {
           if (!state.disposed && revision === detailRevision) {
             state.detailLoading = false;
@@ -357,10 +400,11 @@ export function createMemoryPage({
           const threads = Array.isArray(overview?.threads) ? overview.threads : [];
           if (!threads.some((thread) => thread.id === state.selectedThreadID)) {
             state.selectedThreadID = threads[0]?.id || "";
+            state.selectedSubjectUID = "";
             state.detail = null;
           }
           state.error = null;
-          if (state.selectedThreadID) void loadDetail(state.selectedThreadID);
+          if (state.selectedThreadID) void loadDetail(state.selectedThreadID, state.selectedSubjectUID);
         } catch (error) {
           if (state.disposed || revision !== overviewRevision || error?.name === "AbortError") return;
           state.error = error;
@@ -695,9 +739,18 @@ export function createMemoryPage({
         selectThread(threadID) {
           if (threadID === state.selectedThreadID) return;
           state.selectedThreadID = threadID;
+          state.selectedSubjectUID = "";
           state.detail = null;
           state.error = null;
-          void loadDetail(threadID);
+          void loadDetail(threadID, "");
+        },
+        selectSubject(uid, { focus = false } = {}) {
+          const selectedUID = String(uid || "");
+          if (selectedUID === state.selectedSubjectUID || !state.selectedThreadID) return;
+          if (focus) requestedMemberFocus = { uid: selectedUID };
+          state.selectedSubjectUID = selectedUID;
+          state.error = null;
+          void loadDetail(state.selectedThreadID, selectedUID);
         },
         editThread(memory, opener) {
           if (!state.pending) openThreadEditor(memory, opener);
