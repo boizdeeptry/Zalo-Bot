@@ -324,11 +324,6 @@ func (d *defaultConnectRunner) detect(kind string) (bool, error) {
 // to the same prefix, so codex.js is found where npm just put it. On a dev box it uses PATH npm and
 // the machine's global prefix, unchanged.
 func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine func(string)) error {
-	// Claude Code is a native binary, not an npm package — we can't install it. Tell the user where
-	// to get it; the state machine surfaces this as install-failed.
-	if kind == "claude-code" {
-		return fmt.Errorf("Claude Code chưa cài — cài tại claude.com/claude-code rồi thử lại")
-	}
 	pkg := cliDescriptors[kind].npmPackage
 	if pkg == "" {
 		return fmt.Errorf("connect install: kind %q không cài qua npm", kind)

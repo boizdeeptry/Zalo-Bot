@@ -402,3 +402,18 @@ func TestConnectRoutesRegisterWithoutConflict(t *testing.T) {
 	mux := http.NewServeMux()
 	a.registerAppRoutes(mux) // must not panic
 }
+
+func TestInstallAcceptsClaude(t *testing.T) {
+	// claude-code now has a non-empty npmPackage, so install must NOT take the old reject branch.
+	if cliDescriptors["claude-code"].npmPackage == "" {
+		t.Fatal("precondition: claude-code.npmPackage empty (T4 not applied?)")
+	}
+	// Call install with an already-cancelled ctx so npm can't actually run; assert the error is NOT
+	// the old 'cài tại claude.com/claude-code' rejection (i.e. we got past the reject branch).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := (&defaultConnectRunner{}).install(ctx, "claude-code", func(string) {})
+	if err != nil && strings.Contains(err.Error(), "claude.com/claude-code") {
+		t.Fatalf("still hitting the old reject branch: %v", err)
+	}
+}
