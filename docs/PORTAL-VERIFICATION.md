@@ -288,11 +288,75 @@ không thể hồi tố trình tự 11:40/11:45 của deployment ban đầu thà
 | `npm test --prefix appmode` | PASS — 89/89, fail 0 |
 | `run-overlay-go-tests.ps1 -Package all` | PASS — toàn bộ package Go |
 | `tests/build-app.Tests.ps1` | PASS — 10/10 checkpoint; executable Memory V2 gates parse và giữ đúng safety ordering |
-| `tests/memory-v2-deployment.Tests.ps1` | PASS — 4/4 checkpoint: export/parse, outside-root scrub, manifest fail-closed và full rollback/restart health |
+| `tests/memory-v2-deployment.Tests.ps1` | PASS — 5/5 checkpoint: export/parse, outside-root scrub, cả bảy default closure giữ module-private helper, manifest fail-closed và full rollback/restart health |
 | Parser/static safety | PASS — ba script/module PowerShell parse sạch; Python AST parse sạch; manifest → live-schema preflight → staging đều đứng trước `StopLive`; schema args bắt buộc; không có `File.Replace(..., $null)` |
 | Evidence integrity/redaction | PASS — manifest/transcript hash đúng; manifest PASS qua validator; 17 giá trị secret live được so khớp cục bộ, không giá trị nào xuất hiện trong evidence |
 | Live/canary isolation | PASS — live vẫn PID 8424, exact path/hash, HTTP 200, DB `quick_check=ok`/schema 4; port 8783/8784 đóng và không có process chạy từ candidate path |
 | `git diff --check` | PASS |
+
+### Rollout operator rewrite thành structured lesson — 2026-08-10 14:53–15:26 ICT
+
+Candidate này chỉ đổi đường ghi khi người trực sửa câu trả lời: thay legacy `AddZaloMemory` bằng
+`CreateAppLesson(store.AppLessonInput{...})`; không đổi schema live đang là 4. Binary được build từ
+commit `10c1fc55797b0baec1197903ec7a3cd5e85737ef`, path
+`D:\TuvanZalo\_artifacts\memory-v2-operator-lesson\app\agentdc.exe`, SHA-256
+`5034A8BAB0A8E97CCB4695DE8B92A7AFAEA4F3628322C4AC93D5706CC5ED6C0B`.
+
+Source V4 được giữ tại
+`D:\TuvanZalo\_backups\memory-v2-operator-source-20260810T145303ICT`: binary SHA-256
+`940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45`; DB
+`data\agentdc.db` SHA-256 `220BBB32F45DEC344B60B7610F979990E0C94C02F9B3881EA807C7085A53D5C2`,
+`quick_check=ok`, schema 4, immutable baseline SHA-256
+`6DA05DD33A1C9A83911197DF6EE0EBC899A173B1140B49F7F4F39C0D44B40FA9`.
+
+Canary V4→V4 đầu tiên đã PASS trước lần deploy thứ nhất và được giữ làm bằng chứng redacted:
+
+- Manifest `docs/evidence/memory-v2-operator-canary-20260810T145941ICT.json`, SHA-256
+  `4206FC6A0A79E0B49621DFAD13AC777A174E13E18BFCFDD545B50848321D81CC`.
+- Transcript cạnh manifest, SHA-256
+  `A49D6AF3717014B466A7A418856449160DA11C4BFD2DF6F9F2DE77C76A953E50`.
+- Port 8785; J1–J6 và toàn bộ isolation flag `true`; process/listener dừng sạch; source DB không đổi;
+  final canary DB SHA-256 `C9C0AD8FDA42A46D37F610D69088E4BE0319149B78BACB4DC8162D9C1E7B694F`;
+  migration comparison SHA-256
+  `FB43ABA57CFFF01C0A0E6CD6A4CBAEF6427DADCD981C0500743E1BCC73480CC4`.
+
+Lần gọi `Invoke-MemoryV2Deploy.ps1` đầu tiên fail-closed **trước staging và trước stop live**: default
+closure `InspectLive` không phân giải được private helper `Invoke-MemoryV2SQLiteTool` sau
+`.GetNewClosure()`. Không có live mutation, không cần rollback; live cũ vẫn đúng path/hash, HTTP 200 và
+DB schema 4. Regression tái hiện lỗi bằng module import bình thường, sau đó fix capture trực tiếp các
+module-bound helper scriptblock cho cả bảy default closure. Fix ở commit
+`bad6761d38981e888d91bdc3ecb48737f184b19e`; spec review và quality review đều PASS, 0/0/0 phát hiện,
+rồi commit mới được push fast-forward. Không hand-copy binary.
+
+Sau review, canary mới được tạo bằng chính tooling đã commit trên port riêng 8786:
+
+| Cổng canary mới | Kết quả |
+|---|---|
+| Copied home | `C:\Users\manva\AppData\Local\Temp\agentdc-memory-v2-operator-canary-20260810T082228Z`, ngoài live root |
+| Candidate/source | Candidate hash đúng approved hash; source DB byte-for-byte vẫn là `220BBB32F45DEC344B60B7610F979990E0C94C02F9B3881EA807C7085A53D5C2`, schema 4/`quick_check=ok` |
+| Isolation/J1–J6 | Toàn bộ flag `true`; credential Zalo và transport runtime vắng; candidate process/listener dừng sạch; evidence không chứa literal secret đã kiểm tra |
+| Final canary DB | SHA-256 `CB2A2A98069B4A4902848F83E4F817A84DFB9CFDB0226F91D7DE4FFC086F2FD2`, schema 4/`quick_check=ok` |
+| Manifest | `docs/evidence/memory-v2-operator-canary-20260810T082228Z.json`; SHA-256 `14846044E36F59691F7D98E90DA63E1902F5A0234E40449E66194EED154DFF23` |
+| Transcript | `docs/evidence/memory-v2-operator-canary-20260810T082228Z.transcript.json`; SHA-256 `C83F2531B328047A8168BD047F13152268F3871B4430F246F2930564B6EBCE74` |
+
+Retry duy nhất qua committed `Invoke-MemoryV2Deploy.ps1` PASS. Backup deploy ở
+`D:\TuvanZalo\_backups\memory-v2-20260810T082525Z-66547463`: `agentdc.exe` và
+`file-replace-backup-agentdc.exe` đều có old hash
+`940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45`; backup DB SHA-256
+`375EC7D74109400B3A79E574E1835B309F1C53FBCFBD419CE9B8A3114AC1BCEB`, immutable
+`quick_check=ok`, schema 4, baseline stable, baseline SHA-256
+`C14CBC9761912CCB1A5091105E757529A271AB286087842FE60D152A70B1FFF3`; WAL/SHM không tồn tại.
+
+Post-deploy độc lập xác nhận live PID 6068, executable path đúng
+`D:\TuvanZalo\app\agentdc.exe`, một listener loopback port 8770 thuộc chính PID đó, installed SHA-256
+đúng candidate, `/status` HTTP 200 và live DB `quick_check=ok`/schema 4. `/`, `/zalo` cùng 15 asset
+CSS/JS thực tế của shell/core/pages đều HTTP 200; bốn recovery path không còn collision.
+
+Các cổng chạy lại sau deploy đều PASS: focused staged Go 4/4 (session seam và ba operator-lesson
+contract), full staged Go theo vetted gate với đúng bảy legacy asset assertion bị supersede, Portal Node
+89/89, deployment 5/5 và package 10/10. Không gửi tin/reaction/file Zalo thật và không dùng dữ liệu
+khách hàng trong canary. Quan sát visual local cùng lượt Zalo thử nghiệm vẫn là phần chờ người vận hành,
+không được đánh dấu PASS trong biên bản này.
 
 ### Phần còn chờ người vận hành
 

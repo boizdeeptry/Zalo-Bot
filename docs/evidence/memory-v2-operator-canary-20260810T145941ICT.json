@@ -1,0 +1,54 @@
+{
+  "version": "memory-v2-canary/v1",
+  "status": "PASS",
+  "generatedUtc": "2026-08-10T07:59:56.9690803Z",
+  "port": 8785,
+  "candidate": {
+    "path": "D:\\TuvanZalo\\_artifacts\\memory-v2-operator-lesson\\app\\agentdc.exe",
+    "sha256": "5034A8BAB0A8E97CCB4695DE8B92A7AFAEA4F3628322C4AC93D5706CC5ED6C0B"
+  },
+  "source": {
+    "dbPath": "D:\\TuvanZalo\\_backups\\memory-v2-operator-source-20260810T145303ICT\\data\\agentdc.db",
+    "dbSha256": "220BBB32F45DEC344B60B7610F979990E0C94C02F9B3881EA807C7085A53D5C2",
+    "schema": 4,
+    "quickCheck": "ok"
+  },
+  "copy": {
+    "homePath": "C:\\Users\\manva\\AppData\\Local\\Temp\\agentdc-memory-v2-operator-canary-20260810T145941ICT",
+    "dbSha256Before": "220BBB32F45DEC344B60B7610F979990E0C94C02F9B3881EA807C7085A53D5C2",
+    "schemaBefore": 4,
+    "quickCheckBefore": "ok",
+    "schemaMigrated": 4,
+    "quickCheckMigrated": "ok",
+    "dbSha256Final": "C9C0AD8FDA42A46D37F610D69088E4BE0319149B78BACB4DC8162D9C1E7B694F",
+    "schemaFinal": 4,
+    "quickCheckFinal": "ok"
+  },
+  "journeys": {
+    "J1": true,
+    "J2": true,
+    "J3": true,
+    "J4": true,
+    "J5": true,
+    "J6": true
+  },
+  "isolation": {
+    "outsideLiveRoot": true,
+    "credentialsAbsent": true,
+    "transportEnvironmentCleared": true,
+    "runtimeControlsRemoved": true,
+    "portInitiallyFree": true,
+    "candidatePathExact": true
+  },
+  "stopped": {
+    "processExited": true,
+    "listenerAbsent": true
+  },
+  "evidence": {
+    "transcriptPath": "D:\\TuvanZalo\\_build\\.worktrees\\portal-m1\\docs\\evidence\\memory-v2-operator-canary-20260810T145941ICT.transcript.json",
+    "transcriptSha256": "A49D6AF3717014B466A7A418856449160DA11C4BFD2DF6F9F2DE77C76A953E50",
+    "sourceBaselineSha256": "6DA05DD33A1C9A83911197DF6EE0EBC899A173B1140B49F7F4F39C0D44B40FA9",
+    "migrationComparisonSha256": "FB43ABA57CFFF01C0A0E6CD6A4CBAEF6427DADCD981C0500743E1BCC73480CC4",
+    "finalDbSha256": "C9C0AD8FDA42A46D37F610D69088E4BE0319149B78BACB4DC8162D9C1E7B694F"
+  }
+}
