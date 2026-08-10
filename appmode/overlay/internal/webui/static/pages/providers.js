@@ -314,6 +314,9 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       // !== kind — kind không đổi khi bấm lại nút hay điều hướng, nên phép so sánh cũ không bắt được
       // vòng lặp cũ vẫn đang chạy nền.
       let connectRun = 0;
+      const ownsConnectRun = (kind, run) => (
+        !disposed && connectRun === run && connect?.kind === kind
+      );
       const connectSlot = element("div", { className: "pv-connect" });
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const defaultLabel = (p) => `Tài khoản ${(p?.accounts?.length ?? 0) + 1}`;
@@ -412,12 +415,55 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       }
 
       async function cancelConnect(kind) {
-        await service.connectCancel(kind);
-        // Nếu vòng lặp poll trong runConnect chưa kịp quan sát "canceled" (ví dụ đang await sleep),
-        // tự vẽ trạng thái đã huỷ ngay — người dùng không phải chờ tick kế tiếp mới thấy phản hồi.
-        if (connect?.kind === kind && connect.phase !== "canceled") {
-          stopConnectTimer(); // canceled is terminal — the bar freezes, no more crawl
-          connect = { ...connect, phase: "canceled" };
+        const myRun = connectRun;
+        try {
+          const canceled = await service.connectCancel(kind);
+          if (!ownsConnectRun(kind, myRun)) return;
+          if (canceled?.ok === true) {
+            // Cancellation owns the job only when the server confirms it. Invalidate the old poll
+            // before painting the terminal phase so an in-flight GET cannot overwrite the truth.
+            connectRun++;
+            stopConnectTimer();
+            connect = { ...connect, phase: "canceled" };
+            paintConnect();
+            return;
+          }
+
+          // Another success/persistence path owns the job. Reconcile immediately, then leave the
+          // original run token intact for non-terminal phases so its poll loop keeps following the
+          // authoritative job instead of claiming an optimistic cancellation.
+          const st = await service.connectStatus(kind);
+          if (!ownsConnectRun(kind, myRun)) return;
+          const prevPhase = connect.phase;
+          connect = {
+            ...connect,
+            phase: st.phase,
+            message: st.message,
+            loginUrl: st.loginUrl || connect.loginUrl,
+            code: st.code || connect.code,
+          };
+          if (st.phase !== prevPhase) anchorTo(st.phase);
+          paintConnect();
+          if (st.phase === "connected") {
+            connectRun++;
+            stopConnectTimer();
+            connect = null;
+            await refresh();
+            return;
+          }
+          if (st.phase === "error" || st.phase === "canceled") {
+            connectRun++;
+            stopConnectTimer();
+            return;
+          }
+          if (connectTimer === null) startConnectTimer();
+        } catch (error) {
+          if (error?.name === "AbortError" || !ownsConnectRun(kind, myRun)) return;
+          // A failed DELETE (or its follow-up GET) says nothing about the backend job itself. Keep
+          // the last authoritative phase and run token so the normal status loop can still observe
+          // success; surface the uncertainty separately instead of freezing the flow as an error.
+          const detail = error?.message || "Không thể xác nhận yêu cầu huỷ kết nối.";
+          connect = { ...connect, cancelWarning: `${detail} Tiếp tục theo dõi kết nối.` };
           paintConnect();
         }
       }
@@ -505,8 +551,16 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         const logLine = connect.message
           ? element("div", { className: "pv-connect-log", text: connect.message })
           : null;
+        const cancelWarning = connect.cancelWarning
+          ? element("div", {
+              className: "pv-connect-log pv-connect-warning",
+              attributes: { role: "status" },
+              text: connect.cancelWarning,
+            })
+          : null;
         connectSlot.replaceChildren(element("div", { className: "pv-connect-live" },
           renderProgress(false),
+          cancelWarning,
           logLine,
           element("div", { className: "pv-connect-status" },
             element("div", { className: "pv-connect-message", text: phaseLabel(connect.phase, connect.message, connect.kind) }),
@@ -542,14 +596,25 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
             connect = { ...connect, phase: st.phase, message: st.message, loginUrl: st.loginUrl || connect.loginUrl, code: st.code || connect.code };
             if (st.phase !== prevPhase) anchorTo(st.phase); // real transition → jump the bar forward
             paintConnect();
-            if (st.phase === "connected") { stopConnectTimer(); connect = null; await refresh(); return; }
-            if (st.phase === "error" || st.phase === "canceled") { stopConnectTimer(); return; }
+            if (st.phase === "connected") {
+              connectRun++; // terminal: invalidate pending cancel/reconciliation work for this run
+              stopConnectTimer();
+              connect = null;
+              await refresh();
+              return;
+            }
+            if (st.phase === "error" || st.phase === "canceled") {
+              connectRun++; // terminal state owns the final UI; late cancel work must be ignored
+              stopConnectTimer();
+              return;
+            }
             await sleep(pollMs);
           }
         } catch (error) {
           // Lượt cũ/lỗi muộn không được đè connect: {...null, phase:"error"} sinh ra một đối tượng
           // thiếu kind là đúng thứ lỗi cần chặn.
           if (disposed || connectRun !== myRun || error?.name === "AbortError") { stopConnectTimer(); return; }
+          connectRun++; // this run is terminal; invalidate pending cancel/reconciliation work
           stopConnectTimer();
           connect = { ...connect, phase: "error", message: error?.message || "Kết nối thất bại" };
           paintConnect();

@@ -717,6 +717,497 @@ func TestConnectLoginWaitNilPreservesConcurrentAuthSuccess(t *testing.T) {
 	}
 }
 
+func useManualConnectPollTicker(m *connectManager) (chan time.Time, <-chan struct{}) {
+	ticks := make(chan time.Time, 1)
+	stopped := make(chan struct{})
+	m.newPollTicker = func(time.Duration) connectPollTicker {
+		return connectPollTicker{
+			ticks: ticks,
+			stop:  func() { close(stopped) },
+		}
+	}
+	return ticks, stopped
+}
+
+func TestConnectLoginWaitNilUnknownContinuesPollingToLoggedIn(t *testing.T) {
+	polls := 0
+	ensured, created := 0, 0
+	immediateUnknown := make(chan struct{})
+	laterUnknown := make(chan struct{})
+	r := &earlyLoginWaitRunner{
+		fakeRunner:  fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut},
+		waitStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+		poll: func() authState {
+			polls++
+			switch polls {
+			case 1:
+				return authLoggedOut
+			case 2:
+				close(immediateUnknown)
+				return authUnknown
+			case 3:
+				close(laterUnknown)
+				return authUnknown
+			default:
+				return authLoggedIn
+			}
+		},
+	}
+	m := newTestManager(t, r,
+		func(string) error { ensured++; return nil },
+		func(store.LLMAccount) error { created++; return nil },
+	)
+	m.loginTimeout = 5 * time.Minute
+	m.pollInterval = time.Hour
+	ticks, tickerStopped := useManualConnectPollTicker(m)
+	if _, err := m.start("codex", "unknown then logged in"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.waitStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login wait callback did not start")
+	}
+	close(r.release)
+	select {
+	case <-immediateUnknown:
+	case <-time.After(time.Second):
+		m.cancel("codex")
+		t.Fatal("authUnknown was not probed immediately after the completed wait callback")
+	}
+	select {
+	case <-job.done:
+		t.Fatal("auth polling completed before the first manual tick")
+	default:
+	}
+	ticks <- time.Now()
+	select {
+	case <-laterUnknown:
+	case <-time.After(time.Second):
+		m.cancel("codex")
+		t.Fatal("authUnknown was not rechecked after the first manual tick")
+	}
+	select {
+	case <-job.done:
+		t.Fatal("auth polling completed before the second manual tick")
+	default:
+	}
+	ticks <- time.Now()
+	select {
+	case <-job.done:
+	case <-time.After(time.Second):
+		m.cancel("codex")
+		t.Fatal("authUnknown after wait completion did not continue bounded polling")
+	}
+	if st := job.snapshot(); st.Phase != phaseConnected {
+		t.Fatalf("phase after auth unknown then logged in = %q; want connected", st.Phase)
+	}
+	if ensured != 1 || created != 1 {
+		t.Fatalf("persistence calls after auth unknown then logged in = ensure:%d account:%d; want 1/1", ensured, created)
+	}
+	if _, err := os.Stat(job.configDir); err != nil {
+		t.Fatalf("connected config dir was removed after auth unknown: %v", err)
+	}
+	select {
+	case <-tickerStopped:
+	default:
+		t.Fatal("manual poll ticker was not stopped when the connect job finished")
+	}
+}
+
+func TestConnectLoginWaitNilUnknownThenLoggedOutFailsExplicitly(t *testing.T) {
+	polls := 0
+	ensured, created := 0, 0
+	immediateUnknown := make(chan struct{})
+	r := &earlyLoginWaitRunner{
+		fakeRunner:  fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut},
+		waitStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+		poll: func() authState {
+			polls++
+			switch polls {
+			case 1:
+				return authLoggedOut
+			case 2:
+				close(immediateUnknown)
+				return authUnknown
+			default:
+				return authLoggedOut
+			}
+		},
+	}
+	m := newTestManager(t, r,
+		func(string) error { ensured++; return nil },
+		func(store.LLMAccount) error { created++; return nil },
+	)
+	m.loginTimeout = 5 * time.Minute
+	m.pollInterval = time.Hour
+	ticks, tickerStopped := useManualConnectPollTicker(m)
+	if _, err := m.start("codex", "unknown then logged out"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.waitStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login wait callback did not start")
+	}
+	close(r.release)
+	select {
+	case <-immediateUnknown:
+	case <-time.After(time.Second):
+		m.cancel("codex")
+		t.Fatal("authUnknown was not probed immediately after the completed wait callback")
+	}
+	select {
+	case <-job.done:
+		t.Fatal("auth polling completed before the manual logout tick")
+	default:
+	}
+	ticks <- time.Now()
+	select {
+	case <-job.done:
+	case <-time.After(time.Second):
+		m.cancel("codex")
+		t.Fatal("known logout after authUnknown did not fail promptly")
+	}
+	st := job.snapshot()
+	if st.Phase != phaseError {
+		t.Fatalf("phase after auth unknown then logged out = %q; want error", st.Phase)
+	}
+	if st.Error != "đăng nhập kết thúc nhưng chưa xác thực" {
+		t.Fatalf("error after auth unknown then logged out = %q; want explicit incomplete-login failure", st.Error)
+	}
+	if ensured != 0 || created != 0 {
+		t.Fatalf("persistence ran after auth unknown then logged out: ensure:%d account:%d", ensured, created)
+	}
+	if _, err := os.Stat(job.configDir); !os.IsNotExist(err) {
+		t.Fatalf("failed auth config dir still exists: %v", err)
+	}
+	select {
+	case <-tickerStopped:
+	default:
+		t.Fatal("manual poll ticker was not stopped when the connect job finished")
+	}
+}
+
+type blockingSuccessfulStageRunner struct {
+	stage   connectPhase
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingSuccessfulStageRunner) detect(string) (bool, error) {
+	if r.stage == phaseDetecting {
+		close(r.entered)
+		<-r.release
+	}
+	return r.stage != phaseInstalling, nil
+}
+
+func (r *blockingSuccessfulStageRunner) install(context.Context, string, func(string)) error {
+	if r.stage == phaseInstalling {
+		close(r.entered)
+		<-r.release
+	}
+	return nil
+}
+
+func (r *blockingSuccessfulStageRunner) login(ctx context.Context, _, _ string) (string, string, func() error, error) {
+	if r.stage == phaseAwaitingLogin {
+		close(r.entered)
+		<-r.release
+	}
+	return "https://x", "AAAA-BBBBB", func() error {
+		<-ctx.Done()
+		return ctx.Err()
+	}, nil
+}
+
+func (*blockingSuccessfulStageRunner) pollAuth(string, string) authState  { return authLoggedIn }
+func (*blockingSuccessfulStageRunner) accountLabel(string, string) string { return "" }
+
+func TestConnectCancelWhileBlockingStageReturnsSuccessStaysCanceled(t *testing.T) {
+	tests := []struct {
+		name  string
+		stage connectPhase
+	}{
+		{name: "detect", stage: phaseDetecting},
+		{name: "install", stage: phaseInstalling},
+		{name: "login", stage: phaseAwaitingLogin},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &blockingSuccessfulStageRunner{
+				stage: tt.stage, entered: make(chan struct{}), release: make(chan struct{}),
+			}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(r.release) }) }
+			t.Cleanup(release)
+			ensured, created := 0, 0
+			m := newTestManager(t, r,
+				func(string) error { ensured++; return nil },
+				func(store.LLMAccount) error { created++; return nil },
+			)
+			if _, err := m.start("codex", "cancel blocked "+tt.name); err != nil {
+				t.Fatal(err)
+			}
+			m.mu.Lock()
+			job := m.job
+			m.mu.Unlock()
+			select {
+			case <-r.entered:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("%s did not enter blocking gate", tt.name)
+			}
+			if !m.cancel("codex") {
+				t.Fatalf("cancel did not win while %s was blocked", tt.name)
+			}
+			release()
+			select {
+			case <-job.done:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("job did not finish after blocked %s returned success", tt.name)
+			}
+			if st := job.snapshot(); st.Phase != phaseCanceled || st.Error != "" {
+				t.Fatalf("final state after canceled %s returned success = %+v; want canceled with empty error", tt.name, st)
+			}
+			if ensured != 0 || created != 0 {
+				t.Fatalf("persistence ran after canceled %s returned success: ensure:%d account:%d", tt.name, ensured, created)
+			}
+			if _, err := os.Stat(job.configDir); !os.IsNotExist(err) {
+				t.Fatalf("canceled %s config dir still exists: %v", tt.name, err)
+			}
+		})
+	}
+}
+
+type gatedLoggedInPollRunner struct {
+	fakeRunner
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *gatedLoggedInPollRunner) pollAuth(_, configDir string) authState {
+	r.lastCfgDir = configDir
+	r.once.Do(func() { close(r.entered) })
+	<-r.release
+	return authLoggedIn
+}
+
+func TestConnectCancelWhilePollBlockedPreventsPersistence(t *testing.T) {
+	r := &gatedLoggedInPollRunner{
+		fakeRunner: fakeRunner{installed: true, loginURL: "https://x"},
+		entered:    make(chan struct{}), release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(r.release) }) }
+	t.Cleanup(release)
+	ensured, created := 0, 0
+	m := newTestManager(t, r,
+		func(string) error { ensured++; return nil },
+		func(store.LLMAccount) error { created++; return nil },
+	)
+	if _, err := m.start("codex", "cancel blocked poll"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pollAuth did not enter gate")
+	}
+	if !m.cancel("codex") {
+		t.Fatal("cancel did not win while pollAuth was blocked")
+	}
+	release()
+	select {
+	case <-job.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled poll job did not finish")
+	}
+	st := job.snapshot()
+	if st.Phase != phaseCanceled || st.Error != "" {
+		t.Fatalf("final canceled poll state = %+v; want canceled with empty error", st)
+	}
+	if ensured != 0 || created != 0 {
+		t.Fatalf("persistence ran after cancel won blocked poll: ensure:%d account:%d", ensured, created)
+	}
+	if _, err := os.Stat(job.configDir); !os.IsNotExist(err) {
+		t.Fatalf("canceled poll config dir still exists: %v", err)
+	}
+}
+
+type gatedAccountLabelRunner struct {
+	fakeRunner
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *gatedAccountLabelRunner) accountLabel(_, _ string) string {
+	close(r.entered)
+	<-r.release
+	return "signed-in@example.com"
+}
+
+func TestConnectCancelImmediatelyBeforePersistencePreventsWrites(t *testing.T) {
+	r := &gatedAccountLabelRunner{
+		fakeRunner: fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedIn},
+		entered:    make(chan struct{}), release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(r.release) }) }
+	t.Cleanup(release)
+	ensured, created := 0, 0
+	m := newTestManager(t, r,
+		func(string) error { ensured++; return nil },
+		func(store.LLMAccount) error { created++; return nil },
+	)
+	if _, err := m.start("codex", "cancel before persistence"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("account label preparation did not enter gate")
+	}
+	if !m.cancel("codex") {
+		t.Fatal("cancel did not win before persistence claim")
+	}
+	release()
+	select {
+	case <-job.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pre-persistence canceled job did not finish")
+	}
+	if st := job.snapshot(); st.Phase != phaseCanceled || st.Error != "" {
+		t.Fatalf("final pre-persistence cancel state = %+v; want canceled with empty error", st)
+	}
+	if ensured != 0 || created != 0 {
+		t.Fatalf("persistence ran after pre-persistence cancel: ensure:%d account:%d", ensured, created)
+	}
+}
+
+type gatedLogHandler struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*gatedLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *gatedLogHandler) Handle(context.Context, slog.Record) error {
+	h.once.Do(func() { close(h.entered) })
+	<-h.release
+	return nil
+}
+func (h *gatedLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *gatedLogHandler) WithGroup(string) slog.Handler      { return h }
+
+func TestConnectCancelBetweenErrorCheckAndTransitionWins(t *testing.T) {
+	r := &earlyLoginWaitRunner{
+		fakeRunner:  fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut},
+		waitErr:     errors.New("oauth exchange failed"),
+		waitStarted: make(chan struct{}), release: make(chan struct{}),
+	}
+	h := &gatedLogHandler{entered: make(chan struct{}), release: make(chan struct{})}
+	var waitReleaseOnce, logReleaseOnce sync.Once
+	releaseWait := func() { waitReleaseOnce.Do(func() { close(r.release) }) }
+	releaseLog := func() { logReleaseOnce.Do(func() { close(h.release) }) }
+	t.Cleanup(releaseWait)
+	t.Cleanup(releaseLog)
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	m.logger = slog.New(h)
+	m.loginTimeout = 5 * time.Minute
+	m.pollInterval = time.Hour
+	if _, err := m.start("codex", "cancel error race"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.waitStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login wait callback did not start")
+	}
+	releaseWait()
+	select {
+	case <-h.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("error transition did not reach logger gate")
+	}
+	if !m.cancel("codex") {
+		t.Fatal("cancel did not win while error transition was gated")
+	}
+	releaseLog()
+	select {
+	case <-job.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("error-race job did not finish")
+	}
+	if st := job.snapshot(); st.Phase != phaseCanceled || st.Error != "" {
+		t.Fatalf("final error-race state = %+v; want canceled with empty error", st)
+	}
+}
+
+func TestConnectCancelAfterSuccessClaimReportsFalse(t *testing.T) {
+	r := &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedIn}
+	ensureEntered := make(chan struct{})
+	ensureRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(ensureRelease) }) }
+	t.Cleanup(release)
+	ensured, created := 0, 0
+	m := newTestManager(t, r,
+		func(string) error {
+			close(ensureEntered)
+			<-ensureRelease
+			ensured++
+			return nil
+		},
+		func(store.LLMAccount) error { created++; return nil },
+	)
+	if _, err := m.start("codex", "claimed success"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-ensureEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("claimed success did not enter persistence gate")
+	}
+	canceled := m.cancel("codex")
+	release()
+	select {
+	case <-job.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("claimed success job did not finish")
+	}
+	if canceled {
+		t.Fatal("cancel reported success after persistence claim had won")
+	}
+	if st := job.snapshot(); st.Phase != phaseConnected {
+		t.Fatalf("phase after success claim won = %q; want connected", st.Phase)
+	}
+	if ensured != 1 || created != 1 {
+		t.Fatalf("persistence after success claim = ensure:%d account:%d; want 1/1", ensured, created)
+	}
+}
+
 type cancelDuringLoginRunner struct {
 	fakeRunner
 	entered chan struct{}

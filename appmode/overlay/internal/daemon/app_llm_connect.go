@@ -73,8 +73,18 @@ const (
 	connectPollInterval = 2 * time.Second
 )
 
+type connectPollTicker struct {
+	ticks <-chan time.Time
+	stop  func()
+}
+
+func startConnectPollTicker(interval time.Duration) connectPollTicker {
+	ticker := time.NewTicker(interval)
+	return connectPollTicker{ticks: ticker.C, stop: ticker.Stop}
+}
+
 // connectJob holds one in-flight connect attempt. configDir/accountID/label are internal (not
-// in connectState). All state access goes through set/snapshot under the mutex.
+// in connectState). All state access goes through guarded helpers/snapshot under the mutex.
 type connectJob struct {
 	mu        sync.Mutex
 	state     connectState
@@ -83,10 +93,80 @@ type connectJob struct {
 	label     string
 	cancel    context.CancelFunc
 	done      chan struct{}
+	claimed   bool // success owns persistence; protected by mu and never exposed to the Portal
 }
 
-func (j *connectJob) set(mut func(*connectState)) { j.mu.Lock(); defer j.mu.Unlock(); mut(&j.state) }
-func (j *connectJob) snapshot() connectState      { j.mu.Lock(); defer j.mu.Unlock(); return j.state }
+func (j *connectJob) snapshot() connectState { j.mu.Lock(); defer j.mu.Unlock(); return j.state }
+
+func terminalConnectPhase(phase connectPhase) bool {
+	return phase == phaseConnected || phase == phaseError || phase == phaseCanceled
+}
+
+// transitionActive advances one expected non-terminal phase atomically. The context check and
+// state check happen under the same mutex used by requestCancel, so a blocked runner cannot revive
+// a canceled job when it returns. Passing the same phase updates fields without weakening the guard.
+func (j *connectJob) transitionActive(
+	ctx context.Context,
+	expected, next connectPhase,
+	mut func(*connectState),
+) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if ctx.Err() != nil || j.claimed || terminalConnectPhase(j.state.Phase) || j.state.Phase != expected {
+		return false
+	}
+	j.state.Phase = next
+	if mut != nil {
+		mut(&j.state)
+	}
+	return true
+}
+
+// requestCancel and claimSuccess share j.mu as their linearization point. If cancel wins, the
+// success path observes phaseCanceled and performs no persistence. If claim wins, cancellation
+// reports false and leaves the claimed persistence sequence to finish.
+func (j *connectJob) requestCancel() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.claimed || terminalConnectPhase(j.state.Phase) {
+		return false
+	}
+	j.cancel()
+	j.state.Phase = phaseCanceled
+	j.state.Error = ""
+	return true
+}
+
+func (j *connectJob) claimSuccess() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.claimed || j.state.Phase != phasePolling {
+		return false
+	}
+	j.claimed = true
+	return true
+}
+
+func (j *connectJob) finishSuccess() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !j.claimed {
+		return
+	}
+	j.state.Phase = phaseConnected
+	j.state.Message = ""
+}
+
+func (j *connectJob) failIfActive(userMsg string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if terminalConnectPhase(j.state.Phase) {
+		return false
+	}
+	j.state.Phase = phaseError
+	j.state.Error = userMsg
+	return true
+}
 
 // connectManager runs ONE connect job at a time. Dependencies are injected (not the store) so
 // the state machine tests without a DB: ensure creates the provider row, createAccount records
@@ -104,13 +184,14 @@ type connectManager struct {
 	jobKind       string
 	loginTimeout  time.Duration // 0 → connectLoginTimeout (5m default); test seam
 	pollInterval  time.Duration // 0 → connectPollInterval (2s default); test seam
+	newPollTicker func(time.Duration) connectPollTicker
 }
 
 func (m *connectManager) start(kind, label string) (connectState, error) {
 	m.mu.Lock()
 	if m.job != nil {
 		cur := m.job.snapshot()
-		terminal := cur.Phase == phaseConnected || cur.Phase == phaseError || cur.Phase == phaseCanceled
+		terminal := terminalConnectPhase(cur.Phase)
 		finished := false
 		select {
 		case <-m.job.done:
@@ -163,18 +244,12 @@ func (m *connectManager) cancel(kind string) bool {
 	if job == nil || k != kind {
 		return false
 	}
-	job.cancel()
-	job.set(func(s *connectState) {
-		if s.Phase != phaseConnected {
-			s.Phase = phaseCanceled
-		}
-	})
-	return true
+	return job.requestCancel()
 }
 
 func (m *connectManager) fail(job *connectJob, kind, userMsg string, cause error) {
 	m.logger.Error("connect failed", "kind", kind, "phase", job.snapshot().Phase, "err", cause)
-	job.set(func(s *connectState) { s.Phase = phaseError; s.Error = userMsg })
+	job.failIfActive(userMsg)
 }
 
 func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) {
@@ -207,35 +282,67 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 		}
 	}()
 	installed, err := m.runner.detect(kind)
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil {
 		m.fail(job, kind, "không kiểm được CLI: "+err.Error(), err)
 		return
 	}
 	if !installed {
-		job.set(func(s *connectState) { s.Phase = phaseInstalling; s.Message = "Đang cài…" })
+		if !job.transitionActive(ctx, phaseDetecting, phaseInstalling, func(s *connectState) {
+			s.Message = "Đang cài…"
+		}) {
+			return
+		}
 		if err := m.runner.install(ctx, kind, func(line string) {
-			job.set(func(s *connectState) { s.Message = line })
+			job.transitionActive(ctx, phaseInstalling, phaseInstalling, func(s *connectState) {
+				s.Message = line
+			})
 		}); err != nil {
 			if ctx.Err() != nil {
-				job.set(func(s *connectState) { s.Phase = phaseCanceled })
 				return
 			}
 			m.fail(job, kind, "cài thất bại", err)
 			return
 		}
+		if ctx.Err() != nil {
+			return
+		}
+		if !job.transitionActive(ctx, phaseInstalling, phaseAwaitingLogin, func(s *connectState) {
+			s.Message = ""
+		}) {
+			return
+		}
+	} else if !job.transitionActive(ctx, phaseDetecting, phaseAwaitingLogin, func(s *connectState) {
+		s.Message = ""
+	}) {
+		return
 	}
-	job.set(func(s *connectState) { s.Phase = phaseAwaitingLogin; s.Message = "" })
 	loginURL, code, wait, err := m.runner.login(ctx, kind, job.configDir)
 	if err != nil {
 		if ctx.Err() != nil {
-			job.set(func(s *connectState) { s.Phase = phaseCanceled })
 			return
 		}
 		m.fail(job, kind, "không mở được đăng nhập", err)
 		return
 	}
-	if loginURL != "" {
-		job.set(func(s *connectState) { s.LoginURL = loginURL; s.Code = code })
+	// Start and retain the wait callback before checking cancellation. login may have launched a
+	// process/OAuth server even if cancel won while login itself was blocked; the deferred join must
+	// still reap that resource before cleanup and global-slot release.
+	waitResult := make(chan error, 1)
+	loginWaitDone = waitResult
+	go func() { waitResult <- wait() }()
+	if ctx.Err() != nil {
+		return
+	}
+	if !job.transitionActive(ctx, phaseAwaitingLogin, phasePolling, func(s *connectState) {
+		if loginURL != "" {
+			s.LoginURL = loginURL
+			s.Code = code
+		}
+	}) {
+		return
 	}
 	timeout := m.loginTimeout
 	if timeout == 0 {
@@ -247,15 +354,42 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	}
 	loginCtx, stop := context.WithTimeout(ctx, timeout)
 	defer stop()
-	waitResult := make(chan error, 1)
-	loginWaitDone = waitResult
-	go func() { waitResult <- wait() }()
-	job.set(func(s *connectState) { s.Phase = phasePolling })
-	tick := time.NewTicker(poll)
-	defer tick.Stop()
-	authenticated := false
+	newPollTicker := m.newPollTicker
+	if newPollTicker == nil {
+		newPollTicker = startConnectPollTicker
+	}
+	ticker := newPollTicker(poll)
+	defer ticker.stop()
+	waitCompleted := false
 	for {
-		if authenticated || m.runner.pollAuth(kind, job.configDir) == authLoggedIn {
+		auth := m.runner.pollAuth(kind, job.configDir)
+		if waitCompleted {
+			switch auth {
+			case authLoggedIn:
+				// Continue into the success path below.
+			case authLoggedOut:
+				m.fail(job, kind, "đăng nhập kết thúc nhưng chưa xác thực",
+					errors.New("login callback completed without authentication"))
+				return
+			case authUnknown:
+				// Inconclusive: wait for the next bounded poll or loginCtx timeout.
+			}
+		}
+		if auth == authLoggedIn {
+			// Everything above the claim is read-only preparation. requestCancel races with this
+			// claim under job.mu; all provider/account persistence stays strictly after it.
+			label := m.runner.accountLabel(kind, job.configDir)
+			if label == "" {
+				label = job.label
+			}
+			now := time.Now()
+			acct := store.LLMAccount{
+				ID: job.accountID, ProviderID: kind, Label: label,
+				ConfigDir: job.configDir, Enabled: true, AddedAt: &now,
+			}
+			if !job.claimSuccess() {
+				return
+			}
 			if err := m.ensure(kind); err != nil {
 				m.fail(job, kind, "lưu provider lỗi: "+err.Error(), err)
 				return
@@ -265,23 +399,12 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 			if m.ensureModels != nil {
 				m.ensureModels(kind)
 			}
-			now := time.Now()
-			// Prefer the vendor's own label (claude → signed-in email); fall back to the user-given
-			// one (codex prints no email → accountLabel returns "").
-			label := m.runner.accountLabel(kind, job.configDir)
-			if label == "" {
-				label = job.label
-			}
-			acct := store.LLMAccount{
-				ID: job.accountID, ProviderID: kind, Label: label,
-				ConfigDir: job.configDir, Enabled: true, AddedAt: &now,
-			}
 			if err := m.createAccount(acct); err != nil {
 				m.fail(job, kind, "lưu account lỗi: "+err.Error(), err)
 				return
 			}
 			connected = true // row created — keep the config dir (holds auth.json); skip cleanup
-			job.set(func(s *connectState) { s.Phase = phaseConnected; s.Message = "" })
+			job.finishSuccess()
 			return
 		}
 		select {
@@ -289,32 +412,26 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 			// This receive joins wait(); keep the deferred join only for paths that leave while the
 			// callback is still running (cancel, timeout, or auth observed first).
 			loginWaitDone = nil
+			waitResult = nil
 			if ctx.Err() != nil {
-				job.set(func(s *connectState) { s.Phase = phaseCanceled })
 				return
 			}
 			if waitErr != nil {
 				m.fail(job, kind, "đăng nhập thất bại", waitErr)
 				return
 			}
-			// The callback may have written credentials immediately before reporting success. Poll
-			// once here instead of waiting for the next tick, and retain the positive observation so
-			// a non-monotonic probe cannot turn this successful race into a false failure.
-			if m.runner.pollAuth(kind, job.configDir) == authLoggedIn {
-				authenticated = true
-				continue
-			}
-			m.fail(job, kind, "đăng nhập kết thúc nhưng chưa xác thực",
-				errors.New("login callback completed without authentication"))
-			return
+			// Disable the consumed channel permanently. Every probe from the next loop onward uses
+			// the completed-wait switch above: loggedIn succeeds, loggedOut fails explicitly, and
+			// authUnknown remains bounded by ticker/loginCtx.
+			waitCompleted = true
+			continue
 		case <-loginCtx.Done():
 			if ctx.Err() != nil {
-				job.set(func(s *connectState) { s.Phase = phaseCanceled })
 				return
 			}
 			m.fail(job, kind, "hết giờ đăng nhập", nil)
 			return
-		case <-tick.C:
+		case <-ticker.ticks:
 		}
 	}
 }
@@ -812,6 +929,6 @@ func (a *api) handleLLMConnectStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) handleLLMConnectCancel(w http.ResponseWriter, r *http.Request) {
-	connectMgr.cancel(r.PathValue("kind"))
-	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	ok := connectMgr.cancel(r.PathValue("kind"))
+	a.writeJSON(w, http.StatusOK, map[string]any{"ok": ok})
 }

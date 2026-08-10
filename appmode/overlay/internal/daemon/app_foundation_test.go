@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -328,6 +329,9 @@ func TestAppRoutesDispatchEveryConnectHandler(t *testing.T) {
 	if !canceled.OK {
 		t.Fatal("DELETE connect returned ok=false; want true")
 	}
+	manager.mu.Lock()
+	canceledJob := manager.job
+	manager.mu.Unlock()
 	status = decodeAppRouteJSON[connectState](t, serveAppPortalRoute(
 		t, mux, http.MethodGet, "/llm/providers/codex/connect", "", http.StatusOK,
 	))
@@ -342,7 +346,70 @@ func TestAppRoutesDispatchEveryConnectHandler(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("deterministic connect runner did not stop")
 	}
-	if stopped := waitPhase(t, manager, "codex", phaseError); stopped.Phase != phaseError {
-		t.Fatalf("released deterministic runner phase = %q; want error", stopped.Phase)
+	select {
+	case <-canceledJob.done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled connect job did not finish cleanup")
+	}
+	// Cancellation is terminal even after cleanup: the runner's later error must not overwrite it.
+	if stopped := canceledJob.snapshot(); stopped.Phase != phaseCanceled {
+		t.Fatalf("released deterministic runner phase = %q; want canceled", stopped.Phase)
+	}
+}
+
+func TestAppRouteConnectCancelReportsFalseAfterSuccessClaim(t *testing.T) {
+	a := newAppRouteAPI(t)
+	a.portalOpen = true
+	mux := http.NewServeMux()
+	a.registerAppRoutes(mux)
+
+	ensureEntered := make(chan struct{})
+	ensureRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(ensureRelease) }) }
+	runner := &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedIn}
+	manager := newTestManager(t, runner,
+		func(string) error {
+			close(ensureEntered)
+			<-ensureRelease
+			return nil
+		},
+		func(store.LLMAccount) error { return nil },
+	)
+	connectMgr = manager
+	t.Cleanup(func() {
+		release()
+		manager.cancel("codex")
+		connectMgr = nil
+	})
+
+	decodeAppRouteJSON[connectState](t, serveAppPortalRoute(
+		t, mux, http.MethodPost, "/llm/providers/codex/connect", `{"label":"Claimed account"}`,
+		http.StatusOK,
+	))
+	manager.mu.Lock()
+	job := manager.job
+	manager.mu.Unlock()
+	select {
+	case <-ensureEntered:
+	case <-time.After(time.Second):
+		t.Fatal("connect did not reach claimed persistence gate")
+	}
+
+	canceled := decodeAppRouteJSON[struct {
+		OK bool `json:"ok"`
+	}](t, serveAppPortalRoute(t, mux, http.MethodDelete,
+		"/llm/providers/codex/connect", "", http.StatusOK))
+	if canceled.OK {
+		t.Fatal("DELETE connect returned ok=true after success claim; want false")
+	}
+	release()
+	select {
+	case <-job.done:
+	case <-time.After(time.Second):
+		t.Fatal("claimed connect job did not finish")
+	}
+	if st := job.snapshot(); st.Phase != phaseConnected {
+		t.Fatalf("claimed connect phase = %q; want connected", st.Phase)
 	}
 }
