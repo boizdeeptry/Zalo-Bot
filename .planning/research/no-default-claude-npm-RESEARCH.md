@@ -133,3 +133,29 @@ Note: a plain `("", nil)` or `("", someError)` from the silent runner does **not
 3. **[HAZARD] Orphan-on-timeout, base consult path.** `execZaloRunner.Run` uses `exec.CommandContext` (kills only the direct child). With the node hop, a turn timeout kills `node` but may orphan the native `claude` (280 MB, possibly mid-API-call) until its broken stdout pipe forces it to exit. Verify behavior; if unacceptable, take the A-native-direct-exe fallback (removes the hop) rather than porting `killPidTree` into base. The Connect path (`loginClaude` et al.) already uses `killPidTree` (`taskkill /T`) so it is covered there.
 4. **[DECISION for /discuss re-confirm]** The "B vs A" choice in the spec was made assuming claude npm = `cli.js`. That is false. Both surviving variants satisfy the user's stated B-rationale ("no `.cmd`/BatBadBut"): **B-wrapper** (`node cli-wrapper.cjs`, spec-faithful, near-zero change, two execute risks) vs **A-native-direct-exe** (run the real PE directly, no hop, no stdio/orphan risk, ~5 extra lines). Recommend proceeding with B-wrapper and keeping A-native-direct-exe as the pre-approved fallback so execute doesn't stall.
 5. **[VERIFY at plan]** Confirm `app_knowledge.go:463` (`agent.ConsultReadOnly()`) does not independently spawn `claude` for a turn (would be a third resolve site). Likely just reads the profile.
+   → **RESOLVED at plan (2026-08-10): it IS a third spawn site** — `app_knowledge.go:456` does `exec.LookPath("claude")` + spawns (write-mode KB ingest). Repointed in T4.
+
+---
+
+## Spike results (T1) — 2026-08-10
+
+Installed `@anthropic-ai/claude-code@2.1.226` into a throwaway prefix (`npm i -g`, "added 2 packages in 25s", no `--ignore-scripts`). Verified on this machine (node v22.23.1, npm 10.9.8):
+
+- **`npm root -g` layout:** `<root>\@anthropic-ai\claude-code\` contains `cli-wrapper.cjs` (4997B), `install.cjs`, `bin\`, `node_modules\` (the win32-x64 optional dep is nested here, not top-level).
+- **`bin\claude.exe` = 287,053,472 bytes — the REAL native binary** (postinstall `node install.cjs` copied it over the stub). Stable path: `<npm root>\@anthropic-ai\claude-code\bin\claude.exe`.
+- **stdio works identically both ways:** `node cli-wrapper.cjs --version` and `bin\claude.exe --version` → both `2.1.226 (Claude Code)`, exit 0. `auth status --json` → both print `{"loggedIn":false,...}`, exit 1 (logged-out, expected). `CLAUDE_CONFIG_DIR` honored.
+- **`cli-wrapper.cjs` is explicitly a FALLBACK** (its own header): *"the postinstall script copies the native binary over bin/claude.exe, so this file is never invoked. It exists for environments where postinstall doesn't run (--ignore-scripts) — users can run `node cli-wrapper.cjs` directly and pay the Node-process overhead as the price."* It runs via `spawnSync(binaryPath, argv, {stdio:'inherit'})` (blocking, inherited stdio).
+- **Orphan hazard confirmed by construction (no timing test needed):** B-wrapper = `node` → `spawnSync` native child. On Windows there is no process-group cascade, so `exec.CommandContext` killing `node` on a turn timeout would ORPHAN the 287MB `claude.exe`. A-native runs the PE directly → `CommandContext` kills the actual process.
+
+### DECISION: **A-native-direct-exe** (not B-wrapper)
+
+Vendor-intended path, same tiny change, removes BOTH execute-time hazards (stdio hop + orphan). Overrides spec/plan's B-wrapper primary.
+
+**Implications the implementers MUST apply (supersede plan T4/T6 where they say `binJS`/`cli-wrapper.cjs`):**
+- Descriptor `claude-code`: `npmPackage:"@anthropic-ai/claude-code"` + **new field `npmBin: `@anthropic-ai\claude-code\bin\claude.exe``** (relative to npm root). NOT `binJS` (that's the node+.js rail for codex/gemini). No `nativeBin`.
+- `resolveCLIProgram`: add a branch — `if d.npmBin != "" { root,_ := npmGlobalRoot(); exe := filepath.Join(root, d.npmBin); if _,err := os.Stat(exe); err==nil { return exe, nil, nil } ... }`. Returns `program=exe, prefixArgs=nil`.
+- Because `prefixArgs=nil`, ALL connect call sites (`loginClaude`/`pollAuthClaude`/`accountLabel`) and base `execZaloRunner` run `claude.exe <args>` directly — identical to the old native path, so the change is minimal and the T3 base `Program` mechanism still applies (`Program=exe`, `ProgramPrefixArgs=nil`).
+- `install()` unchanged from plan (plain `npm install -g @anthropic-ai/claude-code`, no `--ignore-scripts`, no `--omit=optional` → postinstall places the real `bin\claude.exe`).
+- Guard (ponytail, optional): if `bin\claude.exe` resolves but is a tiny stub (<1MB, postinstall skipped), fall back to the `node cli-wrapper.cjs` path. T9 verifies the real binary; skip the guard unless E2E shows a stub.
+
+Cleaned up the throwaway prefix after the spike.
