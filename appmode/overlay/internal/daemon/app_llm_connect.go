@@ -253,8 +253,9 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	job.set(func(s *connectState) { s.Phase = phasePolling })
 	tick := time.NewTicker(poll)
 	defer tick.Stop()
+	authenticated := false
 	for {
-		if m.runner.pollAuth(kind, job.configDir) == authLoggedIn {
+		if authenticated || m.runner.pollAuth(kind, job.configDir) == authLoggedIn {
 			if err := m.ensure(kind); err != nil {
 				m.fail(job, kind, "lưu provider lỗi: "+err.Error(), err)
 				return
@@ -284,6 +285,28 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 			return
 		}
 		select {
+		case waitErr := <-waitResult:
+			// This receive joins wait(); keep the deferred join only for paths that leave while the
+			// callback is still running (cancel, timeout, or auth observed first).
+			loginWaitDone = nil
+			if ctx.Err() != nil {
+				job.set(func(s *connectState) { s.Phase = phaseCanceled })
+				return
+			}
+			if waitErr != nil {
+				m.fail(job, kind, "đăng nhập thất bại", waitErr)
+				return
+			}
+			// The callback may have written credentials immediately before reporting success. Poll
+			// once here instead of waiting for the next tick, and retain the positive observation so
+			// a non-monotonic probe cannot turn this successful race into a false failure.
+			if m.runner.pollAuth(kind, job.configDir) == authLoggedIn {
+				authenticated = true
+				continue
+			}
+			m.fail(job, kind, "đăng nhập kết thúc nhưng chưa xác thực",
+				errors.New("login callback completed without authentication"))
+			return
 		case <-loginCtx.Done():
 			if ctx.Err() != nil {
 				job.set(func(s *connectState) { s.Phase = phaseCanceled })

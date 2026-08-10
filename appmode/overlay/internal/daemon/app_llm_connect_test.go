@@ -557,6 +557,166 @@ func TestConnectLoginWaitKeepsGlobalSlotUntilItReturns(t *testing.T) {
 	m.cancel("claude-code")
 }
 
+type earlyLoginWaitRunner struct {
+	fakeRunner
+	mu          sync.Mutex
+	loginRuns   int
+	waitErr     error
+	waitStarted chan struct{}
+	release     chan struct{}
+	poll        func() authState
+}
+
+func (r *earlyLoginWaitRunner) login(ctx context.Context, kind, configDir string) (string, string, func() error, error) {
+	r.mu.Lock()
+	r.loginRuns++
+	run := r.loginRuns
+	r.mu.Unlock()
+	if run != 1 {
+		return r.fakeRunner.login(ctx, kind, configDir)
+	}
+	r.lastCfgDir = configDir
+	return "https://auth.example/login", "AAAA-BBBBB", func() error {
+		close(r.waitStarted)
+		<-r.release
+		return r.waitErr
+	}, nil
+}
+
+func (r *earlyLoginWaitRunner) pollAuth(_, configDir string) authState {
+	r.lastCfgDir = configDir
+	if r.poll != nil {
+		return r.poll()
+	}
+	return r.auth
+}
+
+func finishEarlyLoginWait(t *testing.T, waitErr error) connectState {
+	t.Helper()
+	r := &earlyLoginWaitRunner{
+		fakeRunner:  fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut},
+		waitErr:     waitErr,
+		waitStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(r.release) }) }
+	t.Cleanup(release)
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	m.loginTimeout = 5 * time.Minute
+	m.pollInterval = time.Hour
+	nextID := 0
+	m.newID = func() string {
+		nextID++
+		return fmt.Sprintf("acc%d", nextID)
+	}
+	if _, err := m.start("codex", "first"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.waitStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login wait callback did not start")
+	}
+	if _, err := m.start("claude-code", "before wait cleanup"); !errors.Is(err, errConnectBusy) {
+		t.Fatalf("cross-kind start before wait result = %v; want errConnectBusy", err)
+	}
+	if _, err := os.Stat(job.configDir); err != nil {
+		t.Fatalf("config dir missing before wait result: %v", err)
+	}
+	release()
+	select {
+	case <-job.done:
+	case <-time.After(time.Second):
+		m.cancel("codex")
+		select {
+		case <-job.done:
+		case <-time.After(3 * time.Second):
+		}
+		t.Fatal("completed login wait did not finish job promptly; it was ignored until poll timeout")
+	}
+	if _, err := os.Stat(job.configDir); !os.IsNotExist(err) {
+		t.Fatalf("config dir still exists when completed job released slot: %v", err)
+	}
+	st := job.snapshot()
+	if _, err := m.start("claude-code", "after cleanup"); err != nil {
+		t.Fatalf("cross-kind start after wait-result cleanup = %v; want nil", err)
+	}
+	m.mu.Lock()
+	secondJob := m.job
+	m.mu.Unlock()
+	m.cancel("claude-code")
+	select {
+	case <-secondJob.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replacement connect job did not stop during test cleanup")
+	}
+	return st
+}
+
+func TestConnectLoginWaitErrorFailsPromptly(t *testing.T) {
+	st := finishEarlyLoginWait(t, errors.New("oauth exchange failed"))
+	if st.Phase != phaseError {
+		t.Fatalf("phase after login wait error = %q; want error", st.Phase)
+	}
+	if st.Error != "đăng nhập thất bại" {
+		t.Fatalf("error after login wait error = %q; want explicit login failure", st.Error)
+	}
+}
+
+func TestConnectLoginWaitNilWithoutAuthFailsPromptly(t *testing.T) {
+	st := finishEarlyLoginWait(t, nil)
+	if st.Phase != phaseError {
+		t.Fatalf("phase after login wait success without auth = %q; want error", st.Phase)
+	}
+	if st.Error != "đăng nhập kết thúc nhưng chưa xác thực" {
+		t.Fatalf("error after login wait success without auth = %q; want explicit incomplete-login failure", st.Error)
+	}
+}
+
+func TestConnectLoginWaitNilPreservesConcurrentAuthSuccess(t *testing.T) {
+	polls := 0
+	r := &earlyLoginWaitRunner{
+		fakeRunner:  fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut},
+		waitStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+		poll: func() authState {
+			polls++
+			if polls == 1 {
+				return authLoggedOut
+			}
+			return authLoggedIn
+		},
+	}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	m.loginTimeout = 5 * time.Minute
+	m.pollInterval = time.Hour
+	if _, err := m.start("codex", "auth completes with wait"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-r.waitStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login wait callback did not start")
+	}
+	close(r.release)
+	select {
+	case <-job.done:
+	case <-time.After(time.Second):
+		m.cancel("codex")
+		t.Fatal("wait completion concurrent with auth success was ignored")
+	}
+	if st := job.snapshot(); st.Phase != phaseConnected {
+		t.Fatalf("phase when auth appears with successful wait = %q; want connected", st.Phase)
+	}
+}
+
 type cancelDuringLoginRunner struct {
 	fakeRunner
 	entered chan struct{}
