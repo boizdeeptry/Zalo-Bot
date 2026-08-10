@@ -356,6 +356,14 @@ func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine 
 			onLine(sc.Text())
 		}
 	}
+	// A scan error (e.g. a >64KB line with no newline → bufio.ErrTooLong) exits the loop while the
+	// exec copy goroutine may still be blocked writing to pw. Drain to EOF so that write completes
+	// and cmd.Wait can return — otherwise <-waitErr blocks forever (ctx-cancel can't rescue an
+	// in-process io.Pipe write). npm -g lines are short so this is unreachable in practice, but the
+	// old bounded-buffer code merely truncated; this keeps install() unable to hang on any input.
+	if sc.Err() != nil {
+		_, _ = io.Copy(io.Discard, pr)
+	}
 	if err := <-waitErr; err != nil {
 		return fmt.Errorf("connect install: npm exit: %w", err)
 	}

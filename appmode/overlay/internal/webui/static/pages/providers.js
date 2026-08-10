@@ -328,6 +328,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       let connectStart = 0;
       let connectTimer = null;
       let progressFillRef = null;
+      let progressBarRef = null;
       let progressPctRef = null;
       let progressElapsedRef = null;
 
@@ -358,8 +359,10 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
           connectPct = Math.min(INSTALL_CEILING - 0.1, connectPct + (INSTALL_CEILING - connectPct) * 0.08);
         }
         if (progressFillRef) {
+          const rounded = Math.round(connectPct);
           progressFillRef.style.width = `${connectPct}%`;
-          if (progressPctRef) progressPctRef.textContent = `${Math.round(connectPct)}%`;
+          if (progressBarRef) progressBarRef.setAttribute("aria-valuenow", String(rounded)); // keep SR in sync
+          if (progressPctRef) progressPctRef.textContent = `${rounded}%`;
         }
         if (progressElapsedRef) progressElapsedRef.textContent = elapsedText();
       }
@@ -379,7 +382,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         }, fill);
         const pct = element("span", { className: "pv-progress-pct", text: `${Math.round(connectPct)}%` });
         const elapsed = element("span", { className: "pv-progress-elapsed", text: elapsedText() });
-        if (!frozen) { progressFillRef = fill; progressPctRef = pct; progressElapsedRef = elapsed; }
+        if (!frozen) { progressFillRef = fill; progressBarRef = bar; progressPctRef = pct; progressElapsedRef = elapsed; }
         return element("div", { className: "pv-progress-wrap" }, bar,
           element("div", { className: "pv-progress-row" }, pct, elapsed));
       }
@@ -439,7 +442,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       function paintConnect() {
         // Drop stale progress refs before (maybe) re-creating them: any branch that doesn't render a
         // live bar must leave tickConnect with nothing to poke.
-        progressFillRef = progressPctRef = progressElapsedRef = null;
+        progressFillRef = progressBarRef = progressPctRef = progressElapsedRef = null;
         if (!connect) { connectSlot.replaceChildren(); return; }
         if (connect.phase === "prompt") {
           const input = element("input", { className: "pv-connect-label",
