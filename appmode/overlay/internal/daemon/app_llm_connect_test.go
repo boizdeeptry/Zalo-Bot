@@ -1,13 +1,17 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -416,4 +420,132 @@ func TestInstallAcceptsClaude(t *testing.T) {
 	if err != nil && strings.Contains(err.Error(), "claude.com/claude-code") {
 		t.Fatalf("still hitting the old reject branch: %v", err)
 	}
+}
+
+// TestConnectInstallHelper is the child-process body for TestConnectInstallStreamsLive. It's a no-op
+// unless the parent set GO_WANT_INSTALL_HELPER — the standard os/exec test pattern. It prints one
+// line, then BLOCKS reading stdin (the gate); the parent releases it by closing stdin. os.Exit(0)
+// before the test framework prints its own summary so only these two lines reach the scanner.
+func TestConnectInstallHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_INSTALL_HELPER") != "1" {
+		return
+	}
+	fmt.Fprintln(os.Stdout, "downloading codex")
+	_, _ = bufio.NewReader(os.Stdin).ReadByte() // block until the parent closes the gate
+	fmt.Fprintln(os.Stdout, "added 1 package")
+	os.Exit(0)
+}
+
+// TestConnectInstallStreamsLive proves install() streams npm output LIVE, not buffered-until-exit.
+// The helper process prints a line then blocks on a stdin gate (so it has NOT exited), and the test
+// asserts that line reaches onLine anyway. The old buffer-then-Wait code would deadlock here (it
+// reads nothing until Wait, but Wait can't return while the child blocks) → the receive times out.
+// The live pipe-scan code delivers the line immediately → pass. Then we release the gate and assert
+// clean completion. Race-free: no sleeps for synchronization, only failure-timeout guards.
+func TestConnectInstallStreamsLive(t *testing.T) {
+	gateR, gateW := io.Pipe() // child blocks reading gateR until the test closes gateW
+	orig := installNPMCommand
+	installNPMCommand = func(ctx context.Context, _ string) *exec.Cmd {
+		c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestConnectInstallHelper")
+		c.Env = append(os.Environ(), "GO_WANT_INSTALL_HELPER=1")
+		c.Stdin = gateR
+		return c
+	}
+	t.Cleanup(func() { installNPMCommand = orig })
+
+	lines := make(chan string, 8)
+	done := make(chan error, 1)
+	go func() {
+		done <- (&defaultConnectRunner{}).install(context.Background(), "codex", func(l string) { lines <- l })
+	}()
+
+	// The first real line must arrive while the child is still blocked on the gate (i.e. before it
+	// exits) — the definition of live streaming. Drain any framework preamble until we see it.
+	if !waitForLine(t, lines, "downloading codex", 3*time.Second) {
+		t.Fatal("no live install line before the process exited — install is buffering, not streaming")
+	}
+	gateW.Close() // release the gate → child prints the second line and exits 0
+
+	if !waitForLine(t, lines, "added 1 package", 3*time.Second) {
+		t.Fatal("second install line never arrived")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("install err = %v; want nil (helper exits 0)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("install did not return after the process exited")
+	}
+}
+
+// waitForLine reads onLine deliveries until want is seen or the timeout fires. Robust to any lines
+// the child emits before want (drained, not asserted-against).
+func waitForLine(t *testing.T, lines <-chan string, want string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case got := <-lines:
+			if got == want {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+// gatedInstallRunner drives the state machine with an install that emits a line, then blocks until
+// the test has observed it as connectState.Message, then emits a second line and returns. Proves the
+// run() → onLine → Message wiring surfaces per-line install output LIVE (before install returns), so
+// the Portal poll shows progress instead of a frozen panel.
+type gatedInstallRunner struct {
+	fakeRunner
+	gate chan struct{} // test closes it after observing the first line as Message
+}
+
+func (g *gatedInstallRunner) install(_ context.Context, _ string, onLine func(string)) error {
+	onLine("step 1: tải gói")
+	<-g.gate // block: install has NOT returned yet
+	onLine("step 2: hoàn tất")
+	return nil
+}
+
+// TestConnectInstallMessageStreamsProgressively asserts connectState.Message reflects an install
+// line BEFORE install returns (the machine sits in phaseInstalling with the first line as Message
+// while install is gated), then advances to the second line once released.
+func TestConnectInstallMessageStreamsProgressively(t *testing.T) {
+	g := &gatedInstallRunner{
+		fakeRunner: fakeRunner{installed: false, loginURL: "https://x", auth: authLoggedIn},
+		gate:       make(chan struct{}),
+	}
+	m := newTestManager(t, g, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	if _, err := m.start("codex", "x"); err != nil {
+		t.Fatalf("start = %v; want nil", err)
+	}
+	// While install is gated, Message must already carry the first line (live, before install exits).
+	if st := waitMessage(t, m, "codex", "step 1: tải gói"); st.Phase != phaseInstalling {
+		t.Fatalf("phase = %q while first line showing; want installing", st.Phase)
+	}
+	close(g.gate) // release install → it emits the second line then returns
+	st := waitPhase(t, m, "codex", phaseConnected)
+	if st.Phase != phaseConnected {
+		t.Fatalf("phase = %q; want connected (err=%q)", st.Phase, st.Error)
+	}
+}
+
+// waitMessage polls status until Message == want (or a terminal error) or times out.
+func waitMessage(t *testing.T, m *connectManager, kind, want string) connectState {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st, _ := m.status(kind)
+		if st.Message == want || st.Phase == phaseError {
+			return st
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("Message never became %q within 3s", want)
+	return connectState{}
 }

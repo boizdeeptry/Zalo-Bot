@@ -287,6 +287,25 @@
 }
 .providers-page .pv-connect-hint { font-size:12px; color:var(--dim); margin-top:10px; }
 .providers-page .pv-connect-hint a { color:var(--ink); text-decoration:underline; }
+/* Thanh tiến trình theo pha: crawl tới trần 85% khi đang cài, nhảy 90% lúc chờ đăng nhập, 100% khi
+   xong. Đỏ-mờ + tắt transition khi lỗi/huỷ (đứng yên, không giả bận). */
+.providers-page .pv-connect-live { display:flex; flex-direction:column; gap:9px; width:100%; }
+.providers-page .pv-progress-wrap { display:flex; flex-direction:column; gap:5px; width:100%; }
+.providers-page .pv-progress {
+  height:7px; border-radius:999px; background:#17171b; border:1px solid #2a2a30; overflow:hidden;
+}
+.providers-page .pv-progress-fill {
+  height:100%; width:0; border-radius:inherit;
+  background:linear-gradient(90deg, #3f6ff5, #6f8dff); transition:width .45s ease-out;
+}
+.providers-page .pv-progress--error .pv-progress-fill { background:#b4453a; transition:none; }
+.providers-page .pv-progress-row { display:flex; align-items:center; gap:8px; font-size:11.5px; }
+.providers-page .pv-progress-pct { font-weight:600; color:var(--ink); }
+.providers-page .pv-progress-elapsed { color:var(--dim); }
+.providers-page .pv-connect-log {
+  font:11.5px/1.5 ui-monospace, Consolas, monospace; color:var(--dim);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%;
+}
 /* providers:end */
 
 .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }

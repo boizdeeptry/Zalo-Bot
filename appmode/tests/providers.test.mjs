@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createProviderService, createProvidersPage } from "../overlay/internal/webui/static/pages/providers.js";
+import { createProviderService, createProvidersPage, INSTALL_CEILING, phaseProgress } from "../overlay/internal/webui/static/pages/providers.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
 
 const staticRoot = new URL("../overlay/internal/webui/static/", import.meta.url);
@@ -10,6 +10,31 @@ const flush = () => new Promise((r) => setImmediate(r));
 const hasClass = (n, c) => n.classList?.contains(c) ?? false;
 const cards = (main) => findAll(main, (n) => hasClass(n, "pv-card"));
 const cardName = (card) => text(find(card, (n) => hasClass(n, "pv-name")));
+const progressBar = (main) => find(main, (n) => hasClass(n, "pv-progress"));
+const fillPct = (main) => {
+  const fill = find(main, (n) => hasClass(n, "pv-progress-fill"));
+  return fill ? parseFloat(fill.style.width) : NaN;
+};
+// Drive a connect flow to a chosen phase: the status handler returns `phase` forever, and we pump
+// the poll loop's sleep(pollMs=0) with real event-loop turns (setImmediate/flush never lets the
+// setTimeout(0) timer fire — same reason the existing connect tests use setTimeout(0)).
+async function openConnectAt(t, kind, cardLabel, status) {
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === `/llm/providers/${kind}/connect` && options.method === "POST") return { kind, phase: "detecting" };
+    if (path === `/llm/providers/${kind}/connect` && !options.method) return { kind, ...status };
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((c) => cardName(c) === cardLabel).click();
+  await flush();
+  const detail = find(main, (n) => hasClass(n, "pv-detail"));
+  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  await flush();
+  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
+  for (let k = 0; k < 20; k++) await new Promise((r) => setTimeout(r, 0));
+  return main;
+}
 
 const CLAUDE_ADDED = {
   id: "claude-code", name: "Claude Code", kind: "claude-code", system: true, enabled: true,
@@ -382,6 +407,49 @@ test("cancel: clicking Huỷ while polling sends a DELETE to the connect endpoin
 
   assert.ok(calls.some((c) => c.path === "/llm/providers/codex/connect" && c.options.method === "DELETE"),
     "cancel issues a DELETE to the connect endpoint");
+});
+
+// phaseProgress is the pure phase→% mapping the bar anchors to. Testing it directly avoids the
+// time-based crawl: the mapping is what must stay honest (never 100 until connected).
+test("phaseProgress maps each phase to an honest anchor", () => {
+  assert.equal(phaseProgress("detecting"), 8);
+  assert.equal(phaseProgress("installing"), 12);
+  assert.ok(phaseProgress("installing") < INSTALL_CEILING, "installing starts below the crawl ceiling");
+  assert.ok(INSTALL_CEILING < 100, "the install ceiling is below 100 — never a fake full bar");
+  assert.equal(phaseProgress("awaiting_login"), 90);
+  assert.equal(phaseProgress("polling"), 90);
+  assert.equal(phaseProgress("connected"), 100);
+  // prompt has no bar; error/canceled freeze at whatever % they reached (not a phase anchor).
+  assert.equal(phaseProgress("prompt"), null);
+  assert.equal(phaseProgress("error"), null);
+  assert.equal(phaseProgress("canceled"), null);
+});
+
+test("installing renders a progress bar anchored below the ceiling, with the live npm line", async (t) => {
+  const main = await openConnectAt(t, "codex", "OpenAI Codex", { phase: "installing", message: "npm: added 90 packages" });
+  assert.ok(progressBar(main), "installing shows a progress bar");
+  const pct = fillPct(main);
+  assert.ok(pct >= 12 && pct < INSTALL_CEILING, `installing % ${pct} must sit in [12, ${INSTALL_CEILING})`);
+  assert.ok(pct < 100, "installing is never 100%");
+  assert.equal(find(main, (n) => hasClass(n, "pv-progress--error")), null, "installing bar is not the error style");
+  const log = find(main, (n) => hasClass(n, "pv-connect-log"));
+  assert.ok(log && /added 90 packages/.test(text(log)), "the live npm line renders under the bar");
+});
+
+test("polling jumps the bar to its ~90% anchor, still below 100", async (t) => {
+  const main = await openConnectAt(t, "codex", "OpenAI Codex", { phase: "polling", loginUrl: "https://auth.example/x" });
+  assert.ok(progressBar(main), "polling shows a progress bar");
+  const pct = fillPct(main);
+  assert.equal(pct, 90);
+  assert.ok(pct < 100, "polling is never 100%");
+});
+
+test("an errored connect freezes the bar and styles it red", async (t) => {
+  const main = await openConnectAt(t, "codex", "OpenAI Codex", { phase: "error", message: "Kết nối thất bại" });
+  const bar = progressBar(main);
+  assert.ok(bar, "the error panel still shows the (frozen) bar");
+  assert.ok(hasClass(bar, "pv-progress--error"), "the frozen bar carries the error style");
+  assert.ok(fillPct(main) < 100, "a failed flow never shows 100%");
 });
 
 test("Test all runs the saved-provider test and refreshes status", async (t) => {

@@ -17,6 +17,17 @@ export const PROVIDER_CATALOG = [
 const CONNECTABLE_KINDS = new Set(["codex", "claude-code"]);
 const normalizeKind = (k) => String(k ?? "").replace(/_/g, "-");
 
+// phaseProgress maps a connect phase to its anchor %. Pure (phase in → number|null out) so the
+// mapping is unit-testable without a clock. installing returns its FLOOR (12): the live bar crawls
+// up from there toward INSTALL_CEILING but never reaches it (see tickConnect), so the % only hits
+// 100 once actually connected — honest, never a fake full bar. prompt/error/canceled → null: the
+// prompt has no bar, and terminal phases FREEZE at whatever % they reached (not a phase anchor).
+export const INSTALL_CEILING = 85;
+const PHASE_ANCHOR = { detecting: 8, installing: 12, awaiting_login: 90, polling: 90, connected: 100 };
+export function phaseProgress(phase) {
+  return PHASE_ANCHOR[phase] ?? null;
+}
+
 function providerPath(id, suffix = "") {
   const value = String(id ?? "").trim();
   if (!value) throw new TypeError("Provider id is required");
@@ -249,7 +260,7 @@ function renderDetail(entry, byKind, onBack, connUI) {
   );
 }
 
-export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {}) {
+export function createProvidersPage({ request = requestJSON, pollMs = 1500, crawlMs = 500 } = {}) {
   return Object.freeze({
     mount(container) {
       const controller = new AbortController();
@@ -274,8 +285,8 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
       // Rời khỏi detail (mở kind khác, hoặc quay lại gallery) phải chấm dứt một luồng connect đang
       // chạy — bump connectRun ở đây để vòng lặp poll của runConnect tự thấy mình lỗi thời ở lượt
       // kiểm kế tiếp và dừng lại, không tiếp tục refresh() nền sau khi người dùng đã rời trang.
-      const openDetail = (kind) => { connectRun++; connect = null; view = kind; paint(); };
-      const backToGallery = () => { connectRun++; connect = null; view = "gallery"; paint(); };
+      const openDetail = (kind) => { connectRun++; stopConnectTimer(); connect = null; view = kind; paint(); };
+      const backToGallery = () => { connectRun++; stopConnectTimer(); connect = null; view = "gallery"; paint(); };
 
       const byKindFrom = (providers) => new Map(providers.map((p) => [normalizeKind(p.kind), p]));
       let lastProviders = [];
@@ -307,17 +318,85 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const defaultLabel = (p) => `Tài khoản ${(p?.accounts?.length ?? 0) + 1}`;
 
+      // Progress-bar state for a live connect flow. connectPct is the displayed %, moved forward by
+      // real phase transitions (anchorTo) and, during installing, crawled toward INSTALL_CEILING by a
+      // single interval (connectTimer). connectStart anchors the elapsed timer. progress*Ref hold the
+      // live nodes so a crawl tick can nudge width/text WITHOUT rebuilding the whole panel — that
+      // keeps the CSS width transition smooth (a fresh node each tick wouldn't animate). Refs are
+      // reassigned on every paintConnect and nulled when no bar is shown.
+      let connectPct = 0;
+      let connectStart = 0;
+      let connectTimer = null;
+      let progressFillRef = null;
+      let progressPctRef = null;
+      let progressElapsedRef = null;
+
+      // anchorTo jumps connectPct FORWARD to a phase's anchor on a real transition (never backward:
+      // anchors increase with the flow, and Math.max keeps a crawled installing % from snapping down).
+      const anchorTo = (phase) => {
+        const a = phaseProgress(phase);
+        if (a !== null) connectPct = Math.max(connectPct, a);
+      };
+      const elapsedText = () => `· ${Math.max(0, Math.floor((Date.now() - connectStart) / 1000))}s`;
+
+      function stopConnectTimer() {
+        if (connectTimer !== null) { clearInterval(connectTimer); connectTimer = null; }
+      }
+      function startConnectTimer() {
+        stopConnectTimer();
+        connectTimer = setInterval(tickConnect, crawlMs);
+        // unref so a stray interval never keeps Node's event loop (or a test run) alive — dispose
+        // clears it anyway, this is belt-and-suspenders. No-op in the browser (no unref on timers).
+        if (connectTimer && typeof connectTimer.unref === "function") connectTimer.unref();
+      }
+      // tickConnect runs every crawlMs: during installing it eases connectPct toward the ceiling
+      // (a fraction of the remaining gap, so it always moves but slows and never reaches 85). Then it
+      // nudges the live nodes directly. Other running phases hold at their anchor; only elapsed ticks.
+      function tickConnect() {
+        if (!connect) { stopConnectTimer(); return; }
+        if (connect.phase === "installing") {
+          connectPct = Math.min(INSTALL_CEILING - 0.1, connectPct + (INSTALL_CEILING - connectPct) * 0.08);
+        }
+        if (progressFillRef) {
+          progressFillRef.style.width = `${connectPct}%`;
+          if (progressPctRef) progressPctRef.textContent = `${Math.round(connectPct)}%`;
+        }
+        if (progressElapsedRef) progressElapsedRef.textContent = elapsedText();
+      }
+
+      // renderProgress builds the bar + %/elapsed row and stashes refs for tickConnect. frozen=true
+      // (error/canceled) styles the bar muted-red and skips the CSS width transition — a dead flow
+      // must not keep animating. Not stored as refs when frozen: no tick will touch it.
+      function renderProgress(frozen) {
+        const fill = element("div", { className: "pv-progress-fill" });
+        fill.style.width = `${connectPct}%`;
+        const bar = element("div", {
+          className: `pv-progress${frozen ? " pv-progress--error" : ""}`,
+          attributes: {
+            role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100",
+            "aria-valuenow": String(Math.round(connectPct)),
+          },
+        }, fill);
+        const pct = element("span", { className: "pv-progress-pct", text: `${Math.round(connectPct)}%` });
+        const elapsed = element("span", { className: "pv-progress-elapsed", text: elapsedText() });
+        if (!frozen) { progressFillRef = fill; progressPctRef = pct; progressElapsedRef = elapsed; }
+        return element("div", { className: "pv-progress-wrap" }, bar,
+          element("div", { className: "pv-progress-row" }, pct, elapsed));
+      }
+
       // startConnect mở panel ở chế độ "prompt" (nhập tên + bấm Bắt đầu). Đây là hàm mà nút
       // "Thêm account" ở trang Accounts (việc sau) cũng sẽ gọi lại — nên export ra ngoài paint().
       function startConnect(kind) {
         const p = byKindFrom(lastProviders).get(normalizeKind(kind));
         connectRun++; // invalidate any prior run before opening a fresh prompt
+        stopConnectTimer(); // kill any crawl still ticking from a prior flow
         connect = { kind, phase: "prompt", label: defaultLabel(p) };
         paint();
         paintConnect();
       }
 
       function closeConnect() {
+        stopConnectTimer();
         connect = null;
         paint();
       }
@@ -334,6 +413,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
         // Nếu vòng lặp poll trong runConnect chưa kịp quan sát "canceled" (ví dụ đang await sleep),
         // tự vẽ trạng thái đã huỷ ngay — người dùng không phải chờ tick kế tiếp mới thấy phản hồi.
         if (connect?.kind === kind && connect.phase !== "canceled") {
+          stopConnectTimer(); // canceled is terminal — the bar freezes, no more crawl
           connect = { ...connect, phase: "canceled" };
           paintConnect();
         }
@@ -342,7 +422,9 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
       function phaseLabel(phase, message, kind) {
         switch (phase) {
           case "detecting": return "Đang kiểm tra…";
-          case "installing": return message || "Đang cài…";
+          // Stable heading, not the raw npm line — the live npm output shows on its own .pv-connect-log
+          // line under the bar (see paintConnect), so the heading stays clean while the log streams.
+          case "installing": return "Đang cài đặt gói…";
           // Claude has no device-auth code — just a browser URL to click. Codex needs the code typed in.
           case "awaiting_login": return kind === "claude-code"
             ? "Bấm link để đăng nhập Claude ở trình duyệt vừa mở, rồi chờ xác nhận…"
@@ -355,6 +437,9 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
 
       // paintConnect chỉ vẽ lại connectSlot — cùng nguyên tắc với paintGallery().
       function paintConnect() {
+        // Drop stale progress refs before (maybe) re-creating them: any branch that doesn't render a
+        // live bar must leave tickConnect with nothing to poke.
+        progressFillRef = progressPctRef = progressElapsedRef = null;
         if (!connect) { connectSlot.replaceChildren(); return; }
         if (connect.phase === "prompt") {
           const input = element("input", { className: "pv-connect-label",
@@ -380,7 +465,11 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
                 element("a", { attributes: { href: "https://claude.com/claude-code", target: "_blank", rel: "noopener" },
                   text: "claude.com/claude-code" }))
             : null;
+          // Frozen red bar above the message: shows how far the flow got before it died, and reads
+          // unmistakably as "stopped, not working" (muted-red, no animation). connectPct holds
+          // whatever the live bar reached (≥ the detecting anchor, since a flow always ran first).
           connectSlot.replaceChildren(element("div", { className: "pv-connect-status" },
+            renderProgress(true),
             element("div", { className: "pv-connect-message",
               text: connect.message || (connect.phase === "canceled" ? "Đã huỷ kết nối." : "Kết nối thất bại.") }),
             installHint,
@@ -408,12 +497,21 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
               element("span", { className: "pv-connect-code-label", text: "Mã đăng nhập:" }),
               element("code", { className: "pv-connect-code-value", text: connect.code }))
           : null;
-        connectSlot.replaceChildren(element("div", { className: "pv-connect-status" },
-          element("div", { className: "pv-connect-message", text: phaseLabel(connect.phase, connect.message, connect.kind) }),
-          loginLink,
-          codeBlock,
-          element("button", { className: "pv-btn", attributes: { type: "button" },
-            text: "Huỷ", on: { click() { void cancelConnect(connect.kind); } } }),
+        // Live npm output (streamed into connect.message during installing) shows on its own muted
+        // log line under the bar — the heading stays a stable phase label. Empty message → no line.
+        const logLine = connect.message
+          ? element("div", { className: "pv-connect-log", text: connect.message })
+          : null;
+        connectSlot.replaceChildren(element("div", { className: "pv-connect-live" },
+          renderProgress(false),
+          logLine,
+          element("div", { className: "pv-connect-status" },
+            element("div", { className: "pv-connect-message", text: phaseLabel(connect.phase, connect.message, connect.kind) }),
+            loginLink,
+            codeBlock,
+            element("button", { className: "pv-btn", attributes: { type: "button" },
+              text: "Huỷ", on: { click() { void cancelConnect(connect.kind); } } }),
+          ),
         ));
       }
 
@@ -423,24 +521,33 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
       // theo kind bỏ lọt đúng ca gây lỗi (vòng lặp cũ chạy nền, đè trạng thái của lượt mới).
       async function runConnect(kind, label) {
         const myRun = ++connectRun;
+        // Fresh progress state for this flow: base at the detecting anchor, start the elapsed clock,
+        // and start the single crawl timer (cleared on every terminal/teardown path below).
+        connectPct = 0;
+        connectStart = Date.now();
         connect = { kind, phase: "detecting", label };
+        anchorTo("detecting");
+        startConnectTimer();
         paintConnect();
         try {
           await service.connectStart(kind, label);
           for (;;) {
-            if (disposed || connectRun !== myRun) return;
+            if (disposed || connectRun !== myRun) { stopConnectTimer(); return; }
             const st = await service.connectStatus(kind);
-            if (disposed || connectRun !== myRun) return;
+            if (disposed || connectRun !== myRun) { stopConnectTimer(); return; }
+            const prevPhase = connect.phase;
             connect = { ...connect, phase: st.phase, message: st.message, loginUrl: st.loginUrl || connect.loginUrl, code: st.code || connect.code };
+            if (st.phase !== prevPhase) anchorTo(st.phase); // real transition → jump the bar forward
             paintConnect();
-            if (st.phase === "connected") { connect = null; await refresh(); return; }
-            if (st.phase === "error" || st.phase === "canceled") return;
+            if (st.phase === "connected") { stopConnectTimer(); connect = null; await refresh(); return; }
+            if (st.phase === "error" || st.phase === "canceled") { stopConnectTimer(); return; }
             await sleep(pollMs);
           }
         } catch (error) {
           // Lượt cũ/lỗi muộn không được đè connect: {...null, phase:"error"} sinh ra một đối tượng
           // thiếu kind là đúng thứ lỗi cần chặn.
-          if (disposed || connectRun !== myRun || error?.name === "AbortError") return;
+          if (disposed || connectRun !== myRun || error?.name === "AbortError") { stopConnectTimer(); return; }
+          stopConnectTimer();
           connect = { ...connect, phase: "error", message: error?.message || "Kết nối thất bại" };
           paintConnect();
         }
@@ -541,6 +648,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
         dispose() {
           disposed = true;
           listRevision++;
+          stopConnectTimer(); // no interval may outlive the mounted page
           controller.abort();
         },
       };

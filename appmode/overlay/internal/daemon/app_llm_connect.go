@@ -299,6 +299,14 @@ func newDefaultConnectRunner(l *slog.Logger) *defaultConnectRunner {
 	return &defaultConnectRunner{logger: l}
 }
 
+// installNPMCommand builds the `npm install -g <pkg>` command. It's a package var purely as a test
+// seam: real npm isn't assumed present in the test env, so TestConnectInstallStreamsLive swaps in a
+// helper-process command to exercise install()'s live pipe-scan streaming portably. Production never
+// reassigns it.
+var installNPMCommand = func(ctx context.Context, pkg string) *exec.Cmd {
+	return exec.CommandContext(ctx, "npm", "install", "-g", pkg)
+}
+
 func (d *defaultConnectRunner) detect(kind string) (bool, error) {
 	desc, ok := cliDescriptors[kind]
 	if !ok {
@@ -312,11 +320,16 @@ func (d *defaultConnectRunner) detect(kind string) (bool, error) {
 	return false, nil
 }
 
-// install runs npm to completion, then replays the buffered output to onLine — it does NOT
-// stream live. The "installing" phase message the user sees live comes from run()'s Phase/Message
-// set beforehand; per-line npm progress only appears after npm exits. Kept buffer-then-Wait
-// (not a live pipe) because it's race-free as-is: see login()'s cmd.Wait() note for why writing
-// combined output straight into a bytes.Buffer while still reading it would race.
+// install runs npm and streams its combined output to onLine LIVE — each line fires as npm emits
+// it, not after exit — so run()'s onLine → connectState.Message updates during the (long) download
+// and the Portal poll shows progress instead of a frozen panel. An io.Pipe carries stdout+stderr:
+// a single goroutine Waits and closes the write end, the main goroutine scans the read end to EOF,
+// then collects the wait result. That's race-free (one writer via exec's copy, one reader here) —
+// unlike sharing a bytes.Buffer between exec's copy goroutine and a concurrent reader.
+//
+// NOTE npm suppresses its TTY progress bar in a non-TTY pipe, so live lines are sparse during the
+// download — that's expected; the frontend's crawling bar + elapsed timer carry the "it's working"
+// signal, and whatever npm does emit ("added N packages", notices) now shows live.
 //
 // ponytail: shells the ambient `npm` (inherits the daemon env — no cmd.Env set). In the packaged
 // app, run.bat puts bundled node+npm on PATH and sets npm_config_prefix=<data>\cli, so this installs
@@ -328,21 +341,22 @@ func (d *defaultConnectRunner) install(ctx context.Context, kind string, onLine 
 	if pkg == "" {
 		return fmt.Errorf("connect install: kind %q không cài qua npm", kind)
 	}
-	cmd := exec.CommandContext(ctx, "npm", "install", "-g", pkg)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out // npm writes progress to stderr; fold into the same stream
+	cmd := installNPMCommand(ctx, pkg)
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw // npm writes progress to stderr; fold into the same stream
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("connect install: start npm: %w", err)
 	}
-	err := cmd.Wait()
-	if onLine != nil {
-		sc := bufio.NewScanner(bytes.NewReader(out.Bytes()))
-		for sc.Scan() {
+	waitErr := make(chan error, 1)
+	go func() { e := cmd.Wait(); pw.Close(); waitErr <- e }()
+	sc := bufio.NewScanner(pr)
+	for sc.Scan() {
+		if onLine != nil {
 			onLine(sc.Text())
 		}
 	}
-	if err != nil {
+	if err := <-waitErr; err != nil {
 		return fmt.Errorf("connect install: npm exit: %w", err)
 	}
 	return nil
