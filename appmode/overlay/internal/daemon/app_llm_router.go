@@ -296,6 +296,15 @@ func (r *appLLMRunner) runClaude(ctx context.Context, e store.LLMRouteEntry,
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", fmt.Errorf("llm route: lượt bị huỷ trong %s: %w", e.ProviderID, ctxErr)
 		}
+		// Trong chuỗi = bot ĐÃ cấu hình (đã qua cổng hasAnyConnectedProvider). Mắt xích Claude cuối
+		// không chạy được (0 account / không resolve được claude.exe) trả ErrZaloSilent là lỗi
+		// runtime → PHẢI leo thang (gọi người), KHÔNG nuốt im. ErrZaloSilent chỉ mang nghĩa "chưa
+		// cấu hình" ở TẦNG VÀO (appZaloRunner), không xuyên qua answerZalo từ trong chuỗi. Dùng %v
+		// để cắt chuỗi sentinel — cùng ghi telemetry "không khả dụng" như mọi cách cạn chuỗi khác.
+		if errors.Is(err, ErrZaloSilent) {
+			r.record(llmErrorAttempt(e, started, elapsed, llmErrorUpstream, ""))
+			return "", fmt.Errorf("llm route: mắt xích Claude cuối không khả dụng: %v", err)
+		}
 		// Không còn mắt xích nào sau Claude Code, nên đây là trạng thái "không khả dụng": cả
 		// chuỗi đã cạn và lượt này không có câu trả lời nào để gửi.
 		r.record(llmErrorAttempt(e, started, elapsed, llmErrorUpstream, ""))

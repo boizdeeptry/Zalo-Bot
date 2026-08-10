@@ -1553,6 +1553,11 @@ func TestAppZaloRunnerSilentWhenNoProvider(t *testing.T) {
 // TestAppClaudeRunnerSilentWhenNoAccount: 0 account claude-code → im, không rơi về base. Claude chỉ
 // chạy khi có account nối, nên mắt xích cuối của một bot chưa cấu hình là im chứ không phải một
 // login sẵn nào của máy này.
+//
+// ĐÂY LÀ TẦNG UNIT: appClaudeRunner trả silentZaloRunner. Nhưng nó CHỈ được gọi từ TRONG chuỗi
+// (runClaude), và runClaude DIỄN GIẢI LẠI ErrZaloSilent thành lỗi leo thang — vì tới trong chuỗi
+// thì bot đã cấu hình, một mắt xích cuối không chạy được là lỗi runtime phải gọi người, không nuốt
+// im. Xem TestRunClaudeEscalatesWhenTerminalDeclines.
 func TestAppClaudeRunnerSilentWhenNoAccount(t *testing.T) {
 	a := newAppRouteAPI(t)
 	base := &fakeClaude{fn: func(context.Context, string) (string, error) {
@@ -1562,6 +1567,24 @@ func TestAppClaudeRunnerSilentWhenNoAccount(t *testing.T) {
 	r := a.appClaudeRunner(zaloConfig{}, base, "opus")
 	if _, err := r.Run(t.Context(), "hỏi", func(string) {}); !errors.Is(err, ErrZaloSilent) {
 		t.Fatalf("Run() = _, %v; want ErrZaloSilent", err)
+	}
+}
+
+// TestRunClaudeEscalatesWhenTerminalDeclines ghim cửa an toàn của toàn đường: một bot ĐÃ cấu hình
+// (chuỗi không rỗng) mà mắt xích Claude cuối trả ErrZaloSilent (0 account / claude.exe không resolve
+// được lúc chạy) PHẢI leo thang — lỗi trả về non-nil và KHÔNG còn mang ErrZaloSilent, nên
+// answerZalo (errors.Is(err, ErrZaloSilent)) sẽ gọi người thay vì nuốt im. Nếu %w rò sentinel ra thì
+// mọi tin của khách rơi vào im lặng dù Portal hiện "Đã kết nối".
+func TestRunClaudeEscalatesWhenTerminalDeclines(t *testing.T) {
+	declining := &fakeClaude{fn: func(context.Context, string) (string, error) { return "", ErrZaloSilent }}
+	f := newRouterFixture(newRoute(entry("claude-code", "haiku", true)), declining)
+
+	_, err := f.runner(appLLMRunnerConfig{}).Run(t.Context(), "hỏi", f.step)
+	if err == nil {
+		t.Fatal("Run() = _, nil; want lỗi leo thang (mắt xích Claude cuối không khả dụng)")
+	}
+	if errors.Is(err, ErrZaloSilent) {
+		t.Fatalf("Run() err = %v; MANG ErrZaloSilent → answerZalo sẽ nuốt im. Đường trong chuỗi phải cắt sentinel", err)
 	}
 }
 
