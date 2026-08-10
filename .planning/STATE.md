@@ -1,12 +1,31 @@
 # Planning state
 
-step: ship
-current_topic: no-default-claude-npm
-current_spec: .planning/specs/2026-08-10-no-default-claude-npm-design.md
-current_plan: .planning/plans/2026-08-10-no-default-claude-npm.md
+step: done
+current_topic:
+current_spec:
+current_plan:
 last_updated: 2026-08-10
 
-Nhánh `feat/no-default-claude-npm` off main `ccc3ac8`. Execute subagent-driven XONG — T1–T8 code + review sạch,
+## SHIPPED 2026-08-10 → main (`343e32f`) — No-default + Claude npm + Codex-fix + connect progress
+
+Nhánh `feat/no-default-claude-npm` (17 commit, fast-forward `ccc3ac8`→`343e32f`) merge LOCAL vào main, nhánh
+xoá. Local main ahead origin ~168 commit — CHƯA push (ship local). Suite xanh bản merged (ff, HEAD y hệt commit
+đã test): Go PASS, Portal 113/113. Base AgentDC giữ 2 commit `3f224e9`(ErrZaloSilent)+`e05a13c`(zaloConfig.Program)
+ở history AgentDC (như CC4). Gói cuối `F:\dist\_verify-nd2` (7/7 gate, canary sạch, 3177 tệp/121MB) đã swap vào
+`_verify-nodefault` (đang chạy, pid ~22460).
+- Ngoài T1–T9 kế hoạch, 3 việc phát sinh từ E2E: **T10** combo picker CHỈ hiện provider đã-kết-nối (shared
+  `isProviderConnected`); **T11** — BUG THẬT có sẵn trên main từ pivot PX5: codex proxy bị chặn bởi credential
+  precheck (`appLLMCredential` ErrNotFound→lỗi) → fix trả (nil,nil); **XÁC MINH E2E: codex/gpt-5.5 ok 4.7s** qua
+  combo thật; **T12** progress bar % theo giai đoạn + log sống + elapsed khi Connect/cài (install stream live).
+- **Claude npm path (T4/T5)**: unit + spike (A-native `bin\claude.exe`) xong; **LIVE OAuth click là bước của
+  user** — CHƯA xác nhận lúc ship (như mọi ship trước; F:\dist\_verify-nodefault đang chạy để user thử Connect
+  Claude, xem progress bar + validate npm install E2E).
+- **KẾ TIẾP (user đã đồng ý): ONBOARDING WIZARD** — option A (terminal-style TRONG Portal, gate toàn app tới khi
+  Provider→Combo→chat-thử xong). Sub-project mới, chạy `/discuss`. Xem [[project-zalobot-onboarding-wizard]].
+- **Vận hành CÒN MỞ**: bot live "Bé Mi" hiện là instance test `_verify-nodefault` (fresh data, KB rỗng). Nếu cần
+  khôi phục build live cũ `F:\dist\_verify-20260808` trên :8770 → nói mình.
+
+## (execute record) Nhánh `feat/no-default-claude-npm` off main `ccc3ac8`. Execute subagent-driven XONG — T1–T8 code + review sạch,
 final whole-branch integration review bắt 1 lỗi thật (ErrZaloSilent rò qua runClaude → bot đã-cấu-hình nuốt
 im thay vì leo thang) → fix `92b0e98`. Full build gate XANH 7/7, canary sạch, F:\dist\_verify-nodefault
 (3177 tệp/121MB). Base AgentDC: 2 commit `3f224e9`(ErrZaloSilent)+`e05a13c`(zaloConfig.Program) ở lại AgentDC
