@@ -254,6 +254,31 @@ func TestConnectLoginTimeoutIsError(t *testing.T) {
 	}
 }
 
+// TestConnectFailureLeavesNoConfigDir proves the orphan-dir fix: a failed connect (login rejected)
+// removes the config dir start() created, since no account row references it. Contrast the happy
+// path (TestConnectHappyPathAlreadyInstalled) which asserts the dir survives.
+func TestConnectFailureLeavesNoConfigDir(t *testing.T) {
+	r := &fakeRunner{installed: true, loginErr: errors.New("đăng nhập bị từ chối")}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	if _, err := m.start("codex", "x"); err != nil {
+		t.Fatalf("start = %v; want nil", err)
+	}
+	st := waitPhase(t, m, "codex", phaseError)
+	if st.Phase != phaseError {
+		t.Fatalf("phase = %q; want error", st.Phase)
+	}
+	// Cleanup is run()'s deferred remove, which fires just after the terminal phase is set — poll for it.
+	dir := filepath.Join(m.dataDir, "accounts", "codex", "acc1")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			return // removed — pass
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("config dir %q still exists after failed connect; want removed", dir)
+}
+
 func TestConnectCancelStopsLoginAndPolls(t *testing.T) {
 	// auth never loggedIn → machine sits in polling until cancel.
 	r := &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut}

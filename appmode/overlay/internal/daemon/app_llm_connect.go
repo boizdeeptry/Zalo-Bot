@@ -171,6 +171,20 @@ func (m *connectManager) fail(job *connectJob, kind, userMsg string, cause error
 }
 
 func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) {
+	// start() created job.configDir before OAuth ran. Only the success path (connected=true) writes
+	// auth.json into it and records an account row; every terminal non-success (detect/install/login
+	// fail, timeout, cancel) leaves it empty and unreferenced. Remove it on non-success so failed
+	// attempts don't orphan empty dirs. Deferred FIRST so it runs LAST (after job.cancel below), giving
+	// the login process its ctx-cancel kill before we drop its dir. Best-effort: a failed remove logs.
+	connected := false
+	defer func() {
+		if connected {
+			return
+		}
+		if err := os.RemoveAll(job.configDir); err != nil && m.logger != nil {
+			m.logger.Warn("connect: remove orphan config dir", "kind", kind, "dir", job.configDir, "err", err)
+		}
+	}()
 	defer job.cancel() // cancel ctx on EVERY return path — unblocks the wait() goroutine below
 	installed, err := m.runner.detect(kind)
 	if err != nil {
@@ -235,6 +249,7 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 				m.fail(job, kind, "lưu account lỗi: "+err.Error(), err)
 				return
 			}
+			connected = true // row created — keep the config dir (holds auth.json); skip cleanup
 			job.set(func(s *connectState) { s.Phase = phaseConnected; s.Message = "" })
 			return
 		}
