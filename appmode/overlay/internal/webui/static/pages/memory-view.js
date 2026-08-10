@@ -73,22 +73,67 @@ function memoryMetadata(memory, { status = memory?.status, includeStatus = true 
   return element("div", { className: "memory-entry-meta memory-chips" }, chips);
 }
 
-function actionButton(label, onClick, { disabled = false, destructive = false } = {}) {
+function actionButton(label, onClick, {
+  disabled = false,
+  destructive = false,
+  rowID = "",
+  actionKind = "",
+} = {}) {
   const button = element("button", {
     className: `memory-action${destructive ? " is-destructive" : ""}`,
-    attributes: { type: "button", disabled },
+    attributes: {
+      type: "button",
+      "aria-disabled": String(disabled),
+      "data-memory-row-id": String(rowID),
+      "data-memory-action-kind": actionKind,
+    },
     text: label,
-    on: { click: (event) => onClick(event.currentTarget) },
+    on: { click: (event) => {
+      if (!disabled) onClick(event.currentTarget);
+    } },
   });
-  button.disabled = disabled;
   return button;
 }
 
 function activeActions(memory, actions, pending) {
   return element("div", { className: "memory-entry-actions" },
-    actionButton(memory.pinned ? "Bỏ ghim" : "Ghim", (opener) => actions.pinThread(memory, opener), { disabled: pending }),
-    actionButton("Sửa", (opener) => actions.editThread(memory, opener), { disabled: pending }),
-    actionButton("Xoá", (opener) => actions.deleteThread(memory, opener), { disabled: pending, destructive: true }),
+    actionButton(memory.pinned ? "Bỏ ghim" : "Ghim", (opener) => actions.pinThread(memory, opener), {
+      disabled: pending, rowID: memory.id, actionKind: "pin",
+    }),
+    actionButton("Sửa", (opener) => actions.editThread(memory, opener), {
+      disabled: pending, rowID: memory.id, actionKind: "edit",
+    }),
+    actionButton("Xoá", (opener) => actions.deleteThread(memory, opener), {
+      disabled: pending, destructive: true, rowID: memory.id, actionKind: "delete",
+    }),
+  );
+}
+
+function pendingActions(memory, actions, pending) {
+  return element("div", { className: "memory-entry-actions memory-proposal-actions" },
+    actionButton("Duyệt", (opener) => actions.approveThread(memory, opener), {
+      disabled: pending, rowID: memory.id, actionKind: "approve",
+    }),
+    actionButton("Sửa rồi duyệt", (opener) => actions.editApproveThread(memory, opener), {
+      disabled: pending, rowID: memory.id, actionKind: "edit-approve",
+    }),
+    actionButton("Từ chối", (opener) => actions.rejectThread(memory, opener), {
+      disabled: pending, destructive: true, rowID: memory.id, actionKind: "reject",
+    }),
+  );
+}
+
+function expiredActions(memory, actions, pending) {
+  return element("div", { className: "memory-entry-actions" },
+    actionButton("Khôi phục", (opener) => actions.restoreThread(memory, opener), {
+      disabled: pending, rowID: memory.id, actionKind: "restore",
+    }),
+    actionButton("Ghim", (opener) => actions.pinThread(memory, opener), {
+      disabled: pending, rowID: memory.id, actionKind: "pin",
+    }),
+    actionButton("Xoá", (opener) => actions.deleteThread(memory, opener), {
+      disabled: pending, destructive: true, rowID: memory.id, actionKind: "delete",
+    }),
   );
 }
 
@@ -99,11 +144,13 @@ function memoryCard(memory, status, actions, pending) {
       element("div", { className: "memory-entry-text", text: memory.text }),
       memoryMetadata(memory, { status }),
       status === "active" ? activeActions(memory, actions, pending) : null,
+      status === "pending" ? pendingActions(memory, actions, pending) : null,
+      status === "expired" ? expiredActions(memory, actions, pending) : null,
     ),
   );
 }
 
-export function replacementCard(memory) {
+export function replacementCard(memory, actions, pending) {
   const target = memory.proposal_target;
   return element("article", { className: "memory-entry memory-status-card memory-replacement is-pending" },
     element("div", { className: "memory-pin", attributes: { "aria-hidden": "true" }, text: memory.pinned ? "★" : "" }),
@@ -121,6 +168,7 @@ export function replacementCard(memory) {
           memoryMetadata(memory, { status: "pending", includeStatus: false }),
         ),
       ),
+      pendingActions(memory, actions, pending),
     ),
   );
 }
@@ -150,7 +198,7 @@ export function memorySection(status, items, actions, pending) {
   memories.length
     ? element("div", { className: "memory-entries" }, memories.map((entry) =>
       status === "pending" && entry.proposal_action === "replace" && entry.proposal_target
-        ? replacementCard(entry)
+        ? replacementCard(entry, actions, pending)
         : memoryCard(entry, status, actions, pending)))
     : sectionEmpty(status),
   );

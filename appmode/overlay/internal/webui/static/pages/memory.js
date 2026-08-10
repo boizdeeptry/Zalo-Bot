@@ -1,5 +1,6 @@
-import { requestJSON } from "../core/api.js";
+import { AppAPIError, requestJSON } from "../core/api.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
+import { createThreadMemoryActions } from "./memory-actions.js";
 import { memberSelector, memorySections } from "./memory-view.js";
 
 const SEARCH_DELAY_MS = 250;
@@ -13,8 +14,16 @@ function filterQuery({ query = "", pinned = false } = {}) {
   return encoded ? `?${encoded}` : "";
 }
 
+function threadMemoryPath(threadID, id) {
+  const threadPath = `/memory/threads/${encodeURIComponent(threadID)}`;
+  return id === undefined ? threadPath : `${threadPath}/${encodeURIComponent(id)}`;
+}
+
 export function createMemoryService(request = requestJSON) {
   if (typeof request !== "function") throw new TypeError("Memory service requires an API request function");
+  const approve = (threadID, id, body) => request(`${threadMemoryPath(threadID, id)}/approve`, { method: "POST", body });
+  const reject = (threadID, id, body) => request(`${threadMemoryPath(threadID, id)}/reject`, { method: "POST", body });
+  const restore = (threadID, id, body) => request(`${threadMemoryPath(threadID, id)}/restore`, { method: "POST", body });
   return Object.freeze({
     overview: (filters) => request(`/memory${filterQuery(filters)}`),
     thread: (threadID, uid = "") => {
@@ -24,9 +33,18 @@ export function createMemoryService(request = requestJSON) {
       return request(`/memory/threads/${encodeURIComponent(threadID)}${suffix ? `?${suffix}` : ""}`);
     },
     lessons: (filters) => request(`/memory/lessons${filterQuery(filters)}`),
-    createThread: (threadID, body) => request(`/memory/threads/${encodeURIComponent(threadID)}`, { method: "POST", body }),
-    updateThread: (threadID, id, body) => request(`/memory/threads/${encodeURIComponent(threadID)}/${id}`, { method: "PUT", body }),
-    deleteThread: (threadID, id) => request(`/memory/threads/${encodeURIComponent(threadID)}/${id}`, { method: "DELETE" }),
+    createThread: (threadID, body) => request(threadMemoryPath(threadID), { method: "POST", body }),
+    updateThread: (threadID, id, body) => request(threadMemoryPath(threadID, id), { method: "PUT", body }),
+    deleteThread: (threadID, id, body) => request(threadMemoryPath(threadID, id), {
+      method: "DELETE",
+      ...(body === undefined ? {} : { body }),
+    }),
+    approve,
+    reject,
+    restore,
+    approveThread: approve,
+    rejectThread: reject,
+    restoreThread: restore,
     createLesson: (body) => request("/memory/lessons", { method: "POST", body }),
     updateLesson: (id, body) => request(`/memory/lessons/${id}`, { method: "PUT", body }),
     deleteLesson: (id) => request(`/memory/lessons/${id}`, { method: "DELETE" }),
@@ -99,6 +117,40 @@ function findMemberTab(root, uid) {
     nodes.push(...(node?.childNodes || []));
   }
   return null;
+}
+
+function isWithinMemoryRoot(root, node) {
+  let current = node;
+  while (current && current !== root) current = current.parentNode;
+  return current === root;
+}
+
+function memoryFocusDescriptor(root, node = document.activeElement) {
+  if (!isWithinMemoryRoot(root, node)) return null;
+  const focusKey = node.getAttribute?.("data-memory-focus-key") || "";
+  if (focusKey) return { type: "stable", focusKey };
+  const rowID = node.getAttribute?.("data-memory-row-id") || "";
+  const actionKind = node.getAttribute?.("data-memory-action-kind") || "";
+  return rowID && actionKind ? { type: "row-action", rowID, actionKind } : null;
+}
+
+function findMemoryFocusTarget(root, descriptor, selectedUID) {
+  const nodes = [root];
+  let rowFallback = null;
+  let addFallback = null;
+  while (nodes.length) {
+    const node = nodes.shift();
+    const focusKey = node?.getAttribute?.("data-memory-focus-key") || "";
+    if (focusKey === "add") addFallback = node;
+    if (descriptor?.type === "stable" && focusKey === descriptor.focusKey) return node;
+    if (descriptor?.type === "row-action" && node?.classList?.contains("memory-action") &&
+        (node.getAttribute("data-memory-row-id") || "") === descriptor.rowID) {
+      if ((node.getAttribute("data-memory-action-kind") || "") === descriptor.actionKind) return node;
+      rowFallback ||= node;
+    }
+    nodes.push(...(node?.childNodes || []));
+  }
+  return rowFallback || addFallback || findMemberTab(root, selectedUID);
 }
 
 function threadDetail(state, actions) {
@@ -233,14 +285,40 @@ function pinnedField({ id, label, checked = false }) {
   };
 }
 
+const SAFE_MEMORY_API_MESSAGES = new Set([
+  "dữ liệu memory vượt quá giới hạn",
+  "dữ liệu JSON không hợp lệ",
+  "ID memory không hợp lệ",
+  "bộ lọc pinned không hợp lệ",
+  "Memory đã thay đổi; hãy tải lại trước khi lưu",
+  "dữ liệu memory không hợp lệ",
+  "không tìm thấy memory",
+  "đã đạt giới hạn nội dung được ghim",
+]);
+const SAFE_API_MESSAGE_LIMIT = 240;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
+
+function trustedAPIMessage(error) {
+  if (!(error instanceof AppAPIError)) return "";
+  const status = Number(error.status);
+  const rawMessage = typeof error.message === "string" ? error.message : "";
+  if (!Number.isInteger(status) || status < 400 || status > 499 ||
+      !rawMessage || rawMessage.length > SAFE_API_MESSAGE_LIMIT || CONTROL_CHARACTERS.test(rawMessage)) {
+    return "";
+  }
+  const message = rawMessage.trim();
+  if (!message) return "";
+  const code = typeof error.code === "string" ? error.code : "";
+  if (/^HTTP_\d{3}$/.test(code) && !SAFE_MEMORY_API_MESSAGES.has(message)) return "";
+  return message;
+}
+
 function safeMutationMessage(error) {
-  const message = typeof error?.message === "string" ? error.message.trim() : "";
-  return message || "Không thể cập nhật Memory. Vui lòng thử lại.";
+  return trustedAPIMessage(error) || "Không thể cập nhật Memory. Vui lòng thử lại.";
 }
 
 function safeReadError(error) {
-  const message = typeof error?.message === "string" ? error.message.trim() : "";
-  return new Error(message || "Không thể đọc Memory. Vui lòng thử lại.");
+  return new Error(trustedAPIMessage(error) || "Không thể đọc Memory. Vui lòng thử lại.");
 }
 
 function renderMemoryPage(root, state, actions) {
@@ -265,11 +343,18 @@ function renderMemoryPage(root, state, actions) {
   const addDisabled = state.tab === "threads" && !state.selectedThreadID;
   const add = element("button", {
     className: "btn go memory-add",
-    attributes: { type: "button", disabled: addDisabled || state.pending },
+    attributes: {
+      type: "button",
+      disabled: addDisabled,
+      "aria-disabled": String(addDisabled || state.pending),
+      "data-memory-focus-key": "add",
+    },
     text: state.tab === "threads" ? "+ Thêm ghi chú" : "+ Thêm bài học",
-    on: { click: (event) => actions.add(event.currentTarget) },
+    on: { click: (event) => {
+      if (!addDisabled && !state.pending) actions.add(event.currentTarget);
+    } },
   });
-  add.disabled = addDisabled || state.pending;
+  add.disabled = addDisabled;
 
   const children = [
     element("div", { className: "memory-heading" },
@@ -343,15 +428,22 @@ export function createMemoryPage({
       let liveRegion = null;
       let activeDialog = null;
       let requestedMemberFocus = null;
+      let requestedMemoryFocus = null;
       container.append(root);
 
       const render = () => {
         if (state.disposed) return;
         const preservedFocus = focusedMemberTab(root);
-        const focus = requestedMemberFocus || preservedFocus;
+        const memberFocus = requestedMemberFocus || preservedFocus;
+        const memoryFocus = requestedMemoryFocus || memoryFocusDescriptor(root);
         requestedMemberFocus = null;
+        requestedMemoryFocus = null;
         liveRegion = renderMemoryPage(root, state, actions);
-        if (focus) findMemberTab(root, focus.uid)?.focus();
+        if (memoryFocus) {
+          findMemoryFocusTarget(root, memoryFocus, state.selectedSubjectUID)?.focus();
+        } else if (memberFocus) {
+          findMemberTab(root, memberFocus.uid)?.focus();
+        }
       };
 
       const announce = (message) => {
@@ -369,18 +461,25 @@ export function createMemoryPage({
         render();
         try {
           const detail = await service.thread(threadID, requestUID);
-          if (state.disposed || revision !== detailRevision || threadID !== state.selectedThreadID || uid !== state.selectedSubjectUID) return;
+          if (state.disposed || revision !== detailRevision || threadID !== state.selectedThreadID || uid !== state.selectedSubjectUID) {
+            return { ok: false, stale: true };
+          }
           state.detail = detail;
           state.selectedSubjectUID = typeof detail?.selected_uid === "string" ? detail.selected_uid : uid;
           state.error = null;
+          return { ok: true };
         } catch (error) {
-          if (state.disposed || revision !== detailRevision || error?.name === "AbortError") return;
+          if (state.disposed || revision !== detailRevision || error?.name === "AbortError") {
+            return { ok: false, stale: true };
+          }
           const previousUID = typeof state.detail?.selected_uid === "string"
             ? state.detail.selected_uid
             : state.selectedSubjectUID;
           if (focusedMemberTab(root)) requestedMemberFocus = { uid: previousUID };
           state.selectedSubjectUID = previousUID;
-          state.error = safeReadError(error);
+          const readError = safeReadError(error);
+          state.error = readError;
+          return { ok: false, error: readError };
         } finally {
           if (!state.disposed && revision === detailRevision) {
             state.detailLoading = false;
@@ -389,25 +488,38 @@ export function createMemoryPage({
         }
       }
 
-      async function loadOverview() {
+      async function loadOverview({ loadSelectedDetail = true, preserveSelectedThread = false } = {}) {
         const revision = ++overviewRevision;
         state.loading = true;
         render();
         try {
-          const overview = await service.overview({ query: state.query, pinned: state.pinned });
-          if (state.disposed || revision !== overviewRevision) return;
+          let overview = await service.overview({ query: state.query, pinned: state.pinned });
+          if (state.disposed || revision !== overviewRevision) return { ok: false, stale: true };
+          let threads = Array.isArray(overview?.threads) ? overview.threads : [];
+          const selectedThread = Array.isArray(state.overview?.threads)
+            ? state.overview.threads.find((thread) => thread.id === state.selectedThreadID)
+            : null;
+          if (preserveSelectedThread && selectedThread &&
+              !threads.some((thread) => thread.id === state.selectedThreadID)) {
+            threads = [selectedThread, ...threads];
+            overview = { ...overview, threads };
+          }
           state.overview = overview;
-          const threads = Array.isArray(overview?.threads) ? overview.threads : [];
           if (!threads.some((thread) => thread.id === state.selectedThreadID)) {
             state.selectedThreadID = threads[0]?.id || "";
             state.selectedSubjectUID = "";
             state.detail = null;
           }
           state.error = null;
-          if (state.selectedThreadID) void loadDetail(state.selectedThreadID, state.selectedSubjectUID);
+          if (loadSelectedDetail && state.selectedThreadID) void loadDetail(state.selectedThreadID, state.selectedSubjectUID);
+          return { ok: true };
         } catch (error) {
-          if (state.disposed || revision !== overviewRevision || error?.name === "AbortError") return;
-          state.error = error;
+          if (state.disposed || revision !== overviewRevision || error?.name === "AbortError") {
+            return { ok: false, stale: true };
+          }
+          const readError = safeReadError(error);
+          state.error = readError;
+          return { ok: false, error: readError };
         } finally {
           if (!state.disposed && revision === overviewRevision) {
             state.loading = false;
@@ -427,7 +539,7 @@ export function createMemoryPage({
           state.error = null;
         } catch (error) {
           if (state.disposed || revision !== lessonRevision || error?.name === "AbortError") return;
-          state.error = error;
+          state.error = safeReadError(error);
         } finally {
           if (!state.disposed && revision === lessonRevision) {
             state.lessonsLoading = false;
@@ -442,11 +554,12 @@ export function createMemoryPage({
 
       function openDialog({ title, description, fields = [], inputs = [], submitLabel, destructive = false, onSubmit }, opener) {
         dismissActiveDialog();
+        const restorationFocus = memoryFocusDescriptor(root, opener);
         const revision = ++dialogRevision;
         const titleID = `memory-dialog-title-${revision}`;
         const descriptionID = `memory-dialog-description-${revision}`;
         const errorID = `memory-dialog-error-${revision}`;
-        const overlay = element("div", { className: "sheetback", attributes: { "data-memory-overlay": "" } });
+        const overlay = element("div", { className: "sheetback memory-page", attributes: { "data-memory-overlay": "" } });
         const error = element("div", {
           className: "memory-dialog-error note",
           attributes: { id: errorID, role: "alert", "aria-live": "assertive" },
@@ -462,6 +575,7 @@ export function createMemoryPage({
         let closed = false;
 
         const dialog = {
+          restorationFocus,
           dismiss(restoreFocus, force = false) {
             if (closed || (pending && !force)) return;
             closed = true;
@@ -469,7 +583,13 @@ export function createMemoryPage({
             document.removeEventListener?.("keydown", onDocumentKeydown);
             overlay.remove();
             if (activeDialog === dialog) activeDialog = null;
-            if (restoreFocus) opener?.focus();
+            if (restoreFocus) {
+              let mountedTarget = isWithinMemoryRoot(root, opener) ? opener : null;
+              if (!mountedTarget && restorationFocus) {
+                mountedTarget = findMemoryFocusTarget(root, restorationFocus, state.selectedSubjectUID);
+              }
+              mountedTarget?.focus();
+            }
           },
           setError(message = "") {
             error.textContent = message;
@@ -495,7 +615,7 @@ export function createMemoryPage({
         overlay.addEventListener("keydown", (event) => {
           if (event.key !== "Tab") return;
           const focusable = (overlay.querySelectorAll
-            ? [...overlay.querySelectorAll("button:not([disabled]), input:not([disabled]), textarea:not([disabled])")]
+            ? [...overlay.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])")]
             : controls.filter((control) => !control.disabled));
           if (!focusable.length) return;
           const position = focusable.indexOf(document.activeElement);
@@ -542,14 +662,48 @@ export function createMemoryPage({
         return dialog;
       }
 
-      async function refreshAfterMutation(scope) {
-        await loadOverview();
+      async function refreshAfterMutation(scope, target) {
+        if (scope === "thread") {
+          const threadID = target.threadID;
+          const uid = target.uid;
+          const targetIsCurrent = () => (
+            threadID === state.selectedThreadID && uid === state.selectedSubjectUID
+          );
+          const detailResult = await loadDetail(threadID, uid);
+          if (state.disposed || !targetIsCurrent() || detailResult?.stale) {
+            return { ok: false, stale: true };
+          }
+          const overviewResult = await loadOverview({
+            loadSelectedDetail: false,
+            preserveSelectedThread: true,
+          });
+          if (state.disposed || !targetIsCurrent() || overviewResult?.stale) {
+            return { ok: false, stale: true };
+          }
+          const failure = [detailResult, overviewResult].find((result) => result?.error);
+          if (failure) state.error = failure.error;
+          return failure || { ok: true };
+        }
+        const overviewResult = await loadOverview({ loadSelectedDetail: false });
+        if (state.disposed || overviewResult?.stale) return overviewResult;
         if (scope === "lessons" && state.tab === "lessons") await loadLessons();
+        return overviewResult;
       }
 
       async function runMutation(work, { success, scope, dialog = null }) {
         if (state.pending || state.disposed) return;
         const revision = ++mutationRevision;
+        const target = scope === "thread"
+          ? { threadID: state.selectedThreadID, uid: state.selectedSubjectUID }
+          : null;
+        const scopeIsStale = () => target && (
+          target.threadID !== state.selectedThreadID || target.uid !== state.selectedSubjectUID
+        );
+        const releaseStaleMutation = () => {
+          state.pending = false;
+          dialog?.setPending(false);
+          if (!dialog) render();
+        };
         state.pending = true;
         dialog?.setError();
         dialog?.setPending(true);
@@ -557,13 +711,29 @@ export function createMemoryPage({
         try {
           await work();
           if (state.disposed || revision !== mutationRevision) return;
-          state.pending = false;
+          if (scopeIsStale()) {
+            releaseStaleMutation();
+            return;
+          }
           announce(success);
-          dialog?.dismiss(true, true);
+          if (dialog?.restorationFocus) requestedMemoryFocus = dialog.restorationFocus;
+          dialog?.dismiss(false, true);
           render();
-          await refreshAfterMutation(scope);
+          const refreshResult = await refreshAfterMutation(scope, target);
+          if (state.disposed || revision !== mutationRevision) return;
+          if (scopeIsStale()) {
+            releaseStaleMutation();
+            return;
+          }
+          state.pending = false;
+          if (refreshResult?.error) announce(refreshResult.error.message);
+          render();
         } catch (error) {
           if (state.disposed || revision !== mutationRevision || error?.name === "AbortError") return;
+          if (scopeIsStale()) {
+            releaseStaleMutation();
+            return;
+          }
           state.pending = false;
           const message = safeMutationMessage(error);
           announce(message);
@@ -574,50 +744,6 @@ export function createMemoryPage({
             render();
           }
         }
-      }
-
-      function openThreadEditor(memory, opener) {
-        const editing = Boolean(memory);
-        const textField = textareaField({
-          id: `memory-text-${dialogRevision + 1}`,
-          name: "text",
-          label: "Nội dung ghi chú",
-          value: memory?.text || "",
-          maxlength: 240,
-          required: true,
-        });
-        const pinField = pinnedField({
-          id: `memory-pinned-${dialogRevision + 1}`,
-          label: "Ghim ghi chú này",
-          checked: memory?.pinned,
-        });
-        const thread = state.detail?.thread;
-        let dialog;
-        dialog = openDialog({
-          title: editing ? "Sửa ghi chú" : "Thêm ghi chú",
-          description: `Chỉ dùng cho ${thread?.name || thread?.id || "hội thoại đã chọn"}. Có hiệu lực từ lượt Zalo kế tiếp.`,
-          fields: [textField.node, pinField.node],
-          inputs: [textField.input, pinField.input],
-          submitLabel: "Lưu",
-          onSubmit: () => {
-            const body = { text: textField.input.value.trim(), pinned: Boolean(pinField.input.checked) };
-            if (!body.text) {
-              const message = "Hãy nhập nội dung ghi chú.";
-              dialog.setError(message);
-              announce(message);
-              textField.input.focus();
-              return;
-            }
-            const work = editing
-              ? () => service.updateThread(state.selectedThreadID, memory.id, body)
-              : () => service.createThread(state.selectedThreadID, body);
-            void runMutation(work, {
-              success: editing ? "Đã lưu ghi chú." : "Đã thêm ghi chú.",
-              scope: "thread",
-              dialog,
-            });
-          },
-        }, opener);
       }
 
       function openLessonEditor(lesson, opener) {
@@ -682,21 +808,17 @@ export function createMemoryPage({
         }, opener);
       }
 
-      function openDeleteDialog(scope, item, opener) {
-        const threadMemory = scope === "thread";
+      function openLessonDeleteDialog(item, opener) {
         let dialog;
         dialog = openDialog({
-          title: threadMemory ? "Xoá ghi chú?" : "Xoá bài học chung?",
+          title: "Xoá bài học chung?",
           description: "Thao tác này không thể hoàn tác. Session Zalo sẽ nhận danh sách mới ở lượt kế tiếp.",
           submitLabel: "Xác nhận xoá",
           destructive: true,
           onSubmit: () => {
-            const work = threadMemory
-              ? () => service.deleteThread(state.selectedThreadID, item.id)
-              : () => service.deleteLesson(item.id);
-            void runMutation(work, {
-              success: threadMemory ? "Đã xoá ghi chú." : "Đã xoá bài học.",
-              scope: threadMemory ? "thread" : "lessons",
+            void runMutation(() => service.deleteLesson(item.id), {
+              success: "Đã xoá bài học.",
+              scope: "lessons",
               dialog,
             });
           },
@@ -704,10 +826,13 @@ export function createMemoryPage({
       }
 
       const loadCurrent = () => state.tab === "threads" ? loadOverview() : loadLessons();
+      const threadActions = createThreadMemoryActions({
+        state, service, openDialog, runMutation, announce,
+      });
       const actions = {
         add(opener) {
           if (state.pending) return;
-          if (state.tab === "threads") openThreadEditor(null, opener);
+          if (state.tab === "threads") threadActions.addThread(opener);
           else openLessonEditor(null, opener);
         },
         tab(tab) {
@@ -752,27 +877,12 @@ export function createMemoryPage({
           state.error = null;
           void loadDetail(state.selectedThreadID, selectedUID);
         },
-        editThread(memory, opener) {
-          if (!state.pending) openThreadEditor(memory, opener);
-        },
-        deleteThread(memory, opener) {
-          if (!state.pending) openDeleteDialog("thread", memory, opener);
-        },
-        pinThread(memory) {
-          const body = { text: memory.text.trim(), pinned: !memory.pinned };
-          void runMutation(
-            () => service.updateThread(state.selectedThreadID, memory.id, body),
-            {
-              success: memory.pinned ? "Đã bỏ ghim ghi chú." : "Đã ghim ghi chú.",
-              scope: "thread",
-            },
-          );
-        },
+        ...threadActions,
         editLesson(lesson, opener) {
           if (!state.pending) openLessonEditor(lesson, opener);
         },
         deleteLesson(lesson, opener) {
-          if (!state.pending) openDeleteDialog("lessons", lesson, opener);
+          if (!state.pending) openLessonDeleteDialog(lesson, opener);
         },
         pinLesson(lesson) {
           const body = {

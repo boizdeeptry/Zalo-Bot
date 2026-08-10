@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { AppAPIError } from "../overlay/internal/webui/static/core/api.js";
 import {
   createMemoryPage,
   createMemoryService,
@@ -376,7 +377,10 @@ test("memory thread edit sends trimmed content then refreshes detail", async (t)
   await flush();
 
   const update = calls.find(({ path, options }) => path === "/memory/threads/thread-a/7" && options.method === "PUT");
-  assert.deepEqual(update.options.body, { text: "nhận hàng sau 9 giờ", pinned: true });
+  assert.deepEqual(update.options.body, {
+    uid: "thread-a", expected_revision: 4,
+    memory_key: "profile.delivery", text: "nhận hàng sau 9 giờ", category: "preference", pinned: true,
+  });
   assert.ok(update.options.signal instanceof AbortSignal);
   assert.ok(calls.filter(({ path, options }) => path === "/memory/threads/thread-a" && !options.method).length >= 2);
   assert.match(text(find(main, (node) => hasClass(node, "memory-live"))), /Đã lưu ghi chú/);
@@ -477,7 +481,10 @@ test("memory delete is confirmed and dialog supports keyboard focus lifecycle", 
   await flush();
   assert.equal(calls.filter(({ options }) => options.method === "DELETE").length, 1);
   assert.equal(calls.find(({ options }) => options.method === "DELETE").path, "/memory/threads/thread-a/7");
-  assert.equal(document.activeElement, opener);
+  const restoredDelete = find(main, (node) => node.tagName === "BUTTON" && text(node) === "Xoá" &&
+    node.getAttribute("data-memory-row-id") === "7");
+  assert.equal(document.activeElement, restoredDelete);
+  assert.notEqual(document.activeElement, opener);
   assert.match(text(find(main, (node) => hasClass(node, "memory-live"))), /Đã xoá ghi chú/);
 });
 
@@ -489,7 +496,11 @@ test("memory pin failure keeps rendered data and announces the API message", asy
     request: async (path, options = {}) => {
       if (path === "/memory") return overviewFixture();
       if (path === "/memory/threads/thread-a/6" && options.method === "PUT") {
-        throw new Error("đã đạt giới hạn nội dung được ghim");
+        throw new AppAPIError({
+          status: 409,
+          code: "memory_pin_limit",
+          message: "đã đạt giới hạn nội dung được ghim",
+        });
       }
       if (path === "/memory/threads/thread-a") return detailFixture();
       throw new Error(`Unexpected request: ${path}`);
@@ -541,7 +552,8 @@ test("memory keeps the last detail visible when post-mutation refresh fails", as
   await flush();
 
   assert.match(text(main), /Ưu tiên trả lời ngắn/);
-  assert.match(text(main), /không thể làm mới chi tiết/);
+  assert.match(text(main), /Không thể đọc Memory\. Vui lòng thử lại\./);
+  assert.doesNotMatch(text(main), /không thể làm mới chi tiết/);
 });
 
 test("memory dispose aborts a pending mutation and ignores its late result", async (t) => {
