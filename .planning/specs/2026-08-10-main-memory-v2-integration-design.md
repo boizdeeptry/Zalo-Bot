@@ -2,7 +2,7 @@
 
 **Ngày:** 2026-08-10
 
-**Trạng thái:** Chờ người dùng xác nhận spec; hướng thiết kế đã được duyệt qua báo cáo merge ngày 2026-08-10
+**Trạng thái:** Đã được người dùng xác nhận ngày 2026-08-10; triển khai theo TDD
 
 **Repository:** `D:\TuvanZalo\_build\.worktrees\portal-m1`
 
