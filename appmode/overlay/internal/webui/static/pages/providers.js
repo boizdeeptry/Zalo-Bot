@@ -87,7 +87,9 @@ function galleryStatus(entry, byKind) {
     if (accounts.length) {
       return { cls: "on", label: accounts.length > 1 ? `Đã kết nối · ${accounts.length} tài khoản` : "Đã kết nối" };
     }
-    if (p.system) return { cls: "on", label: "Sẵn sàng" }; // claude-code: lưới mặc định của máy, vẫn trả lời được
+    // KHÔNG có nhánh p.system "Sẵn sàng" ở đây: dưới no-default, một claude-code hệ thống mà 0 account
+    // đăng nhập KHÔNG trả lời được — nó im. "Đã nối" = có account bật (cùng luật hasAnyConnectedProvider
+    // bên Go), nên 0 account = "Chưa kết nối", không phải một nhãn xanh gây hiểu nhầm.
     return { cls: "off", label: "Chưa kết nối" };
   }
   if (p.last_check_status === "ok") return { cls: "on", label: "Đã kết nối" };
@@ -273,6 +275,9 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
 
       const byKindFrom = (providers) => new Map(providers.map((p) => [normalizeKind(p.kind), p]));
       let lastProviders = [];
+      // Mặc định true để KHÔNG nháy banner trước lượt fetch đầu; refresh() ghi đè bằng giá trị thật.
+      // Chỉ hiện banner khi backend nói HẲN false (thiếu trường = backend cũ = không kết luận "chưa nối").
+      let hasConnectedProvider = true;
       let query = "";
       const searchBox = element("input", { className: "pv-search-input",
         attributes: { type: "search", placeholder: "Tìm provider…", "aria-label": "Tìm provider" },
@@ -361,10 +366,10 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
           return;
         }
         if (connect.phase === "error" || connect.phase === "canceled") {
-          // Claude installs natively (not via npm), so the backend can't auto-install it and an
-          // install-step failure comes back as a generic error. Point the user at the download page
-          // on any claude-code connect error — install-missing is the likeliest early failure and
-          // the hint is harmless otherwise.
+          // Claude Code installs via npm now (Tasks 4–5), but a connect can still fail before/during
+          // install (npm missing, network, bad login) and surface a generic error. Point the user at
+          // the download page on any claude-code connect error — install trouble is the likeliest
+          // early failure and the hint is harmless otherwise.
           const installHint = connect.kind === "claude-code" && connect.phase === "error"
             ? element("div", { className: "pv-connect-hint" },
                 element("span", { text: "Chưa cài Claude Code? Tải tại " }),
@@ -443,6 +448,17 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
         isSubscription ? safeTag() : null,
         testAllButton(groupEntries, byKind, service, refresh));
 
+      // noProviderBanner cảnh báo người trực: chưa nối gì thì bot IM với khách (không có Claude mặc
+      // định để rơi về). null khi đã có ít nhất một provider nối — element()/replaceChildren bỏ qua null.
+      function noProviderBanner() {
+        if (hasConnectedProvider) return null;
+        return element("div", {
+          className: "pv-no-provider",
+          attributes: { "data-no-provider-warning": "true", role: "status" },
+          text: "Chưa kết nối provider nào — bot sẽ IM LẶNG với người nhắn. Hãy Connect một provider.",
+        });
+      }
+
       function galleryNode() {
         const filtered = query
           ? PROVIDER_CATALOG.filter((e) => e.name.toLowerCase().includes(query))
@@ -477,7 +493,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
           view = "gallery";
         }
         paintGallery();
-        root.replaceChildren(header(), toolbar(), searchBar(), gallerySlot);
+        root.replaceChildren(header(), noProviderBanner(), toolbar(), searchBar(), gallerySlot);
       }
 
       const toolbar = () => element("div", { className: "row" },
@@ -504,6 +520,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
           const providers = Array.isArray(data?.providers) ? data.providers : [];
           live.textContent = "";
           lastProviders = providers;
+          hasConnectedProvider = data?.hasConnectedProvider !== false;
           paint();
         } catch (error) {
           if (disposed || revision !== listRevision || error?.name === "AbortError") return;

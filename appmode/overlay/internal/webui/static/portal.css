@@ -161,6 +161,12 @@
   box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:9px;
   padding:8px 12px; color:var(--ink); background:var(--sunk); font-size:13px;
 }
+/* Banner cảnh báo "chưa nối provider nào": tông hổ phách/cảnh báo như pv-risk-badge — chưa nối gì
+   thì bot IM với khách, người trực phải thấy ngay. */
+.providers-page .pv-no-provider {
+  border:1px solid rgba(245,180,90,.34); background:rgba(245,180,90,.10); color:#f0c07a;
+  border-radius:10px; padding:12px 15px; margin:0 0 16px; font-size:13px; font-weight:500;
+}
 .providers-page .pv-gallery { display:flex; flex-direction:column; gap:6px; }
 .providers-page .pv-group { margin:0 0 26px; }
 .providers-page .pv-group-head { display:flex; align-items:center; gap:12px; margin:0 0 12px; flex-wrap:wrap; }

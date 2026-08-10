@@ -58,12 +58,18 @@ test("the subscription group carries the green official-CLI safety badge, never 
   }
 });
 
-test("an added provider shows connected-ish status, an unlisted one shows not connected", async (t) => {
+test("a system subscription provider with no connected account shows 'Chưa kết nối', never 'Sẵn sàng'", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();
   const claude = cards(main).find((c) => cardName(c) === "Claude Code");
   const codex = cards(main).find((c) => cardName(c) === "OpenAI Codex");
-  assert.ok(hasClass(find(claude, (n) => hasClass(n, "pv-status")), "on"));
+  const claudeStatus = find(claude, (n) => hasClass(n, "pv-status"));
+  // Dưới no-default, claude-code hệ thống mà 0 account KHÔNG trả lời được → phải "Chưa kết nối"/xám,
+  // KHÔNG phải nhãn xanh "Sẵn sàng" gây hiểu nhầm. ("Đã nối" = có account bật, xem test kế trên.)
+  assert.ok(hasClass(claudeStatus, "off"), "system claude-code with no account is not connected");
+  assert.match(text(claudeStatus), /Chưa kết nối/);
+  assert.ok(!text(claudeStatus).includes("Sẵn sàng"), "no misleading 'Sẵn sàng' label under no-default");
+  // Một kind subscription không nằm trong danh sách cũng "Chưa kết nối".
   assert.ok(hasClass(find(codex, (n) => hasClass(n, "pv-status")), "off"));
   assert.match(text(codex), /Chưa kết nối/);
 });
@@ -76,6 +82,26 @@ test("a subscription provider with a connected account shows Đã kết nối, n
   // codex-proxy có 0 credential nhưng CÓ account → phải "Đã kết nối" (không rơi về "Chưa kết nối").
   assert.ok(hasClass(status, "on"), "codex with an enabled account must read as connected");
   assert.match(text(status), /Đã kết nối/);
+});
+
+test("banner cảnh báo hiện khi 0 provider connected", async (t) => {
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [], hasConnectedProvider: false };
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  const banner = find(main, (n) => n.hasAttribute?.("data-no-provider-warning"));
+  assert.ok(banner, "phải có banner khi 0 provider connected");
+  assert.match(text(banner), /im lặng|chưa kết nối/i);
+});
+
+test("banner ẩn khi có provider connected", async (t) => {
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return { providers: [CODEX_CONNECTED], kinds: [], hasConnectedProvider: true };
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  assert.equal(find(main, (n) => n.hasAttribute?.("data-no-provider-warning")), null);
 });
 
 test("typing in the search box filters cards by name", async (t) => {
@@ -272,8 +298,9 @@ test("claude connect (polling) renders the login link but no device-code block",
   assert.equal(find(main, (n) => hasClass(n, "pv-connect-code-value")), null, "claude has no device-auth code block");
 });
 
-// Claude can't be auto-installed (native install, not npm), so an install-step failure surfaces a
-// generic error. The claude connect error panel must point the user at claude.com/claude-code.
+// Claude Code installs via npm now (Tasks 4–5), but a connect can still fail before/during install
+// (npm missing, network, bad login). On any claude connect error the panel must still point the
+// user at claude.com/claude-code.
 test("claude connect failure points the user at claude.com/claude-code", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };

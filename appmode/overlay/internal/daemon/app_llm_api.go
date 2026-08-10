@@ -34,7 +34,13 @@ func (a *api) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
 		}
 		out = append(out, body)
 	}
-	a.writeJSON(w, http.StatusOK, map[string]any{"providers": out, "kinds": llmProviderKinds})
+	// hasConnectedProvider để Portal cảnh báo khi CHƯA nối gì — cùng cửa hasAnyConnectedProvider mà
+	// router dùng để quyết bot có im hay không, nên banner nói đúng thứ khách sẽ gặp: 0 nối = im lặng.
+	a.writeJSON(w, http.StatusOK, map[string]any{
+		"providers":            out,
+		"kinds":                llmProviderKinds,
+		"hasConnectedProvider": a.hasAnyConnectedProvider(),
+	})
 }
 
 type llmProviderCreateRequest struct {
