@@ -16,6 +16,11 @@ var ErrLLMComboProtected = errors.New("llm combo: không xoá được combo đa
 // đối xứng ErrLLMRouteConflict.
 var ErrLLMComboConflict = errors.New("llm combo revision conflict")
 
+// errNoActiveCombo: không có combo nào đang active. §7 bỏ combo mặc định nên máy mới rơi vào đúng
+// trạng thái này — LLMRoute dịch nó thành snapshot RỖNG (không lỗi) để bot im như "chưa cấu hình",
+// còn ReplaceLLMRoute vẫn để nó nổi lên (không có combo để ghi members vào là lỗi thật của caller).
+var errNoActiveCombo = errors.New("active combo: không có combo nào đang active")
+
 // LLMCombo là một chiến lược định tuyến có tên: một chuỗi mắt xích (Members) chạy theo type.
 type LLMCombo struct {
 	ID, Name, Type string
@@ -80,14 +85,15 @@ func (s *Store) comboMembers(comboID string) ([]LLMRouteEntry, error) {
 	return entries, nil
 }
 
-// activeCombo trả (id, type, revision) của combo đang active. Luôn có đúng một (seed default,
-// SetActive giữ bất biến), nên không tìm thấy là database hỏng — trả lỗi, KHÔNG bịa mặc định.
+// activeCombo trả (id, type, revision) của combo đang active. §7: máy mới KHÔNG còn combo mặc định,
+// nên "không có combo active" là trạng thái HỢP LỆ của máy chưa cấu hình — trả errNoActiveCombo để
+// caller tự quyết (LLMRoute → snapshot rỗng, ReplaceLLMRoute → lỗi). KHÔNG bịa mặc định ở đây.
 func (s *Store) activeCombo() (id, typ string, revision int64, err error) {
 	err = s.db.QueryRow(
 		`SELECT id, type, revision FROM llm_combos WHERE active = 1 LIMIT 1`).Scan(&id, &typ, &revision)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", "", 0, fmt.Errorf("active combo: không có combo nào đang active")
+			return "", "", 0, errNoActiveCombo
 		}
 		return "", "", 0, fmt.Errorf("active combo: %w", err)
 	}

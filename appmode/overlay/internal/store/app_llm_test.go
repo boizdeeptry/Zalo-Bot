@@ -32,6 +32,17 @@ func addAPIProvider(t *testing.T, st *Store, id, modelID string, enabled bool) {
 	}
 }
 
+// seedDefaultCombo dựng lại combo 'default' active mà §7 đã bỏ khỏi migration. Các test còn giả
+// định có sẵn một combo active (revision 1) — để ghi route/members vào — gọi nó ngay sau
+// newLLMStore. Test nào cần trạng thái máy-mới-RỖNG thì KHÔNG gọi (xem TestFreshStoreHasNoDefaultCombo).
+func seedDefaultCombo(t *testing.T, st *Store) {
+	t.Helper()
+	if _, err := st.db.Exec(
+		`INSERT INTO llm_combos(id, name, type, active, revision) VALUES('default','Mặc định','fallback',1,1)`); err != nil {
+		t.Fatalf("seed default combo: %v", err)
+	}
+}
+
 // addClaudeModel ghim một model cho Provider hệ thống để chuỗi route kết thúc hợp lệ.
 func addClaudeModel(t *testing.T, st *Store, modelID string) {
 	t.Helper()
@@ -118,6 +129,7 @@ func TestLLMModelsUpsertAndReplaceBySource(t *testing.T) {
 
 func TestLLMRouteStartsEmptyAtRevisionOne(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 
 	snap, err := st.LLMRoute()
 	if err != nil {
@@ -129,7 +141,7 @@ func TestLLMRouteStartsEmptyAtRevisionOne(t *testing.T) {
 	if len(snap.Entries) != 0 {
 		t.Errorf("LLMRoute().Entries = %v; want empty", snap.Entries)
 	}
-	// Route giờ phân giải combo active: máy mới có combo 'default' fallback đang active.
+	// Route phân giải combo active: seedDefaultCombo dựng combo 'default' fallback rỗng ở revision 1.
 	if snap.Type != "fallback" || snap.ComboID != "default" {
 		t.Errorf("LLMRoute() type/combo = %q/%q; want fallback/default", snap.Type, snap.ComboID)
 	}
@@ -137,6 +149,7 @@ func TestLLMRouteStartsEmptyAtRevisionOne(t *testing.T) {
 
 func TestLLMRouteReplaceIsCompareAndSwap(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
 	addClaudeModel(t, st, "sonnet")
 
@@ -191,6 +204,7 @@ func routeRevision(t *testing.T, st *Store) int64 {
 // claude-code cuối), chuỗi rỗng là hợp lệ (onboarding máy mới) — nhưng mắt xích cuối TẮT vẫn bị từ chối.
 func TestRouteNoLongerRequiresClaudeCodeLast(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 	// Chuỗi chỉ có codex, không có claude-code — trước đây bị từ chối, giờ hợp lệ.
 	addAPIProvider(t, st, "codex", "gpt-5.4", true)
 	if _, err := st.ReplaceLLMRoute(routeRevision(t, st), []LLMRouteEntry{
@@ -241,6 +255,7 @@ func TestLLMRouteRejectsInvalidChains(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newLLMStore(t)
+			seedDefaultCombo(t, st)
 			addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
 			addAPIProvider(t, st, "openai-off", "gpt-5-mini", false)
 			addClaudeModel(t, st, "sonnet")
@@ -264,6 +279,7 @@ func TestLLMRouteRejectsInvalidChains(t *testing.T) {
 
 func TestLLMDeleteProviderBlockedWhileRouted(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
 	addClaudeModel(t, st, "sonnet")
 
@@ -294,6 +310,7 @@ func TestLLMDeleteProviderBlockedWhileRouted(t *testing.T) {
 
 func TestLLMRouteSnapshotIsIndependentCopy(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
 	addClaudeModel(t, st, "sonnet")
 

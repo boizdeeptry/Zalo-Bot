@@ -934,6 +934,7 @@ func TestLLMAPIDeleteRemovesAnUnroutedProviderWithItsKeyAndModels(t *testing.T) 
 
 func TestLLMAPIDeleteRejectsAProviderTheRouteUses(t *testing.T) {
 	h := newLLMAPIHarness(t)
+	ensureActiveCombo(t, h.st) // §7: máy mới không còn combo mặc định để PUT /llm/route ghi vào
 	id := h.createProvider("openai", "OpenAI", llmAPIKey)
 	h.mustStatus(h.do(http.MethodPost, "/llm/providers/"+id+"/models", `{"model_id":"gpt-4o"}`),
 		http.StatusCreated, "add model")
@@ -1080,6 +1081,7 @@ func TestLLMAPIDeleteAccountWrongProviderIs404(t *testing.T) {
 
 func TestLLMAPIRouteConflictReturns409(t *testing.T) {
 	h := newLLMAPIHarness(t)
+	ensureActiveCombo(t, h.st) // §7: máy mới không còn combo mặc định để PUT /llm/route ghi vào
 	h.seedClaudeModel("haiku")
 	current := h.mustStatus(h.do(http.MethodGet, "/llm/route", ""), http.StatusOK, "read route")
 	revision := llmAPIRouteRevision(t, current)

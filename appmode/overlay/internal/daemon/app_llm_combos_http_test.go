@@ -67,45 +67,67 @@ func seedComboAPIProvider(t *testing.T, a *api, id, modelID string) {
 	}
 }
 
+// createCombo POST /llm/combos rồi trả comboBody đã tạo (200 mong đợi).
+func createCombo(t *testing.T, a *api, body string) comboBody {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/llm/combos", strings.NewReader(body))
+	a.handleLLMComboCreate(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /llm/combos %s = %d; want 200 (body=%s)", body, rec.Code, rec.Body)
+	}
+	assertNoConfigLeak(t, rec.Body.Bytes())
+	var c comboBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &c); err != nil {
+		t.Fatalf("decode create response: %v (body=%s)", err, rec.Body)
+	}
+	return c
+}
+
+// activateCombo POST /llm/combos/{id}/activate (200 mong đợi).
+func activateCombo(t *testing.T, a *api, id string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/llm/combos/"+id+"/activate", nil)
+	req.SetPathValue("id", id)
+	a.handleLLMComboActivate(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST activate %s = %d; want 200 (body=%s)", id, rec.Code, rec.Body)
+	}
+}
+
 func TestComboEndpoints(t *testing.T) {
 	a := newAppRouteAPI(t)
 
-	// GET: combo default được gieo sẵn (active, fallback).
-	combos := getCombos(t, a)
-	if len(combos) != 1 {
-		t.Fatalf("initial combos = %d; want 1 (seeded default)", len(combos))
-	}
-	if def := combos[0]; def.ID != "default" || def.Type != "fallback" || !def.Active {
-		t.Fatalf("default combo = %+v; want id=default type=fallback active=true", def)
+	// §7: máy mới ship RỖNG — chưa có combo nào.
+	if combos := getCombos(t, a); len(combos) != 0 {
+		t.Fatalf("initial combos = %d; want 0 (§7: no seeded default)", len(combos))
 	}
 
-	// DELETE combo default: đang active VÀ là combo cuối → 409 COMBO_PROTECTED.
+	// Tạo combo đầu tiên rồi activate → nó active VÀ là combo cuối.
+	first := createCombo(t, a, `{"name":"Mặc định","type":"fallback"}`)
+	if first.Active {
+		t.Error("combo đầu tiên active=true; want inactive (chỉ activate qua endpoint)")
+	}
+	activateCombo(t, a, first.ID)
+
+	// DELETE combo đang active VÀ là combo cuối → 409 COMBO_PROTECTED.
 	recDel := httptest.NewRecorder()
-	reqDel := httptest.NewRequest("DELETE", "/llm/combos/default", nil)
-	reqDel.SetPathValue("id", "default")
+	reqDel := httptest.NewRequest("DELETE", "/llm/combos/"+first.ID, nil)
+	reqDel.SetPathValue("id", first.ID)
 	a.handleLLMComboDelete(recDel, reqDel)
 	if recDel.Code != http.StatusConflict {
-		t.Fatalf("DELETE /llm/combos/default = %d; want 409", recDel.Code)
+		t.Fatalf("DELETE combo active+cuối = %d; want 409", recDel.Code)
 	}
 	if code := errCode(t, recDel.Body.Bytes()); code != "COMBO_PROTECTED" {
 		t.Errorf("delete-protected code = %q; want COMBO_PROTECTED", code)
 	}
 	assertNoConfigLeak(t, recDel.Body.Bytes())
 
-	// POST create {name,type:round_robin} → 200, id mới, inactive.
-	recNew := httptest.NewRecorder()
-	reqNew := httptest.NewRequest("POST", "/llm/combos", strings.NewReader(`{"name":"Xoay vòng","type":"round_robin"}`))
-	a.handleLLMComboCreate(recNew, reqNew)
-	if recNew.Code != http.StatusOK {
-		t.Fatalf("POST /llm/combos = %d; want 200 (body=%s)", recNew.Code, recNew.Body)
-	}
-	assertNoConfigLeak(t, recNew.Body.Bytes())
-	var created comboBody
-	if err := json.Unmarshal(recNew.Body.Bytes(), &created); err != nil {
-		t.Fatalf("decode create response: %v", err)
-	}
-	if created.ID == "" || created.ID == "default" {
-		t.Fatalf("created id = %q; want a fresh non-default id", created.ID)
+	// POST create combo thứ 2 {name,type:round_robin} → 200, id mới khác, inactive.
+	created := createCombo(t, a, `{"name":"Xoay vòng","type":"round_robin"}`)
+	if created.ID == "" || created.ID == first.ID {
+		t.Fatalf("created id = %q; want a fresh id khác combo đầu", created.ID)
 	}
 	if created.Active {
 		t.Error("created combo active=true; want inactive")
@@ -114,23 +136,17 @@ func TestComboEndpoints(t *testing.T) {
 		t.Errorf("created type = %q; want round_robin", created.Type)
 	}
 
-	// POST activate combo mới → 200; con trỏ active phải xoay sang nó.
-	recAct := httptest.NewRecorder()
-	reqAct := httptest.NewRequest("POST", "/llm/combos/"+created.ID+"/activate", nil)
-	reqAct.SetPathValue("id", created.ID)
-	a.handleLLMComboActivate(recAct, reqAct)
-	if recAct.Code != http.StatusOK {
-		t.Fatalf("POST activate = %d; want 200 (body=%s)", recAct.Code, recAct.Body)
-	}
+	// activate combo thứ 2 → con trỏ active phải xoay sang nó, combo đầu tắt.
+	activateCombo(t, a, created.ID)
 	for _, c := range getCombos(t, a) {
 		switch c.ID {
 		case created.ID:
 			if !c.Active {
 				t.Error("sau activate: combo mới không active")
 			}
-		case "default":
+		case first.ID:
 			if c.Active {
-				t.Error("sau activate: default vẫn active")
+				t.Error("sau activate: combo đầu vẫn active")
 			}
 		}
 	}

@@ -1231,9 +1231,31 @@ func saveClaudeRoute(t *testing.T, a *api, model string) {
 	saveRoute(t, a, store.LLMRouteEntry{ProviderID: "claude-code", ModelID: model, Enabled: true})
 }
 
+// ensureActiveCombo dựng+kích hoạt một combo nếu chưa có combo active nào. §7 bỏ combo mặc định
+// khỏi migration, nên máy mới RỖNG — mà ReplaceLLMRoute/PUT /llm/route ghi vào combo ĐANG ACTIVE,
+// nên các test đường route cần một combo để ghi vào. Idempotent: gọi nhiều lần chỉ dựng một cái.
+func ensureActiveCombo(t *testing.T, st *store.Store) {
+	t.Helper()
+	snap, err := st.LLMRoute()
+	if err != nil {
+		t.Fatalf("LLMRoute() = _, %v; want nil", err)
+	}
+	if snap.ComboID != "" {
+		return // đã có combo active
+	}
+	c, err := st.CreateLLMCombo("Mặc định", "fallback")
+	if err != nil {
+		t.Fatalf("CreateLLMCombo = _, %v; want nil", err)
+	}
+	if err := st.SetActiveLLMCombo(c.ID); err != nil {
+		t.Fatalf("SetActiveLLMCombo(%q) = %v; want nil", c.ID, err)
+	}
+}
+
 // saveRoute lưu một chuỗi bất kỳ, giả định model của từng mắt xích đã có sẵn.
 func saveRoute(t *testing.T, a *api, entries ...store.LLMRouteEntry) {
 	t.Helper()
+	ensureActiveCombo(t, a.st) // §7: máy mới không còn combo mặc định để ghi route vào
 	snapshot, err := a.st.LLMRoute()
 	if err != nil {
 		t.Fatalf("LLMRoute() = _, %v; want nil", err)

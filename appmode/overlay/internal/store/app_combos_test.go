@@ -5,11 +5,32 @@ import (
 	"testing"
 )
 
-// newLLMStore (app_llm_test.go) mở qua Open(":memory:") nên đã chạy migrateApp — migration
-// gieo combo 'default' active=1. Dùng lại nó thay vì dựng thêm một constructor thứ hai.
+// newLLMStore (app_llm_test.go) mở qua Open(":memory:") nên đã chạy migrateApp. §7 bỏ gieo combo
+// mặc định, nên store mới RỖNG (0 combo). Test cần một combo active có sẵn gọi seedDefaultCombo.
+
+// §7: máy mới ship RỖNG — 0 combo, không có combo active, LLMRoute trả entries rỗng. Đây là điều
+// kiện để bản cài mới KHÔNG có định tuyến mặc định (router im, §6).
+func TestFreshStoreHasNoDefaultCombo(t *testing.T) {
+	st := newLLMStore(t)
+	combos, err := st.LLMCombos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combos) != 0 {
+		t.Fatalf("fresh store combos = %d; want 0 (no default)", len(combos))
+	}
+	route, err := st.LLMRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(route.Entries) != 0 {
+		t.Fatalf("fresh store route entries = %d; want 0", len(route.Entries))
+	}
+}
 
 func TestCreateComboIsInactiveByDefault(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 	c, err := st.CreateLLMCombo("Xoay vòng", "round_robin")
 	if err != nil {
 		t.Fatalf("CreateLLMCombo = %v", err)
@@ -60,6 +81,7 @@ func TestSetActiveComboFlipsExactlyOne(t *testing.T) {
 
 func TestDeleteComboRefusesActiveAndLast(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 	if err := st.DeleteLLMCombo("default"); !errors.Is(err, ErrLLMComboProtected) {
 		t.Fatalf("delete active = %v; want ErrLLMComboProtected", err)
 	}
@@ -74,6 +96,7 @@ func TestDeleteComboRefusesActiveAndLast(t *testing.T) {
 
 func TestReplaceComboMembersIsCAS(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
 	entries := []LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}
 	saved, err := st.ReplaceLLMComboMembers("default", 1, "round_robin", entries)
@@ -90,6 +113,7 @@ func TestReplaceComboMembersIsCAS(t *testing.T) {
 
 func TestLLMRouteResolvesActiveCombo(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st)
 	addAPIProvider(t, st, "openai-1", "gpt-5-mini", true)
 	if _, err := st.ReplaceLLMComboMembers("default", 1, "round_robin",
 		[]LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}); err != nil {
@@ -129,6 +153,7 @@ func TestDeleteProviderBlockedByInactiveComboMember(t *testing.T) {
 // không chạy — members phải bị xoá tay trong cùng transaction, nếu không sẽ để lại member mồ côi.
 func TestDeleteComboRemovesMembers(t *testing.T) {
 	st := newLLMStore(t)
+	seedDefaultCombo(t, st) // cần combo thứ 2 để 'Xoay vòng' không phải combo cuối (DeleteLLMCombo chặn combo cuối)
 	c, _ := st.CreateLLMCombo("Xoay vòng", "round_robin")
 	// Chèn thẳng một member: API thêm member thuộc task sau, test đi qua db nội bộ (cùng package).
 	if _, err := st.db.Exec(

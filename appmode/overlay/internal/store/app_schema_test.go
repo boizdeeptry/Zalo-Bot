@@ -120,7 +120,9 @@ func TestMigrateAppUnifiesClaudeKind(t *testing.T) {
 	}
 }
 
-func TestMigrateAppSeedsDefaultCombo(t *testing.T) {
+// §7: migration KHÔNG gieo combo mặc định — máy mới ship RỖNG để không có định tuyến mặc định.
+// (Bảng llm_combos vẫn được tạo; chỉ không có hàng nào.)
+func TestMigrateAppSeedsNoDefaultCombo(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -131,14 +133,12 @@ func TestMigrateAppSeedsDefaultCombo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var id, name, typ string
-	var active int
-	if err := db.QueryRow(
-		`SELECT id, name, type, active FROM llm_combos WHERE active = 1`).Scan(&id, &name, &typ, &active); err != nil {
-		t.Fatalf("read active combo: %v", err)
+	var combos int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM llm_combos`).Scan(&combos); err != nil {
+		t.Fatalf("count combos: %v", err)
 	}
-	if id != "default" || typ != "fallback" || active != 1 {
-		t.Errorf("active combo = (%q,%q,%q,%d); want (default,Mặc định,fallback,1)", id, name, typ, active)
+	if combos != 0 {
+		t.Errorf("combos after migration = %d; want 0 (no seeded default)", combos)
 	}
 
 	var version string
@@ -147,33 +147,5 @@ func TestMigrateAppSeedsDefaultCombo(t *testing.T) {
 	}
 	if version != "4" {
 		t.Errorf("schema_version = %q; want 4", version)
-	}
-}
-
-// Lần chạy thứ hai không được gieo đè: INSERT OR IGNORE trượt thì tên combo người dùng đã
-// sửa sẽ bị trả về mặc định mỗi lần mở máy.
-func TestMigrateAppKeepsEditedCombo(t *testing.T) {
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	if err := migrateApp(db); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`UPDATE llm_combos SET name='Của tôi' WHERE id='default'`); err != nil {
-		t.Fatal(err)
-	}
-	if err := migrateApp(db); err != nil { // re-run: INSERT OR IGNORE must not clobber
-		t.Fatalf("re-migrate: %v", err)
-	}
-
-	var name string
-	if err := db.QueryRow(`SELECT name FROM llm_combos WHERE id='default'`).Scan(&name); err != nil {
-		t.Fatal(err)
-	}
-	if name != "Của tôi" {
-		t.Errorf("combo name after re-migration = %q; want unchanged 'Của tôi'", name)
 	}
 }

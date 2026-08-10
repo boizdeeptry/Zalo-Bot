@@ -453,6 +453,11 @@ func (s *Store) DeleteLLMAccount(id string) error {
 // tới lượt sau — đó là điều kiện để router coi snapshot là bất biến trong suốt một lượt.
 func (s *Store) LLMRoute() (LLMRouteSnapshot, error) {
 	id, typ, revision, err := s.activeCombo()
+	if errors.Is(err, errNoActiveCombo) {
+		// §7: máy mới chưa tạo combo nào → route RỖNG là hợp lệ (không lỗi). Router coi snapshot
+		// rỗng là "chưa cấu hình" và im (§6), không rơi về Claude mặc định.
+		return LLMRouteSnapshot{}, nil
+	}
 	if err != nil {
 		return LLMRouteSnapshot{}, err
 	}

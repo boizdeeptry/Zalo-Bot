@@ -93,9 +93,10 @@ INSERT OR IGNORE INTO llm_providers(id, name, kind, enabled, system_provider)
 VALUES ('claude-code', 'Claude Code', 'claude-code', 1, 1);
 INSERT OR IGNORE INTO app_meta(key, value) VALUES ('llm_route_revision', '1');
 
--- Combos: chiến lược định tuyến có tên. ĐÚNG một hàng active = 1 (bất biến giữ ở tầng app
--- trong inLLMTx, giống CAS của ReplaceLLMRoute — partial-unique của SQLite mong manh qua
--- lần chạy migration lặp lại nên không đặt ràng buộc DB).
+-- Combos: chiến lược định tuyến có tên. TỐI ĐA một hàng active = 1 — máy mới rỗng (§7 bỏ gieo
+-- combo mặc định để không có định tuyến mặc định); bất biến "không quá một active" giữ ở tầng app
+-- trong inLLMTx, giống CAS của ReplaceLLMRoute — partial-unique của SQLite mong manh qua lần chạy
+-- migration lặp lại nên không đặt ràng buộc DB.
 CREATE TABLE IF NOT EXISTS llm_combos (
   id       TEXT PRIMARY KEY,
   name     TEXT NOT NULL,
@@ -115,8 +116,9 @@ CREATE TABLE IF NOT EXISTS llm_combo_members (
   PRIMARY KEY (combo_id, position)
 );
 
--- OR IGNORE: migration chạy mỗi lần mở database; gieo đè sẽ trả tên combo về mặc định.
-INSERT OR IGNORE INTO llm_combos(id, name, type, active) VALUES ('default', 'Mặc định', 'fallback', 1);
+-- §7: KHÔNG gieo combo mặc định. Máy mới ship RỖNG (0 combo, không có active) nên không có định
+-- tuyến mặc định — router im cho tới khi người dùng tự tạo+kích hoạt combo qua Portal. Máy đã cài
+-- từ trước vẫn giữ combo 'default' rỗng của mình; nó vô hại (route rỗng → router im, xem §6).
 
 -- Đường nâng cấp: máy đã cài trước khi hợp nhất có hàng claude-code với kind='claude_code'
 -- (gạch dưới). INSERT OR IGNORE ở trên không đụng hàng đã có, nên sửa riêng ở đây. WHERE
