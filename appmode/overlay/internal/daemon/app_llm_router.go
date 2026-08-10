@@ -573,8 +573,8 @@ func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, has
 	}
 	adapters, disabled, err := a.appLLMAdapters()
 	if err != nil {
-		a.logger.Error("llm route: không dựng được adapter, lượt này đi thẳng Claude Code", "err", err)
-		return base
+		a.logger.Error("llm route: không dựng được adapter, lỗi, bot im", "err", err)
+		return silentZaloRunner{}
 	}
 	return newAppLLMRunner(appLLMRunnerConfig{
 		Store:      a.st,
