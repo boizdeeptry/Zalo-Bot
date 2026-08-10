@@ -1,10 +1,26 @@
 # Planning state
 
-step: done
-current_topic:
-current_spec:
+step: research
+current_topic: no-default-claude-npm
+current_spec: .planning/specs/2026-08-10-no-default-claude-npm-design.md
 current_plan:
 last_updated: 2026-08-10
+
+## Đang làm: No-default provider + Claude auto-install qua npm bundled (spec DUYỆT → /plan)
+
+Nhánh dự kiến off `main` (`43859e4`). Spec `.planning/specs/2026-08-10-no-default-claude-npm-design.md` DUYỆT.
+- **Phần 1** bỏ default: cổng "có provider chạy được không" ở overlay TRƯỚC lượt → chưa cấu hình = IM (đường
+  như `ZaloManual`, KHÔNG escalate); `appZaloRunner`/`appClaudeRunner` im thay vì rơi `base`; bỏ seed combo
+  mặc định; Claude mất đặc quyền mắt-xích-cuối.
+- **Phần 2** Claude npm (cơ chế B = node+binJS, khớp codex): descriptor claude-code → `@anthropic-ai/claude-code`
+  +`binJS`; `install()` cho phép claude (npm bundled → `data\cli`); base `execZaloRunner` nhận
+  `zc.Program`/`ProgramPrefixArgs` **opt-in** (rỗng = LookPath cũ → standalone KHÔNG đổi = ràng buộc tương thích ngược).
+- **Phần 3** Portal banner "chưa có provider — bot im lặng".
+- **User chốt lúc /discuss**: KHÔNG default nào; chưa kết nối → IM + Portal cảnh báo (không handoff); Claude
+  on-demand install (không pre-bundle); cơ chế B.
+- **Capture-first (chặn sớm)**: tên npm + node entry thật của Claude Code; `node cli.js auth login`/`-p
+  --add-dir`/stream-json/`CLAUDE_CONFIG_DIR` y hệt native (checkpoint như CC login); định vị seam dispatch
+  cho cổng im. RỦI RO: nếu Claude Code không còn npm entry headless → B bất khả, quay lại pre-bundle/cài-tay.
 
 ## SHIPPED 2026-08-10 → main (`43859e4`) — Combos 9Router UI + Codex PROXY pivot + OAuth connect
 
