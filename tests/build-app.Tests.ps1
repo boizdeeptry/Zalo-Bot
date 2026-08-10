@@ -92,6 +92,32 @@ function Assert-PackageRejectsCanarySafely {
   }
 }
 
+function Assert-PackageRejectsMissingSignatureSafely {
+  param(
+    [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][string]$BinaryContent,
+    [Parameter(Mandatory)][string]$Label,
+    [Parameter(Mandatory)][string]$Canary
+  )
+
+  $binary = Join-Path $Root 'app\agentdc.exe'
+  Write-TestFile -Path $binary -Content "$BinaryContent $Canary`n"
+  try {
+    Assert-AppPackage -Out $Root | Out-Null
+  } catch {
+    $errorMessage = $_.Exception.Message
+    if ($errorMessage.Contains($Canary)) {
+      throw "Package signature scan leaked canary content for $Label"
+    }
+    if ($errorMessage -ne "package binary missing $Label") {
+      throw "Package missing $Label returned an unexpected error"
+    }
+    return
+  }
+
+  throw "Package missing $Label was accepted"
+}
+
 function Get-SeamTargetHashes {
   param([Parameter(Mandatory)][string]$Stage)
 
@@ -288,6 +314,8 @@ try {
 }
 
 $cleanRepoRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-clean-source-' + [guid]::NewGuid().ToString('N'))
+$cleanOverlayRoot = Join-Path ([IO.Path]::GetTempPath()) ('portal-clean-overlay-' + [guid]::NewGuid().ToString('N'))
+$dirtyOverlayStage = Join-Path ([IO.Path]::GetTempPath()) ('portal-dirty-overlay-stage-' + [guid]::NewGuid().ToString('N'))
 
 try {
   New-Item -ItemType Directory -Force -Path $cleanRepoRoot | Out-Null
@@ -300,14 +328,31 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Could not commit the clean-source fixture' }
 
   Assert-CleanGitSource -Repo $cleanRepoRoot | Out-Null
+
+  New-Item -ItemType Directory -Force -Path $cleanOverlayRoot | Out-Null
+  & git -C $cleanOverlayRoot init --quiet
+  & git -C $cleanOverlayRoot config user.name 'Portal Test'
+  & git -C $cleanOverlayRoot config user.email 'portal-test@example.invalid'
+  Write-TestFile (Join-Path $cleanOverlayRoot 'overlay.txt') "committed overlay`n"
+  & git -C $cleanOverlayRoot add -- 'overlay.txt'
+  & git -C $cleanOverlayRoot commit --quiet -m 'fixture'
+  if ($LASTEXITCODE -ne 0) { throw 'Could not commit the clean-overlay fixture' }
+  Write-TestFile (Join-Path $cleanOverlayRoot 'overlay.txt') "working-tree overlay edit`n"
+  Assert-ThrowsLike -Action {
+    New-AppStage -Repo $cleanRepoRoot -Overlay $cleanOverlayRoot -StageRoot $dirtyOverlayStage
+  } -Pattern 'overlay.*không sạch|overlay.*not clean' `
+    -Message 'A dirty overlay worktree was accepted'
+
   Write-TestFile (Join-Path $cleanRepoRoot 'tracked.txt') "working-tree edit`n"
   Assert-ThrowsLike -Action { Assert-CleanGitSource -Repo $cleanRepoRoot } `
     -Pattern 'không sạch|not clean' -Message 'A dirty source repository was accepted'
 
-  Write-Host 'PASS: Assert-CleanGitSource rejects uncommitted source content.'
+  Write-Host 'PASS: source and overlay cleanliness gates reject uncommitted package inputs.'
 } finally {
-  if (Test-Path -LiteralPath $cleanRepoRoot) {
-    Remove-Item -LiteralPath $cleanRepoRoot -Recurse -Force
+  foreach ($path in @($cleanRepoRoot, $cleanOverlayRoot, $dirtyOverlayStage)) {
+    if (Test-Path -LiteralPath $path) {
+      Remove-Item -LiteralPath $path -Recurse -Force
+    }
   }
 }
 
@@ -347,16 +392,27 @@ try {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
   $packageBinary = Join-Path $packageRoot 'app\agentdc.exe'
-  Write-TestFile $packageBinary "fixture /memory/threads/ app_memory_revisions`n"
+  $validPackageBinary = 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions memory_ops /memory/threads/{tid}/{id}/approve'
+  Write-TestFile $packageBinary "$validPackageBinary`n"
   Assert-AppPackage -Out $packageRoot | Out-Null
 
-  Write-TestFile $packageBinary "fixture app_memory_revisions`n"
+  Write-TestFile $packageBinary "fixture app_memory_revisions app_memory_subject_revisions memory_ops`n"
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'Memory API signature' -Message 'A package missing the Memory API signature was accepted'
-  Write-TestFile $packageBinary "fixture /memory/threads/`n"
+  Write-TestFile $packageBinary "fixture /memory/threads/ app_memory_subject_revisions memory_ops /memory/threads/{tid}/{id}/approve`n"
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
     -Pattern 'Memory schema signature' -Message 'A package missing the Memory schema signature was accepted'
-  Write-TestFile $packageBinary "fixture /memory/threads/ app_memory_revisions`n"
+  $memoryV2Canary = 'APP_TEST_MEMORY_V2_SIGNATURE_CANARY_6D40B3'
+  Assert-PackageRejectsMissingSignatureSafely -Root $packageRoot `
+    -BinaryContent 'fixture /memory/threads/ app_memory_revisions memory_ops /memory/threads/{tid}/{id}/approve' `
+    -Label 'Memory V2 schema signature' -Canary $memoryV2Canary
+  Assert-PackageRejectsMissingSignatureSafely -Root $packageRoot `
+    -BinaryContent 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions /memory/threads/{tid}/{id}/approve' `
+    -Label 'Memory V2 prompt contract' -Canary $memoryV2Canary
+  Assert-PackageRejectsMissingSignatureSafely -Root $packageRoot `
+    -BinaryContent 'fixture /memory/threads/ app_memory_revisions app_memory_subject_revisions memory_ops' `
+    -Label 'Memory V2 proposal API' -Canary $memoryV2Canary
+  Write-TestFile $packageBinary "$validPackageBinary`n"
 
   $canaryCases = @(
     @{

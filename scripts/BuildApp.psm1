@@ -154,6 +154,35 @@ function Resolve-PersonaSource {
   return $sourcePath
 }
 
+function Assert-CleanGitOverlay {
+  param(
+    [Parameter(Mandatory)][string]$Overlay,
+    [switch]$RequireGit
+  )
+
+  $overlayPath = [IO.Path]::GetFullPath($Overlay)
+  $gitRootOutput = & git -C $overlayPath --no-optional-locks rev-parse --show-toplevel 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    if ($RequireGit) {
+      throw "Portal overlay không nằm trong Git worktree: '$overlayPath'"
+    }
+    # Unit fixtures may be plain directories. Production overlays live in this
+    # worktree and are checked below before any of their files are staged.
+    return
+  }
+
+  $gitRoot = [IO.Path]::GetFullPath(($gitRootOutput -join '').Trim())
+  $relative = [IO.Path]::GetRelativePath($gitRoot, $overlayPath).Replace('\', '/')
+  $status = (& git -C $gitRoot --no-optional-locks status --porcelain=v1 `
+      --untracked-files=all -- $relative) -join "`n"
+  if ($LASTEXITCODE -ne 0) {
+    throw "không đọc được Git status của Portal overlay '$overlayPath'"
+  }
+  if (-not [string]::IsNullOrWhiteSpace($status)) {
+    throw "Portal overlay không sạch; commit hoặc cất thay đổi trước khi build: '$overlayPath'`n$status"
+  }
+}
+
 function New-AppStage {
   [CmdletBinding()]
   param(
@@ -170,6 +199,9 @@ function New-AppStage {
   if (-not (Test-Path -LiteralPath $overlayPath -PathType Container)) {
     throw "không thấy Portal overlay ở '$overlayPath'"
   }
+  $productionOverlay = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\appmode\overlay'))
+  $requiresGit = $overlayPath.Equals($productionOverlay, [StringComparison]::OrdinalIgnoreCase)
+  Assert-CleanGitOverlay -Overlay $overlayPath -RequireGit:$requiresGit
   if (Test-Path -LiteralPath $stagePath) {
     throw "thư mục stage đã tồn tại: '$stagePath'"
   }
@@ -439,6 +471,9 @@ function Assert-AppPackage {
   $binary = Join-Path $outPath 'app\agentdc.exe'
   Assert-AppPackageBinaryContains -Path $binary -Signature '/memory/threads/' -Label 'Memory API signature'
   Assert-AppPackageBinaryContains -Path $binary -Signature 'app_memory_revisions' -Label 'Memory schema signature'
+  Assert-AppPackageBinaryContains -Path $binary -Signature 'app_memory_subject_revisions' -Label 'Memory V2 schema signature'
+  Assert-AppPackageBinaryContains -Path $binary -Signature 'memory_ops' -Label 'Memory V2 prompt contract'
+  Assert-AppPackageBinaryContains -Path $binary -Signature '/memory/threads/{tid}/{id}/approve' -Label 'Memory V2 proposal API'
 
   Assert-AppPackageSensitiveContentAbsent -Out $outPath
 
