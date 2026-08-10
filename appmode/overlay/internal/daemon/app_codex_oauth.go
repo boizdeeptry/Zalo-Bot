@@ -237,7 +237,12 @@ func startCodexOAuthLogin(ctx context.Context, client *http.Client, configDir st
 			http.Error(w, "thiếu code", http.StatusBadRequest)
 			return
 		}
-		writeHTML(w, "<h3>Đã kết nối Codex.</h3><p>Có thể đóng tab này và quay lại phần mềm.</p>")
+		// Thử tự đóng tab: browser CHỈ cho window.close() nếu tab do script mở — tab này do OS mở
+		// (rundll32) nên phần lớn browser chặn. Vẫn thử (một số browser cho với tab OAuth); không đóng
+		// được thì câu dưới là fallback.
+		writeHTML(w, "<h3>Đã kết nối Codex.</h3><p>Đang đóng tab…</p>"+
+			"<script>setTimeout(function(){try{window.close();}catch(e){}},300);</script>"+
+			"<p style=\"color:#888\">Nếu tab không tự đóng, bạn đóng tay rồi quay lại phần mềm.</p>")
 		trySend(codeCh, code)
 	})
 	srv := &http.Server{Handler: mux}
