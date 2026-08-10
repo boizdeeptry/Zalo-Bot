@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -105,6 +106,66 @@ func TestAppPromptMemoryForSubjectIsolatesThreadAndMember(t *testing.T) {
 	if snapshot.Subject[0].UID != "u-1" || snapshot.Subject[0].ID == 0 ||
 		snapshot.Subject[0].MemoryKey != "profile.occupation" {
 		t.Fatalf("subject metadata = %#v", snapshot.Subject[0])
+	}
+}
+
+func TestAppMemoryScopeAndPolicyRejectWhitespaceDecoratedIdentities(t *testing.T) {
+	s := newStore(t)
+	seedAppMemoryGroup(t, s)
+	if _, err := s.CreateAppThreadMemoryV2("group-a", AppThreadMemoryInput{
+		UID: "u-1", MemoryKey: "profile.note", Category: "profile",
+		Text: "U1-PRIVATE-MEMORY", ExpectedRevision: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+
+	for _, scope := range []struct {
+		threadID string
+		uid      string
+	}{
+		{threadID: "group-a", uid: " u-1 "},
+		{threadID: " group-a ", uid: "u-1"},
+	} {
+		if _, err := s.AppThreadMemoryScope(scope.threadID, scope.uid, now); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("AppThreadMemoryScope(%q, %q) error = %v; want ErrAppMemoryInvalid",
+				scope.threadID, scope.uid, err)
+		}
+		if _, err := s.AppPromptMemoryForSubject(scope.threadID, scope.uid, 12, now); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("AppPromptMemoryForSubject(%q, %q) error = %v; want ErrAppMemoryInvalid",
+				scope.threadID, scope.uid, err)
+		}
+	}
+
+	for _, input := range []AppMemoryApplyInput{
+		{
+			ThreadID: "group-a", SubjectUID: " u-1 ", Now: now,
+			Operations: []AppMemoryOperation{{
+				Action: "add", MemoryKey: "profile.decorated", Value: "không được thêm",
+				Category: "profile", Confidence: 1,
+			}},
+		},
+		{
+			ThreadID: " group-a ", SubjectUID: "u-1", Now: now,
+			Operations: []AppMemoryOperation{{
+				Action: "add", MemoryKey: "profile.decorated", Value: "không được thêm",
+				Category: "profile", Confidence: 1,
+			}},
+		},
+	} {
+		if _, err := s.ApplyAppMemoryOperations(input); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("ApplyAppMemoryOperations(%q, %q) error = %v; want ErrAppMemoryInvalid",
+				input.ThreadID, input.SubjectUID, err)
+		}
+	}
+
+	detail, err := s.AppThreadMemoryScope("group-a", "u-1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.SelectedUID != "u-1" || detail.Revision != 1 || len(detail.Active) != 1 ||
+		detail.Active[0].Text != "U1-PRIVATE-MEMORY" {
+		t.Fatalf("canonical scope changed = %#v", detail)
 	}
 }
 

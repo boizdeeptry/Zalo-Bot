@@ -104,7 +104,10 @@ func TestAppInboundMemorySubjectFallsBackOnlyForPrivateThread(t *testing.T) {
 func TestAppInboundMemorySubjectValidatesOpaqueIDsWithoutLeakingThem(t *testing.T) {
 	s := newStore(t)
 	secret := strings.Repeat("s", maxZaloMemoryLen+1)
-	for _, input := range [][2]string{{"", "msg"}, {"thread", ""}, {secret, "msg"}, {"thread", secret}} {
+	for _, input := range [][2]string{
+		{"", "msg"}, {"thread", ""}, {secret, "msg"}, {"thread", secret},
+		{" thread ", "msg"}, {"thread", " msg "},
+	} {
 		_, err := s.AppInboundMemorySubject(input[0], input[1])
 		if !errors.Is(err, ErrAppMemoryInvalid) {
 			t.Fatalf("AppInboundMemorySubject(%d,%d) error = %v; want ErrAppMemoryInvalid",

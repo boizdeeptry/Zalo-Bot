@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 type AppMemorySubject struct {
@@ -16,11 +15,11 @@ type AppMemorySubject struct {
 // AppInboundMemorySubject resolves the current Memory subject only from the
 // durable inbound row identified by the exact thread and Zalo message IDs.
 func (s *Store) AppInboundMemorySubject(threadID, zaloMsgID string) (AppMemorySubject, error) {
-	threadID = strings.TrimSpace(threadID)
-	zaloMsgID = strings.TrimSpace(zaloMsgID)
-	if threadID == "" || zaloMsgID == "" ||
-		len([]rune(threadID)) > maxZaloMemoryLen || len([]rune(zaloMsgID)) > maxZaloMemoryLen {
-		return AppMemorySubject{}, fmt.Errorf("%w: invalid Memory subject identifiers", ErrAppMemoryInvalid)
+	if err := validateAppMemoryIdentity(threadID, true); err != nil {
+		return AppMemorySubject{}, err
+	}
+	if err := validateAppMemoryIdentity(zaloMsgID, true); err != nil {
+		return AppMemorySubject{}, err
 	}
 
 	var subject AppMemorySubject
@@ -37,8 +36,7 @@ ORDER BY m.id DESC LIMIT 1`, threadID, zaloMsgID).Scan(
 	if err != nil {
 		return AppMemorySubject{}, fmt.Errorf("resolve inbound Memory subject: %w", err)
 	}
-	subject.UID = strings.TrimSpace(subject.UID)
-	if len([]rune(subject.UID)) > maxZaloMemoryLen {
+	if err := validateAppMemoryIdentity(subject.UID, false); err != nil {
 		return AppMemorySubject{}, fmt.Errorf("%w: invalid durable Memory subject", ErrAppMemoryInvalid)
 	}
 	if subject.UID == "" && subject.ThreadType == "user" {

@@ -537,18 +537,21 @@ func (s *Store) AppPromptMemoryForSubject(
 }
 
 func validateAppPromptMemoryScope(threadID, subjectUID string) (string, string, error) {
-	threadID = strings.TrimSpace(threadID)
-	subjectUID = strings.TrimSpace(subjectUID)
-	if threadID == "" {
-		return "", "", fmt.Errorf("%w: thread ID is required", ErrAppMemoryInvalid)
+	if err := validateAppMemoryIdentity(threadID, true); err != nil {
+		return "", "", err
 	}
-	if len([]rune(threadID)) > maxZaloMemoryLen {
-		return "", "", fmt.Errorf("%w: thread ID exceeds %d runes", ErrAppMemoryInvalid, maxZaloMemoryLen)
-	}
-	if len([]rune(subjectUID)) > maxZaloMemoryLen {
-		return "", "", fmt.Errorf("%w: subject UID exceeds %d runes", ErrAppMemoryInvalid, maxZaloMemoryLen)
+	if err := validateAppMemoryIdentity(subjectUID, false); err != nil {
+		return "", "", err
 	}
 	return threadID, subjectUID, nil
+}
+
+func validateAppMemoryIdentity(value string, required bool) error {
+	if (required && value == "") || value != strings.TrimSpace(value) ||
+		len([]rune(value)) > maxZaloMemoryLen {
+		return fmt.Errorf("%w: invalid opaque Memory identifier", ErrAppMemoryInvalid)
+	}
+	return nil
 }
 
 type appMemorySubjectScope struct {

@@ -8,11 +8,19 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"agentdc/internal/store"
 )
 
 const appMemoryRequestLimit = 16 << 10
+
+const appMemoryInternalErrorCode = "memory_internal_error"
+
+type appMemoryScopeRevisionInput struct {
+	UID              string `json:"uid"`
+	ExpectedRevision int64  `json:"expected_revision"`
+}
 
 func (a *api) handleMemoryOverview(w http.ResponseWriter, r *http.Request) {
 	pinned, ok := a.appMemoryPinnedFilter(w, r)
@@ -28,7 +36,10 @@ func (a *api) handleMemoryOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) handleMemoryThreadGet(w http.ResponseWriter, r *http.Request) {
-	detail, err := a.st.AppThreadMemories(r.PathValue("tid"))
+	now := time.Now()
+	detail, err := a.st.AppThreadMemoryScope(
+		r.PathValue("tid"), r.URL.Query().Get("uid"), now,
+	)
 	if err != nil {
 		a.writeAppMemoryError(w, err)
 		return
@@ -41,7 +52,7 @@ func (a *api) handleMemoryThreadPost(w http.ResponseWriter, r *http.Request) {
 	if !a.decodeAppMemoryJSON(w, r, &input) {
 		return
 	}
-	memory, err := a.st.CreateAppThreadMemory(r.PathValue("tid"), input)
+	memory, err := a.st.CreateAppThreadMemoryV2(r.PathValue("tid"), input)
 	if err != nil {
 		a.writeAppMemoryError(w, err)
 		return
@@ -58,7 +69,7 @@ func (a *api) handleMemoryThreadPut(w http.ResponseWriter, r *http.Request) {
 	if !a.decodeAppMemoryJSON(w, r, &input) {
 		return
 	}
-	memory, err := a.st.UpdateAppThreadMemory(r.PathValue("tid"), id, input)
+	memory, err := a.st.UpdateAppThreadMemoryV2(r.PathValue("tid"), id, input)
 	if err != nil {
 		a.writeAppMemoryError(w, err)
 		return
@@ -71,11 +82,73 @@ func (a *api) handleMemoryThreadDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := a.st.DeleteAppThreadMemory(r.PathValue("tid"), id); err != nil {
+	input, ok := a.decodeAppMemoryScopeRevision(w, r)
+	if !ok {
+		return
+	}
+	if err := a.st.DeleteAppThreadMemoryV2(r.PathValue("tid"), id, store.AppThreadMemoryInput{
+		UID: input.UID, ExpectedRevision: input.ExpectedRevision,
+	}); err != nil {
 		a.writeAppMemoryError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *api) handleMemoryThreadApprove(w http.ResponseWriter, r *http.Request) {
+	id, ok := a.appMemoryID(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	var input store.AppMemoryDecisionInput
+	if !a.decodeAppMemoryJSON(w, r, &input) {
+		return
+	}
+	input.Now = time.Now()
+	memory, err := a.st.ApproveAppThreadMemory(r.PathValue("tid"), id, input)
+	if err != nil {
+		a.writeAppMemoryError(w, err)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, memory)
+}
+
+func (a *api) handleMemoryThreadReject(w http.ResponseWriter, r *http.Request) {
+	id, ok := a.appMemoryID(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	input, ok := a.decodeAppMemoryScopeRevision(w, r)
+	if !ok {
+		return
+	}
+	if err := a.st.RejectAppThreadMemory(r.PathValue("tid"), id, store.AppMemoryDecisionInput{
+		UID: input.UID, ExpectedRevision: input.ExpectedRevision,
+	}); err != nil {
+		a.writeAppMemoryError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *api) handleMemoryThreadRestore(w http.ResponseWriter, r *http.Request) {
+	id, ok := a.appMemoryID(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	input, ok := a.decodeAppMemoryScopeRevision(w, r)
+	if !ok {
+		return
+	}
+	now := time.Now()
+	memory, err := a.st.RestoreAppThreadMemory(r.PathValue("tid"), id, store.AppMemoryDecisionInput{
+		UID: input.UID, ExpectedRevision: input.ExpectedRevision, Now: now,
+	})
+	if err != nil {
+		a.writeAppMemoryError(w, err)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, memory)
 }
 
 func (a *api) handleMemoryLessonsGet(w http.ResponseWriter, r *http.Request) {
@@ -138,19 +211,34 @@ func (a *api) decodeAppMemoryJSON(w http.ResponseWriter, r *http.Request, target
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		var sizeError *http.MaxBytesError
-		if errors.As(err, &sizeError) {
-			a.writeErr(w, http.StatusRequestEntityTooLarge, "dữ liệu memory vượt quá giới hạn")
-		} else {
-			a.writeErr(w, http.StatusBadRequest, "dữ liệu JSON không hợp lệ")
-		}
+		a.writeAppMemoryJSONError(w, err)
 		return false
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		a.writeErr(w, http.StatusBadRequest, "dữ liệu JSON không hợp lệ")
+		a.writeAppMemoryJSONError(w, err)
 		return false
 	}
 	return true
+}
+
+func (a *api) writeAppMemoryJSONError(w http.ResponseWriter, err error) {
+	var sizeError *http.MaxBytesError
+	if errors.As(err, &sizeError) {
+		a.writeErr(w, http.StatusRequestEntityTooLarge, "dữ liệu memory vượt quá giới hạn")
+		return
+	}
+	a.writeErr(w, http.StatusBadRequest, "dữ liệu JSON không hợp lệ")
+}
+
+func (a *api) decodeAppMemoryScopeRevision(
+	w http.ResponseWriter,
+	r *http.Request,
+) (appMemoryScopeRevisionInput, bool) {
+	var input appMemoryScopeRevisionInput
+	if !a.decodeAppMemoryJSON(w, r, &input) {
+		return appMemoryScopeRevisionInput{}, false
+	}
+	return input, true
 }
 
 func (a *api) appMemoryID(w http.ResponseWriter, raw string) (int64, bool) {
@@ -177,14 +265,35 @@ func (a *api) appMemoryPinnedFilter(w http.ResponseWriter, r *http.Request) (boo
 
 func (a *api) writeAppMemoryError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, store.ErrAppMemoryConflict):
+		a.writeErr(w, http.StatusConflict, "Memory đã thay đổi; hãy tải lại trước khi lưu")
 	case errors.Is(err, store.ErrAppMemoryInvalid):
-		a.writeErr(w, http.StatusBadRequest, "dữ liệu memory không hợp lệ")
+		a.writeErr(w, http.StatusUnprocessableEntity, "dữ liệu memory không hợp lệ")
 	case errors.Is(err, store.ErrAppMemoryNotFound):
 		a.writeErr(w, http.StatusNotFound, "không tìm thấy memory")
 	case errors.Is(err, store.ErrAppMemoryPinLimit):
 		a.writeErr(w, http.StatusConflict, "đã đạt giới hạn nội dung được ghim")
 	default:
-		a.logger.Error("memory request failed", "error", fmt.Sprintf("%T", err))
+		a.logAppMemoryInternalError(err)
 		a.writeErr(w, http.StatusInternalServerError, "không xử lý được memory")
 	}
+}
+
+func (a *api) logAppMemoryInternalError(err error) {
+	root := err
+	for {
+		cause := errors.Unwrap(root)
+		if cause == nil {
+			break
+		}
+		root = cause
+	}
+	attributes := []any{
+		"error_code", appMemoryInternalErrorCode,
+		"error_type", fmt.Sprintf("%T", root),
+	}
+	if coded, ok := root.(interface{ Code() int }); ok {
+		attributes = append(attributes, "cause_code", coded.Code())
+	}
+	a.logger.Error("memory request failed", attributes...)
 }

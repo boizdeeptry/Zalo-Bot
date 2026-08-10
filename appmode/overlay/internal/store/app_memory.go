@@ -223,7 +223,6 @@ LIMIT ?`, now, now, trimmed, pattern, pattern, now, pinned, now, now, appOvervie
 }
 
 func (s *Store) AppThreadMemories(threadID string) (AppThreadMemoryDetail, error) {
-	threadID = strings.TrimSpace(threadID)
 	out, err := s.AppThreadMemoryScope(threadID, "", time.Now())
 	if err != nil {
 		return AppThreadMemoryDetail{}, err
@@ -563,6 +562,9 @@ ORDER BY l.pinned DESC, l.id DESC LIMIT ?`,
 }
 
 func (s *Store) AppMemoryRevisions(threadID string) (AppMemoryRevision, error) {
+	if err := validateAppMemoryIdentity(threadID, true); err != nil {
+		return AppMemoryRevision{}, err
+	}
 	var out AppMemoryRevision
 	if err := s.db.QueryRow(`SELECT
   COALESCE((SELECT revision FROM app_memory_revisions
@@ -577,6 +579,9 @@ func (s *Store) AppMemoryRevisions(threadID string) (AppMemoryRevision, error) {
 }
 
 func (s *Store) AppPromptMemory(threadID string, limit int) ([]ipc.ZaloMemory, int64, error) {
+	if err := validateAppMemoryIdentity(threadID, true); err != nil {
+		return nil, 0, err
+	}
 	subjectUID := ""
 	var threadType string
 	if err := s.db.QueryRow(`SELECT thread_type FROM zalo_threads WHERE id = ?`,

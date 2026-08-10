@@ -23,7 +23,7 @@ func TestWorkflowHookDefaultsToContinueAgent(t *testing.T) {
 	}
 }
 
-func TestAppRoutesAreRegisteredAndCookieReachable(t *testing.T) {
+func TestMemoryFoundationRoutesAreRegisteredAndCookieReachable(t *testing.T) {
 	a := &api{}
 	mux := http.NewServeMux()
 	a.registerAppRoutes(mux)
@@ -47,6 +47,9 @@ func TestAppRoutesAreRegisteredAndCookieReachable(t *testing.T) {
 		{"POST /memory/threads/{tid}", "/memory/threads/thread-a"},
 		{"PUT /memory/threads/{tid}/{id}", "/memory/threads/thread-a/1"},
 		{"DELETE /memory/threads/{tid}/{id}", "/memory/threads/thread-a/1"},
+		{"POST /memory/threads/{tid}/{id}/approve", "/memory/threads/thread-a/1/approve"},
+		{"POST /memory/threads/{tid}/{id}/reject", "/memory/threads/thread-a/1/reject"},
+		{"POST /memory/threads/{tid}/{id}/restore", "/memory/threads/thread-a/1/restore"},
 		{"GET /memory/lessons", "/memory/lessons"},
 		{"POST /memory/lessons", "/memory/lessons"},
 		{"PUT /memory/lessons/{id}", "/memory/lessons/1"},

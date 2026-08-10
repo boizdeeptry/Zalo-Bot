@@ -462,6 +462,215 @@ WHERE scope = 'thread' AND scope_id = 'group-a'`).Scan(&legacyRevision); err != 
 	}
 }
 
+func TestDeleteAppThreadMemoryV2AlwaysRequiresExactRevision(t *testing.T) {
+	s := newStore(t)
+	if err := s.UpsertZaloThreadInfo(ipc.ZaloThreadInfo{
+		ID: "group-a", Name: "Nhóm A", ThreadType: ipc.ZaloThreadGroup,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.CreateAppThreadMemoryV2("group-a", AppThreadMemoryInput{
+		MemoryKey: "group.rule", Category: "preference", Text: "quy tắc chung",
+		ExpectedRevision: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteAppThreadMemoryV2("group-a", created.ID, AppThreadMemoryInput{
+		ExpectedRevision: 0,
+	}); !errors.Is(err, ErrAppMemoryConflict) {
+		t.Fatalf("strict stale delete error = %v; want ErrAppMemoryConflict", err)
+	}
+	if appMemoryTestRowCount(t, s, created.ID) != 1 {
+		t.Fatal("strict stale delete removed Memory")
+	}
+	if err := s.DeleteAppThreadMemoryV2("group-a", created.ID, AppThreadMemoryInput{
+		ExpectedRevision: 1,
+	}); err != nil {
+		t.Fatalf("strict current delete: %v", err)
+	}
+
+	legacy, err := s.CreateAppThreadMemoryV2("group-a", AppThreadMemoryInput{
+		MemoryKey: "group.legacy", Category: "preference", Text: "legacy",
+		ExpectedRevision: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteAppThreadMemory("group-a", legacy.ID); err != nil {
+		t.Fatalf("legacy two-argument delete: %v", err)
+	}
+}
+
+func TestAppMemoryLifecycleRejectsWhitespaceDecoratedIdentities(t *testing.T) {
+	newScopedStore := func(t *testing.T) *Store {
+		t.Helper()
+		s := newStore(t)
+		seedAppMemoryGroup(t, s)
+		return s
+	}
+
+	t.Run("create UID", func(t *testing.T) {
+		s := newScopedStore(t)
+		if _, err := s.CreateAppThreadMemoryV2("group-a", AppThreadMemoryInput{
+			UID: " u-1 ", MemoryKey: "profile.note", Category: "profile",
+			Text: "không được tạo", ExpectedRevision: 0,
+		}); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("decorated create UID error = %v; want ErrAppMemoryInvalid", err)
+		}
+		detail, err := s.AppThreadMemoryScope("group-a", "u-1", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if detail.Revision != 0 || len(detail.Active) != 0 {
+			t.Fatalf("decorated create mutated canonical scope: %#v", detail)
+		}
+	})
+
+	t.Run("create thread ID", func(t *testing.T) {
+		s := newScopedStore(t)
+		if _, err := s.CreateAppThreadMemoryV2(" group-a ", AppThreadMemoryInput{
+			UID: "u-1", MemoryKey: "profile.note", Category: "profile",
+			Text: "không được tạo", ExpectedRevision: 0,
+		}); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("decorated create thread error = %v; want ErrAppMemoryInvalid", err)
+		}
+		detail, err := s.AppThreadMemoryScope("group-a", "u-1", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if detail.Revision != 0 || len(detail.Active) != 0 {
+			t.Fatalf("decorated thread create mutated canonical scope: %#v", detail)
+		}
+	})
+
+	t.Run("update", func(t *testing.T) {
+		s := newScopedStore(t)
+		created, err := s.CreateAppThreadMemoryV2("group-a", AppThreadMemoryInput{
+			UID: "u-1", MemoryKey: "profile.note", Category: "profile",
+			Text: "nguyên bản", ExpectedRevision: 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.UpdateAppThreadMemoryV2("group-a", created.ID, AppThreadMemoryInput{
+			UID: " u-1 ", MemoryKey: "profile.note", Category: "profile",
+			Text: "không được sửa", ExpectedRevision: 1,
+		}); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("decorated update error = %v; want ErrAppMemoryInvalid", err)
+		}
+		detail, err := s.AppThreadMemoryScope("group-a", "u-1", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if detail.Revision != 1 || len(detail.Active) != 1 || detail.Active[0].Text != "nguyên bản" {
+			t.Fatalf("decorated update mutated canonical scope: %#v", detail)
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		s := newScopedStore(t)
+		created, err := s.CreateAppThreadMemoryV2("group-a", AppThreadMemoryInput{
+			UID: "u-1", MemoryKey: "profile.note", Category: "profile",
+			Text: "phải còn", ExpectedRevision: 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteAppThreadMemoryV2("group-a", created.ID, AppThreadMemoryInput{
+			UID: " u-1 ", ExpectedRevision: 1,
+		}); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("decorated delete error = %v; want ErrAppMemoryInvalid", err)
+		}
+		if appMemoryTestRowCount(t, s, created.ID) != 1 {
+			t.Fatal("decorated delete removed canonical Memory")
+		}
+	})
+
+	seedPending := func(t *testing.T, s *Store) int64 {
+		t.Helper()
+		if _, err := s.ApplyAppMemoryOperations(AppMemoryApplyInput{
+			ThreadID: "group-a", SubjectUID: "u-1", Now: time.Now(),
+			Operations: []AppMemoryOperation{{
+				Action: "add", MemoryKey: "health.note", Value: "nhạy cảm",
+				Category: "health", Confidence: 1,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		detail, err := s.AppThreadMemoryScope("group-a", "u-1", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(detail.Pending) != 1 {
+			t.Fatalf("pending detail = %#v", detail)
+		}
+		return detail.Pending[0].ID
+	}
+
+	t.Run("approve", func(t *testing.T) {
+		s := newScopedStore(t)
+		id := seedPending(t, s)
+		if _, err := s.ApproveAppThreadMemory("group-a", id, AppMemoryDecisionInput{
+			UID: " u-1 ", MemoryKey: "health.note", Text: "nhạy cảm",
+			Category: "health", ExpectedRevision: 0, Now: time.Now(),
+		}); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("decorated approve error = %v; want ErrAppMemoryInvalid", err)
+		}
+		if appMemoryTestRowCount(t, s, id) != 1 {
+			t.Fatal("decorated approve changed pending Memory")
+		}
+	})
+
+	t.Run("reject", func(t *testing.T) {
+		s := newScopedStore(t)
+		id := seedPending(t, s)
+		if err := s.RejectAppThreadMemory("group-a", id, AppMemoryDecisionInput{
+			UID: " u-1 ", ExpectedRevision: 0,
+		}); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("decorated reject error = %v; want ErrAppMemoryInvalid", err)
+		}
+		if appMemoryTestRowCount(t, s, id) != 1 {
+			t.Fatal("decorated reject removed pending Memory")
+		}
+	})
+
+	t.Run("restore", func(t *testing.T) {
+		s := newScopedStore(t)
+		past := time.Now().Add(-31 * 24 * time.Hour)
+		if _, err := s.ApplyAppMemoryOperations(AppMemoryApplyInput{
+			ThreadID: "group-a", SubjectUID: "u-1", Now: past,
+			Operations: []AppMemoryOperation{{
+				Action: "add", MemoryKey: "interest.old", Value: "đã cũ",
+				Category: "interest", Confidence: 1,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		detail, err := s.AppThreadMemoryScope("group-a", "u-1", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(detail.Expired) != 1 {
+			t.Fatalf("expired detail = %#v", detail)
+		}
+		id := detail.Expired[0].ID
+		if _, err := s.RestoreAppThreadMemory("group-a", id, AppMemoryDecisionInput{
+			UID: " u-1 ", ExpectedRevision: detail.Revision, Now: time.Now(),
+		}); !errors.Is(err, ErrAppMemoryInvalid) {
+			t.Fatalf("decorated restore error = %v; want ErrAppMemoryInvalid", err)
+		}
+		detail, err = s.AppThreadMemoryScope("group-a", "u-1", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(detail.Expired) != 1 || detail.Expired[0].ID != id {
+			t.Fatalf("decorated restore changed canonical Memory: %#v", detail)
+		}
+	})
+}
+
 func TestAppMemoryConflictChecksStrictCommonCreateAndUpdate(t *testing.T) {
 	s := newStore(t)
 	if err := s.UpsertZaloThreadInfo(ipc.ZaloThreadInfo{

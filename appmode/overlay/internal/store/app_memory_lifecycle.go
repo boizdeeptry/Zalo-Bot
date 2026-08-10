@@ -38,7 +38,6 @@ func (s *Store) createAppThreadMemory(
 	input AppThreadMemoryInput,
 	legacy bool,
 ) (AppThreadMemory, error) {
-	threadID = strings.TrimSpace(threadID)
 	input, err := validateAppThreadMemoryInput(threadID, input)
 	if err != nil {
 		return AppThreadMemory{}, err
@@ -139,7 +138,6 @@ func (s *Store) updateAppThreadMemory(
 	input AppThreadMemoryInput,
 	legacy bool,
 ) (AppThreadMemory, error) {
-	threadID = strings.TrimSpace(threadID)
 	input, err := validateAppThreadMemoryInput(threadID, input)
 	if err != nil {
 		return AppThreadMemory{}, err
@@ -275,12 +273,33 @@ func (s *Store) DeleteAppThreadMemory(
 	if len(inputs) == 1 {
 		input = inputs[0]
 	}
-	threadID = strings.TrimSpace(threadID)
-	input.UID = strings.TrimSpace(input.UID)
-	if threadID == "" || id <= 0 {
+	return s.deleteAppThreadMemory(threadID, id, input, legacy)
+}
+
+func (s *Store) DeleteAppThreadMemoryV2(
+	threadID string,
+	id int64,
+	input AppThreadMemoryInput,
+) error {
+	return s.deleteAppThreadMemory(threadID, id, input, false)
+}
+
+func (s *Store) deleteAppThreadMemory(
+	threadID string,
+	id int64,
+	input AppThreadMemoryInput,
+	legacy bool,
+) error {
+	if err := validateAppMemoryIdentity(threadID, true); err != nil {
+		return err
+	}
+	if err := validateAppMemoryIdentity(input.UID, false); err != nil {
+		return err
+	}
+	if id <= 0 {
 		return fmt.Errorf("%w: thread and memory IDs are required", ErrAppMemoryInvalid)
 	}
-	if input.ExpectedRevision < 0 || len([]rune(input.UID)) > maxZaloMemoryLen {
+	if input.ExpectedRevision < 0 {
 		return fmt.Errorf("%w: invalid delete scope or revision", ErrAppMemoryInvalid)
 	}
 	tx, err := s.db.Begin()
@@ -535,16 +554,17 @@ func validateAppMemoryDecision(
 	input AppMemoryDecisionInput,
 	requireEditableFields bool,
 ) (string, AppMemoryDecisionInput, error) {
-	threadID = strings.TrimSpace(threadID)
-	input.UID = strings.TrimSpace(input.UID)
+	if err := validateAppMemoryIdentity(threadID, true); err != nil {
+		return "", AppMemoryDecisionInput{}, err
+	}
+	if err := validateAppMemoryIdentity(input.UID, false); err != nil {
+		return "", AppMemoryDecisionInput{}, err
+	}
 	input.MemoryKey = strings.TrimSpace(input.MemoryKey)
 	input.Text = strings.TrimSpace(input.Text)
 	input.Category = strings.TrimSpace(input.Category)
-	if threadID == "" || id <= 0 {
+	if id <= 0 {
 		return "", AppMemoryDecisionInput{}, fmt.Errorf("%w: thread and memory IDs are required", ErrAppMemoryInvalid)
-	}
-	if len([]rune(threadID)) > maxZaloMemoryLen || len([]rune(input.UID)) > maxZaloMemoryLen {
-		return "", AppMemoryDecisionInput{}, fmt.Errorf("%w: Memory scope is too long", ErrAppMemoryInvalid)
 	}
 	if input.ExpectedRevision < 0 {
 		return "", AppMemoryDecisionInput{}, fmt.Errorf("%w: expected revision cannot be negative", ErrAppMemoryInvalid)
@@ -564,11 +584,13 @@ func validateAppThreadMemoryInput(
 	threadID string,
 	input AppThreadMemoryInput,
 ) (AppThreadMemoryInput, error) {
-	if threadID == "" {
-		return AppThreadMemoryInput{}, fmt.Errorf("%w: thread ID is required", ErrAppMemoryInvalid)
+	if err := validateAppMemoryIdentity(threadID, true); err != nil {
+		return AppThreadMemoryInput{}, err
+	}
+	if err := validateAppMemoryIdentity(input.UID, false); err != nil {
+		return AppThreadMemoryInput{}, err
 	}
 	input.Text = strings.TrimSpace(input.Text)
-	input.UID = strings.TrimSpace(input.UID)
 	input.MemoryKey = strings.TrimSpace(input.MemoryKey)
 	input.Category = strings.TrimSpace(input.Category)
 	if input.Text == "" {
@@ -576,9 +598,6 @@ func validateAppThreadMemoryInput(
 	}
 	if len([]rune(input.Text)) > maxZaloMemoryLen {
 		return AppThreadMemoryInput{}, fmt.Errorf("%w: memory exceeds %d runes", ErrAppMemoryInvalid, maxZaloMemoryLen)
-	}
-	if len([]rune(input.UID)) > maxZaloMemoryLen {
-		return AppThreadMemoryInput{}, fmt.Errorf("%w: subject UID exceeds %d runes", ErrAppMemoryInvalid, maxZaloMemoryLen)
 	}
 	if input.MemoryKey != "" && !appMemoryKeyPattern.MatchString(input.MemoryKey) {
 		return AppThreadMemoryInput{}, fmt.Errorf("%w: invalid memory key", ErrAppMemoryInvalid)
@@ -598,6 +617,12 @@ func appResolveMemoryMutationScope(
 	tx *sql.Tx,
 	threadID, requestedUID string,
 ) (string, string, error) {
+	if err := validateAppMemoryIdentity(threadID, true); err != nil {
+		return "", "", err
+	}
+	if err := validateAppMemoryIdentity(requestedUID, false); err != nil {
+		return "", "", err
+	}
 	var threadType string
 	if err := tx.QueryRow(`SELECT thread_type FROM zalo_threads WHERE id = ?`, threadID).Scan(
 		&threadType,
@@ -606,7 +631,6 @@ func appResolveMemoryMutationScope(
 	} else if err != nil {
 		return "", "", fmt.Errorf("read Memory thread %s: %w", threadID, err)
 	}
-	requestedUID = strings.TrimSpace(requestedUID)
 	if threadType == ipc.ZaloThreadUser {
 		if requestedUID != "" && requestedUID != threadID {
 			return "", "", fmt.Errorf("memory scope in %s: %w", threadID, ErrAppMemoryNotFound)
