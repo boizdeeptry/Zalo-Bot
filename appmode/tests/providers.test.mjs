@@ -104,6 +104,13 @@ test("banner ẩn khi có provider connected", async (t) => {
   assert.equal(find(main, (n) => n.hasAttribute?.("data-no-provider-warning")), null);
 });
 
+test("banner ẩn khi payload không có trường hasConnectedProvider (backend cũ)", async (t) => {
+  // Ghim guard mặc-định-ẩn (`!== false`): thiếu trường = không kết luận "chưa nối", KHÔNG hiện banner.
+  const { main } = mountPage(t, listWith([CODEX_CONNECTED]));
+  await flush();
+  assert.equal(find(main, (n) => n.hasAttribute?.("data-no-provider-warning")), null);
+});
+
 test("typing in the search box filters cards by name", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();

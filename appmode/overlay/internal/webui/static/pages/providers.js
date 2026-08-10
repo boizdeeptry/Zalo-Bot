@@ -449,7 +449,8 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
         testAllButton(groupEntries, byKind, service, refresh));
 
       // noProviderBanner cảnh báo người trực: chưa nối gì thì bot IM với khách (không có Claude mặc
-      // định để rơi về). null khi đã có ít nhất một provider nối — element()/replaceChildren bỏ qua null.
+      // định để rơi về). null khi đã có provider nối — chỗ gọi phải filter(Boolean) trước khi đưa vào
+      // native root.replaceChildren (nó ép null thành chuỗi "null", không tự bỏ như element()).
       function noProviderBanner() {
         if (hasConnectedProvider) return null;
         return element("div", {
@@ -493,7 +494,9 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500 } = {
           view = "gallery";
         }
         paintGallery();
-        root.replaceChildren(header(), noProviderBanner(), toolbar(), searchBar(), gallerySlot);
+        // filter(Boolean) vì root là DOM element THẬT: native replaceChildren ép null → chuỗi "null"
+        // (một text node lạ ở đầu lưới cho mọi máy đã cấu hình đúng), khác element() tự bỏ null.
+        root.replaceChildren(...[header(), noProviderBanner(), toolbar(), searchBar(), gallerySlot].filter(Boolean));
       }
 
       const toolbar = () => element("div", { className: "row" },
