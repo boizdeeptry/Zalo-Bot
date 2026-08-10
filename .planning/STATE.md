@@ -10,7 +10,15 @@ Nhánh `feat/no-default-claude-npm` off main `ccc3ac8`. Execute subagent-driven 
 final whole-branch integration review bắt 1 lỗi thật (ErrZaloSilent rò qua runClaude → bot đã-cấu-hình nuốt
 im thay vì leo thang) → fix `92b0e98`. Full build gate XANH 7/7, canary sạch, F:\dist\_verify-nodefault
 (3177 tệp/121MB). Base AgentDC: 2 commit `3f224e9`(ErrZaloSilent)+`e05a13c`(zaloConfig.Program) ở lại AgentDC
-history (như CC4). Overlay HEAD `92b0e98`.
+history (như CC4). Overlay HEAD `b1ea16c`.
+- **ND-T10 (E2E-found `b1ea16c`)**: combo model picker CHỈ hiện model của provider ĐÃ KẾT NỐI (trước đây lọc
+  theo provider.enabled → hiện model Claude dù 0 account). Tách helper JS dùng chung `isProviderConnected`
+  (core/providers-status.js) cho galleryStatus + picker + note "Chưa kết nối". Spec✅ quality-Pass, Portal 109 xanh.
+  LƯU Ý: instance đang chạy (pid 20388) build từ `52bf07d` — CHƯA có fix này; cần rebuild để thấy live (hoãn
+  tới rebuild trước-ship / sau-onboarding).
+- **E2E phát hiện lỗ hổng hệ thống → user quyết làm ONBOARDING WIZARD** (option A: terminal-style TRONG Portal,
+  gate app tới khi Provider→Combo→chat-thử xong) làm sub-project kế. Xem [[project-zalobot-onboarding-wizard]].
+  "Connect xong vẫn im" gốc = chưa có combo active (routing đi qua Combo).
 - **CÒN (checkpoint NEEDS-LOGIN, hành động USER trước /ship):** chạy F:\dist\_verify-nodefault → xác nhận fresh
   data IM + banner "chưa kết nối"; bấm Connect Claude (OAuth thật) → npm i -g @anthropic-ai/claude-code tự chạy
   → account hiện → consult trả lời qua bin\claude.exe (A-native, chạy thẳng PE, không hop node → không mồ côi).
