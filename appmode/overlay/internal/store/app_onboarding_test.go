@@ -1646,6 +1646,77 @@ func TestSaveOnboardingTestReceiptCancellationBeforeCommitRollsBack(t *testing.T
 	}
 }
 
+func TestClearOnboardingTestReceiptClearsOnlyExactCommittedReceipt(t *testing.T) {
+	st := openAppStoreForTest(t)
+	seedOnboardingTestReceiptForTest(t, st, 17)
+	issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
+	policy := NewOnboardingTestReceiptPolicy(issuedAt)
+	hash := strings.Repeat("ab", sha256.Size)
+	saved, err := st.SaveOnboardingTestReceipt(
+		context.Background(), 17, "persona-fingerprint", hash, policy,
+	)
+	if err != nil {
+		t.Fatalf("SaveOnboardingTestReceipt() = %v", err)
+	}
+
+	cleared, err := st.ClearOnboardingTestReceipt(
+		context.Background(), saved.Revision, "persona-fingerprint", hash, policy,
+	)
+	if err != nil {
+		t.Fatalf("ClearOnboardingTestReceipt() = %v", err)
+	}
+	if cleared.Revision != saved.Revision+1 || cleared.TestNonceHash != "" || cleared.TestExpiresAt != "" {
+		t.Fatalf("cleared state = %+v; want monotonic revision and empty receipt", cleared)
+	}
+}
+
+func TestClearOnboardingTestReceiptMismatchNeverClearsNewerReceipt(t *testing.T) {
+	tests := []struct {
+		name        string
+		revision    func(OnboardingState) int64
+		fingerprint string
+		hash        string
+		policy      func(OnboardingTestReceiptPolicy) OnboardingTestReceiptPolicy
+	}{
+		{name: "stale revision", revision: func(saved OnboardingState) int64 { return saved.Revision - 1 }, fingerprint: "persona-fingerprint", hash: strings.Repeat("ab", sha256.Size)},
+		{name: "different fingerprint", revision: func(saved OnboardingState) int64 { return saved.Revision }, fingerprint: "other", hash: strings.Repeat("ab", sha256.Size)},
+		{name: "different hash", revision: func(saved OnboardingState) int64 { return saved.Revision }, fingerprint: "persona-fingerprint", hash: strings.Repeat("cd", sha256.Size)},
+		{name: "different expiry", revision: func(saved OnboardingState) int64 { return saved.Revision }, fingerprint: "persona-fingerprint", hash: strings.Repeat("ab", sha256.Size), policy: func(policy OnboardingTestReceiptPolicy) OnboardingTestReceiptPolicy {
+			return NewOnboardingTestReceiptPolicy(policy.IssuedAt.Add(time.Minute))
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			seedOnboardingTestReceiptForTest(t, st, 17)
+			issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
+			policy := NewOnboardingTestReceiptPolicy(issuedAt)
+			hash := strings.Repeat("ab", sha256.Size)
+			saved, err := st.SaveOnboardingTestReceipt(
+				context.Background(), 17, "persona-fingerprint", hash, policy,
+			)
+			if err != nil {
+				t.Fatalf("SaveOnboardingTestReceipt() = %v", err)
+			}
+			before := mustOnboardingStateForTest(t, st)
+			matchPolicy := policy
+			if tt.policy != nil {
+				matchPolicy = tt.policy(policy)
+			}
+
+			_, err = st.ClearOnboardingTestReceipt(
+				context.Background(), tt.revision(saved), tt.fingerprint, tt.hash, matchPolicy,
+			)
+			if !errors.Is(err, ErrOnboardingConflict) {
+				t.Fatalf("ClearOnboardingTestReceipt() error = %v; want %v", err, ErrOnboardingConflict)
+			}
+			if after := mustOnboardingStateForTest(t, st); after != before {
+				t.Fatalf("mismatched compensation changed receipt: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
 func TestSaveOnboardingTestReceiptCASFailureRollsBack(t *testing.T) {
 	st := openAppStoreForTest(t)
 	seedOnboardingTestReceiptForTest(t, st, 8)

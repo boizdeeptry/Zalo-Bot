@@ -692,6 +692,56 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 	return updated, nil
 }
 
+// ClearOnboardingTestReceipt compensates a committed receipt only when every
+// captured binding still matches. A newer retry or any state transition makes
+// the CAS fail, so cancellation cleanup can never erase a later success.
+func (s *Store) ClearOnboardingTestReceipt(
+	ctx context.Context,
+	expectedRevision int64,
+	personaFingerprint string,
+	nonceHash string,
+	policy OnboardingTestReceiptPolicy,
+) (OnboardingState, error) {
+	if expectedRevision < 1 || personaFingerprint == "" ||
+		!validOnboardingSHA256Hex(nonceHash) || !validOnboardingTestReceiptPolicy(policy) {
+		return OnboardingState{}, ErrOnboardingInvalidTestReceipt
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("begin onboarding receipt compensation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `UPDATE app_onboarding_state SET
+test_nonce_hash = '', test_expires_at = '', revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ? AND phase = ? AND persona_fingerprint = ?
+  AND test_nonce_hash = ? AND test_expires_at = ?`,
+		ts(policy.IssuedAt), expectedRevision, OnboardingPhaseTest, personaFingerprint,
+		nonceHash, policy.ExpiresAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("clear onboarding test receipt: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding receipt compensation result: %w", err)
+	}
+	if changed != 1 {
+		return OnboardingState{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingStateInTxContext(ctx, tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return OnboardingState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingState{}, fmt.Errorf("commit onboarding receipt compensation: %w", err)
+	}
+	return updated, nil
+}
+
 func validOnboardingTestReceiptPolicy(policy OnboardingTestReceiptPolicy) bool {
 	if !validOnboardingTestReceiptTime(policy.IssuedAt) ||
 		!validOnboardingTestReceiptTime(policy.ExpiresAt) {

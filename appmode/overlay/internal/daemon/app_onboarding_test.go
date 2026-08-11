@@ -15,8 +15,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -68,7 +70,7 @@ func TestAppOnboardingTestChatPersistsHashOnlyReceipt(t *testing.T) {
 		t.Fatalf("test token is not 256-bit Base64URL-no-padding: %q", got.TestToken)
 	}
 	if gotState != state || gotAccount.AccountID != "staged-account" ||
-		gotAccount.ConfigDir != "D:/onboarding/staged-account" {
+		!sameOnboardingPath(gotAccount.ConfigDir, accountConfigDir(env.dataDir, "codex", "staged-account")) {
 		t.Fatalf("executor staging = state %+v account %+v", gotState, gotAccount)
 	}
 	if !strings.Contains(gotPrompt, persona) || !strings.Contains(gotPrompt, `"display_name":"Bé Mi"`) ||
@@ -97,6 +99,131 @@ func TestAppOnboardingTestChatPersistsHashOnlyReceipt(t *testing.T) {
 	}
 	if afterSideEffects := appOnboardingTestSideEffectDigest(t, env); afterSideEffects != beforeSideEffects {
 		t.Fatalf("test chat changed production side effects:\nbefore=%q\nafter=%q", beforeSideEffects, afterSideEffects)
+	}
+}
+
+func TestAppOnboardingTestChatRealClaudeAdapterIsIsolatedAndStateless(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	state, _ := seedAppOnboardingTestChat(t, env, "claude-code", 45)
+	stagedConfig := accountConfigDir(env.dataDir, "claude-code", "staged-account")
+	safeKB := t.TempDir()
+	safeWork := t.TempDir()
+	liveFiles := filepath.Join(t.TempDir(), "customer-files")
+	liveRoster := filepath.Join(t.TempDir(), "roster.md")
+	liveOverlay := filepath.Join(t.TempDir(), "overlays")
+	env.a.zalo.cfg.KBRoots = []string{safeKB}
+	env.a.zalo.cfg.WorkDir = safeWork
+	env.a.zalo.cfg.FilesDir = liveFiles
+	env.a.zalo.cfg.RosterPath = liveRoster
+	env.a.zalo.cfg.OverlayDir = liveOverlay
+	env.a.zalo.cfg.overlayFor = filepath.Join(liveOverlay, "customer-thread.md")
+	env.a.zalo.cfg.OwnerUID = "live-owner-uid"
+	fakeClaudeExe(t)
+
+	var gotArgs []string
+	var gotEnv []string
+	var gotDir string
+	var gotPrompt string
+	oldProcess := appOnboardingRunCLIProcess
+	appOnboardingRunCLIProcess = func(_ context.Context, cmd *exec.Cmd, stdin []byte, _ chan<- int, _ *slog.Logger) ([]byte, error) {
+		gotArgs = slices.Clone(cmd.Args)
+		gotEnv = slices.Clone(cmd.Env)
+		gotDir = cmd.Dir
+		gotPrompt = string(stdin)
+		return []byte(`{"type":"system","subtype":"init"}` + "\n" +
+			`{"type":"result","result":"Xin chào, tôi là Bé Mi."}` + "\n"), nil
+	}
+	t.Cleanup(func() { appOnboardingRunCLIProcess = oldProcess })
+	withAppOnboardingTestSeams(t,
+		defaultAppOnboardingTestExecute,
+		func() time.Time { return time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC) },
+		appOnboardingRandomFromReader(bytes.NewReader(bytes.Repeat([]byte{0x44}, 32))),
+		time.Second,
+	)
+	beforeSideEffects := appOnboardingTestSideEffectDigest(t, env)
+	beforeFiles, err := os.ReadDir(stagedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":45,"message":"xin chào"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	response := decodeOnboardingResponse[appOnboardingTestChatResponse](t, rr)
+	if response.Answer != "Xin chào, tôi là Bé Mi." || response.Revision != state.Revision+1 {
+		t.Fatalf("structured adapter response = %+v", response)
+	}
+	if slices.Contains(gotArgs, "--session-id") || !slices.Contains(gotArgs, "--no-session-persistence") {
+		t.Fatalf("Claude argv is stateful: %q", gotArgs)
+	}
+	joinedArgs := strings.Join(gotArgs, "\x00")
+	for _, forbidden := range []string{liveFiles, liveRoster, liveOverlay, "customer-thread", "live-owner-uid"} {
+		if strings.Contains(joinedArgs, forbidden) || strings.Contains(gotPrompt, forbidden) {
+			t.Fatalf("real adapter leaked live/customer config %q: argv=%q prompt=%q", forbidden, gotArgs, gotPrompt)
+		}
+	}
+	if !strings.Contains(joinedArgs, safeKB) || gotDir != safeWork {
+		t.Fatalf("real adapter safe roots/workdir = argv %q dir %q; want KB %q workdir %q", gotArgs, gotDir, safeKB, safeWork)
+	}
+	var stagedEnv []string
+	for _, item := range gotEnv {
+		if strings.HasPrefix(strings.ToUpper(item), "CLAUDE_CONFIG_DIR=") {
+			stagedEnv = append(stagedEnv, item[len("CLAUDE_CONFIG_DIR="):])
+		}
+	}
+	if !slices.Equal(stagedEnv, []string{stagedConfig}) {
+		t.Fatalf("CLAUDE_CONFIG_DIR values = %v; want [%q]", stagedEnv, stagedConfig)
+	}
+	afterFiles, err := os.ReadDir(stagedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterFiles) != len(beforeFiles) {
+		t.Fatalf("staged config gained session/transcript files: before=%v after=%v", beforeFiles, afterFiles)
+	}
+	if afterSideEffects := appOnboardingTestSideEffectDigest(t, env); afterSideEffects != beforeSideEffects {
+		t.Fatalf("real adapter changed production attempts/sessions/memory/live tables:\nbefore=%q\nafter=%q",
+			beforeSideEffects, afterSideEffects)
+	}
+}
+
+func TestAppOnboardingTestChatClaudeInvalidStreamsPersistNothingAndLeakNothing(t *testing.T) {
+	tests := []struct {
+		name, output, secret string
+	}{
+		{name: "progress only", output: `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"PROGRESS-SECRET"}}]}}` + "\n", secret: "PROGRESS-SECRET"},
+		{name: "malformed JSON", output: `{"type":"result","result":"MALFORMED-SECRET"` + "\n", secret: "MALFORMED-SECRET"},
+		{name: "session metadata only", output: `{"type":"system","session_id":"SESSION-SECRET"}` + "\n", secret: "SESSION-SECRET"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			seedAppOnboardingTestChat(t, env, "claude-code", 46)
+			env.a.zalo.cfg.KBRoots = []string{t.TempDir()}
+			env.a.zalo.cfg.WorkDir = t.TempDir()
+			fakeClaudeExe(t)
+			oldProcess := appOnboardingRunCLIProcess
+			appOnboardingRunCLIProcess = func(context.Context, *exec.Cmd, []byte, chan<- int, *slog.Logger) ([]byte, error) {
+				return []byte(tt.output), nil
+			}
+			t.Cleanup(func() { appOnboardingRunCLIProcess = oldProcess })
+			withAppOnboardingTestSeams(t,
+				defaultAppOnboardingTestExecute,
+				time.Now,
+				appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+				time.Second,
+			)
+
+			rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":46,"message":"xin chào"}`)
+			requireOnboardingCode(t, rr, http.StatusBadGateway, "ONBOARDING_TEST_FAILED")
+			if strings.Contains(rr.Body.String(), tt.secret) {
+				t.Fatalf("raw Claude event leaked to response: %s", rr.Body.String())
+			}
+			if state := env.state(t); state.TestNonceHash != "" || state.TestExpiresAt != "" || state.Revision != 46 {
+				t.Fatalf("invalid Claude stream changed receipt state: %+v", state)
+			}
+		})
 	}
 }
 
@@ -201,12 +328,125 @@ func TestAppOnboardingTestChatRejectsInvalidStagingBeforeRunner(t *testing.T) {
 	}
 }
 
+func TestAppOnboardingTestChatRejectsNonOwnedConfigPathsBeforeRunner(t *testing.T) {
+	tests := []struct {
+		name       string
+		accountID  string
+		configPath func(*onboardingRouteTestEnv, string) string
+	}{
+		{
+			name:      "live account path",
+			accountID: "staged-account",
+			configPath: func(env *onboardingRouteTestEnv, _ string) string {
+				return accountConfigDir(env.dataDir, "codex", "live-account")
+			},
+		},
+		{
+			name:      "outside path",
+			accountID: "staged-account",
+			configPath: func(_ *onboardingRouteTestEnv, _ string) string {
+				return t.TempDir()
+			},
+		},
+		{
+			name:      "traversal alias",
+			accountID: "staged-account",
+			configPath: func(_ *onboardingRouteTestEnv, expected string) string {
+				return expected + string(filepath.Separator) + ".." + string(filepath.Separator) + "staged-account"
+			},
+		},
+		{
+			name:      "invalid account id",
+			accountID: "..",
+			configPath: func(_ *onboardingRouteTestEnv, expected string) string {
+				return expected
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			seedAppOnboardingTestChat(t, env, "codex", 41)
+			expected := accountConfigDir(env.dataDir, "codex", "staged-account")
+			if tt.accountID != "staged-account" {
+				if _, err := env.db.Exec(`UPDATE llm_accounts SET id = ?, config_dir = ? WHERE id = 'staged-account'`,
+					tt.accountID, accountConfigDir(env.dataDir, "codex", tt.accountID)); err != nil {
+					t.Fatal(err)
+				}
+				state := env.state(t)
+				state.AccountID = tt.accountID
+				env.setState(t, state)
+				expected = accountConfigDir(env.dataDir, "codex", tt.accountID)
+			}
+			badPath := tt.configPath(env, expected)
+			if err := os.MkdirAll(filepath.Clean(badPath), 0o700); err != nil {
+				t.Fatalf("MkdirAll corrupt config path: %v", err)
+			}
+			if _, err := env.db.Exec(`UPDATE llm_accounts SET config_dir = ? WHERE id = ?`, badPath, tt.accountID); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			withAppOnboardingTestSeams(t,
+				func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+					calls++
+					return "unexpected", nil
+				},
+				time.Now,
+				appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+				time.Second,
+			)
+
+			rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":41,"message":"xin chào"}`)
+			requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_STAGING_INVALID")
+			if calls != 0 {
+				t.Fatalf("unsafe config path called runner %d times", calls)
+			}
+			if state := env.state(t); state.TestNonceHash != "" || state.TestExpiresAt != "" {
+				t.Fatalf("unsafe config path persisted receipt: %+v", state)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingTestChatRejectsLinkedConfigPathBeforeRunner(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 41)
+	configDir := accountConfigDir(env.dataDir, "codex", "staged-account")
+	if err := os.Remove(configDir); err != nil {
+		t.Fatalf("remove empty config dir: %v", err)
+	}
+	victim := t.TempDir()
+	if runtime.GOOS == "windows" {
+		makeForcedOnboardingJunction(t, victim, configDir)
+	} else if err := os.Symlink(victim, configDir); err != nil {
+		t.Fatalf("create config symlink: %v", err)
+	}
+	calls := 0
+	withAppOnboardingTestSeams(t,
+		func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+			calls++
+			return "unexpected", nil
+		},
+		time.Now,
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+		time.Second,
+	)
+
+	rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":41,"message":"xin chào"}`)
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_STAGING_INVALID")
+	if calls != 0 {
+		t.Fatalf("linked config path called runner %d times", calls)
+	}
+}
+
 func TestAppOnboardingTestChatRejectsEmptyOrMissingNameAnswer(t *testing.T) {
 	tests := []struct {
 		name, answer string
+		wantCode     string
 	}{
-		{name: "empty", answer: " \n\t "},
-		{name: "missing name", answer: "Xin chào, tôi là trợ lý của bạn."},
+		{name: "empty", answer: " \n\t ", wantCode: "ONBOARDING_TEST_ANSWER_INVALID"},
+		{name: "missing name", answer: "Xin chào, tôi là trợ lý của bạn.", wantCode: "ONBOARDING_PERSONA_NOT_APPLIED"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -222,9 +462,30 @@ func TestAppOnboardingTestChatRejectsEmptyOrMissingNameAnswer(t *testing.T) {
 				120*time.Second,
 			)
 			rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":9,"message":"xin chào"}`)
-			requireOnboardingCode(t, rr, http.StatusUnprocessableEntity, "ONBOARDING_TEST_ANSWER_INVALID")
+			requireOnboardingCode(t, rr, http.StatusUnprocessableEntity, tt.wantCode)
 			if after := env.state(t); after != before {
 				t.Fatalf("invalid answer changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestNormalizedOnboardingAnswerContainsNameUsesUnicodeSimpleFoldAndWhitespace(t *testing.T) {
+	tests := []struct {
+		name, answer, displayName string
+		want                      bool
+	}{
+		{name: "Greek sigma cycle", answer: "Είμαι ΟΣ", displayName: "ος", want: true},
+		{name: "Kelvin fold cycle", answer: "Tôi là K Bot", displayName: "k bot", want: true},
+		{name: "long s fold cycle", answer: "Đây là ſora", displayName: "SORA", want: true},
+		{name: "Unicode whitespace", answer: "Xin chào, Bé\u2003\tMi", displayName: "bé mi", want: true},
+		{name: "different name", answer: "Xin chào An Nhiên", displayName: "Bé Mi", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizedOnboardingAnswerContainsName(tt.answer, tt.displayName); got != tt.want {
+				t.Fatalf("normalizedOnboardingAnswerContainsName(%q, %q) = %t; want %t",
+					tt.answer, tt.displayName, got, tt.want)
 			}
 		})
 	}
@@ -370,6 +631,188 @@ func TestAppOnboardingTestChatRejectsLateSuccessAfterHardTimeout(t *testing.T) {
 	}
 }
 
+func TestAppOnboardingTestChatPostflightRejectsMutationsWhileRunnerIsBlocked(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(*testing.T, *onboardingRouteTestEnv)
+		wantCode string
+	}{
+		{
+			name: "persona bytes",
+			mutate: func(t *testing.T, env *onboardingRouteTestEnv) {
+				t.Helper()
+				if err := os.WriteFile(env.a.zalo.cfg.PersonaPath, []byte("persona changed directly"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantCode: "ONBOARDING_PERSONA_CHANGED",
+		},
+		{
+			name: "display name",
+			mutate: func(t *testing.T, env *onboardingRouteTestEnv) {
+				t.Helper()
+				if err := env.a.st.SetAgentDisplayName("Tên Khác"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantCode: "ONBOARDING_PERSONA_CHANGED",
+		},
+		{
+			name: "account config",
+			mutate: func(t *testing.T, env *onboardingRouteTestEnv) {
+				t.Helper()
+				if _, err := env.db.Exec(`UPDATE llm_accounts SET config_dir = ? WHERE id = 'staged-account'`, t.TempDir()); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantCode: "ONBOARDING_STAGING_INVALID",
+		},
+		{
+			name: "account enabled",
+			mutate: func(t *testing.T, env *onboardingRouteTestEnv) {
+				t.Helper()
+				if _, err := env.db.Exec(`UPDATE llm_accounts SET enabled = 1 WHERE id = 'staged-account'`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantCode: "ONBOARDING_STAGING_INVALID",
+		},
+		{
+			name: "model availability",
+			mutate: func(t *testing.T, env *onboardingRouteTestEnv) {
+				t.Helper()
+				if _, err := env.db.Exec(`UPDATE llm_models SET available = 0 WHERE provider_id = 'codex' AND model_id = 'gpt-5.6-terra'`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantCode: "ONBOARDING_NO_MODEL",
+		},
+		{
+			name: "state staging combo",
+			mutate: func(t *testing.T, env *onboardingRouteTestEnv) {
+				t.Helper()
+				if _, err := env.db.Exec(`UPDATE app_onboarding_state SET staged_combo_id = 'changed-combo' WHERE id = 1`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantCode: "ONBOARDING_STAGING_INVALID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			seedAppOnboardingTestChat(t, env, "codex", 31)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			withAppOnboardingTestSeams(t,
+				func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+					close(entered)
+					select {
+					case <-release:
+						return "Xin chào, tôi là Bé Mi.", nil
+					case <-ctx.Done():
+						return "", ctx.Err()
+					}
+				},
+				time.Now,
+				appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+				time.Second,
+			)
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				done <- env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":31,"message":"xin chào"}`)
+			}()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("runner was not entered")
+			}
+
+			tt.mutate(t, env)
+			close(release)
+			var rr *httptest.ResponseRecorder
+			select {
+			case rr = <-done:
+			case <-time.After(time.Second):
+				t.Fatal("test chat did not finish after runner release")
+			}
+			wantStatus := http.StatusConflict
+			if tt.wantCode == "ONBOARDING_NO_MODEL" {
+				wantStatus = http.StatusUnprocessableEntity
+			}
+			requireOnboardingCode(t, rr, wantStatus, tt.wantCode)
+			if state := env.state(t); state.TestNonceHash != "" || state.TestExpiresAt != "" {
+				t.Fatalf("postflight mutation persisted receipt: %+v", state)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingProviderCancelsRunningTestWithoutWaitingForRunnerBudget(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 33)
+	configDir := accountConfigDir(env.dataDir, "codex", "staged-account")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRunner := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseRunner()
+	withAppOnboardingTestSeams(t,
+		func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+			close(entered)
+			select {
+			case <-ctx.Done():
+				if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
+					t.Errorf("provider cleanup raced the active runner: info=%v err=%v", info, err)
+				}
+				return "", ctx.Err()
+			case <-release:
+				return "Xin chào, tôi là Bé Mi.", nil
+			}
+		},
+		time.Now,
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+		120*time.Second,
+	)
+	testDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		testDone <- env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":33,"message":"xin chào"}`)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("runner was not entered")
+	}
+
+	providerDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		providerDone <- env.serve(http.MethodPut, "/onboarding/provider", `{"revision":33,"kind":"claude-code"}`)
+	}()
+	select {
+	case rr := <-providerDone:
+		if rr.Code != http.StatusOK {
+			t.Fatalf("provider mutation status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(time.Second):
+		releaseRunner()
+		<-providerDone
+		t.Fatal("provider mutation remained blocked behind the external runner")
+	}
+	select {
+	case rr := <-testDone:
+		requireOnboardingCode(t, rr, http.StatusRequestTimeout, "ONBOARDING_REQUEST_CANCELED")
+	case <-time.After(time.Second):
+		t.Fatal("canceled test chat did not finish")
+	}
+	if state := env.state(t); state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		t.Fatalf("provider mutation left stale receipt: %+v", state)
+	}
+	if _, err := os.Stat(configDir); !os.IsNotExist(err) {
+		t.Fatalf("provider cleanup did not remove staging config after runner exit: %v", err)
+	}
+}
+
 func TestAppOnboardingTestChatRunnerFailureIsSafeAndDoesNotPersist(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	seedAppOnboardingTestChat(t, env, "codex", 18)
@@ -510,7 +953,7 @@ func TestAppOnboardingTestChatCancellationBeforeStoreDoesNotPersist(t *testing.T
 	}
 }
 
-func TestAppOnboardingTestChatCancellationAfterCommitKeepsReceiptAndWritesNoResponse(t *testing.T) {
+func TestAppOnboardingTestChatCancellationAfterCommitCompensatesReceiptAndAllowsRetry(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	state, _ := seedAppOnboardingTestChat(t, env, "codex", 29)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -530,8 +973,28 @@ func TestAppOnboardingTestChatCancellationAfterCommitKeepsReceiptAndWritesNoResp
 		t.Fatalf("canceled client received post-commit response: headers=%v body=%s", rr.Header(), rr.Body.String())
 	}
 	after := env.state(t)
-	if after.Revision != state.Revision+1 || after.TestNonceHash == "" || after.TestExpiresAt == "" {
-		t.Fatalf("post-commit cancellation lost receipt: before=%+v after=%+v", state, after)
+	if after.Revision != state.Revision+2 || after.TestNonceHash != "" || after.TestExpiresAt != "" {
+		t.Fatalf("post-commit cancellation left an orphan receipt: before=%+v after=%+v", state, after)
+	}
+	status := env.serve(http.MethodGet, "/onboarding/status", "")
+	if status.Code != http.StatusOK {
+		t.Fatalf("status after compensation=%d body=%s", status.Code, status.Body.String())
+	}
+	current := decodeOnboardingResponse[appOnboardingStatusResponse](t, status)
+	if current.Revision != after.Revision {
+		t.Fatalf("status revision = %d; want compensated revision %d", current.Revision, after.Revision)
+	}
+
+	appOnboardingTestAfterCommit = func() {}
+	appOnboardingTestRandom = appOnboardingRandomFromReader(bytes.NewReader(bytes.Repeat([]byte{0x33}, 32)))
+	retry := env.serve(http.MethodPost, "/onboarding/test-chat",
+		fmt.Sprintf(`{"revision":%d,"message":"xin chào lần nữa"}`, current.Revision))
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry status=%d body=%s", retry.Code, retry.Body.String())
+	}
+	retried := env.state(t)
+	if retried.Revision != current.Revision+1 || retried.TestNonceHash == "" || retried.TestExpiresAt == "" {
+		t.Fatalf("retry did not persist a fresh receipt: %+v", retried)
 	}
 }
 
@@ -1656,9 +2119,12 @@ func seedAppOnboardingSetup(
 	}
 	if err := env.a.st.CreateLLMAccount(store.LLMAccount{
 		ID: accountID, ProviderID: kind, Label: accountID,
-		ConfigDir: "D:/onboarding/" + accountID, Enabled: accountEnabled,
+		ConfigDir: accountConfigDir(env.dataDir, kind, accountID), Enabled: accountEnabled,
 	}); err != nil {
 		t.Fatalf("CreateLLMAccount(%q) = %v", accountID, err)
+	}
+	if err := os.MkdirAll(accountConfigDir(env.dataDir, kind, accountID), 0o700); err != nil {
+		t.Fatalf("MkdirAll account config %q: %v", accountID, err)
 	}
 	for _, model := range models {
 		model.ProviderID = kind
