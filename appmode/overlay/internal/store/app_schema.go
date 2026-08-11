@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const appSchemaVersion int64 = 6
+const appSchemaVersion int64 = 7
 
 const appFoundationSchema = `
 CREATE TABLE IF NOT EXISTS app_meta (
@@ -126,6 +126,31 @@ CREATE TABLE IF NOT EXISTS llm_combo_members (
 UPDATE llm_providers
 SET kind = 'claude-code'
 WHERE id = 'claude-code' AND kind = 'claude_code';
+`
+
+const appOnboardingV7Schema = `
+CREATE TABLE IF NOT EXISTS app_onboarding_state (
+  id                  INTEGER PRIMARY KEY CHECK (id = 1),
+  completed_version   INTEGER NOT NULL DEFAULT 0,
+  phase               TEXT NOT NULL CHECK (phase IN ('provider', 'connect', 'setup', 'persona', 'test', 'completed')),
+  provider_kind       TEXT NOT NULL DEFAULT '',
+  provider_id         TEXT NOT NULL DEFAULT '',
+  account_id          TEXT NOT NULL DEFAULT '',
+  model_id            TEXT NOT NULL DEFAULT '',
+  staged_combo_id     TEXT NOT NULL DEFAULT '',
+  persona_fingerprint TEXT NOT NULL DEFAULT '',
+  test_nonce_hash     TEXT NOT NULL DEFAULT '',
+  test_expires_at     TEXT NOT NULL DEFAULT '',
+  restart_in_progress INTEGER NOT NULL DEFAULT 0 CHECK (restart_in_progress IN (0, 1)),
+  revision            INTEGER NOT NULL DEFAULT 1,
+  updated_at          TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO app_onboarding_state(
+  id, completed_version, phase, revision, updated_at
+) VALUES (
+  1, 0, 'provider', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+);
 `
 
 type appColumnMigration struct {
@@ -279,6 +304,9 @@ func migrateApp(db *sql.DB) error {
 	}
 	if _, err := tx.Exec(appLLMSchema); err != nil {
 		return fmt.Errorf("migrate Portal LLM providers: %w", err)
+	}
+	if _, err := tx.Exec(appOnboardingV7Schema); err != nil {
+		return fmt.Errorf("migrate Portal onboarding V7 capability: %w", err)
 	}
 	if !versionExists {
 		if _, err := tx.Exec(

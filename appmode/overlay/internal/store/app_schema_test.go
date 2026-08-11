@@ -144,6 +144,19 @@ func appSchemaVersionForTest(t *testing.T, db *sql.DB) string {
 	return version
 }
 
+func openMigratedAppTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := migrateApp(db); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
 func createFeatureV4Fixture(t *testing.T, db *sql.DB) {
 	t.Helper()
 	execAppFixture(t, db,
@@ -366,6 +379,24 @@ INSERT INTO llm_combos(id, name, type, active, revision)
 INSERT INTO llm_combo_members(combo_id, position, provider_id, model_id, enabled)
   VALUES ('combo-v5', 0, 'provider-v5', 'model-v5', 1),
     ('combo-v5', 1, 'claude-code', 'haiku', 1);`,
+	)
+}
+
+// createProductionV6Fixture models the final V6 shape without calling migrateApp,
+// so a V7 migration test cannot accidentally prepare its fixture at V7.
+func createProductionV6Fixture(t *testing.T, db *sql.DB) {
+	t.Helper()
+	createProductionV5Fixture(t, db)
+	execAppFixture(t, db,
+		`ALTER TABLE app_zalo_cli_sessions
+  ADD COLUMN claude_account_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE app_zalo_cli_sessions
+  ADD COLUMN claude_config_dir TEXT NOT NULL DEFAULT '';
+UPDATE app_zalo_cli_sessions
+SET claude_account_id = 'account-claude-v5',
+    claude_config_dir = 'D:/claude-v5'
+WHERE thread_id = 'feature-user';
+UPDATE app_meta SET value = '6' WHERE key = 'schema_version';`,
 	)
 }
 
@@ -606,7 +637,7 @@ func productionV5DataSnapshot(t *testing.T, db *sql.DB) map[string]string {
 	return snapshot
 }
 
-func TestMigrateAppFeatureV4ToV6PreservesMemoryAndAddsLLM(t *testing.T) {
+func TestMigrateAppFeatureV4ToV7PreservesMemoryAndAddsLLM(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -617,8 +648,8 @@ func TestMigrateAppFeatureV4ToV6PreservesMemoryAndAddsLLM(t *testing.T) {
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "6" {
-		t.Fatalf("schema_version = %q; want 6", got)
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version = %q; want 7", got)
 	}
 	for _, table := range []string{
 		"llm_providers", "llm_models", "llm_route_entries", "llm_attempts",
@@ -722,7 +753,91 @@ WHERE id = 'claude-code'`).Scan(&kind, &systemProvider); err != nil {
 	}
 }
 
-func TestMigrateAppMainV4ToV6PreservesRoutingAndAddsMemory(t *testing.T) {
+func TestMigrateAppV7SeedsRequiredOnboarding(t *testing.T) {
+	db := openMigratedAppTestDB(t)
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version = %q; want 7", got)
+	}
+	if CurrentOnboardingVersion != 1 {
+		t.Fatalf("CurrentOnboardingVersion = %d; want 1", CurrentOnboardingVersion)
+	}
+	st := &Store{db: db}
+	got, err := st.OnboardingState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CompletedVersion != 0 || got.Phase != OnboardingPhaseProvider || got.Revision != 1 {
+		t.Fatalf("initial onboarding state = %+v", got)
+	}
+	if got.UpdatedAt == "" {
+		t.Fatal("initial onboarding updated_at is empty")
+	}
+}
+
+func TestMigrateAppV7PreservesV6Data(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createProductionV6Fixture(t, db)
+	wantData := productionV5DataSnapshot(t, db)
+	var wantAccountID, wantConfigDir string
+	if err := db.QueryRow(`SELECT claude_account_id, claude_config_dir
+FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
+		&wantAccountID, &wantConfigDir,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrateApp(db); err != nil {
+		t.Fatal(err)
+	}
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version = %q; want 7", got)
+	}
+	gotData := productionV5DataSnapshot(t, db)
+	for table, want := range wantData {
+		if got := gotData[table]; got != want {
+			t.Errorf("%s changed during V6-to-V7 migration:\n got %q\nwant %q", table, got, want)
+		}
+	}
+	var gotAccountID, gotConfigDir string
+	if err := db.QueryRow(`SELECT claude_account_id, claude_config_dir
+FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
+		&gotAccountID, &gotConfigDir,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if gotAccountID != wantAccountID || gotConfigDir != wantConfigDir {
+		t.Errorf("Zalo session binding changed from %q/%q to %q/%q",
+			wantAccountID, wantConfigDir, gotAccountID, gotConfigDir)
+	}
+}
+
+func TestMigrateAppV7EnforcesOnboardingSingleton(t *testing.T) {
+	db := openMigratedAppTestDB(t)
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM app_onboarding_state`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("onboarding row count = %d; want 1", count)
+	}
+	if _, err := db.Exec(`INSERT INTO app_onboarding_state(id, phase, updated_at)
+VALUES (2, 'provider', '2026-08-11T00:00:00Z')`); err == nil {
+		t.Fatal("inserting a second onboarding row succeeded; want singleton CHECK failure")
+	}
+}
+
+func TestMigrateAppV7RejectsUnknownOnboardingPhase(t *testing.T) {
+	db := openMigratedAppTestDB(t)
+	if _, err := db.Exec(`UPDATE app_onboarding_state SET phase = 'unknown' WHERE id = 1`); err == nil {
+		t.Fatal("setting an unknown onboarding phase succeeded; want CHECK failure")
+	}
+}
+
+func TestMigrateAppMainV4ToV7PreservesRoutingAndAddsMemory(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -733,8 +848,8 @@ func TestMigrateAppMainV4ToV6PreservesRoutingAndAddsMemory(t *testing.T) {
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "6" {
-		t.Fatalf("schema_version = %q; want 6", got)
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version = %q; want 7", got)
 	}
 	for _, table := range []string{
 		"app_zalo_cli_sessions", "app_memory_revisions", "app_memory_subject_revisions",
@@ -920,7 +1035,7 @@ END;`,
 	}
 }
 
-func TestMigrateAppV6IsIdempotent(t *testing.T) {
+func TestMigrateAppV7IsIdempotent(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -994,14 +1109,14 @@ WHERE thread_id = 'feature-user' AND uid = 'feature-user'`).Scan(&secondSubjectR
 	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'llm_route_revision'`).Scan(&routeRevision); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "6" {
-		t.Fatalf("schema_version = %q; want 6", got)
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version = %q; want 7", got)
 	}
 	if secondSQLiteSchemaVersion != firstSQLiteSchemaVersion || secondObjectCount != firstObjectCount ||
 		secondMemoryCount != firstMemoryCount || secondThreadRevision != firstThreadRevision ||
 		secondSubjectRevision != firstSubjectRevision || secondExpiry != firstExpiry ||
 		providerName != "Claude Code edited" || routeRevision != "23" {
-		t.Fatalf("second migration changed V6 state: SQLite %d->%d objects %d->%d memory %d->%d thread revision %d->%d subject revision %d->%d expiry %q->%q provider %q route revision %q",
+		t.Fatalf("second migration changed V7 state: SQLite %d->%d objects %d->%d memory %d->%d thread revision %d->%d subject revision %d->%d expiry %q->%q provider %q route revision %q",
 			firstSQLiteSchemaVersion, secondSQLiteSchemaVersion, firstObjectCount, secondObjectCount,
 			firstMemoryCount, secondMemoryCount, firstThreadRevision, secondThreadRevision,
 			firstSubjectRevision, secondSubjectRevision, firstExpiry, secondExpiry,
@@ -1009,7 +1124,7 @@ WHERE thread_id = 'feature-user' AND uid = 'feature-user'`).Scan(&secondSubjectR
 	}
 }
 
-func TestMigrateAppV5ToV6AddsClaudeBindingWithoutChangingSession(t *testing.T) {
+func TestMigrateAppV5ToV7AddsClaudeBindingWithoutChangingSession(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -1021,8 +1136,8 @@ func TestMigrateAppV5ToV6AddsClaudeBindingWithoutChangingSession(t *testing.T) {
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "6" {
-		t.Fatalf("schema_version = %q; want 6", got)
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version = %q; want 7", got)
 	}
 	columns := appTableColumns(t, db, "app_zalo_cli_sessions")
 	for _, column := range []string{"claude_account_id", "claude_config_dir"} {
@@ -1061,8 +1176,8 @@ FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
 	if err := migrateApp(db); err != nil {
 		t.Fatalf("second migrateApp: %v", err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "6" {
-		t.Fatalf("schema_version after second migration = %q; want 6", got)
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version after second migration = %q; want 7", got)
 	}
 	var secondSQLiteSchemaVersion, secondObjectCount int
 	if err := db.QueryRow(`PRAGMA schema_version`).Scan(&secondSQLiteSchemaVersion); err != nil {
@@ -1078,7 +1193,7 @@ FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
 	secondData := productionV5DataSnapshot(t, db)
 	for table, want := range gotData {
 		if got := secondData[table]; got != want {
-			t.Errorf("%s changed during second V6 migration:\n got %q\nwant %q", table, got, want)
+			t.Errorf("%s changed during second V7 migration:\n got %q\nwant %q", table, got, want)
 		}
 	}
 	assertBlankBinding("second migration")
@@ -1092,11 +1207,12 @@ func TestMigrateAppAdvancesSchemaVersionMonotonically(t *testing.T) {
 		want       string
 		wantErr    bool
 	}{
-		{name: "missing metadata", want: "6"},
-		{name: "older metadata", seed: "2", insertSeed: true, want: "6"},
-		{name: "previous metadata", seed: "5", insertSeed: true, want: "6"},
-		{name: "current metadata", seed: "6", insertSeed: true, want: "6"},
-		{name: "newer metadata", seed: "7", insertSeed: true, want: "7"},
+		{name: "missing metadata", want: "7"},
+		{name: "V1 metadata", seed: "1", insertSeed: true, want: "7"},
+		{name: "older metadata", seed: "2", insertSeed: true, want: "7"},
+		{name: "previous metadata", seed: "6", insertSeed: true, want: "7"},
+		{name: "current metadata", seed: "7", insertSeed: true, want: "7"},
+		{name: "newer metadata", seed: "8", insertSeed: true, want: "8"},
 		{name: "malformed metadata", seed: "future", insertSeed: true, want: "future", wantErr: true},
 		{name: "negative metadata", seed: "-1", insertSeed: true, want: "-1", wantErr: true},
 	}
@@ -1418,7 +1534,7 @@ func TestMigrateAppFutureVersionIsUntouched(t *testing.T) {
 	}
 	defer db.Close()
 	if _, err := db.Exec(`CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO app_meta(key, value) VALUES ('schema_version', '7')`); err != nil {
+INSERT INTO app_meta(key, value) VALUES ('schema_version', '8')`); err != nil {
 		t.Fatal(err)
 	}
 	var firstSQLiteSchemaVersion, firstObjectCount int64
@@ -1435,8 +1551,8 @@ INSERT INTO app_meta(key, value) VALUES ('schema_version', '7')`); err != nil {
 	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'schema_version'`).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
-	if got != "7" {
-		t.Fatalf("future schema_version = %q; want 7", got)
+	if got != "8" {
+		t.Fatalf("future schema_version = %q; want 8", got)
 	}
 	var secondSQLiteSchemaVersion, secondObjectCount int64
 	if err := db.QueryRow(`PRAGMA schema_version`).Scan(&secondSQLiteSchemaVersion); err != nil {
@@ -1503,7 +1619,7 @@ func TestMigrateAppUnifiesClaudeKind(t *testing.T) {
 		t.Fatal(err)
 	}
 	if kind != "claude-code" {
-		t.Errorf("claude-code kind after V4-to-V6 migration = %q; want claude-code", kind)
+		t.Errorf("claude-code kind after V4-to-V7 migration = %q; want claude-code", kind)
 	}
 }
 
@@ -1524,7 +1640,7 @@ func TestMigrateAppSeedsNoDefaultCombo(t *testing.T) {
 	if combos != 0 {
 		t.Errorf("combos after migration = %d; want 0", combos)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "6" {
-		t.Errorf("schema_version = %q; want 6", got)
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Errorf("schema_version = %q; want 7", got)
 	}
 }
