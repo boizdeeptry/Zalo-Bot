@@ -91,6 +91,9 @@ export function createPersonaFieldModel(agent = {}) {
   const persistedDisplayName = validatePersonaValue(displayName);
   const holes = normalizedHoles(agent);
   const hasBotName = holes.some(({ key }) => key === "TEN_BOT");
+  const authoritativeDisplayName = !hasBotName && persistedDisplayName.ok
+    ? persistedDisplayName.value
+    : "";
   const firstValues = new Map();
   const fields = holes.map((hole, index) => {
     const friendly = FRIENDLY_FIELDS[hole.key];
@@ -128,9 +131,7 @@ export function createPersonaFieldModel(agent = {}) {
     const fieldErrorEntries = [];
     const recordedValues = new Set();
     const recordedErrors = new Set();
-    let authoritativeDisplayName = !hasBotName && persistedDisplayName.ok
-      ? persistedDisplayName.value
-      : "";
+    let validatedDisplayName = authoritativeDisplayName;
     let firstErrorKey = null;
     let firstErrorId = null;
     for (const field of fields) {
@@ -140,7 +141,7 @@ export function createPersonaFieldModel(agent = {}) {
         recordedValues.add(field.key);
       }
       if (field.key === "TEN_BOT" || field.kind === "display-name") {
-        authoritativeDisplayName = result.value;
+        validatedDisplayName = result.value;
       }
       if (!result.ok) {
         const message = `${fieldErrorLabel(field)} ${result.error}`;
@@ -158,7 +159,7 @@ export function createPersonaFieldModel(agent = {}) {
     return {
       ok: fieldErrorEntries.length === 0,
       values: Object.fromEntries(valueEntries),
-      displayName: authoritativeDisplayName,
+      displayName: validatedDisplayName,
       errors: Object.fromEntries(errorEntries),
       fieldErrors: Object.fromEntries(fieldErrorEntries),
       remaining: fieldErrorEntries.length,
@@ -169,6 +170,7 @@ export function createPersonaFieldModel(agent = {}) {
 
   return Object.freeze({
     fields: Object.freeze(fields),
+    displayName: authoritativeDisplayName,
     validate,
     remaining(input = {}) { return validate(input).remaining; },
   });
@@ -216,7 +218,7 @@ export function createPersonaFields({
 
   function read() {
     const valueEntries = [];
-    let displayName = "";
+    let displayName = model.displayName;
     for (const { field, input } of entries) {
       if (field.kind === "persona") valueEntries.push([field.key, input.value]);
       if (field.key === "TEN_BOT" || field.kind === "display-name") displayName = input.value;

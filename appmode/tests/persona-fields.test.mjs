@@ -247,6 +247,48 @@ test("invalid persisted display name fails closed with an editable dedicated fie
   assert.equal(result.firstErrorId, "display-name");
 });
 
+test("DOM read retains the authoritative persisted display name across renders", (t) => {
+  const dom = installDOM();
+  t.after(dom.restore);
+  const host = document.createElement("div");
+  const controller = createPersonaFields({
+    agent: {
+      display_name: " Trợ lý An ",
+      placeholders: [{ key: "don-vi", count: 1 }],
+    },
+  });
+  controller.mount(host);
+
+  let inputs = findAll(host, (node) => node.tagName === "INPUT");
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0].getAttribute("data-persona-kind"), "persona");
+  inputs[0].value = " Công ty Mở ";
+  inputs[0].dispatchEvent({ type: "input" });
+  assert.deepEqual(controller.read(), {
+    values: { "don-vi": " Công ty Mở " },
+    displayName: "Trợ lý An",
+  });
+  assert.equal(controller.validate().displayName, controller.read().displayName);
+
+  controller.render({
+    display_name: " Tên mới ",
+    placeholders: [
+      { key: "vai-tro", count: 1 },
+      { key: "vai-tro", count: 2 },
+    ],
+  });
+  inputs = findAll(host, (node) => node.tagName === "INPUT");
+  assert.equal(inputs.length, 2);
+  inputs[1].value = " Tư vấn ";
+  inputs[1].dispatchEvent({ type: "input" });
+  assert.equal(inputs[0].value, " Tư vấn ");
+  assert.deepEqual(controller.read(), {
+    values: { "vai-tro": " Tư vấn " },
+    displayName: "Tên mới",
+  });
+  assert.equal(controller.validate().displayName, controller.read().displayName);
+});
+
 test("synthetic display name stays distinct from legitimate display_name holes", () => {
   const model = createPersonaFieldModel({
     placeholders: [
