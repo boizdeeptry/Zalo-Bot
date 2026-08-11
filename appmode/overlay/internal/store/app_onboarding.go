@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 const CurrentOnboardingVersion int64 = 1
@@ -17,8 +18,13 @@ const (
 	OnboardingPhaseCompleted = "completed"
 )
 
-var ErrOnboardingStateMissing = errors.New("onboarding state is missing")
-var ErrOnboardingConflict = errors.New("onboarding revision conflict")
+var (
+	ErrOnboardingStateMissing            = errors.New("onboarding state is missing")
+	ErrOnboardingConflict                = errors.New("onboarding revision conflict")
+	ErrOnboardingProviderUnsupported     = errors.New("unsupported onboarding provider")
+	ErrOnboardingInvalidPhase            = errors.New("invalid onboarding phase")
+	ErrOnboardingInvalidStagingOwnership = errors.New("invalid onboarding staging ownership")
+)
 
 type OnboardingState struct {
 	CompletedVersion   int64
@@ -36,16 +42,126 @@ type OnboardingState struct {
 	UpdatedAt          string
 }
 
+type OnboardingStagingAccount struct {
+	AccountID    string
+	ProviderID   string
+	ProviderKind string
+	ConfigDir    string
+}
+
+func IsOnboardingProviderKind(kind string) bool {
+	return kind == "codex" || kind == "claude-code"
+}
+
 // OnboardingState returns the required singleton state. A missing row is an
 // explicit error so callers cannot mistake a damaged database for completion.
 func (s *Store) OnboardingState() (OnboardingState, error) {
-	var state OnboardingState
-	var restartInProgress int64
-	err := s.db.QueryRow(`SELECT
+	state, err := scanOnboardingState(s.db.QueryRow(onboardingStateSelect))
+	if errors.Is(err, sql.ErrNoRows) {
+		return OnboardingState{}, ErrOnboardingStateMissing
+	}
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding state: %w", err)
+	}
+	return state, nil
+}
+
+// OnboardingStagingAccount returns only a disabled Account exactly owned by
+// the requested onboarding revision. ConfigDir is metadata for the caller's
+// cleanup; Store never removes it from the filesystem.
+func (s *Store) OnboardingStagingAccount(expectedRevision int64) (OnboardingStagingAccount, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingStagingAccount{}, fmt.Errorf("begin onboarding staging inspection: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingStagingAccount{}, err
+	}
+	if state.Revision != expectedRevision {
+		return OnboardingStagingAccount{}, onboardingConflict(expectedRevision, state.Revision)
+	}
+	if state.AccountID == "" {
+		if err := tx.Commit(); err != nil {
+			return OnboardingStagingAccount{}, fmt.Errorf("commit empty onboarding staging inspection: %w", err)
+		}
+		return OnboardingStagingAccount{}, nil
+	}
+
+	staging, err := onboardingStagingAccountInTx(tx, state)
+	if err != nil {
+		return OnboardingStagingAccount{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingStagingAccount{}, fmt.Errorf("commit onboarding staging inspection: %w", err)
+	}
+	return staging, nil
+}
+
+// SelectOnboardingProvider starts the selected Provider's connect phase. Any
+// prior disabled staging Account is deleted only after the caller confirms it
+// cleaned the matching Account directory.
+func (s *Store) SelectOnboardingProvider(
+	expectedRevision int64,
+	kind string,
+	cleanedAccountID string,
+) (OnboardingState, error) {
+	if !IsOnboardingProviderKind(kind) {
+		return OnboardingState{}, fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
+	}
+	return s.transitionOnboarding(expectedRevision, cleanedAccountID, func(state *OnboardingState) error {
+		switch state.Phase {
+		case OnboardingPhaseProvider,
+			OnboardingPhaseConnect,
+			OnboardingPhaseSetup,
+			OnboardingPhasePersona,
+			OnboardingPhaseTest:
+		default:
+			return fmt.Errorf("select onboarding provider from %q: %w", state.Phase, ErrOnboardingInvalidPhase)
+		}
+		state.Phase = OnboardingPhaseConnect
+		state.ProviderKind = kind
+		clearOnboardingStaging(state)
+		return nil
+	})
+}
+
+// RestartOnboarding begins a new current-version flow while retaining the fact
+// that an earlier onboarding version completed successfully.
+func (s *Store) RestartOnboarding(
+	expectedRevision int64,
+	cleanedAccountID string,
+) (OnboardingState, error) {
+	return s.transitionOnboarding(expectedRevision, cleanedAccountID, func(state *OnboardingState) error {
+		if state.Phase != OnboardingPhaseCompleted ||
+			state.CompletedVersion < CurrentOnboardingVersion ||
+			state.RestartInProgress {
+			return fmt.Errorf("restart onboarding from phase %q: %w", state.Phase, ErrOnboardingInvalidPhase)
+		}
+		state.Phase = OnboardingPhaseProvider
+		state.ProviderKind = ""
+		state.RestartInProgress = true
+		clearOnboardingStaging(state)
+		return nil
+	})
+}
+
+const onboardingStateSelect = `SELECT
 completed_version, phase, provider_kind, provider_id, account_id, model_id,
 staged_combo_id, persona_fingerprint, test_nonce_hash, test_expires_at,
 restart_in_progress, revision, updated_at
-FROM app_onboarding_state WHERE id = 1`).Scan(
+FROM app_onboarding_state WHERE id = 1`
+
+type onboardingRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanOnboardingState(row onboardingRowScanner) (OnboardingState, error) {
+	var state OnboardingState
+	var restartInProgress int64
+	err := row.Scan(
 		&state.CompletedVersion,
 		&state.Phase,
 		&state.ProviderKind,
@@ -60,12 +176,196 @@ FROM app_onboarding_state WHERE id = 1`).Scan(
 		&state.Revision,
 		&state.UpdatedAt,
 	)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	state.RestartInProgress = restartInProgress != 0
+	return state, nil
+}
+
+func onboardingStateInTx(tx *sql.Tx) (OnboardingState, error) {
+	state, err := scanOnboardingState(tx.QueryRow(onboardingStateSelect))
 	if errors.Is(err, sql.ErrNoRows) {
 		return OnboardingState{}, ErrOnboardingStateMissing
 	}
 	if err != nil {
-		return OnboardingState{}, fmt.Errorf("read onboarding state: %w", err)
+		return OnboardingState{}, fmt.Errorf("read onboarding state in transaction: %w", err)
 	}
-	state.RestartInProgress = restartInProgress != 0
 	return state, nil
+}
+
+func onboardingStagingAccountInTx(
+	tx *sql.Tx,
+	state OnboardingState,
+) (OnboardingStagingAccount, error) {
+	var staging OnboardingStagingAccount
+	var enabled int64
+	err := tx.QueryRow(`SELECT
+a.id, a.provider_id, p.kind, a.config_dir, a.enabled
+FROM llm_accounts a
+JOIN llm_providers p ON p.id = a.provider_id
+WHERE a.id = ?`, state.AccountID).Scan(
+		&staging.AccountID,
+		&staging.ProviderID,
+		&staging.ProviderKind,
+		&staging.ConfigDir,
+		&enabled,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return OnboardingStagingAccount{}, fmt.Errorf(
+			"%w: onboarding Account %q does not exist with its Provider",
+			ErrOnboardingInvalidStagingOwnership,
+			state.AccountID,
+		)
+	}
+	if err != nil {
+		return OnboardingStagingAccount{}, fmt.Errorf("read onboarding staging Account %q: %w", state.AccountID, err)
+	}
+	if staging.AccountID != state.AccountID ||
+		staging.ProviderID != state.ProviderID ||
+		staging.ProviderKind != state.ProviderKind ||
+		enabled != 0 {
+		return OnboardingStagingAccount{}, fmt.Errorf(
+			"%w: onboarding Account %q is not the exact disabled staging owner",
+			ErrOnboardingInvalidStagingOwnership,
+			state.AccountID,
+		)
+	}
+	return staging, nil
+}
+
+func (s *Store) transitionOnboarding(
+	expectedRevision int64,
+	cleanedAccountID string,
+	apply func(*OnboardingState) error,
+) (OnboardingState, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("begin onboarding transition: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if state.Revision != expectedRevision {
+		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
+	}
+	ownedState := state
+	if err := apply(&state); err != nil {
+		return OnboardingState{}, err
+	}
+	if err := deleteOnboardingStagingAccount(tx, ownedState, cleanedAccountID); err != nil {
+		return OnboardingState{}, err
+	}
+
+	state.Revision++
+	state.UpdatedAt = ts(time.Now())
+	result, err := tx.Exec(`UPDATE app_onboarding_state SET
+completed_version = ?, phase = ?, provider_kind = ?, provider_id = ?, account_id = ?,
+model_id = ?, staged_combo_id = ?, persona_fingerprint = ?, test_nonce_hash = ?,
+test_expires_at = ?, restart_in_progress = ?, revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ?`,
+		state.CompletedVersion,
+		state.Phase,
+		state.ProviderKind,
+		state.ProviderID,
+		state.AccountID,
+		state.ModelID,
+		state.StagedComboID,
+		state.PersonaFingerprint,
+		state.TestNonceHash,
+		state.TestExpiresAt,
+		state.RestartInProgress,
+		state.UpdatedAt,
+		expectedRevision,
+	)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("update onboarding state: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding update result: %w", err)
+	}
+	if changed != 1 {
+		return OnboardingState{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingState{}, fmt.Errorf("commit onboarding transition: %w", err)
+	}
+	return updated, nil
+}
+
+func deleteOnboardingStagingAccount(
+	tx *sql.Tx,
+	state OnboardingState,
+	cleanedAccountID string,
+) error {
+	if state.AccountID == "" {
+		if cleanedAccountID != "" {
+			return fmt.Errorf(
+				"%w: state owns no Account but cleanup named %q",
+				ErrOnboardingInvalidStagingOwnership,
+				cleanedAccountID,
+			)
+		}
+		return nil
+	}
+	if cleanedAccountID != state.AccountID {
+		return fmt.Errorf(
+			"%w: cleanup Account %q does not match owned Account %q",
+			ErrOnboardingInvalidStagingOwnership,
+			cleanedAccountID,
+			state.AccountID,
+		)
+	}
+	staging, err := onboardingStagingAccountInTx(tx, state)
+	if err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM llm_accounts
+WHERE id = ? AND provider_id = ? AND enabled = 0
+  AND EXISTS (
+    SELECT 1 FROM llm_providers p
+    WHERE p.id = llm_accounts.provider_id AND p.kind = ?
+  )`, staging.AccountID, staging.ProviderID, staging.ProviderKind)
+	if err != nil {
+		return fmt.Errorf("delete onboarding staging Account %q: %w", staging.AccountID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read onboarding staging delete result: %w", err)
+	}
+	if changed != 1 {
+		return fmt.Errorf(
+			"%w: onboarding Account %q changed before deletion",
+			ErrOnboardingInvalidStagingOwnership,
+			staging.AccountID,
+		)
+	}
+	return nil
+}
+
+func clearOnboardingStaging(state *OnboardingState) {
+	state.ProviderID = ""
+	state.AccountID = ""
+	state.ModelID = ""
+	state.StagedComboID = ""
+	state.PersonaFingerprint = ""
+	state.TestNonceHash = ""
+	state.TestExpiresAt = ""
+}
+
+func onboardingConflict(expectedRevision, currentRevision int64) error {
+	return fmt.Errorf(
+		"%w: expected revision %d, current revision %d",
+		ErrOnboardingConflict,
+		expectedRevision,
+		currentRevision,
+	)
 }
