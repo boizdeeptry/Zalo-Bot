@@ -1,0 +1,711 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  createOnboardingPage,
+  createOnboardingService,
+} from "../overlay/internal/webui/static/pages/onboarding.js";
+import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
+
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+const microtask = () => Promise.resolve();
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
+function hasClass(node, name) {
+  return Boolean(node?.classList?.contains(name));
+}
+
+function button(root, label) {
+  return find(root, (node) => node.tagName === "BUTTON" && text(node).includes(label));
+}
+
+function byClass(root, name) {
+  return find(root, (node) => hasClass(node, name));
+}
+
+function providerCard(root, kind) {
+  return find(root, (node) => hasClass(node, "onboarding-provider-card")
+    && node.dataset.providerKind === kind);
+}
+
+function providerStatus(overrides = {}) {
+  return {
+    required: true,
+    phase: "provider",
+    provider_kind: "",
+    suggested_provider_kind: "",
+    provider_id: "",
+    account_id: "",
+    model_id: "",
+    revision: 1,
+    ...overrides,
+  };
+}
+
+function connectStatus(overrides = {}) {
+  return providerStatus({
+    phase: "connect",
+    provider_kind: "codex",
+    revision: 2,
+    ...overrides,
+  });
+}
+
+function setupStatus(overrides = {}) {
+  return providerStatus({
+    phase: "setup",
+    provider_kind: "codex",
+    provider_id: "codex",
+    account_id: "account-1",
+    revision: 3,
+    ...overrides,
+  });
+}
+
+function personaStatus(overrides = {}) {
+  return providerStatus({
+    phase: "persona",
+    provider_kind: "codex",
+    provider_id: "codex",
+    account_id: "account-1",
+    model_id: "gpt-5.6-terra",
+    revision: 4,
+    ...overrides,
+  });
+}
+
+function baseService(overrides = {}) {
+  return {
+    status: () => Promise.resolve(providerStatus()),
+    selectProvider: () => Promise.resolve(connectStatus()),
+    setup: () => Promise.resolve({
+      revision: 4,
+      provider_kind: "codex",
+      provider_id: "codex",
+      account_id: "account-1",
+      model_id: "gpt-5.6-terra",
+    }),
+    ...overrides,
+  };
+}
+
+function idleConnectService() {
+  return {
+    connectStart: () => Promise.resolve({ kind: "codex", phase: "detecting" }),
+    connectStatus: () => new Promise(() => {}),
+    connectCancel: () => Promise.resolve({ ok: true }),
+  };
+}
+
+function fakeConnectFactory(log = []) {
+  const instances = [];
+  const factory = (options) => {
+    const instance = {
+      options,
+      slot: null,
+      starts: [],
+      mount(slot) {
+        this.slot = slot;
+        log.push("mount");
+        return this;
+      },
+      start(value) {
+        this.starts.push(value);
+        log.push("start");
+        return true;
+      },
+      cancel() {
+        log.push("cancel");
+        return Promise.resolve(true);
+      },
+      dispose() {
+        log.push("dispose");
+        this.slot?.replaceChildren();
+      },
+    };
+    instances.push(instance);
+    log.push("create");
+    return instance;
+  };
+  factory.instances = instances;
+  return factory;
+}
+
+function controlledTimers() {
+  let nextID = 1;
+  const timers = new Map();
+  return {
+    setTimeoutFn(callback) {
+      const id = nextID++;
+      timers.set(id, callback);
+      return id;
+    },
+    clearTimeoutFn(id) {
+      timers.delete(id);
+    },
+    runAll() {
+      for (const [id, callback] of [...timers]) {
+        timers.delete(id);
+        callback();
+      }
+    },
+    get size() { return timers.size; },
+  };
+}
+
+function mountPage(t, options = {}) {
+  const dom = installDOM();
+  const host = document.createElement("div");
+  const page = createOnboardingPage({
+    initialStatus: providerStatus(),
+    service: baseService(),
+    connectService: idleConnectService(),
+    ...options,
+  });
+  page.mount(host);
+  t.after(() => {
+    page.dispose();
+    dom.restore();
+  });
+  return { page, host };
+}
+
+test("onboarding service sends exact paths, bodies, and AbortSignals", async () => {
+  const calls = [];
+  const signal = new AbortController().signal;
+  const service = createOnboardingService({
+    requestJSON: async (path, options = {}) => {
+      calls.push({ path, options });
+      if (path === "/onboarding/setup") {
+        return {
+          revision: 9,
+          provider_kind: "codex",
+          provider_id: "codex",
+          account_id: "account-7",
+          model_id: "gpt-5.6-terra",
+          access_token: "SECRET",
+          config_dir: "C:/secret",
+        };
+      }
+      return { ok: true };
+    },
+  });
+
+  assert.ok(Object.isFrozen(service));
+  await service.status(signal);
+  await service.selectProvider("codex", 7, signal);
+  const setup = await service.setup("account-7", 8, signal);
+
+  assert.deepEqual(calls, [
+    { path: "/onboarding/status", options: { signal } },
+    {
+      path: "/onboarding/provider",
+      options: { method: "PUT", body: { kind: "codex", revision: 7 }, signal },
+    },
+    {
+      path: "/onboarding/setup",
+      options: {
+        method: "POST",
+        body: { account_id: "account-7", revision: 8 },
+        signal,
+      },
+    },
+  ]);
+  assert.deepEqual(setup, {
+    phase: "persona",
+    revision: 9,
+    provider_kind: "codex",
+    provider_id: "codex",
+    account_id: "account-7",
+    model_id: "gpt-5.6-terra",
+  });
+  assert.throws(() => service.selectProvider("Codex", 7), /supported/i);
+  assert.throws(() => service.selectProvider("openai", 7), /supported/i);
+  assert.throws(() => service.setup(" account-7 ", 8), /account/i);
+  assert.throws(() => service.setup("account-7", 0), /revision/i);
+});
+
+test("Welcome renders only two provider cards, an exact three-step rail, and guarded warning", (t) => {
+  const { host } = mountPage(t);
+  const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
+  const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
+  const continueButton = button(host, "Tiếp tục");
+
+  assert.deepEqual(cards.map((card) => text(card)), ["Codex", "Claude Code"]);
+  assert.deepEqual(steps.map((step) => text(step)), [
+    "Kết nối",
+    "Cá nhân hoá",
+    "Trò chuyện thử",
+  ]);
+  assert.equal(steps.some((step) => /setup|chuẩn bị/i.test(text(step))), false);
+  assert.equal(continueButton.disabled, true);
+  assert.match(text(byClass(host, "onboarding-provider-warning")), /đăng nhập/i);
+  assert.match(text(byClass(host, "onboarding-provider-warning")), /xác minh/i);
+  assert.match(text(byClass(host, "onboarding-provider-warning")), /Hoàn tất/i);
+
+  providerCard(host, "codex").click();
+  assert.equal(providerCard(host, "codex").getAttribute("aria-pressed"), "true");
+  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "false");
+  assert.equal(button(host, "Tiếp tục").disabled, false);
+});
+
+test("Welcome preselects an eligible persisted provider before a suggestion", (t) => {
+  const { host } = mountPage(t, {
+    initialStatus: providerStatus({
+      provider_kind: "claude-code",
+      suggested_provider_kind: "codex",
+    }),
+  });
+
+  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "true");
+  assert.equal(button(host, "Tiếp tục").disabled, false);
+});
+
+test("Welcome ignores unsupported suggestions and keeps Continue disabled", (t) => {
+  const { host } = mountPage(t, {
+    initialStatus: providerStatus({ suggested_provider_kind: "openai" }),
+  });
+
+  assert.equal(providerCard(host, "codex").getAttribute("aria-pressed"), "false");
+  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "false");
+  assert.equal(button(host, "Tiếp tục").disabled, true);
+});
+
+test("provider selection uses the current revision once and adopts the server Connect snapshot", async (t) => {
+  const selection = deferred();
+  const calls = [];
+  const connectFactory = fakeConnectFactory();
+  const { host } = mountPage(t, {
+    initialStatus: providerStatus({ revision: 11, suggested_provider_kind: "codex" }),
+    service: baseService({
+      selectProvider(kind, revision, signal) {
+        calls.push({ kind, revision, signal });
+        return selection.promise;
+      },
+    }),
+    connectFactory,
+  });
+
+  const retainedContinue = button(host, "Tiếp tục");
+  retainedContinue.click();
+  retainedContinue.click();
+  assert.equal(calls.length, 1);
+  assert.deepEqual({ kind: calls[0].kind, revision: calls[0].revision }, {
+    kind: "codex",
+    revision: 11,
+  });
+  assert.ok(calls[0].signal instanceof AbortSignal);
+  assert.equal(retainedContinue.disabled, true);
+
+  selection.resolve(connectStatus({ revision: 18, provider_kind: "codex" }));
+  await flush();
+
+  assert.equal(connectFactory.instances.length, 1);
+  assert.equal(connectFactory.instances[0].options.kind, "codex");
+  assert.deepEqual(connectFactory.instances[0].starts, [{
+    label: "Onboarding",
+    onboardingRevision: 18,
+  }]);
+  assert.match(text(host), /Kết nối Codex/);
+});
+
+test("disposed and stale provider selections cannot render Connect", async (t) => {
+  const selection = deferred();
+  const connectFactory = fakeConnectFactory();
+  const { page, host } = mountPage(t, {
+    initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
+    service: baseService({ selectProvider: () => selection.promise }),
+    connectFactory,
+  });
+
+  button(host, "Tiếp tục").click();
+  page.dispose();
+  selection.resolve(connectStatus());
+  await flush();
+
+  assert.equal(connectFactory.instances.length, 0);
+  assert.equal(text(host), "");
+});
+
+test("selection errors fail safely and Retry reloads an authoritative status", async (t) => {
+  const selectCalls = [];
+  let statusCalls = 0;
+  const { host } = mountPage(t, {
+    initialStatus: providerStatus({ revision: 3, suggested_provider_kind: "codex" }),
+    service: baseService({
+      selectProvider(kind, revision) {
+        selectCalls.push({ kind, revision });
+        if (selectCalls.length === 1) return Promise.reject(new Error("SECRET token=abc"));
+        return Promise.resolve(connectStatus({ revision: 10 }));
+      },
+      status() {
+        statusCalls++;
+        return Promise.resolve(providerStatus({ revision: 9, suggested_provider_kind: "codex" }));
+      },
+    }),
+    connectFactory: fakeConnectFactory(),
+  });
+
+  button(host, "Tiếp tục").click();
+  await flush();
+  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+  assert.doesNotMatch(text(host), /SECRET|token=abc/);
+
+  button(host, "Thử lại").click();
+  await flush();
+  assert.equal(statusCalls, 1);
+  button(host, "Tiếp tục").click();
+  await flush();
+  assert.deepEqual(selectCalls[1], { kind: "codex", revision: 9 });
+});
+
+test("Connect resume creates and starts exactly one component without re-PUT", (t) => {
+  let selects = 0;
+  const connectFactory = fakeConnectFactory();
+  const { page, host } = mountPage(t, {
+    initialStatus: connectStatus({ revision: 6, provider_kind: "claude-code" }),
+    service: baseService({ selectProvider: () => { selects++; } }),
+    connectFactory,
+  });
+
+  page.mount(host);
+  assert.equal(selects, 0);
+  assert.equal(connectFactory.instances.length, 1);
+  assert.deepEqual(connectFactory.instances[0].starts, [{
+    label: "Onboarding",
+    onboardingRevision: 6,
+  }]);
+  assert.equal(connectFactory.instances[0].options.kind, "claude-code");
+});
+
+test("Back invalidates first, then cancels and disposes; a late terminal cannot call Setup", async (t) => {
+  const order = [];
+  const cancelGate = deferred();
+  let setupCalls = 0;
+  let statusCalls = 0;
+  let captured;
+  const connectFactory = (options) => {
+    captured = options;
+    return {
+      mount: () => { order.push("mount"); },
+      start: () => { order.push("start"); },
+      cancel: () => { order.push("cancel"); return cancelGate.promise; },
+      dispose: () => { order.push("dispose"); },
+    };
+  };
+  const { host } = mountPage(t, {
+    initialStatus: connectStatus({ revision: 6 }),
+    service: baseService({
+      status: () => { statusCalls++; return Promise.resolve(setupStatus()); },
+      setup: () => { setupCalls++; return Promise.resolve({}); },
+    }),
+    connectFactory,
+  });
+
+  const backPromise = captured.onBack();
+  const lateTerminal = captured.onConnected({
+    kind: "codex",
+    providerId: "codex",
+    accountId: "account-1",
+  });
+  await microtask();
+  assert.equal(statusCalls, 0);
+  assert.equal(setupCalls, 0);
+  cancelGate.resolve(true);
+  await Promise.all([backPromise, lateTerminal]);
+
+  assert.deepEqual(order.slice(-2), ["cancel", "dispose"]);
+  assert.match(text(host), /Chọn nhà cung cấp/);
+  assert.equal(statusCalls, 0);
+  assert.equal(setupCalls, 0);
+});
+
+test("a connected terminal reconciles authoritative Setup and deduplicates the POST", async (t) => {
+  const setupGate = deferred();
+  const timers = controlledTimers();
+  const calls = [];
+  let captured;
+  const { host } = mountPage(t, {
+    initialStatus: connectStatus({ revision: 6 }),
+    service: baseService({
+      status(signal) {
+        calls.push({ op: "status", signal });
+        return Promise.resolve(setupStatus({ revision: 7 }));
+      },
+      setup(accountId, revision, signal) {
+        calls.push({ op: "setup", accountId, revision, signal });
+        return setupGate.promise;
+      },
+    }),
+    connectFactory(options) {
+      captured = options;
+      return { mount() {}, start() {}, cancel: () => Promise.resolve(true), dispose() {} };
+    },
+    ...timers,
+  });
+
+  const terminal = { kind: "codex", providerId: "codex", accountId: "account-1" };
+  const first = captured.onConnected(terminal);
+  const duplicate = captured.onConnected(terminal);
+  assert.equal(first, duplicate);
+  await flush();
+  const whileSetupIsPending = captured.onConnected(terminal);
+  assert.equal(whileSetupIsPending, first);
+  assert.deepEqual(calls.map((call) => call.op), ["status", "setup"]);
+  assert.deepEqual(
+    { accountId: calls[1].accountId, revision: calls[1].revision },
+    { accountId: "account-1", revision: 7 },
+  );
+  assert.match(text(host), /Đang chuẩn bị cấu hình…/);
+
+  setupGate.resolve({
+    revision: 8,
+    provider_kind: "codex",
+    provider_id: "codex",
+    account_id: "account-1",
+    model_id: "gpt-5.6-terra",
+  });
+  await microtask();
+  await microtask();
+  assert.match(text(host), /✓/);
+  assert.equal(timers.size, 1);
+  timers.runAll();
+  assert.match(text(host), /Trợ lý của bạn là ai/);
+  await Promise.all([first, duplicate, whileSetupIsPending]);
+});
+
+test("Setup resume auto-runs once, shows failure, and Retry starts exactly one new request", async (t) => {
+  const first = deferred();
+  const second = deferred();
+  const calls = [];
+  const { host } = mountPage(t, {
+    initialStatus: setupStatus({ revision: 21, account_id: "resume-account" }),
+    service: baseService({
+      setup(accountId, revision, signal) {
+        calls.push({ accountId, revision, signal });
+        return calls.length === 1 ? first.promise : second.promise;
+      },
+    }),
+  });
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(
+    { accountId: calls[0].accountId, revision: calls[0].revision },
+    { accountId: "resume-account", revision: 21 },
+  );
+  assert.match(text(host), /Đang chuẩn bị cấu hình…/);
+
+  first.reject(new Error("private config path"));
+  await flush();
+  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+  assert.doesNotMatch(text(host), /private config path/);
+  const retry = button(host, "Thử lại");
+  retry.click();
+  retry.click();
+  assert.equal(calls.length, 2);
+  second.resolve({
+    revision: 22,
+    provider_kind: "codex",
+    provider_id: "codex",
+    account_id: "resume-account",
+    model_id: "gpt-5.6-terra",
+  });
+  await flush();
+});
+
+test("malformed Setup resume fails closed until status Retry supplies an account", async (t) => {
+  let setupCalls = 0;
+  let statusCalls = 0;
+  const { host } = mountPage(t, {
+    initialStatus: setupStatus({ account_id: "" }),
+    service: baseService({
+      status: () => {
+        statusCalls++;
+        return Promise.resolve(setupStatus({ account_id: "restored-account", revision: 30 }));
+      },
+      setup: () => { setupCalls++; return new Promise(() => {}); },
+    }),
+  });
+
+  assert.equal(setupCalls, 0);
+  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+  button(host, "Thử lại").click();
+  await flush();
+  assert.equal(statusCalls, 1);
+  assert.equal(setupCalls, 1);
+});
+
+test("Persona resume renders directly without PUT, Connect, or Setup", (t) => {
+  let selects = 0;
+  let setups = 0;
+  const connectFactory = fakeConnectFactory();
+  const { host } = mountPage(t, {
+    initialStatus: personaStatus(),
+    service: baseService({
+      selectProvider: () => { selects++; },
+      setup: () => { setups++; },
+    }),
+    connectFactory,
+  });
+
+  assert.match(text(host), /Trợ lý của bạn là ai/);
+  assert.equal(selects, 0);
+  assert.equal(setups, 0);
+  assert.equal(connectFactory.instances.length, 0);
+});
+
+test("unknown, non-required, and malformed initial snapshots show retryable safe errors", async (t) => {
+  for (const [name, initialStatus] of [
+    ["unknown", providerStatus({ phase: "invented", secret: "DO-NOT-RENDER" })],
+    ["not required", providerStatus({ required: false })],
+    ["bad revision", providerStatus({ revision: 0 })],
+  ]) {
+    await t.test(name, async (subtest) => {
+      let retries = 0;
+      const { host } = mountPage(subtest, {
+        initialStatus,
+        service: baseService({
+          status: () => {
+            retries++;
+            return Promise.resolve(providerStatus({ phase: "still-invalid" }));
+          },
+        }),
+      });
+      assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+      assert.doesNotMatch(text(host), /DO-NOT-RENDER|invented|still-invalid/);
+      button(host, "Thử lại").click();
+      await flush();
+      assert.equal(retries, 1);
+      assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+    });
+  }
+});
+
+test("later Test and Completed phases render safe placeholders without a fourth step", async (t) => {
+  for (const phase of ["test", "completed"]) {
+    await t.test(phase, (subtest) => {
+      const { host } = mountPage(subtest, {
+        initialStatus: providerStatus({ phase, revision: 40 }),
+      });
+      const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
+      assert.equal(steps.length, 3);
+      assert.match(text(host), phase === "test" ? /Trò chuyện thử/ : /hoàn tất/i);
+    });
+  }
+});
+
+test("dispose aborts Setup, clears timers/listeners, and suppresses stale rendering and callbacks", async (t) => {
+  const gate = deferred();
+  const timers = controlledTimers();
+  let signal;
+  let completions = 0;
+  const { page, host } = mountPage(t, {
+    initialStatus: setupStatus(),
+    service: baseService({
+      setup(_accountId, _revision, setupSignal) {
+        signal = setupSignal;
+        return gate.promise;
+      },
+    }),
+    onComplete: () => { completions++; },
+    ...timers,
+  });
+
+  page.dispose();
+  page.dispose();
+  assert.equal(signal.aborted, true);
+  gate.resolve({
+    revision: 4,
+    provider_kind: "codex",
+    provider_id: "codex",
+    account_id: "account-1",
+    model_id: "gpt-5.6-terra",
+  });
+  await flush();
+
+  assert.equal(text(host), "");
+  assert.equal(timers.size, 0);
+  assert.equal(completions, 0);
+  assert.equal(page.mount(host), page);
+  assert.equal(text(host), "");
+});
+
+test("same-host remount does not duplicate provider listeners", async (t) => {
+  let selects = 0;
+  const gate = deferred();
+  const { page, host } = mountPage(t, {
+    initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
+    service: baseService({
+      selectProvider: () => { selects++; return gate.promise; },
+    }),
+  });
+
+  const retained = button(host, "Tiếp tục");
+  page.mount(host);
+  retained.click();
+  retained.click();
+  assert.equal(selects, 1);
+});
+
+test("the real Provider Connect owns the explicit start action and receives onboarding revision", async (t) => {
+  const connectCalls = [];
+  const setupCalls = [];
+  const timers = controlledTimers();
+  const { host } = mountPage(t, {
+    initialStatus: connectStatus({ revision: 51 }),
+    connectService: {
+      connectStart(kind, label, onboardingRevision) {
+        connectCalls.push({ kind, label, onboardingRevision });
+        return Promise.resolve({
+          kind,
+          phase: "connected",
+          providerId: kind,
+          accountId: "actual-account",
+        });
+      },
+      connectStatus: () => Promise.reject(new Error("must not poll after terminal start")),
+      connectCancel: () => Promise.resolve({ ok: true }),
+    },
+    service: baseService({
+      status: () => Promise.resolve(setupStatus({
+        revision: 52,
+        account_id: "actual-account",
+      })),
+      setup(accountId, revision) {
+        setupCalls.push({ accountId, revision });
+        return Promise.resolve({
+          revision: 53,
+          provider_kind: "codex",
+          provider_id: "codex",
+          account_id: accountId,
+          model_id: "gpt-5.6-terra",
+        });
+      },
+    }),
+    ...timers,
+  });
+
+  assert.equal(connectCalls.length, 0, "mounting only prepares the component prompt");
+  const starts = findAll(host, (node) => node.tagName === "BUTTON"
+    && text(node).includes("Bắt đầu kết nối"));
+  assert.equal(starts.length, 1, "the shared component owns the sole start action");
+  starts[0].click();
+  await flush();
+  await flush();
+
+  assert.deepEqual(connectCalls, [{
+    kind: "codex",
+    label: "Onboarding",
+    onboardingRevision: 51,
+  }]);
+  assert.deepEqual(setupCalls, [{ accountId: "actual-account", revision: 52 }]);
+});
