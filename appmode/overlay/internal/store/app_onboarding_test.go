@@ -102,6 +102,153 @@ func TestAdvanceOnboardingPersonaStoresNameAndAdvancesExactlyOnce(t *testing.T) 
 	}
 }
 
+func TestAdvanceOnboardingPersonaFromTestReplacesFingerprintAndReceiptExactlyOnce(t *testing.T) {
+	st := openAppStoreForTest(t)
+	if err := st.SetAgentDisplayName("Old"); err != nil {
+		t.Fatal(err)
+	}
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseTest, ProviderKind: "codex", ProviderID: "codex",
+		AccountID: "account", ModelID: "model", StagedComboID: "combo",
+		PersonaFingerprint: "old-fingerprint", TestNonceHash: "old-receipt",
+		TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 11,
+	})
+
+	got, err := st.AdvanceOnboardingPersonaWithRecovery(11, "new-fingerprint", "New", "recovery-token")
+	if err != nil {
+		t.Fatalf("AdvanceOnboardingPersonaWithRecovery() = %v", err)
+	}
+	if got.Phase != OnboardingPhaseTest || got.Revision != 12 ||
+		got.PersonaFingerprint != "new-fingerprint" ||
+		got.TestNonceHash != "" || got.TestExpiresAt != "" {
+		t.Fatalf("Test-to-Test state = %+v", got)
+	}
+	if name, err := st.AgentDisplayName(); err != nil || name != "New" {
+		t.Fatalf("AgentDisplayName() = %q, %v", name, err)
+	}
+	if committed, err := st.AgentPersonaRecoveryCommitted("recovery-token"); err != nil || !committed {
+		t.Fatalf("AgentPersonaRecoveryCommitted() = %t, %v", committed, err)
+	}
+}
+
+func TestAdvanceOnboardingPersonaFromTestUnchangedConfirmationStillInvalidatesReceipt(t *testing.T) {
+	st := openAppStoreForTest(t)
+	if err := st.SetAgentDisplayName("Bot"); err != nil {
+		t.Fatal(err)
+	}
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: "same-fingerprint", TestNonceHash: "old-receipt",
+		TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 13,
+	})
+
+	got, err := st.AdvanceOnboardingPersona(13, "same-fingerprint", "Bot")
+	if err != nil {
+		t.Fatalf("AdvanceOnboardingPersona() = %v", err)
+	}
+	if got.Phase != OnboardingPhaseTest || got.Revision != 14 ||
+		got.PersonaFingerprint != "same-fingerprint" ||
+		got.TestNonceHash != "" || got.TestExpiresAt != "" {
+		t.Fatalf("unchanged Test confirmation = %+v", got)
+	}
+}
+
+func TestAdvanceOnboardingPersonaAllowsOnlyOneConcurrentTestSourceWinner(t *testing.T) {
+	st := openAppStoreForTest(t)
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: "old-fingerprint", TestNonceHash: "old-receipt",
+		TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 17,
+	})
+	type result struct {
+		fingerprint string
+		name        string
+		err         error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for i, fingerprint := range []string{"winner-a", "winner-b"} {
+		name := fmt.Sprintf("Bot %d", i)
+		go func(fingerprint, name string) {
+			<-start
+			_, err := st.AdvanceOnboardingPersona(17, fingerprint, name)
+			results <- result{fingerprint: fingerprint, name: name, err: err}
+		}(fingerprint, name)
+	}
+	close(start)
+	first, second := <-results, <-results
+	winners := []result{}
+	losers := []result{}
+	for _, got := range []result{first, second} {
+		if got.err == nil {
+			winners = append(winners, got)
+		} else if errors.Is(got.err, ErrOnboardingConflict) {
+			losers = append(losers, got)
+		} else {
+			t.Fatalf("concurrent advance error = %v", got.err)
+		}
+	}
+	if len(winners) != 1 || len(losers) != 1 {
+		t.Fatalf("concurrent results = %+v / %+v; want one winner and one conflict", first, second)
+	}
+	state := mustOnboardingStateForTest(t, st)
+	if state.Phase != OnboardingPhaseTest || state.Revision != 18 ||
+		state.PersonaFingerprint != winners[0].fingerprint ||
+		state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		t.Fatalf("concurrent winner state = %+v; winner=%+v", state, winners[0])
+	}
+	if name, err := st.AgentDisplayName(); err != nil || name != winners[0].name {
+		t.Fatalf("concurrent winner name = %q, %v; want %q", name, err, winners[0].name)
+	}
+}
+
+func TestAdvanceOnboardingPersonaCASPinsCapturedSourcePhase(t *testing.T) {
+	for _, tt := range []struct {
+		name, source, drift string
+	}{
+		{name: "persona cannot drift to test", source: OnboardingPhasePersona, drift: OnboardingPhaseTest},
+		{name: "test cannot drift to persona", source: OnboardingPhaseTest, drift: OnboardingPhasePersona},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			if err := st.SetAgentDisplayName("Original"); err != nil {
+				t.Fatal(err)
+			}
+			setOnboardingStateForTest(t, st, OnboardingState{
+				Phase: tt.source, ProviderKind: "codex",
+				PersonaFingerprint: "old-fingerprint", TestNonceHash: "old-receipt",
+				TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 23,
+			})
+			before := mustOnboardingStateForTest(t, st)
+			oldBeforeCAS := onboardingPersonaBeforeCAS
+			onboardingPersonaBeforeCAS = func(tx *sql.Tx) error {
+				_, err := tx.Exec(`UPDATE app_onboarding_state SET phase = ? WHERE id = 1`, tt.drift)
+				return err
+			}
+			t.Cleanup(func() { onboardingPersonaBeforeCAS = oldBeforeCAS })
+
+			_, err := st.AdvanceOnboardingPersonaWithRecovery(
+				23,
+				"new-fingerprint",
+				"Changed",
+				"new-recovery-token",
+			)
+			if !errors.Is(err, ErrOnboardingConflict) {
+				t.Fatalf("AdvanceOnboardingPersonaWithRecovery() error = %v; want %v", err, ErrOnboardingConflict)
+			}
+			if after := mustOnboardingStateForTest(t, st); after != before {
+				t.Fatalf("source-phase CAS failure changed state: before=%+v after=%+v", before, after)
+			}
+			if name, err := st.AgentDisplayName(); err != nil || name != "Original" {
+				t.Fatalf("source-phase CAS failure changed name to %q (%v)", name, err)
+			}
+			if committed, err := st.AgentPersonaRecoveryCommitted("new-recovery-token"); err != nil || committed {
+				t.Fatalf("source-phase CAS failure committed token = %t, %v", committed, err)
+			}
+		})
+	}
+}
+
 func TestAdvanceOnboardingPersonaRejectsStaleAndWrongPhaseWithoutMetadataMutation(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -110,7 +257,10 @@ func TestAdvanceOnboardingPersonaRejectsStaleAndWrongPhaseWithoutMetadataMutatio
 		wantErr  error
 	}{
 		{name: "stale", phase: OnboardingPhasePersona, revision: 8, wantErr: ErrOnboardingConflict},
-		{name: "wrong phase", phase: OnboardingPhaseSetup, revision: 7, wantErr: ErrOnboardingInvalidPhase},
+		{name: "provider phase", phase: OnboardingPhaseProvider, revision: 7, wantErr: ErrOnboardingInvalidPhase},
+		{name: "setup phase", phase: OnboardingPhaseSetup, revision: 7, wantErr: ErrOnboardingInvalidPhase},
+		{name: "connect phase", phase: OnboardingPhaseConnect, revision: 7, wantErr: ErrOnboardingInvalidPhase},
+		{name: "completed phase", phase: OnboardingPhaseCompleted, revision: 7, wantErr: ErrOnboardingInvalidPhase},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

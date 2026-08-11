@@ -44,6 +44,7 @@ var (
 	ErrOnboardingTestExpired             = errors.New("onboarding verified test receipt expired")
 	ErrOnboardingConfigurationChanged    = errors.New("onboarding configuration changed")
 	ErrOnboardingCommitFailed            = errors.New("onboarding completion commit failed")
+	onboardingPersonaBeforeCAS           = func(*sql.Tx) error { return nil }
 	onboardingTestReceiptBeforeCommit    = func(context.Context) {}
 	onboardingCompleteFailpoint          = func(string) error { return nil }
 	// Test seam around the actual Commit call. The production default delegates directly to
@@ -460,7 +461,7 @@ func (s *Store) advanceOnboardingPersona(
 	if state.Revision != expectedRevision {
 		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
 	}
-	if state.Phase != OnboardingPhasePersona {
+	if state.Phase != OnboardingPhasePersona && state.Phase != OnboardingPhaseTest {
 		return OnboardingState{}, fmt.Errorf(
 			"advance onboarding persona from %q: %w",
 			state.Phase,
@@ -473,6 +474,9 @@ func (s *Store) advanceOnboardingPersona(
 	if err := setAgentPersonaMetaInTx(tx, displayName, recoveryToken); err != nil {
 		return OnboardingState{}, fmt.Errorf("store onboarding persona metadata: %w", err)
 	}
+	if err := onboardingPersonaBeforeCAS(tx); err != nil {
+		return OnboardingState{}, fmt.Errorf("before onboarding persona CAS: %w", err)
+	}
 
 	updatedAt := ts(time.Now())
 	result, err := tx.Exec(`UPDATE app_onboarding_state SET
@@ -483,7 +487,7 @@ WHERE id = 1 AND revision = ? AND phase = ?`,
 		fingerprint,
 		updatedAt,
 		expectedRevision,
-		OnboardingPhasePersona,
+		state.Phase,
 	)
 	if err != nil {
 		return OnboardingState{}, fmt.Errorf("update onboarding persona: %w", err)

@@ -792,7 +792,7 @@ func (a *api) handleAgentCompletePut(
 	if !ok {
 		return
 	}
-	if state.Phase != store.OnboardingPhasePersona {
+	if state.Phase != store.OnboardingPhasePersona && state.Phase != store.OnboardingPhaseTest {
 		a.writeOnboardingStoreError(w, fmt.Errorf("complete persona from %q: %w", state.Phase, store.ErrOnboardingInvalidPhase))
 		return
 	}

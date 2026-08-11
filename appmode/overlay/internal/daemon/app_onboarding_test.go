@@ -1423,6 +1423,89 @@ func TestAgentCompletesOnboardingWithAuthoritativeNameAndFingerprint(t *testing.
 	}
 }
 
+func TestAgentCompleteFromTestEditsPersonaAndInvalidatesReceipt(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	original := []byte("Tên {{TEN_BOT}}.\n")
+	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
+	if err := env.a.st.SetAgentDisplayName("Old"); err != nil {
+		t.Fatal(err)
+	}
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x6a}, 32))
+	digest := sha256.Sum256([]byte(token))
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: "old-fingerprint", TestNonceHash: fmt.Sprintf("%x", digest[:]),
+		TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 20,
+	})
+
+	rr := env.serve(http.MethodPut, "/agent", `{
+"values":{"TEN_BOT":"New"},"display_name":"New","require_complete":true,"onboarding_revision":20}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	response := decodeOnboardingResponse[struct {
+		Ready              bool   `json:"ready"`
+		DisplayName        string `json:"display_name"`
+		OnboardingPhase    string `json:"onboarding_phase"`
+		OnboardingRevision int64  `json:"onboarding_revision"`
+	}](t, rr)
+	if !response.Ready || response.DisplayName != "New" ||
+		response.OnboardingPhase != store.OnboardingPhaseTest || response.OnboardingRevision != 21 {
+		t.Fatalf("completion response = %+v", response)
+	}
+	wantPersona := []byte("Tên New.\n")
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, wantPersona) {
+		t.Fatalf("persona = %q, %v; want %q", got, err, wantPersona)
+	}
+	state := env.state(t)
+	if state.Phase != store.OnboardingPhaseTest || state.Revision != 21 ||
+		state.PersonaFingerprint != framedAgentFingerprintForTest(wantPersona, "New") ||
+		state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		t.Fatalf("saved Test-phase persona state = %+v", state)
+	}
+	if name, err := env.a.st.AgentDisplayName(); err != nil || name != "New" {
+		t.Fatalf("AgentDisplayName() = %q, %v", name, err)
+	}
+
+	oldReceipt := env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(
+		`{"revision":21,"test_token":%q}`,
+		token,
+	))
+	requireOnboardingCode(t, oldReceipt, http.StatusConflict, "ONBOARDING_TEST_REQUIRED")
+}
+
+func TestAgentCompleteFromTestUnchangedPersonaStillInvalidatesReceipt(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	original := []byte("Persona hoàn chỉnh.\n")
+	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
+	if err := env.a.st.SetAgentDisplayName("Bot"); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := framedAgentFingerprintForTest(original, "Bot")
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: fingerprint, TestNonceHash: strings.Repeat("ab", sha256.Size),
+		TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 30,
+	})
+
+	rr := env.serve(http.MethodPut, "/agent",
+		`{"values":{},"display_name":"Bot","require_complete":true,"onboarding_revision":30}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	state := env.state(t)
+	if state.Phase != store.OnboardingPhaseTest || state.Revision != 31 ||
+		state.PersonaFingerprint != fingerprint || state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		t.Fatalf("unchanged Test-phase save = %+v", state)
+	}
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("unchanged persona = %q, %v", got, err)
+	}
+	if _, err := os.Lstat(persona + ".agentdc-recovery"); !os.IsNotExist(err) {
+		t.Fatalf("metadata-only save left recovery journal: %v", err)
+	}
+}
+
 func TestAgentPersonaFingerprintFramesAmbiguousPairs(t *testing.T) {
 	fingerprints := make([]string, 0, 2)
 	for _, tt := range []struct {
@@ -1658,12 +1741,19 @@ func TestAgentCompleteRejectsRevisionAndPhaseErrors(t *testing.T) {
 		{name: "zero", phase: store.OnboardingPhasePersona, revision: 4, request: 0, status: http.StatusUnprocessableEntity, code: "ONBOARDING_REVISION_INVALID"},
 		{name: "negative", phase: store.OnboardingPhasePersona, revision: 4, request: -1, status: http.StatusUnprocessableEntity, code: "ONBOARDING_REVISION_INVALID"},
 		{name: "stale", phase: store.OnboardingPhasePersona, revision: 4, request: 3, status: http.StatusConflict, code: "ONBOARDING_REVISION_CONFLICT"},
-		{name: "wrong phase", phase: store.OnboardingPhaseSetup, revision: 4, request: 4, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID"},
+		{name: "stale from test", phase: store.OnboardingPhaseTest, revision: 4, request: 3, status: http.StatusConflict, code: "ONBOARDING_REVISION_CONFLICT"},
+		{name: "provider phase", phase: store.OnboardingPhaseProvider, revision: 4, request: 4, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID"},
+		{name: "setup phase", phase: store.OnboardingPhaseSetup, revision: 4, request: 4, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID"},
+		{name: "connect phase", phase: store.OnboardingPhaseConnect, revision: 4, request: 4, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID"},
+		{name: "completed phase", phase: store.OnboardingPhaseCompleted, revision: 4, request: 4, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newOnboardingRouteTestEnv(t)
 			persona := configureAgentPersonaForOnboardingTest(t, env, "Persona hoàn chỉnh.\n")
+			if err := env.a.st.SetAgentDisplayName("Original"); err != nil {
+				t.Fatal(err)
+			}
 			env.setState(t, store.OnboardingState{
 				Phase: tt.phase, ProviderKind: "codex", Revision: tt.revision,
 			})
@@ -1678,6 +1768,9 @@ func TestAgentCompleteRejectsRevisionAndPhaseErrors(t *testing.T) {
 			}
 			if got, err := os.ReadFile(persona); err != nil || string(got) != "Persona hoàn chỉnh.\n" {
 				t.Fatalf("rejected completion changed persona to %q (%v)", got, err)
+			}
+			if name, err := env.a.st.AgentDisplayName(); err != nil || name != "Original" {
+				t.Fatalf("rejected completion changed display name to %q (%v)", name, err)
 			}
 		})
 	}
@@ -1775,6 +1868,44 @@ BEGIN SELECT RAISE(ABORT, 'injected CAS failure'); END`); err != nil {
 	}
 	if after := env.state(t); after != before {
 		t.Fatalf("store failure changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAgentCompleteFromTestStoreFailureRestoresPersonaAndReceipt(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	original := []byte("Tên {{TEN_BOT}}.\n")
+	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
+	if err := env.a.st.SetAgentDisplayName("Original"); err != nil {
+		t.Fatal(err)
+	}
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: "old-fingerprint", TestNonceHash: strings.Repeat("ab", sha256.Size),
+		TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 12,
+	})
+	before := env.state(t)
+	if _, err := env.db.Exec(`CREATE TRIGGER fail_agent_test_persona_cas
+BEFORE UPDATE ON app_onboarding_state
+BEGIN SELECT RAISE(ABORT, 'injected Test persona CAS failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := env.serve(http.MethodPut, "/agent", `{
+"values":{"TEN_BOT":"Changed"},"display_name":"Changed","require_complete":true,"onboarding_revision":12}`)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s; want 500", rr.Code, rr.Body.String())
+	}
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("Store failure left persona %q (%v)", got, err)
+	}
+	if name, err := env.a.st.AgentDisplayName(); err != nil || name != "Original" {
+		t.Fatalf("Store failure changed display name to %q (%v)", name, err)
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("Store failure changed prior receipt: before=%+v after=%+v", before, after)
+	}
+	if _, err := os.Lstat(persona + ".agentdc-recovery"); !os.IsNotExist(err) {
+		t.Fatalf("successful rollback left recovery journal: %v", err)
 	}
 }
 
