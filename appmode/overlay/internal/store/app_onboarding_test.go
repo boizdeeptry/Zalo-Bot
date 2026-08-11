@@ -106,6 +106,42 @@ func TestBindOnboardingAccountStagesDisabledAccountAndAdvancesOnce(t *testing.T)
 	}
 }
 
+func TestBindOnboardingAccountAcceptsExactMatchingDisabledProvider(t *testing.T) {
+	st := openAppStoreForTest(t)
+	if _, err := st.db.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
+VALUES ('codex', 'Codex', 'codex', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 11,
+	})
+	before := mustOnboardingStateForTest(t, st)
+	account := validOnboardingAccountForTest()
+
+	got, err := st.BindOnboardingAccount(before.Revision, "codex", account)
+	if err != nil {
+		t.Fatalf("BindOnboardingAccount() = %v", err)
+	}
+	if got.Phase != OnboardingPhaseSetup || got.ProviderID != "codex" ||
+		got.AccountID != account.ID || got.Revision != before.Revision+1 {
+		t.Fatalf("bound state = %+v", got)
+	}
+	accounts, err := st.LLMAccounts("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != account.ID || accounts[0].Enabled {
+		t.Fatalf("staged accounts = %+v; want one disabled Account", accounts)
+	}
+	var providerEnabled int
+	if err := st.db.QueryRow(`SELECT enabled FROM llm_providers WHERE id = 'codex'`).Scan(&providerEnabled); err != nil {
+		t.Fatal(err)
+	}
+	if providerEnabled != 0 {
+		t.Fatalf("bind changed Provider enabled=%d; want 0", providerEnabled)
+	}
+}
+
 func TestBindOnboardingAccountRejectsInvalidStateAndRollsBack(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -150,11 +186,6 @@ func TestBindOnboardingAccountRejectsInvalidStateAndRollsBack(t *testing.T) {
 		{
 			name: "provider kind mismatch", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 5},
 			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "claude-code", providerEnabled: true,
-			wantErr: ErrOnboardingInvalidStagingOwnership,
-		},
-		{
-			name: "disabled provider", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 5},
-			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: false,
 			wantErr: ErrOnboardingInvalidStagingOwnership,
 		},
 		{

@@ -115,10 +115,9 @@ func (s *Store) BindOnboardingAccount(
 	}
 
 	var providerKind string
-	var providerEnabled int
 	if err := tx.QueryRow(
-		`SELECT kind, enabled FROM llm_providers WHERE id = ?`, account.ProviderID,
-	).Scan(&providerKind, &providerEnabled); errors.Is(err, sql.ErrNoRows) {
+		`SELECT kind FROM llm_providers WHERE id = ?`, account.ProviderID,
+	).Scan(&providerKind); errors.Is(err, sql.ErrNoRows) {
 		return OnboardingState{}, fmt.Errorf(
 			"%w: Provider %q is missing",
 			ErrOnboardingInvalidStagingOwnership,
@@ -127,9 +126,9 @@ func (s *Store) BindOnboardingAccount(
 	} else if err != nil {
 		return OnboardingState{}, fmt.Errorf("read onboarding Provider %q: %w", account.ProviderID, err)
 	}
-	if providerKind != kind || providerEnabled != 1 {
+	if providerKind != kind {
 		return OnboardingState{}, fmt.Errorf(
-			"%w: Provider %q is not the enabled %q provider",
+			"%w: Provider %q does not have kind %q",
 			ErrOnboardingInvalidStagingOwnership,
 			account.ProviderID,
 			kind,
