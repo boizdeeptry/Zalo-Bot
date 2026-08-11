@@ -74,6 +74,143 @@ func TestOnboardingStateMissingRowFailsClosed(t *testing.T) {
 	}
 }
 
+func TestAdvanceOnboardingPersonaStoresNameAndAdvancesExactlyOnce(t *testing.T) {
+	st := openAppStoreForTest(t)
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhasePersona, ProviderKind: "codex", ProviderID: "codex",
+		AccountID: "account", ModelID: "model", StagedComboID: "combo",
+		TestNonceHash: "old-receipt", TestExpiresAt: "2026-08-11T08:00:00Z",
+		Revision: 7,
+	})
+
+	got, err := st.AdvanceOnboardingPersona(7, "persona-fingerprint", "An Nhiên")
+	if err != nil {
+		t.Fatalf("AdvanceOnboardingPersona() = %v", err)
+	}
+	if got.Phase != OnboardingPhaseTest || got.Revision != 8 ||
+		got.PersonaFingerprint != "persona-fingerprint" ||
+		got.TestNonceHash != "" || got.TestExpiresAt != "" {
+		t.Fatalf("advanced state = %+v", got)
+	}
+	if name, err := st.AgentDisplayName(); err != nil || name != "An Nhiên" {
+		t.Fatalf("AgentDisplayName() = %q, %v", name, err)
+	}
+}
+
+func TestAdvanceOnboardingPersonaRejectsStaleAndWrongPhaseWithoutMetadataMutation(t *testing.T) {
+	tests := []struct {
+		name     string
+		phase    string
+		revision int64
+		wantErr  error
+	}{
+		{name: "stale", phase: OnboardingPhasePersona, revision: 8, wantErr: ErrOnboardingConflict},
+		{name: "wrong phase", phase: OnboardingPhaseSetup, revision: 7, wantErr: ErrOnboardingInvalidPhase},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			if err := st.SetAgentDisplayName("Original"); err != nil {
+				t.Fatal(err)
+			}
+			setOnboardingStateForTest(t, st, OnboardingState{
+				Phase: tt.phase, ProviderKind: "codex", Revision: 7,
+			})
+			before := mustOnboardingStateForTest(t, st)
+
+			if _, err := st.AdvanceOnboardingPersona(tt.revision, "new-fingerprint", "Changed"); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("AdvanceOnboardingPersona() error = %v; want %v", err, tt.wantErr)
+			}
+			if after := mustOnboardingStateForTest(t, st); after != before {
+				t.Fatalf("failed advance changed state: before=%+v after=%+v", before, after)
+			}
+			if name, err := st.AgentDisplayName(); err != nil || name != "Original" {
+				t.Fatalf("failed advance changed display name to %q (%v)", name, err)
+			}
+		})
+	}
+}
+
+func TestAdvanceOnboardingPersonaCASFailureRollsBackDisplayName(t *testing.T) {
+	st := openAppStoreForTest(t)
+	if err := st.SetAgentDisplayName("Original"); err != nil {
+		t.Fatal(err)
+	}
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhasePersona, ProviderKind: "codex", Revision: 4,
+	})
+	before := mustOnboardingStateForTest(t, st)
+	if _, err := st.db.Exec(`CREATE TRIGGER fail_persona_advance
+BEFORE UPDATE ON app_onboarding_state
+BEGIN SELECT RAISE(ABORT, 'injected persona CAS failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.AdvanceOnboardingPersona(4, "fingerprint", "Changed"); err == nil {
+		t.Fatal("AdvanceOnboardingPersona() error = nil; want injected failure")
+	}
+	if after := mustOnboardingStateForTest(t, st); after != before {
+		t.Fatalf("failed advance changed state: before=%+v after=%+v", before, after)
+	}
+	if name, err := st.AgentDisplayName(); err != nil || name != "Original" {
+		t.Fatalf("failed advance changed display name to %q (%v)", name, err)
+	}
+}
+
+func TestInvalidateOnboardingPersonaReturnsTestFlowToPersona(t *testing.T) {
+	st := openAppStoreForTest(t)
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: "fingerprint", TestNonceHash: "receipt",
+		TestExpiresAt: "2026-08-11T08:00:00Z", Revision: 11,
+	})
+
+	got, err := st.InvalidateOnboardingPersona()
+	if err != nil {
+		t.Fatalf("InvalidateOnboardingPersona() = %v", err)
+	}
+	if got.Phase != OnboardingPhasePersona || got.Revision != 12 ||
+		got.PersonaFingerprint != "" || got.TestNonceHash != "" || got.TestExpiresAt != "" {
+		t.Fatalf("invalidated state = %+v", got)
+	}
+}
+
+func TestInvalidateOnboardingPersonaIsNoopOutsidePersonaFlow(t *testing.T) {
+	st := openAppStoreForTest(t)
+	before := mustOnboardingStateForTest(t, st)
+
+	got, err := st.InvalidateOnboardingPersona()
+	if err != nil {
+		t.Fatalf("InvalidateOnboardingPersona() = %v", err)
+	}
+	if got != before {
+		t.Fatalf("inactive invalidation changed state: before=%+v after=%+v", before, got)
+	}
+}
+
+func TestInvalidateOnboardingPersonaClearsCompletedReceiptWithoutReopeningFlow(t *testing.T) {
+	st := openAppStoreForTest(t)
+	setOnboardingStateForTest(t, st, OnboardingState{
+		CompletedVersion:   CurrentOnboardingVersion,
+		Phase:              OnboardingPhaseCompleted,
+		ProviderKind:       "codex",
+		PersonaFingerprint: "fingerprint",
+		TestNonceHash:      "receipt",
+		TestExpiresAt:      "2026-08-11T08:00:00Z",
+		Revision:           15,
+	})
+
+	got, err := st.InvalidateOnboardingPersona()
+	if err != nil {
+		t.Fatalf("InvalidateOnboardingPersona() = %v", err)
+	}
+	if got.Phase != OnboardingPhaseCompleted || got.CompletedVersion != CurrentOnboardingVersion ||
+		got.Revision != 16 || got.PersonaFingerprint != "" ||
+		got.TestNonceHash != "" || got.TestExpiresAt != "" {
+		t.Fatalf("completed invalidation state = %+v", got)
+	}
+}
+
 func TestBindOnboardingAccountStagesDisabledAccountAndAdvancesOnce(t *testing.T) {
 	st := openAppStoreForTest(t)
 	insertOnboardingProviderForTest(t, st, "codex", "codex")

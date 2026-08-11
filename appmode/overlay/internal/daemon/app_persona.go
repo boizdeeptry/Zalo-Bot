@@ -108,6 +108,10 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 		a.writeErr(w, http.StatusBadRequest, "nội dung không phải UTF-8 hợp lệ")
 		return
 	}
+	if p == a.zalo.cfg.PersonaPath && a.st != nil {
+		onboardingMutationMu.Lock()
+		defer onboardingMutationMu.Unlock()
+	}
 
 	// Bản gốc, ghi MỘT lần. Cùng cơ chế với việc điền chỗ trống, và cùng lý do: ổ này không có
 	// git, nên .goc là đường lùi duy nhất.
@@ -134,12 +138,24 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 		a.writeErr(w, http.StatusInternalServerError, "không ghi được tệp "+label)
 		return
 	}
+	if p == a.zalo.cfg.PersonaPath && a.st != nil {
+		if _, err := a.st.InvalidateOnboardingPersona(); err != nil {
+			if restoreErr := writeAppFileAtomic(p, old, 0o600); restoreErr != nil {
+				a.logger.Error("persona: khôi phục sau lỗi onboarding", "path", p, "err", restoreErr)
+			}
+			a.logger.Error("persona: vô hiệu hoá kiểm tra onboarding", "err", err)
+			a.writeErr(w, http.StatusInternalServerError, "không cập nhật được trạng thái văn phong")
+			return
+		}
+	}
 	holes := scanPlaceholders(text)
+	validationError := personaValidationError(text)
 	a.zlog.add(ipc.ZaloLogInfo, "", fmt.Sprintf("%s đã sửa (%d KB, %d chỗ trống còn lại)",
 		label, len(text)>>10, len(holes)))
 	// Trả về chỗ trống còn lại: người dùng có thể vừa dán vào một đoạn mang {{...}} mới, và trang
 	// phải biết để đổi bảng trạng thái.
 	a.writeJSON(w, http.StatusOK, map[string]any{
-		"bytes": len(text), "placeholders": holes, "ready": len(holes) == 0,
+		"bytes": len(text), "placeholders": holes,
+		"ready": len(holes) == 0 && validationError == "", "validation_error": validationError,
 	})
 }

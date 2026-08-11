@@ -354,6 +354,129 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 	return OnboardingSetup{OnboardingState: updated, ComboName: comboName}, nil
 }
 
+// AdvanceOnboardingPersona atomically publishes the authoritative display name
+// and advances the exact persona revision to the test phase. A prior test
+// receipt is always cleared because it cannot attest to the new persona.
+func (s *Store) AdvanceOnboardingPersona(
+	expectedRevision int64,
+	fingerprint string,
+	displayName string,
+) (OnboardingState, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("begin onboarding persona advance: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if state.Revision != expectedRevision {
+		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
+	}
+	if state.Phase != OnboardingPhasePersona {
+		return OnboardingState{}, fmt.Errorf(
+			"advance onboarding persona from %q: %w",
+			state.Phase,
+			ErrOnboardingInvalidPhase,
+		)
+	}
+	if fingerprint == "" || displayName == "" {
+		return OnboardingState{}, fmt.Errorf("advance onboarding persona: fingerprint and display name are required")
+	}
+	if _, err := tx.Exec(`INSERT INTO app_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, agentDisplayNameMetaKey, displayName); err != nil {
+		return OnboardingState{}, fmt.Errorf("store onboarding agent display name: %w", err)
+	}
+
+	updatedAt := ts(time.Now())
+	result, err := tx.Exec(`UPDATE app_onboarding_state SET
+phase = ?, persona_fingerprint = ?, test_nonce_hash = '', test_expires_at = '',
+revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ? AND phase = ?`,
+		OnboardingPhaseTest,
+		fingerprint,
+		updatedAt,
+		expectedRevision,
+		OnboardingPhasePersona,
+	)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("update onboarding persona: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding persona update result: %w", err)
+	}
+	if changed != 1 {
+		return OnboardingState{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingState{}, fmt.Errorf("commit onboarding persona advance: %w", err)
+	}
+	return updated, nil
+}
+
+// InvalidateOnboardingPersona returns a tested active onboarding flow to its
+// persona step and clears any persisted persona receipt. A completed flow stays
+// completed, but its stale receipt can no longer attest to the edited document.
+func (s *Store) InvalidateOnboardingPersona() (OnboardingState, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("begin onboarding persona invalidation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	dirtyPersona := state.PersonaFingerprint != "" || state.TestNonceHash != "" || state.TestExpiresAt != ""
+	targetPhase := state.Phase
+	if state.Phase == OnboardingPhaseTest {
+		targetPhase = OnboardingPhasePersona
+	}
+	if state.Phase != OnboardingPhaseTest && !dirtyPersona {
+		if err := tx.Commit(); err != nil {
+			return OnboardingState{}, fmt.Errorf("commit no-op onboarding persona invalidation: %w", err)
+		}
+		return state, nil
+	}
+
+	updatedAt := ts(time.Now())
+	result, err := tx.Exec(`UPDATE app_onboarding_state SET
+phase = ?, persona_fingerprint = '', test_nonce_hash = '', test_expires_at = '',
+revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ? AND phase = ?`,
+		targetPhase,
+		updatedAt,
+		state.Revision,
+		state.Phase,
+	)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("invalidate onboarding persona: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding persona invalidation result: %w", err)
+	}
+	if changed != 1 {
+		return OnboardingState{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingState{}, fmt.Errorf("commit onboarding persona invalidation: %w", err)
+	}
+	return updated, nil
+}
+
 func onboardingSetupStateIsClean(state OnboardingState) bool {
 	return IsOnboardingProviderKind(state.ProviderKind) && state.ProviderID != "" &&
 		state.AccountID != "" && state.ModelID == "" && state.StagedComboID == "" &&

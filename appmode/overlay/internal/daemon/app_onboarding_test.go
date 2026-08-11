@@ -1,13 +1,258 @@
 package daemon
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"agentdc/internal/store"
 )
+
+func TestAgentCompletesOnboardingWithAuthoritativeNameAndFingerprint(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	persona := configureAgentPersonaForOnboardingTest(t, env, "Tên {{TEN_BOT}} ở {{đơn vị}}.\n")
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhasePersona, ProviderKind: "codex",
+		ProviderID: "codex", AccountID: "account", ModelID: "model",
+		StagedComboID: "combo", Revision: 9,
+	})
+
+	rr := env.serve(http.MethodPut, "/agent", `{
+"values":{"TEN_BOT":"  An Nhiên  ","đơn vị":"Công ty Mở"},
+"display_name":"An Nhiên","require_complete":true,"onboarding_revision":9}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	got := decodeOnboardingResponse[struct {
+		Ready           bool   `json:"ready"`
+		DisplayName     string `json:"display_name"`
+		OnboardingPhase string `json:"onboarding_phase"`
+		Revision        int64  `json:"revision"`
+	}](t, rr)
+	if !got.Ready || got.DisplayName != "An Nhiên" ||
+		got.OnboardingPhase != store.OnboardingPhaseTest || got.Revision != 10 {
+		t.Fatalf("completion response = %+v", got)
+	}
+	finalBytes, err := os.ReadFile(persona)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := []byte("Tên An Nhiên ở Công ty Mở.\n")
+	if !bytes.Equal(finalBytes, wantBytes) {
+		t.Fatalf("final persona = %q; want %q", finalBytes, wantBytes)
+	}
+	fingerprintInput := append(append([]byte(nil), wantBytes...), []byte("An Nhiên")...)
+	wantFingerprint := fmt.Sprintf("%x", sha256.Sum256(fingerprintInput))
+	state := env.state(t)
+	if state.Phase != store.OnboardingPhaseTest || state.Revision != 10 ||
+		state.PersonaFingerprint != wantFingerprint ||
+		state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		t.Fatalf("completion state = %+v; want fingerprint %q", state, wantFingerprint)
+	}
+	if name, err := env.a.st.AgentDisplayName(); err != nil || name != "An Nhiên" {
+		t.Fatalf("AgentDisplayName() = %q, %v", name, err)
+	}
+	backup, err := os.ReadFile(persona + ".goc")
+	if err != nil || string(backup) != "Tên {{TEN_BOT}} ở {{đơn vị}}.\n" {
+		t.Fatalf("backup = %q, %v", backup, err)
+	}
+}
+
+func TestAgentCompleteLegacyReadyPersonaStoresOnlyDisplayName(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	original := []byte("Persona cũ đã hoàn chỉnh.\n")
+	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhasePersona, ProviderKind: "codex", Revision: 5,
+	})
+
+	rr := env.serve(http.MethodPut, "/agent",
+		`{"values":{},"display_name":"Bot Cũ","require_complete":true,"onboarding_revision":5}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("legacy persona changed to %q (%v)", got, err)
+	}
+	if _, err := os.Stat(persona + ".goc"); !os.IsNotExist(err) {
+		t.Fatalf("legacy metadata-only completion created backup: %v", err)
+	}
+	get := env.serve(http.MethodGet, "/agent", "")
+	got := decodeOnboardingResponse[struct {
+		Ready       bool   `json:"ready"`
+		DisplayName string `json:"display_name"`
+	}](t, get)
+	if !got.Ready || got.DisplayName != "Bot Cũ" {
+		t.Fatalf("GET /agent = %+v", got)
+	}
+}
+
+func TestAgentCompleteRejectsRevisionAndPhaseErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		phase    string
+		revision int64
+		request  int64
+		status   int
+		code     string
+	}{
+		{name: "zero", phase: store.OnboardingPhasePersona, revision: 4, request: 0, status: http.StatusUnprocessableEntity, code: "ONBOARDING_REVISION_INVALID"},
+		{name: "negative", phase: store.OnboardingPhasePersona, revision: 4, request: -1, status: http.StatusUnprocessableEntity, code: "ONBOARDING_REVISION_INVALID"},
+		{name: "stale", phase: store.OnboardingPhasePersona, revision: 4, request: 3, status: http.StatusConflict, code: "ONBOARDING_REVISION_CONFLICT"},
+		{name: "wrong phase", phase: store.OnboardingPhaseSetup, revision: 4, request: 4, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			persona := configureAgentPersonaForOnboardingTest(t, env, "Persona hoàn chỉnh.\n")
+			env.setState(t, store.OnboardingState{
+				Phase: tt.phase, ProviderKind: "codex", Revision: tt.revision,
+			})
+			before := env.state(t)
+			rr := env.serve(http.MethodPut, "/agent", fmt.Sprintf(
+				`{"values":{},"display_name":"Bot","require_complete":true,"onboarding_revision":%d}`,
+				tt.request,
+			))
+			requireOnboardingCode(t, rr, tt.status, tt.code)
+			if after := env.state(t); after != before {
+				t.Fatalf("rejected completion changed state: before=%+v after=%+v", before, after)
+			}
+			if got, err := os.ReadFile(persona); err != nil || string(got) != "Persona hoàn chỉnh.\n" {
+				t.Fatalf("rejected completion changed persona to %q (%v)", got, err)
+			}
+		})
+	}
+}
+
+func TestAgentCompletePlaceholdersRemainHasZeroWrites(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	original := []byte("Tên {{TEN_BOT}}, vai trò {{vai-trò}}, hỏng {{")
+	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
+	if err := env.a.st.SetAgentDisplayName("Original"); err != nil {
+		t.Fatal(err)
+	}
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhasePersona, ProviderKind: "codex", Revision: 6,
+	})
+	before := env.state(t)
+
+	rr := env.serve(http.MethodPut, "/agent", `{
+"values":{"TEN_BOT":"Bot"},"require_complete":true,"onboarding_revision":6}`)
+	requireOnboardingCode(t, rr, http.StatusUnprocessableEntity, "AGENT_PLACEHOLDERS_REMAIN")
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("validation changed persona to %q (%v)", got, err)
+	}
+	if _, err := os.Stat(persona + ".goc"); !os.IsNotExist(err) {
+		t.Fatalf("validation created backup: %v", err)
+	}
+	if name, err := env.a.st.AgentDisplayName(); err != nil || name != "Original" {
+		t.Fatalf("validation changed display name to %q (%v)", name, err)
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("validation changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAgentCompleteAtomicWriteFailurePreservesAllState(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	original := []byte("Tên {{TEN_BOT}}.\n")
+	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
+	if err := env.a.st.SetAgentDisplayName("Original"); err != nil {
+		t.Fatal(err)
+	}
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhasePersona, ProviderKind: "codex", Revision: 8,
+	})
+	before := env.state(t)
+	originalWriter := writeAgentFileAtomic
+	writeAgentFileAtomic = func(string, []byte, os.FileMode) error {
+		return fmt.Errorf("injected atomic write failure")
+	}
+	t.Cleanup(func() { writeAgentFileAtomic = originalWriter })
+
+	rr := env.serve(http.MethodPut, "/agent", `{
+"values":{"TEN_BOT":"Bot"},"require_complete":true,"onboarding_revision":8}`)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s; want 500", rr.Code, rr.Body.String())
+	}
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("failed write changed persona to %q (%v)", got, err)
+	}
+	if name, err := env.a.st.AgentDisplayName(); err != nil || name != "Original" {
+		t.Fatalf("failed write changed display name to %q (%v)", name, err)
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("failed write changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAgentCompleteStoreFailureRestoresPersonaAndMetadata(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	original := []byte("Tên {{TEN_BOT}}.\n")
+	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
+	if err := env.a.st.SetAgentDisplayName("Original"); err != nil {
+		t.Fatal(err)
+	}
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhasePersona, ProviderKind: "codex", Revision: 12,
+	})
+	before := env.state(t)
+	if _, err := env.db.Exec(`CREATE TRIGGER fail_agent_persona_cas
+BEFORE UPDATE ON app_onboarding_state
+BEGIN SELECT RAISE(ABORT, 'injected CAS failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := env.serve(http.MethodPut, "/agent", `{
+"values":{"TEN_BOT":"Changed"},"require_complete":true,"onboarding_revision":12}`)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s; want 500", rr.Code, rr.Body.String())
+	}
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("store failure left persona %q (%v)", got, err)
+	}
+	if name, err := env.a.st.AgentDisplayName(); err != nil || name != "Original" {
+		t.Fatalf("store failure changed display name to %q (%v)", name, err)
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("store failure changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestPersonaFullEditInvalidatesOnboardingReceipt(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	configureAgentPersonaForOnboardingTest(t, env, "Persona cũ.\n")
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: "fingerprint", TestNonceHash: "receipt",
+		TestExpiresAt: "2026-08-11T08:00:00Z", Revision: 20,
+	})
+
+	rr := env.serve(http.MethodPut, "/agent/persona/persona", `{"text":"Persona mới.\n"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	state := env.state(t)
+	if state.Phase != store.OnboardingPhasePersona || state.Revision != 21 ||
+		state.PersonaFingerprint != "" || state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		t.Fatalf("full edit did not invalidate receipt: %+v", state)
+	}
+}
+
+func configureAgentPersonaForOnboardingTest(t *testing.T, env *onboardingRouteTestEnv, text string) string {
+	t.Helper()
+	persona := filepath.Join(env.dataDir, "persona.md")
+	if err := os.WriteFile(persona, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env.a.zalo = &zaloDeps{cfg: zaloConfig{PersonaPath: persona, Model: "haiku"}}
+	return persona
+}
 
 func TestAppOnboardingSetupStagesComboWithoutChangingLiveRoute(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
