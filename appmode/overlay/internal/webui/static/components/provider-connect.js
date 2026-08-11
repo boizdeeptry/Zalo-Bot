@@ -11,15 +11,53 @@ const PHASE_ANCHOR = Object.freeze({
   connected: 100,
 });
 const TERMINAL_PHASES = new Set(["connected", "error", "canceled"]);
+const BACKEND_PHASES = new Set([
+  "detecting",
+  "installing",
+  "awaiting_login",
+  "polling",
+  "connected",
+  "error",
+  "canceled",
+]);
+const IDLE_MESSAGE = "Không còn tác vụ kết nối đang hoạt động. Vui lòng thử lại.";
+const PROTOCOL_ERROR_MESSAGE = "Phản hồi trạng thái kết nối không hợp lệ. Vui lòng thử lại.";
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
 
 export function phaseProgress(phase) {
   return PHASE_ANCHOR[phase] ?? null;
 }
 
 function safeLogLine(value) {
-  return String(value ?? "")
-    .replace(/[\u0000-\u001f\u007f]/g, "")
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
     .slice(0, MAX_CONNECT_LOG_LENGTH);
+}
+
+function safeSemanticString(value) {
+  if (typeof value !== "string"
+    || value.length > MAX_CONNECT_LOG_LENGTH
+    || CONTROL_CHARACTERS.test(value)
+    || value.trim() !== value) {
+    return "";
+  }
+  return value;
+}
+
+function safeIdentifier(value) {
+  return safeSemanticString(value);
+}
+
+function safeHTTPSURL(value) {
+  const candidate = safeSemanticString(value);
+  if (!candidate) return "";
+  try {
+    const parsed = new URL(candidate);
+    return parsed.protocol === "https:" && parsed.hostname ? candidate : "";
+  } catch {
+    return "";
+  }
 }
 
 function positiveRevision(value) {
@@ -33,6 +71,37 @@ function validateService(service) {
       throw new TypeError(`Provider Connect service requires ${method}()`);
     }
   }
+}
+
+function normalizeServiceSnapshot(snapshot, shape = "status") {
+  const value = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
+    ? snapshot
+    : {};
+  if (shape === "cancel") {
+    return {
+      ok: value.ok === true,
+      message: safeLogLine(value.message),
+      error: safeLogLine(value.error),
+    };
+  }
+  const normalized = {
+    kind: safeIdentifier(value.kind),
+    phase: value.phase,
+    message: safeLogLine(value.message),
+    log: safeLogLine(value.log),
+    error: safeLogLine(value.error),
+    loginUrl: safeHTTPSURL(value.loginUrl),
+    code: safeLogLine(value.code),
+    providerId: safeIdentifier(value.providerId),
+    accountId: safeIdentifier(value.accountId),
+  };
+  if (value.phase === "idle") {
+    return { ...normalized, phase: "error", message: IDLE_MESSAGE, error: "" };
+  }
+  if (typeof value.phase !== "string" || !BACKEND_PHASES.has(value.phase)) {
+    return { ...normalized, phase: "error", message: PROTOCOL_ERROR_MESSAGE, error: "" };
+  }
+  return normalized;
 }
 
 export function createProviderConnect({
@@ -276,7 +345,7 @@ export function createProviderConnect({
   }
 
   function renderLive() {
-    const loginLink = connect.loginUrl?.startsWith("https://")
+    const loginLink = typeof connect.loginUrl === "string" && connect.loginUrl.startsWith("https://")
       ? element("a", {
           className: "pv-btn primary",
           attributes: { href: connect.loginUrl, target: "_blank", rel: "noopener" },
@@ -349,22 +418,22 @@ export function createProviderConnect({
   }
 
   function setStatus(status) {
-    const phase = String(status?.phase ?? "");
+    const phase = status.phase;
     const previousPhase = connect.phase;
     connect = {
       ...connect,
       phase,
-      message: safeLogLine(status?.error || status?.message),
-      loginUrl: status?.loginUrl || connect.loginUrl,
-      code: status?.code || connect.code,
+      message: status.error || status.message || status.log,
+      loginUrl: status.loginUrl || connect.loginUrl,
+      code: status.code || connect.code,
     };
     if (phase !== previousPhase) anchorTo(phase);
     render();
   }
 
   async function finishConnected(status) {
-    const providerId = String(status?.providerId ?? "").trim();
-    const accountId = String(status?.accountId ?? "").trim();
+    const providerId = status.providerId;
+    const accountId = status.accountId;
     if (!providerId || !accountId) {
       generation++;
       stopTimers();
@@ -388,6 +457,27 @@ export function createProviderConnect({
     }
   }
 
+  async function applyServiceStatus(run, snapshot) {
+    const status = normalizeServiceSnapshot(snapshot);
+    if (!ownsRun(run)) return true;
+    if (status.phase === "connected"
+      && (!status.providerId || !status.accountId)) {
+      await finishConnected(status);
+      return true;
+    }
+    setStatus(status);
+    if (status.phase === "connected") {
+      await finishConnected(status);
+      return true;
+    }
+    if (status.phase === "error" || status.phase === "canceled") {
+      generation++;
+      stopTimers();
+      return true;
+    }
+    return false;
+  }
+
   async function runConnect(label, onboardingRevision) {
     if (disposed) return;
     const run = ++generation;
@@ -406,26 +496,12 @@ export function createProviderConnect({
     render();
 
     try {
-      await service.connectStart(providerKind, connect.label, connect.onboardingRevision);
+      const started = await service.connectStart(providerKind, connect.label, connect.onboardingRevision);
+      if (await applyServiceStatus(run, started)) return;
       for (;;) {
         if (!ownsRun(run)) return;
         const status = await service.connectStatus(providerKind);
-        if (!ownsRun(run)) return;
-        if (status?.phase === "connected"
-          && (!String(status?.providerId ?? "").trim() || !String(status?.accountId ?? "").trim())) {
-          await finishConnected(status);
-          return;
-        }
-        setStatus(status);
-        if (status?.phase === "connected") {
-          await finishConnected(status);
-          return;
-        }
-        if (status?.phase === "error" || status?.phase === "canceled") {
-          generation++;
-          stopTimers();
-          return;
-        }
+        if (await applyServiceStatus(run, status)) return;
         if (!await waitToPoll(run)) return;
       }
     } catch (error) {
@@ -435,14 +511,14 @@ export function createProviderConnect({
       connect = {
         ...connect,
         phase: "error",
-        message: safeLogLine(error?.message || "Kết nối thất bại"),
+        message: safeLogLine(error?.message) || "Kết nối thất bại",
       };
       render();
     }
   }
 
   function cancelWarningText(detail) {
-    const message = safeLogLine(detail || "Không thể xác nhận yêu cầu huỷ kết nối.");
+    const message = safeLogLine(detail) || "Không thể xác nhận yêu cầu huỷ kết nối.";
     return safeLogLine(`${message} Tiếp tục theo dõi kết nối.`);
   }
 
@@ -451,22 +527,7 @@ export function createProviderConnect({
       if (!ownsRun(run)) return;
       try {
         const status = await service.connectStatus(providerKind);
-        if (!ownsRun(run)) return;
-        if (status?.phase === "connected"
-          && (!String(status?.providerId ?? "").trim() || !String(status?.accountId ?? "").trim())) {
-          await finishConnected(status);
-          return;
-        }
-        setStatus(status);
-        if (status?.phase === "connected") {
-          await finishConnected(status);
-          return;
-        }
-        if (status?.phase === "error" || status?.phase === "canceled") {
-          generation++;
-          stopTimers();
-          return;
-        }
+        if (await applyServiceStatus(run, status)) return;
       } catch (error) {
         if (!ownsRun(run)) return;
         connect = {
@@ -487,7 +548,18 @@ export function createProviderConnect({
     };
     startConnectTimer();
     render();
-    void reconcileCanceledRun(run);
+    void reconcileCanceledRun(run).catch((error) => {
+      if (!ownsRun(run)) return;
+      connect = {
+        ...connect,
+        cancelWarning: cancelWarningText(error?.message),
+      };
+      try {
+        render();
+      } catch {
+        // The reconciliation task is fire-and-forget; never leak a rejected promise to the page.
+      }
+    });
   }
 
   function cancelConnect() {
@@ -503,7 +575,10 @@ export function createProviderConnect({
     stopTimers();
     cancelPromise = (async () => {
       try {
-        const result = await service.connectCancel(providerKind);
+        const result = normalizeServiceSnapshot(
+          await service.connectCancel(providerKind),
+          "cancel",
+        );
         if (disposed || generation !== cancellation) return false;
         cancelPromise = null;
         if (result?.ok === true) {
