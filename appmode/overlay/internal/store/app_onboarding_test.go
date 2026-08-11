@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -1478,10 +1479,17 @@ func TestSaveOnboardingTestReceiptStoresHashAndExpiresAtomically(t *testing.T) {
 	st := openAppStoreForTest(t)
 	seedOnboardingTestReceiptForTest(t, st, 17)
 	beforeRouting := onboardingLiveRoutingBytesForTest(t, st)
-	expiresAt := time.Date(2099, 8, 11, 8, 10, 0, 0, time.UTC)
+	issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
+	expiresAt := issuedAt.Add(10 * time.Minute)
 	hash := strings.Repeat("ab", sha256.Size)
 
-	got, err := st.SaveOnboardingTestReceipt(17, "persona-fingerprint", hash, expiresAt)
+	got, err := st.SaveOnboardingTestReceipt(
+		context.Background(),
+		17,
+		"persona-fingerprint",
+		hash,
+		OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: expiresAt},
+	)
 	if err != nil {
 		t.Fatalf("SaveOnboardingTestReceipt() = %v", err)
 	}
@@ -1497,28 +1505,31 @@ func TestSaveOnboardingTestReceiptStoresHashAndExpiresAtomically(t *testing.T) {
 
 func TestSaveOnboardingTestReceiptRejectsInvalidStateAndInputWithoutMutation(t *testing.T) {
 	validHash := strings.Repeat("ab", sha256.Size)
-	validExpiry := time.Date(2099, 8, 11, 8, 10, 0, 0, time.UTC)
+	validIssuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
+	validPolicy := OnboardingTestReceiptPolicy{
+		IssuedAt:  validIssuedAt,
+		ExpiresAt: validIssuedAt.Add(10 * time.Minute),
+	}
 	tests := []struct {
 		name        string
 		mutate      func(*Store, *OnboardingState)
 		revision    int64
 		fingerprint string
 		hash        string
-		expiresAt   time.Time
+		policy      OnboardingTestReceiptPolicy
 		wantErr     error
 	}{
-		{name: "stale revision", revision: 16, fingerprint: "persona-fingerprint", hash: validHash, expiresAt: validExpiry, wantErr: ErrOnboardingConflict},
-		{name: "wrong phase", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, expiresAt: validExpiry, mutate: func(_ *Store, state *OnboardingState) { state.Phase = OnboardingPhasePersona }, wantErr: ErrOnboardingInvalidPhase},
-		{name: "fingerprint changed", revision: 17, fingerprint: "different", hash: validHash, expiresAt: validExpiry, wantErr: ErrOnboardingPersonaMismatch},
-		{name: "missing combo", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, expiresAt: validExpiry, mutate: func(_ *Store, state *OnboardingState) { state.StagedComboID = "" }, wantErr: ErrOnboardingInvalidStagingOwnership},
-		{name: "enabled account", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, expiresAt: validExpiry, mutate: func(st *Store, _ *OnboardingState) {
+		{name: "stale revision", revision: 16, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, wantErr: ErrOnboardingConflict},
+		{name: "wrong phase", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, mutate: func(_ *Store, state *OnboardingState) { state.Phase = OnboardingPhasePersona }, wantErr: ErrOnboardingInvalidPhase},
+		{name: "fingerprint changed", revision: 17, fingerprint: "different", hash: validHash, policy: validPolicy, wantErr: ErrOnboardingPersonaMismatch},
+		{name: "missing combo", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, mutate: func(_ *Store, state *OnboardingState) { state.StagedComboID = "" }, wantErr: ErrOnboardingInvalidStagingOwnership},
+		{name: "enabled account", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, mutate: func(st *Store, _ *OnboardingState) {
 			_, _ = st.db.Exec(`UPDATE llm_accounts SET enabled = 1 WHERE id = 'staged-account'`)
 		}, wantErr: ErrOnboardingInvalidStagingOwnership},
-		{name: "unavailable model", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, expiresAt: validExpiry, mutate: func(st *Store, _ *OnboardingState) {
+		{name: "unavailable model", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, mutate: func(st *Store, _ *OnboardingState) {
 			_, _ = st.db.Exec(`UPDATE llm_models SET available = 0 WHERE provider_id = 'codex'`)
 		}, wantErr: ErrOnboardingModelUnavailable},
-		{name: "bad hash", revision: 17, fingerprint: "persona-fingerprint", hash: "not-a-sha256", expiresAt: validExpiry, wantErr: ErrOnboardingInvalidTestReceipt},
-		{name: "zero expiry", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, expiresAt: time.Time{}, wantErr: ErrOnboardingInvalidTestReceipt},
+		{name: "bad hash", revision: 17, fingerprint: "persona-fingerprint", hash: "not-a-sha256", policy: validPolicy, wantErr: ErrOnboardingInvalidTestReceipt},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1531,11 +1542,105 @@ func TestSaveOnboardingTestReceiptRejectsInvalidStateAndInputWithoutMutation(t *
 			}
 			before := mustOnboardingStateForTest(t, st)
 
-			if _, err := st.SaveOnboardingTestReceipt(tt.revision, tt.fingerprint, tt.hash, tt.expiresAt); !errors.Is(err, tt.wantErr) {
+			if _, err := st.SaveOnboardingTestReceipt(context.Background(), tt.revision, tt.fingerprint, tt.hash, tt.policy); !errors.Is(err, tt.wantErr) {
 				t.Fatalf("SaveOnboardingTestReceipt() error = %v; want %v", err, tt.wantErr)
 			}
 			if after := mustOnboardingStateForTest(t, st); after != before {
 				t.Fatalf("rejected receipt changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestSaveOnboardingTestReceiptRejectsInvalidExpiryPolicyWithoutMutation(t *testing.T) {
+	issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 123, time.UTC)
+	tests := []struct {
+		name   string
+		policy OnboardingTestReceiptPolicy
+	}{
+		{name: "zero issued at", policy: OnboardingTestReceiptPolicy{ExpiresAt: issuedAt.Add(10 * time.Minute)}},
+		{name: "nonsensical issued at", policy: OnboardingTestReceiptPolicy{IssuedAt: time.Date(1, 1, 1, 0, 0, 0, 1, time.UTC), ExpiresAt: time.Date(1, 1, 1, 0, 10, 0, 1, time.UTC)}},
+		{name: "non UTC issued at", policy: OnboardingTestReceiptPolicy{IssuedAt: issuedAt.In(time.FixedZone("UTC+7", 7*60*60)), ExpiresAt: issuedAt.Add(10 * time.Minute)}},
+		{name: "non UTC expiry", policy: OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: issuedAt.Add(10 * time.Minute).In(time.FixedZone("UTC+7", 7*60*60))}},
+		{name: "already expired", policy: OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: issuedAt.Add(-time.Nanosecond)}},
+		{name: "less than ten minutes", policy: OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: issuedAt.Add(10*time.Minute - time.Nanosecond)}},
+		{name: "more than ten minutes", policy: OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: issuedAt.Add(10*time.Minute + time.Nanosecond)}},
+		{name: "arbitrary expiry", policy: OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: time.Date(2199, 1, 1, 0, 0, 0, 0, time.UTC)}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			seedOnboardingTestReceiptForTest(t, st, 17)
+			before := mustOnboardingStateForTest(t, st)
+
+			_, err := st.SaveOnboardingTestReceipt(
+				context.Background(),
+				17,
+				"persona-fingerprint",
+				strings.Repeat("ab", sha256.Size),
+				tt.policy,
+			)
+			if !errors.Is(err, ErrOnboardingInvalidTestReceipt) {
+				t.Fatalf("SaveOnboardingTestReceipt() error = %v; want %v", err, ErrOnboardingInvalidTestReceipt)
+			}
+			if after := mustOnboardingStateForTest(t, st); after != before {
+				t.Fatalf("invalid policy changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestSaveOnboardingTestReceiptCancellationBeforeCommitRollsBack(t *testing.T) {
+	tests := []struct {
+		name    string
+		context func() (context.Context, context.CancelFunc)
+		wantErr error
+	}{
+		{
+			name: "client cancellation",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.Background())
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "hard deadline",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 10*time.Millisecond)
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			seedOnboardingTestReceiptForTest(t, st, 17)
+			before := mustOnboardingStateForTest(t, st)
+			issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
+			ctx, cancel := tt.context()
+			defer cancel()
+			oldBeforeCommit := onboardingTestReceiptBeforeCommit
+			onboardingTestReceiptBeforeCommit = func(ctx context.Context) {
+				if errors.Is(tt.wantErr, context.Canceled) {
+					cancel()
+				}
+				<-ctx.Done()
+			}
+			t.Cleanup(func() { onboardingTestReceiptBeforeCommit = oldBeforeCommit })
+
+			_, err := st.SaveOnboardingTestReceipt(
+				ctx,
+				17,
+				"persona-fingerprint",
+				strings.Repeat("ab", sha256.Size),
+				OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: issuedAt.Add(10 * time.Minute)},
+			)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("SaveOnboardingTestReceipt() error = %v; want %v", err, tt.wantErr)
+			}
+			if after := mustOnboardingStateForTest(t, st); after != before {
+				t.Fatalf("canceled pre-commit receipt changed state: before=%+v after=%+v", before, after)
 			}
 		})
 	}
@@ -1552,10 +1657,14 @@ BEGIN SELECT RAISE(ABORT, 'injected receipt CAS failure'); END`); err != nil {
 	}
 
 	_, err := st.SaveOnboardingTestReceipt(
+		context.Background(),
 		8,
 		"persona-fingerprint",
 		strings.Repeat("cd", sha256.Size),
-		time.Date(2099, 8, 11, 8, 10, 0, 0, time.UTC),
+		OnboardingTestReceiptPolicy{
+			IssuedAt:  time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC),
+			ExpiresAt: time.Date(2099, 8, 11, 8, 10, 0, 0, time.UTC),
+		},
 	)
 	if err == nil {
 		t.Fatal("SaveOnboardingTestReceipt() error = nil; want injected failure")
@@ -1574,10 +1683,14 @@ func TestSaveOnboardingTestReceiptDoesNotMaskModelReadFailure(t *testing.T) {
 	}
 
 	_, err := st.SaveOnboardingTestReceipt(
+		context.Background(),
 		8,
 		"persona-fingerprint",
 		strings.Repeat("ef", sha256.Size),
-		time.Date(2099, 8, 11, 8, 10, 0, 0, time.UTC),
+		OnboardingTestReceiptPolicy{
+			IssuedAt:  time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC),
+			ExpiresAt: time.Date(2099, 8, 11, 8, 10, 0, 0, time.UTC),
+		},
 	)
 	if err == nil || errors.Is(err, ErrOnboardingModelUnavailable) {
 		t.Fatalf("SaveOnboardingTestReceipt() error = %v; want unmasked Store read failure", err)

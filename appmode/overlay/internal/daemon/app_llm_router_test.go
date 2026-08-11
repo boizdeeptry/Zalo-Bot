@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -2410,12 +2411,104 @@ func TestOnboardingPinnedAccountClaudeRunnerReceivesExactAccount(t *testing.T) {
 		[]string{"staged-prefix"},
 		slog.New(slog.DiscardHandler),
 	)
-	runner, ok := got.(execZaloRunner)
+	runner, ok := got.(*appOnboardingClaudeRunner)
 	if !ok {
-		t.Fatalf("pinned Claude runner = %T; want execZaloRunner", got)
+		t.Fatalf("pinned Claude runner = %T; want *appOnboardingClaudeRunner", got)
 	}
 	if runner.cfg.ConfigDir != staged.ConfigDir || runner.cfg.Model != "sonnet" ||
 		runner.cfg.Program != "staged-claude.exe" || !slices.Equal(runner.cfg.ProgramPrefixArgs, []string{"staged-prefix"}) {
 		t.Fatalf("pinned Claude config = %+v", runner.cfg)
+	}
+}
+
+func TestOnboardingPinnedClaudeRunnerUsesManagedProcessAndCancelsIt(t *testing.T) {
+	staged := store.OnboardingStagingAccount{
+		AccountID: "staged-claude", ProviderID: "claude-code", ProviderKind: "claude-code",
+		ConfigDir: t.TempDir(),
+	}
+	base := zaloConfig{
+		KBRoots: []string{t.TempDir()}, WorkDir: t.TempDir(), ThinkingTokens: 1536,
+	}
+	got := appOnboardingPinnedClaudeRunner(
+		base,
+		staged,
+		"sonnet",
+		"staged-claude.exe",
+		[]string{"staged-prefix"},
+		slog.New(slog.DiscardHandler),
+	)
+	runner, ok := got.(*appOnboardingClaudeRunner)
+	if !ok {
+		t.Fatalf("pinned Claude runner = %T; want *appOnboardingClaudeRunner", got)
+	}
+
+	called := make(chan struct{})
+	canceled := make(chan error, 1)
+	oldRun := appOnboardingRunCLIProcess
+	appOnboardingRunCLIProcess = func(
+		ctx context.Context,
+		cmd *exec.Cmd,
+		stdin []byte,
+		childPID chan<- int,
+		_ *slog.Logger,
+	) ([]byte, error) {
+		if childPID != nil {
+			t.Errorf("childPID = non-nil; onboarding stateless runner must not leak ownership")
+		}
+		if cmd.Cancel != nil {
+			t.Errorf("cmd.Cancel is set; want exec.Command owned by runCLIProcess, not CommandContext")
+		}
+		if cmd.Path != "staged-claude.exe" {
+			t.Errorf("cmd.Path = %q; want staged executable", cmd.Path)
+		}
+		if len(cmd.Args) < 2 || cmd.Args[1] != "staged-prefix" {
+			t.Errorf("cmd.Args = %q; want staged prefix first", cmd.Args)
+		}
+		if string(stdin) != "prompt-for-managed-child" {
+			t.Errorf("stdin = %q; want exact prompt", stdin)
+		}
+		var values []string
+		for _, item := range cmd.Env {
+			if strings.HasPrefix(strings.ToUpper(item), "CLAUDE_CONFIG_DIR=") {
+				values = append(values, item[len("CLAUDE_CONFIG_DIR="):])
+			}
+		}
+		if !slices.Equal(values, []string{staged.ConfigDir}) {
+			t.Errorf("CLAUDE_CONFIG_DIR values = %v; want exactly [%q]", values, staged.ConfigDir)
+		}
+		close(called)
+		<-ctx.Done()
+		canceled <- ctx.Err()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { appOnboardingRunCLIProcess = oldRun })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.Run(ctx, "prompt-for-managed-child", func(string) {})
+		done <- err
+	}()
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("managed process seam was not invoked")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v; want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("managed process did not return after cancellation")
+	}
+	select {
+	case err := <-canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("managed process context error = %v; want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("managed process seam did not observe cancellation")
 	}
 }

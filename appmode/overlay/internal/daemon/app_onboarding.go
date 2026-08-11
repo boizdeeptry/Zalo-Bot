@@ -39,10 +39,11 @@ var (
 	}
 	appOnboardingConnectCancelWait = 12 * time.Second
 
-	appOnboardingTestNow                               = time.Now
-	appOnboardingTestRandom  io.Reader                 = rand.Reader
-	appOnboardingTestTimeout                           = 120 * time.Second
-	appOnboardingTestExecute appOnboardingTestExecutor = defaultAppOnboardingTestExecute
+	appOnboardingTestNow                                   = time.Now
+	appOnboardingTestRandom                                = defaultAppOnboardingTestRandom
+	appOnboardingTestTimeout                               = 120 * time.Second
+	appOnboardingTestExecute     appOnboardingTestExecutor = defaultAppOnboardingTestExecute
+	appOnboardingTestAfterCommit                           = func() {}
 )
 
 type appOnboardingTestExecutor func(
@@ -52,6 +53,18 @@ type appOnboardingTestExecutor func(
 	store.OnboardingStagingAccount,
 	string,
 ) (string, error)
+
+type appOnboardingTestRandomFunc func(context.Context, []byte) error
+
+func defaultAppOnboardingTestRandom(ctx context.Context, dst []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(rand.Reader, dst); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
 
 type appOnboardingProviderRequest struct {
 	Revision int64  `json:"revision"`
@@ -363,13 +376,7 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	answer, err := appOnboardingTestExecute(testCtx, a, state, staged, prompt)
 	if err != nil || testCtx.Err() != nil {
-		switch {
-		case r.Context().Err() != nil || errors.Is(testCtx.Err(), context.Canceled):
-			a.writeOnboardingTestCanceled(w)
-		case errors.Is(testCtx.Err(), context.DeadlineExceeded):
-			a.writeLLMErr(w, http.StatusGatewayTimeout, "ONBOARDING_TEST_TIMEOUT",
-				"Lượt kiểm tra đã quá thời gian 120 giây", nil)
-		default:
+		if !a.writeOnboardingTestContextError(w, r, testCtx) {
 			a.writeLLMErr(w, http.StatusBadGateway, "ONBOARDING_TEST_FAILED",
 				"Không thể hoàn tất lượt kiểm tra với nhà cung cấp đã chọn", nil)
 		}
@@ -381,34 +388,52 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 			"Câu trả lời kiểm tra chưa xác nhận đúng tên hiển thị của bot", nil)
 		return
 	}
-	if r.Context().Err() != nil {
-		a.writeOnboardingTestCanceled(w)
+	if a.writeOnboardingTestContextError(w, r, testCtx) {
 		return
 	}
 	nonce := make([]byte, 32)
-	if _, err := io.ReadFull(appOnboardingTestRandom, nonce); err != nil {
+	if err := appOnboardingTestRandom(testCtx, nonce); err != nil {
+		if a.writeOnboardingTestContextError(w, r, testCtx) {
+			return
+		}
 		a.writeLLMErr(w, http.StatusInternalServerError, "ONBOARDING_TEST_TOKEN_FAILED",
 			"Không thể tạo biên nhận kiểm tra an toàn", nil)
 		return
 	}
+	if a.writeOnboardingTestContextError(w, r, testCtx) {
+		return
+	}
 	token := base64.RawURLEncoding.EncodeToString(nonce)
 	digest := sha256.Sum256([]byte(token))
-	now := appOnboardingTestNow().UTC()
-	expiresAt := now.Add(10 * time.Minute)
+	policy := store.NewOnboardingTestReceiptPolicy(appOnboardingTestNow().UTC())
+	if a.writeOnboardingTestContextError(w, r, testCtx) {
+		return
+	}
 	updated, err := a.st.SaveOnboardingTestReceipt(
+		testCtx,
 		state.Revision,
 		state.PersonaFingerprint,
 		fmt.Sprintf("%x", digest[:]),
-		expiresAt,
+		policy,
 	)
 	if err != nil {
+		if a.writeOnboardingTestContextError(w, r, testCtx) {
+			return
+		}
 		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	// A successful Commit is the receipt's linearization point. Cancellation
+	// after it cannot turn success into a reported failure, but a disconnected
+	// client must not receive a response body.
+	appOnboardingTestAfterCommit()
+	if r.Context().Err() != nil {
 		return
 	}
 	a.writeJSON(w, http.StatusOK, appOnboardingTestChatResponse{
 		Answer: answer, BotName: displayName, ProviderID: state.ProviderID,
 		ModelID: state.ModelID, TestToken: token,
-		ExpiresAt: expiresAt.Format(time.RFC3339Nano), Revision: updated.Revision,
+		ExpiresAt: policy.ExpiresAt.Format(time.RFC3339Nano), Revision: updated.Revision,
 	})
 }
 
@@ -537,6 +562,24 @@ func defaultAppOnboardingTestExecute(
 func (a *api) writeOnboardingTestCanceled(w http.ResponseWriter) {
 	a.writeLLMErr(w, http.StatusRequestTimeout, "ONBOARDING_REQUEST_CANCELED",
 		"Yêu cầu kiểm tra đã bị huỷ", nil)
+}
+
+func (a *api) writeOnboardingTestContextError(
+	w http.ResponseWriter,
+	r *http.Request,
+	testCtx context.Context,
+) bool {
+	switch {
+	case r.Context().Err() != nil || errors.Is(testCtx.Err(), context.Canceled):
+		a.writeOnboardingTestCanceled(w)
+		return true
+	case errors.Is(testCtx.Err(), context.DeadlineExceeded):
+		a.writeLLMErr(w, http.StatusGatewayTimeout, "ONBOARDING_TEST_TIMEOUT",
+			"Lượt kiểm tra đã quá thời gian 120 giây", nil)
+		return true
+	default:
+		return false
+	}
 }
 
 func selectOnboardingModel(st *store.Store, kind, providerID string) (string, error) {

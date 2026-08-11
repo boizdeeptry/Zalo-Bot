@@ -47,7 +47,7 @@ func TestAppOnboardingTestChatPersistsHashOnlyReceipt(t *testing.T) {
 			return answer, nil
 		},
 		func() time.Time { return fixedNow },
-		bytes.NewReader(randomBytes),
+		appOnboardingRandomFromReader(bytes.NewReader(randomBytes)),
 		120*time.Second,
 	)
 	beforeSideEffects := appOnboardingTestSideEffectDigest(t, env)
@@ -124,7 +124,7 @@ func TestAppOnboardingTestChatStrictMessageValidation(t *testing.T) {
 					return "unexpected", nil
 				},
 				time.Now,
-				bytes.NewReader(make([]byte, 32)),
+				appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
 				120*time.Second,
 			)
 			req := httptest.NewRequest(http.MethodPost, "/onboarding/test-chat", bytes.NewReader(tt.body))
@@ -182,7 +182,7 @@ func TestAppOnboardingTestChatRejectsInvalidStagingBeforeRunner(t *testing.T) {
 					return "unexpected", nil
 				},
 				time.Now,
-				bytes.NewReader(make([]byte, 32)),
+				appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
 				120*time.Second,
 			)
 			rr := env.serve(http.MethodPost, "/onboarding/test-chat", tt.body)
@@ -218,7 +218,7 @@ func TestAppOnboardingTestChatRejectsEmptyOrMissingNameAnswer(t *testing.T) {
 					return tt.answer, nil
 				},
 				time.Now,
-				bytes.NewReader(make([]byte, 32)),
+				appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
 				120*time.Second,
 			)
 			rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":9,"message":"xin chào"}`)
@@ -255,7 +255,7 @@ func TestAppOnboardingTestChatBusySkipsSecondRunner(t *testing.T) {
 			}
 		},
 		time.Now,
-		bytes.NewReader(make([]byte, 32)),
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
 		120*time.Second,
 	)
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
@@ -311,7 +311,7 @@ func TestAppOnboardingTestChatCancellationAndTimeoutDoNotPersist(t *testing.T) {
 					return "", ctx.Err()
 				},
 				time.Now,
-				bytes.NewReader(make([]byte, 32)),
+				appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
 				tt.timeout,
 			)
 			ctx := context.Background()
@@ -359,7 +359,7 @@ func TestAppOnboardingTestChatRejectsLateSuccessAfterHardTimeout(t *testing.T) {
 			return "Xin chào, tôi là Bé Mi.", nil
 		},
 		time.Now,
-		bytes.NewReader(make([]byte, 32)),
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
 		10*time.Millisecond,
 	)
 
@@ -379,7 +379,7 @@ func TestAppOnboardingTestChatRunnerFailureIsSafeAndDoesNotPersist(t *testing.T)
 			return "", errors.New("RUNNER_SECRET prompt and account path")
 		},
 		time.Now,
-		bytes.NewReader(make([]byte, 32)),
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
 		120*time.Second,
 	)
 
@@ -396,12 +396,12 @@ func TestAppOnboardingTestChatRunnerFailureIsSafeAndDoesNotPersist(t *testing.T)
 func TestAppOnboardingTestChatRandomAndStoreFailuresDoNotPersist(t *testing.T) {
 	tests := []struct {
 		name      string
-		random    io.Reader
+		random    appOnboardingTestRandomFunc
 		failStore bool
 		wantCode  string
 	}{
-		{name: "random", random: errorReader{err: errors.New("RANDOM_SECRET")}, wantCode: "ONBOARDING_TEST_TOKEN_FAILED"},
-		{name: "store", random: bytes.NewReader(make([]byte, 32)), failStore: true, wantCode: "ONBOARDING_STATE_UNAVAILABLE"},
+		{name: "random", random: appOnboardingRandomFromReader(errorReader{err: errors.New("RANDOM_SECRET")}), wantCode: "ONBOARDING_TEST_TOKEN_FAILED"},
+		{name: "store", random: appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))), failStore: true, wantCode: "ONBOARDING_STATE_UNAVAILABLE"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -435,15 +435,127 @@ BEGIN SELECT RAISE(ABORT, 'STORE_SECRET'); END`); err != nil {
 	}
 }
 
+func TestAppOnboardingTestChatTimeoutWhileRandomnessBlocksDoesNotPersist(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 27)
+	before := env.state(t)
+	randomEntered := make(chan struct{})
+	randomCanceled := make(chan error, 1)
+	withAppOnboardingTestSeams(t,
+		func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+			return "Xin chào, tôi là Bé Mi.", nil
+		},
+		time.Now,
+		func(ctx context.Context, _ []byte) error {
+			close(randomEntered)
+			<-ctx.Done()
+			randomCanceled <- ctx.Err()
+			return ctx.Err()
+		},
+		10*time.Millisecond,
+	)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":27,"message":"xin chào"}`)
+	}()
+	select {
+	case <-randomEntered:
+	case <-time.After(time.Second):
+		t.Fatal("randomness seam was not entered")
+	}
+	var rr *httptest.ResponseRecorder
+	select {
+	case rr = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not return after timeout while randomness was blocked")
+	}
+	requireOnboardingCode(t, rr, http.StatusGatewayTimeout, "ONBOARDING_TEST_TIMEOUT")
+	select {
+	case err := <-randomCanceled:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("randomness context error = %v; want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("randomness seam did not observe timeout")
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("randomness timeout changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAppOnboardingTestChatCancellationBeforeStoreDoesNotPersist(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 28)
+	before := env.state(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	withAppOnboardingTestSeams(t,
+		func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+			return "Xin chào, tôi là Bé Mi.", nil
+		},
+		time.Now,
+		func(_ context.Context, dst []byte) error {
+			copy(dst, bytes.Repeat([]byte{0x7a}, len(dst)))
+			cancel()
+			return nil
+		},
+		time.Second,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/onboarding/test-chat", strings.NewReader(`{"revision":28,"message":"xin chào"}`)).WithContext(ctx)
+
+	rr := env.serveRequest(req)
+	requireOnboardingCode(t, rr, http.StatusRequestTimeout, "ONBOARDING_REQUEST_CANCELED")
+	if after := env.state(t); after != before {
+		t.Fatalf("cancellation before Store changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAppOnboardingTestChatCancellationAfterCommitKeepsReceiptAndWritesNoResponse(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	state, _ := seedAppOnboardingTestChat(t, env, "codex", 29)
+	ctx, cancel := context.WithCancel(context.Background())
+	withAppOnboardingTestSeams(t,
+		func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+			return "Xin chào, tôi là Bé Mi.", nil
+		},
+		func() time.Time { return time.Date(2026, 8, 11, 8, 0, 0, 0, time.UTC) },
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+		time.Second,
+	)
+	appOnboardingTestAfterCommit = cancel
+	req := httptest.NewRequest(http.MethodPost, "/onboarding/test-chat", strings.NewReader(`{"revision":29,"message":"xin chào"}`)).WithContext(ctx)
+
+	rr := env.serveRequest(req)
+	if rr.Body.Len() != 0 || len(rr.Header()) != 0 {
+		t.Fatalf("canceled client received post-commit response: headers=%v body=%s", rr.Header(), rr.Body.String())
+	}
+	after := env.state(t)
+	if after.Revision != state.Revision+1 || after.TestNonceHash == "" || after.TestExpiresAt == "" {
+		t.Fatalf("post-commit cancellation lost receipt: before=%+v after=%+v", state, after)
+	}
+}
+
 type errorReader struct{ err error }
 
 func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func appOnboardingRandomFromReader(r io.Reader) appOnboardingTestRandomFunc {
+	return func(ctx context.Context, dst []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(r, dst); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}
+}
 
 func withAppOnboardingTestSeams(
 	t *testing.T,
 	execute appOnboardingTestExecutor,
 	now func() time.Time,
-	random io.Reader,
+	random appOnboardingTestRandomFunc,
 	timeout time.Duration,
 ) {
 	t.Helper()
@@ -451,15 +563,18 @@ func withAppOnboardingTestSeams(
 	oldNow := appOnboardingTestNow
 	oldRandom := appOnboardingTestRandom
 	oldTimeout := appOnboardingTestTimeout
+	oldAfterCommit := appOnboardingTestAfterCommit
 	appOnboardingTestExecute = execute
 	appOnboardingTestNow = now
 	appOnboardingTestRandom = random
 	appOnboardingTestTimeout = timeout
+	appOnboardingTestAfterCommit = func() {}
 	t.Cleanup(func() {
 		appOnboardingTestExecute = oldExecute
 		appOnboardingTestNow = oldNow
 		appOnboardingTestRandom = oldRandom
 		appOnboardingTestTimeout = oldTimeout
+		appOnboardingTestAfterCommit = oldAfterCommit
 	})
 }
 

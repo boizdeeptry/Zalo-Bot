@@ -1,15 +1,23 @@
 package daemon
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/exec"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
+	"agentdc/internal/agent"
 	"agentdc/internal/store"
 )
 
@@ -219,8 +227,25 @@ func newAppOnboardingTestRunner(
 	return newAppLLMRunner(cfg), nil
 }
 
+type appOnboardingCLIProcess func(
+	context.Context,
+	*exec.Cmd,
+	[]byte,
+	chan<- int,
+	*slog.Logger,
+) ([]byte, error)
+
+var appOnboardingRunCLIProcess appOnboardingCLIProcess = runCLIProcess
+
+type appOnboardingClaudeRunner struct {
+	cfg    zaloConfig
+	logger *slog.Logger
+}
+
 // appOnboardingPinnedClaudeRunner receives the exact validated staging Account
 // directly. There is no round-robin or live-session selector on this path.
+// Unlike the legacy live runner, this stateless onboarding path delegates child
+// ownership to runCLIProcess so cancellation tears down the managed process tree.
 func appOnboardingPinnedClaudeRunner(
 	base zaloConfig,
 	staged store.OnboardingStagingAccount,
@@ -233,7 +258,59 @@ func appOnboardingPinnedClaudeRunner(
 	base.Model = model
 	base.Program = program
 	base.ProgramPrefixArgs = slices.Clone(prefixArgs)
-	return execZaloRunner{cfg: base, logger: logger}
+	return &appOnboardingClaudeRunner{cfg: base, logger: logger}
+}
+
+func (r *appOnboardingClaudeRunner) Run(
+	ctx context.Context,
+	prompt string,
+	step func(string),
+) (string, error) {
+	profile := agent.ConsultReadOnly()
+	args, err := consultArgv(r.cfg, uuid.NewString())
+	if err != nil {
+		return "", err
+	}
+	args = append(slices.Clone(r.cfg.ProgramPrefixArgs), args...)
+	cmd := exec.Command(r.cfg.Program, args...)
+	cmd.Dir = r.cfg.WorkDir
+	cmd.Env = profile.Env(os.Environ())
+	cmd.Env = appZaloSetEnv(cmd.Env, "CLAUDE_CONFIG_DIR", r.cfg.ConfigDir)
+	if r.cfg.ThinkingTokens > 0 {
+		cmd.Env = appZaloSetEnv(cmd.Env, "MAX_THINKING_TOKENS", fmt.Sprint(r.cfg.ThinkingTokens))
+	}
+
+	step("agent bắt đầu đọc knowledge base")
+	out, err := appOnboardingRunCLIProcess(ctx, cmd, []byte(prompt), nil, r.logger)
+	if err != nil {
+		return "", fmt.Errorf("run staged Claude: %w", err)
+	}
+
+	var answer string
+	var sawResult bool
+	var body strings.Builder
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		body.Write(line)
+		body.WriteByte('\n')
+		progress, result, isResult := parseStreamLine(line)
+		if progress != "" {
+			step(progress)
+		}
+		if isResult {
+			answer, sawResult = result, true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read staged Claude output: %w", err)
+	}
+	if !sawResult {
+		step("không thấy event result, đọc cả stdout")
+		return body.String(), nil
+	}
+	return answer, nil
 }
 
 // Run trả lời một lượt bằng snapshot đã chụp khi dựng runner.

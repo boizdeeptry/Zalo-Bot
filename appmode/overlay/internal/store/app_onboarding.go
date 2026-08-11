@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -12,6 +13,8 @@ import (
 )
 
 const CurrentOnboardingVersion int64 = 1
+
+const onboardingTestReceiptTTL = 10 * time.Minute
 
 const (
 	OnboardingPhaseProvider  = "provider"
@@ -31,7 +34,23 @@ var (
 	ErrOnboardingModelUnavailable        = errors.New("onboarding model is unavailable")
 	ErrOnboardingPersonaMismatch         = errors.New("onboarding persona fingerprint changed")
 	ErrOnboardingInvalidTestReceipt      = errors.New("invalid onboarding test receipt")
+	onboardingTestReceiptBeforeCommit    = func(context.Context) {}
 )
+
+// OnboardingTestReceiptPolicy binds receipt validity to the one clock reading
+// captured by the caller. Store validates the relationship again inside the
+// transaction instead of trusting an arbitrary expiry supplied by HTTP code.
+type OnboardingTestReceiptPolicy struct {
+	IssuedAt  time.Time
+	ExpiresAt time.Time
+}
+
+func NewOnboardingTestReceiptPolicy(issuedAt time.Time) OnboardingTestReceiptPolicy {
+	return OnboardingTestReceiptPolicy{
+		IssuedAt:  issuedAt,
+		ExpiresAt: issuedAt.Add(onboardingTestReceiptTTL),
+	}
+}
 
 type OnboardingState struct {
 	CompletedVersion   int64
@@ -560,22 +579,22 @@ WHERE id = 1 AND revision = ? AND phase = ?`,
 // provider/model/persona revision produced an acceptable test answer. Only the
 // SHA-256 digest of the opaque receipt enters the database.
 func (s *Store) SaveOnboardingTestReceipt(
+	ctx context.Context,
 	expectedRevision int64,
 	personaFingerprint string,
 	nonceHash string,
-	expiresAt time.Time,
+	policy OnboardingTestReceiptPolicy,
 ) (OnboardingState, error) {
-	if !validOnboardingSHA256Hex(nonceHash) || expiresAt.IsZero() {
-		return OnboardingState{}, ErrOnboardingInvalidTestReceipt
-	}
-
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return OnboardingState{}, fmt.Errorf("begin onboarding test receipt: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if !validOnboardingSHA256Hex(nonceHash) || !validOnboardingTestReceiptPolicy(policy) {
+		return OnboardingState{}, ErrOnboardingInvalidTestReceipt
+	}
 
-	state, err := onboardingStateInTx(tx)
+	state, err := onboardingStateInTxContext(ctx, tx)
 	if err != nil {
 		return OnboardingState{}, err
 	}
@@ -598,12 +617,12 @@ func (s *Store) SaveOnboardingTestReceipt(
 		state.AccountID == "" || state.ModelID == "" || state.StagedComboID == "" {
 		return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
 	}
-	if _, err := onboardingStagingAccountInTx(tx, state); err != nil {
+	if _, err := onboardingStagingAccountInTxContext(ctx, tx, state); err != nil {
 		return OnboardingState{}, err
 	}
 
 	var available int64
-	err = tx.QueryRow(`SELECT available FROM llm_models
+	err = tx.QueryRowContext(ctx, `SELECT available FROM llm_models
 WHERE provider_id = ? AND model_id = ?`, state.ProviderID, state.ModelID).Scan(&available)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OnboardingState{}, ErrOnboardingModelUnavailable
@@ -620,7 +639,7 @@ WHERE provider_id = ? AND model_id = ?`, state.ProviderID, state.ModelID).Scan(&
 		return OnboardingState{}, ErrOnboardingModelUnavailable
 	}
 	var displayName string
-	if err := tx.QueryRow(`SELECT value FROM app_meta WHERE key = ?`, agentDisplayNameMetaKey).Scan(&displayName); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT value FROM app_meta WHERE key = ?`, agentDisplayNameMetaKey).Scan(&displayName); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
 		}
@@ -630,9 +649,9 @@ WHERE provider_id = ? AND model_id = ?`, state.ProviderID, state.ModelID).Scan(&
 		return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
 	}
 
-	expiresText := expiresAt.UTC().Format(time.RFC3339Nano)
-	updatedAt := ts(time.Now())
-	result, err := tx.Exec(`UPDATE app_onboarding_state SET
+	expiresText := policy.ExpiresAt.Format(time.RFC3339Nano)
+	updatedAt := ts(policy.IssuedAt)
+	result, err := tx.ExecContext(ctx, `UPDATE app_onboarding_state SET
 test_nonce_hash = ?, test_expires_at = ?, revision = revision + 1, updated_at = ?
 WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
   AND provider_id = ? AND account_id = ? AND model_id = ? AND staged_combo_id = ?
@@ -659,14 +678,34 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 	if changed != 1 {
 		return OnboardingState{}, ErrOnboardingConflict
 	}
-	updated, err := onboardingStateInTx(tx)
+	updated, err := onboardingStateInTxContext(ctx, tx)
 	if err != nil {
+		return OnboardingState{}, err
+	}
+	onboardingTestReceiptBeforeCommit(ctx)
+	if err := ctx.Err(); err != nil {
 		return OnboardingState{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return OnboardingState{}, fmt.Errorf("commit onboarding test receipt: %w", err)
 	}
 	return updated, nil
+}
+
+func validOnboardingTestReceiptPolicy(policy OnboardingTestReceiptPolicy) bool {
+	if !validOnboardingTestReceiptTime(policy.IssuedAt) ||
+		!validOnboardingTestReceiptTime(policy.ExpiresAt) {
+		return false
+	}
+	return policy.ExpiresAt.Equal(policy.IssuedAt.Add(onboardingTestReceiptTTL))
+}
+
+func validOnboardingTestReceiptTime(value time.Time) bool {
+	if value.IsZero() || value.Year() < 1970 || value.Year() > 9999 {
+		return false
+	}
+	_, offset := value.Zone()
+	return offset == 0
 }
 
 func validOnboardingSHA256Hex(value string) bool {
@@ -852,6 +891,17 @@ func onboardingStateInTx(tx *sql.Tx) (OnboardingState, error) {
 	return state, nil
 }
 
+func onboardingStateInTxContext(ctx context.Context, tx *sql.Tx) (OnboardingState, error) {
+	state, err := scanOnboardingState(tx.QueryRowContext(ctx, onboardingStateSelect))
+	if errors.Is(err, sql.ErrNoRows) {
+		return OnboardingState{}, ErrOnboardingStateMissing
+	}
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding state in transaction: %w", err)
+	}
+	return state, nil
+}
+
 func onboardingStagingAccountInTx(
 	tx *sql.Tx,
 	state OnboardingState,
@@ -859,6 +909,47 @@ func onboardingStagingAccountInTx(
 	var staging OnboardingStagingAccount
 	var enabled int64
 	err := tx.QueryRow(`SELECT
+a.id, a.provider_id, p.kind, a.config_dir, a.enabled
+FROM llm_accounts a
+JOIN llm_providers p ON p.id = a.provider_id
+WHERE a.id = ?`, state.AccountID).Scan(
+		&staging.AccountID,
+		&staging.ProviderID,
+		&staging.ProviderKind,
+		&staging.ConfigDir,
+		&enabled,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return OnboardingStagingAccount{}, fmt.Errorf(
+			"%w: onboarding Account %q does not exist with its Provider",
+			ErrOnboardingInvalidStagingOwnership,
+			state.AccountID,
+		)
+	}
+	if err != nil {
+		return OnboardingStagingAccount{}, fmt.Errorf("read onboarding staging Account %q: %w", state.AccountID, err)
+	}
+	if staging.AccountID != state.AccountID ||
+		staging.ProviderID != state.ProviderID ||
+		staging.ProviderKind != state.ProviderKind ||
+		enabled != 0 {
+		return OnboardingStagingAccount{}, fmt.Errorf(
+			"%w: onboarding Account %q is not the exact disabled staging owner",
+			ErrOnboardingInvalidStagingOwnership,
+			state.AccountID,
+		)
+	}
+	return staging, nil
+}
+
+func onboardingStagingAccountInTxContext(
+	ctx context.Context,
+	tx *sql.Tx,
+	state OnboardingState,
+) (OnboardingStagingAccount, error) {
+	var staging OnboardingStagingAccount
+	var enabled int64
+	err := tx.QueryRowContext(ctx, `SELECT
 a.id, a.provider_id, p.kind, a.config_dir, a.enabled
 FROM llm_accounts a
 JOIN llm_providers p ON p.id = a.provider_id
