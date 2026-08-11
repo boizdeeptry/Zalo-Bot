@@ -150,7 +150,8 @@ func TestConnectClaudeLabelsAccountWithEmail(t *testing.T) {
 	}
 	// SECURITY: config dir must NOT be serialized to the Portal (mirror the codex canary)
 	b, _ := json.Marshal(st)
-	if strings.Contains(string(b), "acc1") || strings.Contains(string(b), "accounts") || strings.Contains(string(b), "config_dir") {
+	if strings.Contains(string(b), filepath.Join(m.dataDir, "accounts")) ||
+		strings.Contains(string(b), "configDir") || strings.Contains(string(b), "config_dir") {
 		t.Errorf("connectState JSON leaks the internal config dir: %s", b)
 	}
 }
@@ -192,6 +193,231 @@ func newTestManager(t *testing.T, r connectRunner, ensure func(string) error, cr
 		logger:       slog.New(slog.DiscardHandler),
 		loginTimeout: 200 * time.Millisecond,
 		pollInterval: 5 * time.Millisecond,
+	}
+}
+
+func TestConnectOnboardingSuccessStagesDisabledAccountAndPublishesIDsAfterBind(t *testing.T) {
+	r := &fakeRunner{installed: true, loginURL: "https://auth.example/login", auth: authLoggedIn}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error {
+		t.Error("onboarding Connect called createAccount")
+		return nil
+	})
+	m.ensureModels = func(string) error { return nil }
+	bindEntered := make(chan store.LLMAccount, 1)
+	releaseBind := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseBind) }) })
+	bindCalls := 0
+	m.bindOnboarding = func(revision int64, kind string, account store.LLMAccount) (store.OnboardingState, error) {
+		bindCalls++
+		if revision != 7 || kind != "codex" {
+			t.Errorf("bind context = revision:%d kind:%q", revision, kind)
+		}
+		bindEntered <- account
+		<-releaseBind
+		return store.OnboardingState{
+			Phase: store.OnboardingPhaseSetup, ProviderKind: kind,
+			ProviderID: kind, AccountID: account.ID, Revision: revision + 1,
+		}, nil
+	}
+
+	if _, err := m.start("codex", "Onboarding", &connectOnboardingContext{Revision: 7, Kind: "codex"}); err != nil {
+		t.Fatalf("start onboarding = %v", err)
+	}
+	var staged store.LLMAccount
+	select {
+	case staged = <-bindEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("onboarding bind was not reached")
+	}
+	if staged.Enabled {
+		t.Fatalf("staged Account is enabled: %+v", staged)
+	}
+	if st, _ := m.status("codex"); st.Phase != phasePolling || st.ProviderID != "" || st.AccountID != "" {
+		t.Fatalf("state exposed IDs before bind committed: %+v", st)
+	}
+	releaseOnce.Do(func() { close(releaseBind) })
+	st := waitPhase(t, m, "codex", phaseConnected)
+	if st.ProviderID != "codex" || st.AccountID != "acc1" || bindCalls != 1 {
+		t.Fatalf("terminal=%+v bindCalls=%d", st, bindCalls)
+	}
+}
+
+func TestConnectNormalSuccessCreatesEnabledAccountWithoutOnboardingBind(t *testing.T) {
+	r := &fakeRunner{installed: true, auth: authLoggedIn}
+	var created store.LLMAccount
+	bindCalls := 0
+	m := newTestManager(t, r, func(string) error { return nil }, func(account store.LLMAccount) error {
+		created = account
+		return nil
+	})
+	m.ensureModels = func(string) error { return nil }
+	m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+		bindCalls++
+		return store.OnboardingState{}, nil
+	}
+
+	if _, err := m.start("codex", "Normal"); err != nil {
+		t.Fatal(err)
+	}
+	st := waitPhase(t, m, "codex", phaseConnected)
+	if !created.Enabled || created.ID != "acc1" || bindCalls != 0 {
+		t.Fatalf("created=%+v bindCalls=%d", created, bindCalls)
+	}
+	if st.ProviderID != "codex" || st.AccountID != created.ID {
+		t.Fatalf("terminal=%+v", st)
+	}
+}
+
+func TestConnectModelPersistenceFailureBlocksAccountAndCleansDirectory(t *testing.T) {
+	r := &fakeRunner{installed: true, auth: authLoggedIn}
+	created := 0
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error {
+		created++
+		return nil
+	})
+	m.ensureModels = func(string) error { return errors.New("SQL model failure at D:/private/models") }
+
+	if _, err := m.start("codex", "Normal"); err != nil {
+		t.Fatal(err)
+	}
+	st := waitPhase(t, m, "codex", phaseError)
+	if created != 0 || st.ProviderID != "" || st.AccountID != "" {
+		t.Fatalf("error terminal=%+v created=%d", st, created)
+	}
+	if strings.Contains(strings.ToLower(st.Error), "sql") || strings.Contains(st.Error, "D:/private") {
+		t.Fatalf("terminal error leaked internal detail: %q", st.Error)
+	}
+	waitConnectJobDone(t, m)
+	dir := filepath.Join(m.dataDir, "accounts", "codex", "acc1")
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("model failure left config dir %q: %v", dir, err)
+	}
+}
+
+func TestConnectOnboardingPersistenceFailuresLeaveNoIDsOrConfigDirectory(t *testing.T) {
+	tests := []struct {
+		name       string
+		ensureErr  error
+		modelsErr  error
+		bindErr    error
+		wantModels int
+		wantBind   int
+	}{
+		{name: "provider", ensureErr: errors.New("provider SQL private path"), wantModels: 0, wantBind: 0},
+		{name: "models", modelsErr: errors.New("model SQL private path"), wantModels: 1, wantBind: 0},
+		{name: "bind", bindErr: store.ErrOnboardingConflict, wantModels: 1, wantBind: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &fakeRunner{installed: true, auth: authLoggedIn}
+			createCalls, modelCalls, bindCalls := 0, 0, 0
+			m := newTestManager(t, r, func(string) error { return tt.ensureErr }, func(store.LLMAccount) error {
+				createCalls++
+				return nil
+			})
+			m.ensureModels = func(string) error {
+				modelCalls++
+				return tt.modelsErr
+			}
+			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+				bindCalls++
+				return store.OnboardingState{}, tt.bindErr
+			}
+			if _, err := m.start("codex", "Onboarding", &connectOnboardingContext{Revision: 3, Kind: "codex"}); err != nil {
+				t.Fatal(err)
+			}
+			st := waitPhase(t, m, "codex", phaseError)
+			if st.ProviderID != "" || st.AccountID != "" || createCalls != 0 ||
+				modelCalls != tt.wantModels || bindCalls != tt.wantBind {
+				t.Fatalf("terminal=%+v create=%d models=%d bind=%d", st, createCalls, modelCalls, bindCalls)
+			}
+			if strings.Contains(strings.ToLower(st.Error), "sql") || strings.Contains(strings.ToLower(st.Error), "private") {
+				t.Fatalf("terminal error leaked internal detail: %q", st.Error)
+			}
+			waitConnectJobDone(t, m)
+			if _, err := os.Stat(filepath.Join(m.dataDir, "accounts", "codex", "acc1")); !os.IsNotExist(err) {
+				t.Fatalf("failed persistence left config dir: %v", err)
+			}
+		})
+	}
+}
+
+func TestConnectContextReuseRequiresExactMatch(t *testing.T) {
+	r := &fakeRunner{installed: true, auth: authLoggedOut}
+	m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
+	ctx := &connectOnboardingContext{Revision: 9, Kind: "codex"}
+	if _, err := m.start("codex", "first", ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitPhase(t, m, "codex", phasePolling)
+	if _, err := m.start("codex", "identical", &connectOnboardingContext{Revision: 9, Kind: "codex"}); err != nil {
+		t.Fatalf("identical context = %v; want current state", err)
+	}
+	for _, mismatch := range []*connectOnboardingContext{
+		nil,
+		{Revision: 10, Kind: "codex"},
+		{Revision: 9, Kind: "claude-code"},
+	} {
+		if _, err := m.start("codex", "mismatch", mismatch); !errors.Is(err, errConnectBusy) {
+			t.Errorf("mismatch %+v = %v; want errConnectBusy", mismatch, err)
+		}
+	}
+	m.cancel("codex")
+}
+
+func TestConnectStateJSONPublishesIDsOnlyForSuccess(t *testing.T) {
+	for _, phase := range []connectPhase{
+		phaseDetecting, phaseInstalling, phaseAwaitingLogin, phasePolling, phaseError, phaseCanceled,
+	} {
+		state := connectState{Kind: "codex", Phase: phase, Error: "bounded"}
+		body, err := json.Marshal(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(body, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := fields["providerId"]; ok {
+			t.Errorf("phase %q exposed providerId: %s", phase, body)
+		}
+		if _, ok := fields["accountId"]; ok {
+			t.Errorf("phase %q exposed accountId: %s", phase, body)
+		}
+		for _, forbidden := range []string{"configDir", "config_dir", "credential", "D:/private"} {
+			if strings.Contains(string(body), forbidden) {
+				t.Errorf("phase %q exposed %q: %s", phase, forbidden, body)
+			}
+		}
+	}
+
+	job := &connectJob{state: connectState{Kind: "codex", Phase: phasePolling}, claimed: true}
+	job.finishSuccess("codex", "account-1")
+	body, err := json.Marshal(job.snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"providerId":"codex"`) ||
+		!strings.Contains(string(body), `"accountId":"account-1"`) {
+		t.Fatalf("connected state omitted persisted IDs: %s", body)
+	}
+	for _, forbidden := range []string{"configDir", "config_dir", "credential", "secret"} {
+		if strings.Contains(string(body), forbidden) {
+			t.Errorf("connected state exposed %q: %s", forbidden, body)
+		}
+	}
+}
+
+func waitConnectJobDone(t *testing.T, m *connectManager) {
+	t.Helper()
+	m.mu.Lock()
+	job := m.job
+	m.mu.Unlock()
+	select {
+	case <-job.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("connect job did not finish")
 	}
 }
 
@@ -260,7 +486,8 @@ func TestConnectHappyPathAlreadyInstalled(t *testing.T) {
 	}
 	// SECURITY: config dir must NOT be serialized to the Portal
 	b, _ := json.Marshal(st)
-	if strings.Contains(string(b), "acc1") || strings.Contains(string(b), "accounts") {
+	if strings.Contains(string(b), wantDir) || strings.Contains(string(b), "configDir") ||
+		strings.Contains(string(b), "config_dir") {
 		t.Errorf("connectState JSON leaks the internal config dir: %s", b)
 	}
 }

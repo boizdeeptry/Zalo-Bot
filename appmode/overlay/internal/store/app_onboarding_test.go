@@ -71,6 +71,232 @@ func TestOnboardingStateMissingRowFailsClosed(t *testing.T) {
 	}
 }
 
+func TestBindOnboardingAccountStagesDisabledAccountAndAdvancesOnce(t *testing.T) {
+	st := openAppStoreForTest(t)
+	insertOnboardingProviderForTest(t, st, "codex", "codex")
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 7,
+	})
+	before := mustOnboardingStateForTest(t, st)
+	addedAt := time.Date(2026, 8, 11, 7, 30, 0, 0, time.UTC)
+	account := LLMAccount{
+		ID: "account-new", ProviderID: "codex", Label: "New account",
+		ConfigDir: "D:/onboarding/new", Enabled: false, AddedAt: &addedAt,
+	}
+
+	got, err := st.BindOnboardingAccount(before.Revision, "codex", account)
+	if err != nil {
+		t.Fatalf("BindOnboardingAccount() = %v", err)
+	}
+	if got.Phase != OnboardingPhaseSetup || got.ProviderID != "codex" ||
+		got.AccountID != account.ID || got.Revision != before.Revision+1 {
+		t.Fatalf("bound state = %+v", got)
+	}
+	if got.ProviderKind != before.ProviderKind || got.CompletedVersion != before.CompletedVersion ||
+		got.RestartInProgress != before.RestartInProgress {
+		t.Fatalf("bind changed flow markers: before=%+v got=%+v", before, got)
+	}
+	accounts, err := st.LLMAccounts("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != account.ID || accounts[0].Enabled ||
+		accounts[0].ConfigDir != account.ConfigDir {
+		t.Fatalf("staged accounts = %+v", accounts)
+	}
+}
+
+func TestBindOnboardingAccountRejectsInvalidStateAndRollsBack(t *testing.T) {
+	tests := []struct {
+		name            string
+		state           OnboardingState
+		kind            string
+		account         LLMAccount
+		providerID      string
+		providerKind    string
+		providerEnabled bool
+		duplicate       bool
+		wantErr         error
+	}{
+		{
+			name: "stale revision", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 4},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingConflict,
+		},
+		{
+			name: "wrong phase", state: OnboardingState{Phase: OnboardingPhaseSetup, ProviderKind: "codex", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidPhase,
+		},
+		{
+			name: "wrong selected kind", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "claude-code", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "enabled account", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 5},
+			kind: "codex", account: func() LLMAccount { a := validOnboardingAccountForTest(); a.Enabled = true; return a }(),
+			providerID: "codex", providerKind: "codex", providerEnabled: true, wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "account provider mismatch", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 5},
+			kind: "codex", account: func() LLMAccount { a := validOnboardingAccountForTest(); a.ProviderID = "other"; return a }(),
+			providerID: "codex", providerKind: "codex", providerEnabled: true, wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "missing provider", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "provider kind mismatch", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "claude-code", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "disabled provider", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: false,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "dirty provider id", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", ProviderID: "old", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "dirty account id", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", AccountID: "old", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "dirty model", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", ModelID: "old", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "dirty combo", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", StagedComboID: "old", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "dirty fingerprint", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", PersonaFingerprint: "old", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "dirty receipt", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", TestNonceHash: "old", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "dirty receipt expiry", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", TestExpiresAt: "2026-08-11T08:00:00Z", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+		{
+			name: "duplicate account", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 5},
+			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
+			duplicate: true, wantErr: ErrOnboardingInvalidStagingOwnership,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			if tt.providerID != "" {
+				if _, err := st.db.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
+VALUES (?, ?, ?, ?)`, tt.providerID, tt.providerID, tt.providerKind, boolInt(tt.providerEnabled)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.duplicate {
+				insertOnboardingAccountForTest(t, st, tt.account.ID, tt.account.ProviderID, false, "D:/existing")
+			}
+			setOnboardingStateForTest(t, st, tt.state)
+			before := mustOnboardingStateForTest(t, st)
+			expectedRevision := before.Revision
+			if tt.name == "stale revision" {
+				expectedRevision--
+			}
+
+			if _, err := st.BindOnboardingAccount(expectedRevision, tt.kind, tt.account); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v; want %v", err, tt.wantErr)
+			}
+			if after := mustOnboardingStateForTest(t, st); after != before {
+				t.Fatalf("failed bind changed state: before=%+v after=%+v", before, after)
+			}
+			accounts, err := st.LLMAccounts(tt.account.ProviderID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount := 0
+			if tt.duplicate {
+				wantCount = 1
+			}
+			if len(accounts) != wantCount {
+				t.Fatalf("accounts after failed bind = %+v; want count %d", accounts, wantCount)
+			}
+		})
+	}
+}
+
+func TestBindOnboardingAccountRejectsInvalidInputWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name    string
+		kind    string
+		account LLMAccount
+		wantErr error
+	}{
+		{name: "unsupported kind", kind: "openai", account: validOnboardingAccountForTest(), wantErr: ErrOnboardingProviderUnsupported},
+		{name: "empty account id", kind: "codex", account: func() LLMAccount { a := validOnboardingAccountForTest(); a.ID = ""; return a }(), wantErr: ErrOnboardingInvalidStagingOwnership},
+		{name: "empty provider id", kind: "codex", account: func() LLMAccount { a := validOnboardingAccountForTest(); a.ProviderID = ""; return a }(), wantErr: ErrOnboardingInvalidStagingOwnership},
+		{name: "empty config dir", kind: "codex", account: func() LLMAccount { a := validOnboardingAccountForTest(); a.ConfigDir = ""; return a }(), wantErr: ErrOnboardingInvalidStagingOwnership},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			before := mustOnboardingStateForTest(t, st)
+			if _, err := st.BindOnboardingAccount(before.Revision, tt.kind, tt.account); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v; want %v", err, tt.wantErr)
+			}
+			if after := mustOnboardingStateForTest(t, st); after != before {
+				t.Fatalf("invalid input changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestBindOnboardingAccountCASFailureRollsBackInsertedAccount(t *testing.T) {
+	st := openAppStoreForTest(t)
+	insertOnboardingProviderForTest(t, st, "codex", "codex")
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 9,
+	})
+	before := mustOnboardingStateForTest(t, st)
+	if _, err := st.db.Exec(`CREATE TRIGGER onboarding_test_change_revision_during_bind
+BEFORE INSERT ON llm_accounts WHEN NEW.id = 'account-new'
+BEGIN
+  UPDATE app_onboarding_state SET revision = revision + 1 WHERE id = 1;
+END`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.BindOnboardingAccount(before.Revision, "codex", validOnboardingAccountForTest()); !errors.Is(err, ErrOnboardingConflict) {
+		t.Fatalf("error = %v; want ErrOnboardingConflict", err)
+	}
+	if after := mustOnboardingStateForTest(t, st); after != before {
+		t.Fatalf("CAS rollback changed state: before=%+v after=%+v", before, after)
+	}
+	if onboardingAccountExistsForTest(t, st, "account-new") {
+		t.Fatal("Account insert survived failed onboarding CAS")
+	}
+}
+
+func validOnboardingAccountForTest() LLMAccount {
+	return LLMAccount{
+		ID: "account-new", ProviderID: "codex", Label: "New account",
+		ConfigDir: "D:/onboarding/new", Enabled: false,
+	}
+}
+
 func TestOnboardingStagingAccountReturnsExactDisabledOwnership(t *testing.T) {
 	st := openAppStoreForTest(t)
 	insertOnboardingProviderForTest(t, st, "provider-old", "claude-code")

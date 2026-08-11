@@ -35,14 +35,26 @@ const (
 )
 
 // connectState is the Portal-facing snapshot. SECURITY INVARIANT: it must NOT contain the
-// account's config dir (an internal filesystem path). Only phase/message/loginURL/error.
+// account's config dir or credentials. Persisted IDs appear only in the connected terminal.
 type connectState struct {
-	Kind     string       `json:"kind"`
-	Phase    connectPhase `json:"phase"`
-	Message  string       `json:"message,omitempty"`
-	LoginURL string       `json:"loginUrl,omitempty"`
-	Code     string       `json:"code,omitempty"` // device-auth one-time code (NOT a secret credential; expires ~15m)
-	Error    string       `json:"error,omitempty"`
+	Kind       string       `json:"kind"`
+	Phase      connectPhase `json:"phase"`
+	Message    string       `json:"message,omitempty"`
+	LoginURL   string       `json:"loginUrl,omitempty"`
+	Code       string       `json:"code,omitempty"` // device-auth one-time code (NOT a secret credential; expires ~15m)
+	Error      string       `json:"error,omitempty"`
+	ProviderID string       `json:"providerId,omitempty"`
+	AccountID  string       `json:"accountId,omitempty"`
+}
+
+type connectStartRequest struct {
+	Label              string `json:"label"`
+	OnboardingRevision *int64 `json:"onboarding_revision,omitempty"`
+}
+
+type connectOnboardingContext struct {
+	Revision int64
+	Kind     string
 }
 
 // connectRunner isolates the three side-effecting steps so the state machine is testable
@@ -86,14 +98,15 @@ func startConnectPollTicker(interval time.Duration) connectPollTicker {
 // connectJob holds one in-flight connect attempt. configDir/accountID/label are internal (not
 // in connectState). All state access goes through guarded helpers/snapshot under the mutex.
 type connectJob struct {
-	mu        sync.Mutex
-	state     connectState
-	accountID string
-	configDir string
-	label     string
-	cancel    context.CancelFunc
-	done      chan struct{}
-	claimed   bool // success owns persistence; protected by mu and never exposed to the Portal
+	mu         sync.Mutex
+	state      connectState
+	accountID  string
+	configDir  string
+	label      string
+	onboarding *connectOnboardingContext
+	cancel     context.CancelFunc
+	done       chan struct{}
+	claimed    bool // success owns persistence; protected by mu and never exposed to the Portal
 }
 
 func (j *connectJob) snapshot() connectState { j.mu.Lock(); defer j.mu.Unlock(); return j.state }
@@ -147,12 +160,14 @@ func (j *connectJob) claimSuccess() bool {
 	return true
 }
 
-func (j *connectJob) finishSuccess() {
+func (j *connectJob) finishSuccess(providerID, accountID string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if !j.claimed {
 		return
 	}
+	j.state.ProviderID = providerID
+	j.state.AccountID = accountID
 	j.state.Phase = phaseConnected
 	j.state.Message = ""
 }
@@ -172,22 +187,32 @@ func (j *connectJob) failIfActive(userMsg string) bool {
 // the state machine tests without a DB: ensure creates the provider row, createAccount records
 // the account, dataDir anchors the per-account config dir, newID mints the account id.
 type connectManager struct {
-	mu            sync.Mutex
-	runner        connectRunner
-	ensure        func(kind string) error
-	ensureModels  func(kind string) // gieo model tĩnh của provider vừa kết nối; nil (test không set) = bỏ qua
-	createAccount func(store.LLMAccount) error
-	dataDir       string
-	newID         func() string
-	logger        *slog.Logger
-	job           *connectJob
-	jobKind       string
-	loginTimeout  time.Duration // 0 → connectLoginTimeout (5m default); test seam
-	pollInterval  time.Duration // 0 → connectPollInterval (2s default); test seam
-	newPollTicker func(time.Duration) connectPollTicker
+	mu             sync.Mutex
+	runner         connectRunner
+	ensure         func(kind string) error
+	ensureModels   func(kind string) error
+	createAccount  func(store.LLMAccount) error
+	bindOnboarding func(expectedRevision int64, kind string, account store.LLMAccount) (store.OnboardingState, error)
+	dataDir        string
+	newID          func() string
+	logger         *slog.Logger
+	job            *connectJob
+	jobKind        string
+	loginTimeout   time.Duration // 0 → connectLoginTimeout (5m default); test seam
+	pollInterval   time.Duration // 0 → connectPollInterval (2s default); test seam
+	newPollTicker  func(time.Duration) connectPollTicker
 }
 
-func (m *connectManager) start(kind, label string) (connectState, error) {
+func (m *connectManager) start(
+	kind string,
+	label string,
+	onboardingArgs ...*connectOnboardingContext,
+) (connectState, error) {
+	var onboarding *connectOnboardingContext
+	if len(onboardingArgs) > 0 && onboardingArgs[0] != nil {
+		copied := *onboardingArgs[0]
+		onboarding = &copied
+	}
 	m.mu.Lock()
 	if m.job != nil {
 		cur := m.job.snapshot()
@@ -199,9 +224,10 @@ func (m *connectManager) start(kind, label string) (connectState, error) {
 		default:
 		}
 		if !finished {
-			if m.jobKind == kind && !terminal {
+			if m.jobKind == kind && !terminal &&
+				equalConnectOnboardingContext(m.job.onboarding, onboarding) {
 				m.mu.Unlock()
-				return cur, nil // same kind already running — return current, not an error
+				return cur, nil
 			}
 			m.mu.Unlock()
 			return connectState{}, errConnectBusy
@@ -217,14 +243,21 @@ func (m *connectManager) start(kind, label string) (connectState, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &connectJob{
-		state:     connectState{Kind: kind, Phase: phaseDetecting},
-		accountID: id, configDir: dir, label: label, cancel: cancel, done: make(chan struct{}),
+		state: connectState{Kind: kind, Phase: phaseDetecting}, accountID: id,
+		configDir: dir, label: label, onboarding: onboarding, cancel: cancel, done: make(chan struct{}),
 	}
 	m.job = job
 	m.jobKind = kind
 	m.mu.Unlock()
 	go m.run(ctx, kind, job)
 	return job.snapshot(), nil
+}
+
+func equalConnectOnboardingContext(a, b *connectOnboardingContext) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Revision == b.Revision && a.Kind == b.Kind
 }
 
 func (m *connectManager) status(kind string) (connectState, bool) {
@@ -248,7 +281,9 @@ func (m *connectManager) cancel(kind string) bool {
 }
 
 func (m *connectManager) fail(job *connectJob, kind, userMsg string, cause error) {
-	m.logger.Error("connect failed", "kind", kind, "phase", job.snapshot().Phase, "err", cause)
+	if m.logger != nil {
+		m.logger.Error("connect failed", "kind", kind, "phase", job.snapshot().Phase, "err", cause)
+	}
 	job.failIfActive(userMsg)
 }
 
@@ -286,7 +321,7 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 		return
 	}
 	if err != nil {
-		m.fail(job, kind, "không kiểm được CLI: "+err.Error(), err)
+		m.fail(job, kind, "không kiểm được CLI", err)
 		return
 	}
 	if !installed {
@@ -385,26 +420,42 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 			now := time.Now()
 			acct := store.LLMAccount{
 				ID: job.accountID, ProviderID: kind, Label: label,
-				ConfigDir: job.configDir, Enabled: true, AddedAt: &now,
+				ConfigDir: job.configDir, Enabled: job.onboarding == nil, AddedAt: &now,
 			}
 			if !job.claimSuccess() {
 				return
 			}
 			if err := m.ensure(kind); err != nil {
-				m.fail(job, kind, "lưu provider lỗi: "+err.Error(), err)
+				m.fail(job, kind, "không lưu được kết nối", err)
 				return
 			}
-			// Provider vừa có hàng — gieo model tĩnh của nó ngay để detail + combo picker hiện model.
-			// Provider CLI subscription: providerID == kind. Guard vì test không set hook này.
 			if m.ensureModels != nil {
-				m.ensureModels(kind)
+				if err := m.ensureModels(kind); err != nil {
+					m.fail(job, kind, "không lưu được kết nối", err)
+					return
+				}
 			}
-			if err := m.createAccount(acct); err != nil {
-				m.fail(job, kind, "lưu account lỗi: "+err.Error(), err)
-				return
+			if job.onboarding == nil {
+				if m.createAccount == nil {
+					m.fail(job, kind, "không lưu được kết nối", errors.New("connect Account persistence is unavailable"))
+					return
+				}
+				if err := m.createAccount(acct); err != nil {
+					m.fail(job, kind, "không lưu được kết nối", err)
+					return
+				}
+			} else {
+				if m.bindOnboarding == nil {
+					m.fail(job, kind, "không lưu được kết nối", errors.New("onboarding Account bind is unavailable"))
+					return
+				}
+				if _, err := m.bindOnboarding(job.onboarding.Revision, kind, acct); err != nil {
+					m.fail(job, kind, "không lưu được kết nối", err)
+					return
+				}
 			}
-			connected = true // row created — keep the config dir (holds auth.json); skip cleanup
-			job.finishSuccess()
+			connected = true
+			job.finishSuccess(kind, acct.ID)
 			return
 		}
 		select {
@@ -445,13 +496,17 @@ var connectMgr *connectManager
 
 func (a *api) newConnectManager() *connectManager {
 	return &connectManager{
-		runner:        newDefaultConnectRunner(a.logger),
-		ensure:        a.st.EnsureProviderForKind,
-		ensureModels:  func(k string) { ensureCLIProviderModels(a.st, a.logger, k, k) },
-		createAccount: a.st.CreateLLMAccount,
-		dataDir:       a.cfg.Dir,
-		newID:         newAccountID,
-		logger:        a.logger,
+		runner: newDefaultConnectRunner(a.logger),
+		ensure: a.st.EnsureProviderForKind,
+		ensureModels: func(k string) error {
+			models := cliProviderModels(a.st, k, k)
+			return a.st.ReplaceLLMModels(k, store.LLMModelDiscovered, models)
+		},
+		createAccount:  a.st.CreateLLMAccount,
+		bindOnboarding: a.st.BindOnboardingAccount,
+		dataDir:        a.cfg.Dir,
+		newID:          newAccountID,
+		logger:         a.logger,
 	}
 }
 
@@ -894,9 +949,7 @@ func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 			"loại tài khoản này chưa kết nối được ở bản này", map[string]string{"kind": kind})
 		return
 	}
-	var body struct {
-		Label string `json:"label"`
-	}
+	var body connectStartRequest
 	if !a.decodeLLMBody(w, r, &body) {
 		return // decodeLLMBody already wrote the error
 	}
@@ -914,7 +967,35 @@ func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 			"yêu cầu kết nối đã bị huỷ", nil)
 		return
 	}
-	st, err := connectMgr.start(kind, label)
+	var onboarding *connectOnboardingContext
+	if body.OnboardingRevision != nil {
+		if !a.requireOnboardingRevision(w, *body.OnboardingRevision) {
+			onboardingMutationMu.Unlock()
+			return
+		}
+		state, ok := a.onboardingMutationState(w, *body.OnboardingRevision)
+		if !ok {
+			onboardingMutationMu.Unlock()
+			return
+		}
+		if !onboardingRequired(state) || state.Phase != store.OnboardingPhaseConnect {
+			onboardingMutationMu.Unlock()
+			a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidPhase)
+			return
+		}
+		if state.ProviderKind != kind {
+			onboardingMutationMu.Unlock()
+			a.writeOnboardingStoreError(w, store.ErrOnboardingProviderUnsupported)
+			return
+		}
+		if !connectOnboardingStateIsClean(state) {
+			onboardingMutationMu.Unlock()
+			a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
+			return
+		}
+		onboarding = &connectOnboardingContext{Revision: state.Revision, Kind: kind}
+	}
+	st, err := connectMgr.start(kind, label, onboarding)
 	onboardingMutationMu.Unlock()
 	if errors.Is(err, errConnectBusy) {
 		// Reachable now that codex and claude-code are both subscription kinds: starting one while
@@ -928,6 +1009,16 @@ func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.writeJSON(w, http.StatusOK, st)
+}
+
+func onboardingRequired(state store.OnboardingState) bool {
+	return state.CompletedVersion < store.CurrentOnboardingVersion || state.RestartInProgress
+}
+
+func connectOnboardingStateIsClean(state store.OnboardingState) bool {
+	return state.ProviderID == "" && state.AccountID == "" && state.ModelID == "" &&
+		state.StagedComboID == "" && state.PersonaFingerprint == "" &&
+		state.TestNonceHash == "" && state.TestExpiresAt == ""
 }
 
 func (a *api) handleLLMConnectStatus(w http.ResponseWriter, r *http.Request) {

@@ -3,7 +3,9 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -541,6 +543,206 @@ func TestAppLLMConnectStartCanceledRequestDoesNotEnterManager(t *testing.T) {
 	case <-started:
 		t.Fatal("canceled Connect request entered manager")
 	default:
+	}
+}
+
+func TestConnectOnboardingHandlerValidatesContextBeforeStartingJob(t *testing.T) {
+	tests := []struct {
+		name        string
+		state       store.OnboardingState
+		kind        string
+		body        string
+		status      int
+		code        string
+		wantStart   bool
+		wantContext *connectOnboardingContext
+	}{
+		{
+			name:  "normal request has no onboarding context",
+			state: store.OnboardingState{Phase: store.OnboardingPhaseProvider, Revision: 1},
+			kind:  "codex", body: `{"label":"normal"}`, status: http.StatusOK, wantStart: true,
+		},
+		{
+			name: "zero revision", state: store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 2},
+			kind: "codex", body: `{"onboarding_revision":0}`, status: http.StatusUnprocessableEntity, code: "ONBOARDING_REVISION_INVALID",
+		},
+		{
+			name: "negative revision", state: store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 2},
+			kind: "codex", body: `{"onboarding_revision":-2}`, status: http.StatusUnprocessableEntity, code: "ONBOARDING_REVISION_INVALID",
+		},
+		{
+			name: "stale revision", state: store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 2},
+			kind: "codex", body: `{"onboarding_revision":1}`, status: http.StatusConflict, code: "ONBOARDING_REVISION_CONFLICT",
+		},
+		{
+			name: "wrong phase", state: store.OnboardingState{Phase: store.OnboardingPhaseSetup, ProviderKind: "codex", Revision: 2},
+			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID",
+		},
+		{
+			name: "wrong kind", state: store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 2},
+			kind: "claude-code", body: `{"onboarding_revision":2}`, status: http.StatusUnprocessableEntity, code: "ONBOARDING_PROVIDER_UNSUPPORTED",
+		},
+		{
+			name: "dirty connect staging", state: store.OnboardingState{
+				Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", ProviderID: "old", Revision: 2,
+			},
+			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusConflict, code: "ONBOARDING_STAGING_INVALID",
+		},
+		{
+			name: "correct context", state: store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 2},
+			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusOK, wantStart: true,
+			wantContext: &connectOnboardingContext{Revision: 2, Kind: "codex"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			env.setState(t, tt.state)
+			starts := 0
+			connectMgr = &connectManager{
+				runner:        &fakeRunner{installed: true, auth: authLoggedOut},
+				ensure:        env.a.st.EnsureProviderForKind,
+				createAccount: env.a.st.CreateLLMAccount,
+				dataDir:       env.dataDir,
+				newID:         func() string { starts++; return "context-account" },
+				logger:        env.a.logger,
+				loginTimeout:  5 * time.Second,
+				pollInterval:  5 * time.Millisecond,
+			}
+			rr := env.serve(http.MethodPost, "/llm/providers/"+tt.kind+"/connect", tt.body)
+			if tt.code != "" {
+				requireOnboardingCode(t, rr, tt.status, tt.code)
+			} else if rr.Code != tt.status {
+				t.Fatalf("status=%d body=%s; want %d", rr.Code, rr.Body.String(), tt.status)
+			}
+			if got := starts > 0; got != tt.wantStart {
+				t.Fatalf("manager started=%v; want %v", got, tt.wantStart)
+			}
+			if !tt.wantStart {
+				if _, err := os.Stat(filepath.Join(env.dataDir, "accounts")); !os.IsNotExist(err) {
+					t.Fatalf("rejected request created account root: %v", err)
+				}
+				return
+			}
+			connectMgr.mu.Lock()
+			job := connectMgr.job
+			connectMgr.mu.Unlock()
+			if !equalConnectOnboardingContext(job.onboarding, tt.wantContext) {
+				t.Fatalf("job context=%+v; want %+v", job.onboarding, tt.wantContext)
+			}
+			connectMgr.cancel(tt.kind)
+			waitConnectJobDone(t, connectMgr)
+		})
+	}
+}
+
+func TestConnectOnboardingRouteStagesDisabledAccountAndAdvancesState(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	selected := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"codex"}`)
+	if selected.Code != http.StatusOK {
+		t.Fatalf("select provider status=%d body=%s", selected.Code, selected.Body.String())
+	}
+	state := env.state(t)
+	createCalls := 0
+	connectMgr = &connectManager{
+		runner: &fakeRunner{installed: true, auth: authLoggedIn},
+		ensure: env.a.st.EnsureProviderForKind,
+		ensureModels: func(kind string) error {
+			return env.a.st.ReplaceLLMModels(kind, store.LLMModelDiscovered, cliProviderModels(env.a.st, kind, kind))
+		},
+		createAccount:  func(store.LLMAccount) error { createCalls++; return nil },
+		bindOnboarding: env.a.st.BindOnboardingAccount,
+		dataDir:        env.dataDir,
+		newID:          func() string { return "onboarding-account" },
+		logger:         env.a.logger,
+		loginTimeout:   500 * time.Millisecond,
+		pollInterval:   5 * time.Millisecond,
+	}
+
+	rr := env.serve(http.MethodPost, "/llm/providers/codex/connect",
+		fmt.Sprintf(`{"label":"onboarding","onboarding_revision":%d}`, state.Revision))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("connect status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	terminal := waitPhase(t, connectMgr, "codex", phaseConnected)
+	if terminal.ProviderID == "" || terminal.AccountID == "" {
+		t.Fatalf("terminal=%+v", terminal)
+	}
+	if createCalls != 0 {
+		t.Fatalf("onboarding used createAccount %d times", createCalls)
+	}
+	accounts, err := env.a.st.LLMAccounts(terminal.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != terminal.AccountID || accounts[0].Enabled {
+		t.Fatalf("onboarding accounts=%+v", accounts)
+	}
+	onboarding := env.state(t)
+	if onboarding.AccountID != terminal.AccountID || onboarding.ProviderID != terminal.ProviderID ||
+		onboarding.Phase != store.OnboardingPhaseSetup || onboarding.Revision != state.Revision+1 {
+		t.Fatalf("state=%+v", onboarding)
+	}
+	body, err := json.Marshal(terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), accounts[0].ConfigDir) || strings.Contains(string(body), "configDir") {
+		t.Fatalf("terminal leaked config dir: %s", body)
+	}
+}
+
+func TestConnectOnboardingStateChangeDuringLoginFailsClosed(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	selected := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"codex"}`)
+	if selected.Code != http.StatusOK {
+		t.Fatalf("select provider status=%d body=%s", selected.Code, selected.Body.String())
+	}
+	state := env.state(t)
+	runner := &gatedAccountLabelRunner{
+		fakeRunner: fakeRunner{installed: true, auth: authLoggedIn},
+		entered:    make(chan struct{}), release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(runner.release) }) })
+	connectMgr = &connectManager{
+		runner:         runner,
+		ensure:         env.a.st.EnsureProviderForKind,
+		ensureModels:   func(string) error { return nil },
+		createAccount:  env.a.st.CreateLLMAccount,
+		bindOnboarding: env.a.st.BindOnboardingAccount,
+		dataDir:        env.dataDir,
+		newID:          func() string { return "stale-account" },
+		logger:         env.a.logger,
+		loginTimeout:   500 * time.Millisecond,
+		pollInterval:   5 * time.Millisecond,
+	}
+	rr := env.serve(http.MethodPost, "/llm/providers/codex/connect",
+		fmt.Sprintf(`{"onboarding_revision":%d}`, state.Revision))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("connect status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-runner.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("login did not reach pre-persistence gate")
+	}
+	if _, err := env.db.Exec(`UPDATE app_onboarding_state SET revision = revision + 1 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	releaseOnce.Do(func() { close(runner.release) })
+	terminal := waitPhase(t, connectMgr, "codex", phaseError)
+	if terminal.ProviderID != "" || terminal.AccountID != "" || strings.Contains(strings.ToLower(terminal.Error), "revision") {
+		t.Fatalf("stale terminal leaked detail or IDs: %+v", terminal)
+	}
+	waitConnectJobDone(t, connectMgr)
+	requireAccountPresent(t, env, "codex", "stale-account", false)
+	if _, err := os.Stat(accountConfigDir(env.dataDir, "codex", "stale-account")); !os.IsNotExist(err) {
+		t.Fatalf("stale bind left config dir: %v", err)
+	}
+	got := env.state(t)
+	if got.Phase != store.OnboardingPhaseConnect || got.AccountID != "" || got.Revision != state.Revision+1 {
+		t.Fatalf("stale bind advanced onboarding: %+v", got)
 	}
 }
 

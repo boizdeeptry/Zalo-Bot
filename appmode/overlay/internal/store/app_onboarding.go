@@ -66,6 +66,135 @@ func (s *Store) OnboardingState() (OnboardingState, error) {
 	return state, nil
 }
 
+// BindOnboardingAccount atomically records a freshly authenticated CLI Account as disabled
+// staging and advances the singleton from connect to setup. Store deliberately does not touch
+// ConfigDir: the Connect job owns filesystem cleanup unless this transaction commits.
+func (s *Store) BindOnboardingAccount(
+	expectedRevision int64,
+	kind string,
+	account LLMAccount,
+) (OnboardingState, error) {
+	if !IsOnboardingProviderKind(kind) {
+		return OnboardingState{}, fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
+	}
+	if account.ID == "" || account.ProviderID == "" || account.ConfigDir == "" ||
+		account.ProviderID != kind || account.Enabled {
+		return OnboardingState{}, fmt.Errorf(
+			"%w: onboarding Account must be disabled and match provider kind %q",
+			ErrOnboardingInvalidStagingOwnership,
+			kind,
+		)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("begin onboarding Account bind: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if state.Revision != expectedRevision {
+		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
+	}
+	if state.Phase != OnboardingPhaseConnect {
+		return OnboardingState{}, fmt.Errorf(
+			"bind onboarding Account from %q: %w",
+			state.Phase,
+			ErrOnboardingInvalidPhase,
+		)
+	}
+	if state.ProviderKind != kind || !onboardingConnectStateIsClean(state) {
+		return OnboardingState{}, fmt.Errorf(
+			"%w: onboarding connect state does not own a clean %q staging slot",
+			ErrOnboardingInvalidStagingOwnership,
+			kind,
+		)
+	}
+
+	var providerKind string
+	var providerEnabled int
+	if err := tx.QueryRow(
+		`SELECT kind, enabled FROM llm_providers WHERE id = ?`, account.ProviderID,
+	).Scan(&providerKind, &providerEnabled); errors.Is(err, sql.ErrNoRows) {
+		return OnboardingState{}, fmt.Errorf(
+			"%w: Provider %q is missing",
+			ErrOnboardingInvalidStagingOwnership,
+			account.ProviderID,
+		)
+	} else if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding Provider %q: %w", account.ProviderID, err)
+	}
+	if providerKind != kind || providerEnabled != 1 {
+		return OnboardingState{}, fmt.Errorf(
+			"%w: Provider %q is not the enabled %q provider",
+			ErrOnboardingInvalidStagingOwnership,
+			account.ProviderID,
+			kind,
+		)
+	}
+
+	if _, err := tx.Exec(`INSERT INTO llm_accounts(
+id, provider_id, label, email, config_dir, enabled, added_at
+) VALUES(?,?,?,?,?,?,?)`,
+		account.ID,
+		account.ProviderID,
+		account.Label,
+		account.Email,
+		account.ConfigDir,
+		0,
+		formatNullableTS(account.AddedAt),
+	); err != nil {
+		return OnboardingState{}, fmt.Errorf(
+			"%w: insert onboarding Account %q: %v",
+			ErrOnboardingInvalidStagingOwnership,
+			account.ID,
+			err,
+		)
+	}
+
+	updatedAt := ts(time.Now())
+	result, err := tx.Exec(`UPDATE app_onboarding_state SET
+phase = ?, provider_id = ?, account_id = ?, revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
+  AND provider_id = '' AND account_id = '' AND model_id = '' AND staged_combo_id = ''
+  AND persona_fingerprint = '' AND test_nonce_hash = '' AND test_expires_at = ''`,
+		OnboardingPhaseSetup,
+		account.ProviderID,
+		account.ID,
+		updatedAt,
+		expectedRevision,
+		OnboardingPhaseConnect,
+		kind,
+	)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("update onboarding Account binding: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding Account bind result: %w", err)
+	}
+	if changed != 1 {
+		return OnboardingState{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingState{}, fmt.Errorf("commit onboarding Account bind: %w", err)
+	}
+	return updated, nil
+}
+
+func onboardingConnectStateIsClean(state OnboardingState) bool {
+	return state.ProviderID == "" && state.AccountID == "" && state.ModelID == "" &&
+		state.StagedComboID == "" && state.PersonaFingerprint == "" &&
+		state.TestNonceHash == "" && state.TestExpiresAt == ""
+}
+
 // OnboardingStagingAccount returns only a disabled Account exactly owned by
 // the requested onboarding revision. ConfigDir is metadata for the caller's
 // cleanup; Store never removes it from the filesystem.
