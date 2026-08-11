@@ -97,7 +97,7 @@ export function normalizeSetupResponse(response, { accountID, revision, provider
 export function normalizeStatus(snapshot) {
   if (!isRecord(snapshot) || !SUPPORTED_PHASES.has(snapshot.phase)) return null;
   const completed = snapshot.phase === "completed";
-  if (snapshot.required !== true && !(completed && snapshot.required === false)) return null;
+  if (snapshot.required !== !completed) return null;
   const revision = positiveRevision(snapshot.revision);
   const providerKindValue = optionalSemanticString(snapshot, "provider_kind");
   const suggestionValue = optionalSemanticString(snapshot, "suggested_provider_kind");
@@ -187,6 +187,17 @@ function safeAnswer(value) {
   return value;
 }
 
+function normalizedIdentityText(value) {
+  if (typeof value !== "string") return "";
+  return value.normalize("NFKC").trim().replace(/\s+/gu, " ").toUpperCase();
+}
+
+export function normalizedAnswerContainsName(answer, displayName) {
+  const normalizedName = normalizedIdentityText(displayName);
+  return Boolean(normalizedName)
+    && normalizedIdentityText(answer).includes(normalizedName);
+}
+
 export function normalizeTestResponse(response, { displayName, snapshot, now }) {
   if (!isRecord(response)) return null;
   const answer = safeAnswer(response.answer);
@@ -195,7 +206,7 @@ export function normalizeTestResponse(response, { displayName, snapshot, now }) 
   const modelID = semanticString(response.model_id);
   const token = semanticString(response.test_token, { limit: OPAQUE_TOKEN_LIMIT });
   const expiresAt = typeof response.expires_at === "string" ? Date.parse(response.expires_at) : NaN;
-  if (!answer || botName !== displayName
+  if (!answer || botName !== displayName || !normalizedAnswerContainsName(answer, displayName)
     || providerID !== snapshot.provider_id || modelID !== snapshot.model_id
     || !token || !Number.isFinite(expiresAt) || expiresAt <= now
     || response.revision !== successorRevision(snapshot.revision)) return null;
@@ -231,8 +242,11 @@ export function terminalIdentity(terminal, expectedKind) {
 }
 
 export function testResponseError(response, displayName, now) {
-  if (isRecord(response) && typeof response.bot_name === "string"
-    && response.bot_name !== displayName) return "Bot đã phản hồi nhưng chưa áp dụng đúng Persona.";
+  if (isRecord(response) && ((typeof response.bot_name === "string"
+    && response.bot_name !== displayName)
+    || (safeAnswer(response.answer) && !normalizedAnswerContainsName(response.answer, displayName)))) {
+    return "Bot đã phản hồi nhưng chưa áp dụng đúng Persona.";
+  }
   const expiry = isRecord(response) && typeof response.expires_at === "string"
     ? Date.parse(response.expires_at) : NaN;
   return Number.isFinite(expiry) && expiry <= now

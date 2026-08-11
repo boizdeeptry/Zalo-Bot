@@ -49,7 +49,7 @@ function baseService(overrides = {}) {
   return {
     status: () => Promise.resolve(providerStatus()), selectProvider: () => Promise.resolve(connectStatus()),
     setup: () => Promise.resolve(setupResult()), loadAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [] }),
-    saveAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", onboarding_phase: "test", onboarding_revision: 5 }), testChat: () => Promise.reject(new Error("not used")), complete: () => Promise.reject(new Error("not used")),
+    saveAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [], onboarding_phase: "test", onboarding_revision: 5 }), testChat: () => Promise.reject(new Error("not used")), complete: () => Promise.reject(new Error("not used")),
     ...overrides,
   };
 }
@@ -556,7 +556,7 @@ test("Setup Retry renders an authoritative non-Setup phase without stale POST", 
   const cases = [
     ["persona", personaStatus({ revision: 9 }), "onboarding-persona-stage", "Trợ lý của bạn là ai"],
     ["test", { ...personaStatus({ revision: 9 }), phase: "test" }, "onboarding-test-stage", "Thử trò chuyện với Bé Mi"],
-    ["completed", providerStatus({ phase: "completed", revision: 9 }), "onboarding-done-stage", "Bé Mi đã sẵn sàng!"],
+    ["completed", providerStatus({ required: false, phase: "completed", revision: 9 }), "onboarding-done-stage", "Bé Mi đã sẵn sàng!"],
     ["provider", providerStatus({ revision: 9 }), "onboarding-provider-stage", "Chọn nhà cung cấp"],
     ["connect", connectStatus({ revision: 9 }), "onboarding-connect-stage", "Kết nối Codex"],
   ];

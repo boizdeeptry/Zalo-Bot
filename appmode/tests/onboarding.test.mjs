@@ -66,18 +66,24 @@ function testResult(overrides = {}) {
   };
 }
 
+function personaSaveResult(overrides = {}) {
+  return {
+    ready: true,
+    display_name: "Bé Mi",
+    placeholders: [],
+    onboarding_phase: "test",
+    onboarding_revision: 5,
+    ...overrides,
+  };
+}
+
 function baseService(overrides = {}) {
   return {
     status: () => Promise.resolve(testStatus()),
     selectProvider: () => Promise.reject(new Error("not used")),
     setup: () => Promise.reject(new Error("not used")),
     loadAgent: () => Promise.resolve(agent()),
-    saveAgent: () => Promise.resolve({
-      ready: true,
-      display_name: "Bé Mi",
-      onboarding_phase: "test",
-      onboarding_revision: 5,
-    }),
+    saveAgent: () => Promise.resolve(personaSaveResult()),
     testChat: (_message, revision) => Promise.resolve(testResult({ revision: revision + 1 })),
     complete: () => Promise.resolve({
       completed: true,
@@ -212,12 +218,7 @@ test("Persona mounts shared dynamic fields, updates counter, focuses errors, and
   assert.ok(save.options.signal instanceof AbortSignal);
   assert.equal(button(form, "Tiếp tục").disabled, true);
 
-  saveGate.resolve({
-    ready: true,
-    display_name: "Bé Mi",
-    onboarding_phase: "test",
-    onboarding_revision: 5,
-  });
+  saveGate.resolve(personaSaveResult());
   await flush();
   assert.equal(input(host).value, "Xin chào");
   assertNoSkip(host);
@@ -237,12 +238,9 @@ test("Persona supports legacy display-only state, retains valid names, and handl
         loadAgent: () => Promise.resolve(agent({ display_name: "" })),
         saveAgent(payload) {
           saves.push(payload);
-          return saves.length === 1 ? Promise.reject(error) : Promise.resolve({
-            ready: true,
+          return saves.length === 1 ? Promise.reject(error) : Promise.resolve(personaSaveResult({
             display_name: "Bot Cũ",
-            onboarding_phase: "test",
-            onboarding_revision: 5,
-          });
+          }));
         },
       }),
     });
@@ -269,12 +267,7 @@ test("Persona supports legacy display-only state, retains valid names, and handl
         loadAgent: () => Promise.resolve(agent({ display_name: "Trợ lý An" })),
         saveAgent(value) {
           payload = value;
-          return Promise.resolve({
-            ready: true,
-            display_name: "Trợ lý An",
-            onboarding_phase: "test",
-            onboarding_revision: 5,
-          });
+          return Promise.resolve(personaSaveResult({ display_name: "Trợ lý An" }));
         },
       }),
     });
@@ -290,12 +283,17 @@ test("Persona supports legacy display-only state, retains valid names, and handl
 });
 
 test("Persona malformed successors fail closed without entering Test", async (t) => {
+  const valid = personaSaveResult();
+  const { placeholders: _placeholders, ...missingPlaceholders } = valid;
   const invalid = [
-    { ready: false, display_name: "Bé Mi", onboarding_phase: "test", onboarding_revision: 5 },
-    { ready: true, display_name: "Tên khác", onboarding_phase: "test", onboarding_revision: 5 },
-    { ready: true, display_name: "Bé Mi", onboarding_phase: "persona", onboarding_revision: 5 },
-    { ready: true, display_name: "Bé Mi", onboarding_phase: "test", onboarding_revision: 4 },
-    { ready: true, display_name: "Bé Mi", onboarding_phase: "test", onboarding_revision: 6 },
+    personaSaveResult({ ready: false }),
+    personaSaveResult({ display_name: "Tên khác" }),
+    personaSaveResult({ onboarding_phase: "persona" }),
+    personaSaveResult({ onboarding_revision: 4 }),
+    personaSaveResult({ onboarding_revision: 6 }),
+    missingPlaceholders,
+    personaSaveResult({ placeholders: {} }),
+    personaSaveResult({ placeholders: [{ key: "TEN_BOT", count: 1, sample: "x" }] }),
   ];
   for (const response of invalid) {
     await t.test(JSON.stringify(response), async (subtest) => {
@@ -326,10 +324,9 @@ test("Back from Test reloads Agent and the frontend re-saves against the Test re
       })),
       saveAgent(payload) {
         saves.push(payload);
-        return Promise.resolve({
-          ready: true, display_name: "Tên mới",
-          onboarding_phase: "test", onboarding_revision: 9,
-        });
+        return Promise.resolve(personaSaveResult({
+          display_name: "Tên mới", onboarding_revision: 9,
+        }));
       },
     }),
   });
@@ -389,6 +386,7 @@ test("Test Chat starts with Xin chào, enforces 500 Unicode points, and is IME-s
 test("Test Chat validates receipt identity, revision, expiry, name, and every required field", async (t) => {
   const invalid = [
     ["empty answer", { answer: "" }, /chưa thể xác minh/i],
+    ["answer missing authoritative name", { answer: "Xin chào, tôi là trợ lý của bạn." }, /chưa áp dụng đúng Persona/i],
     ["wrong name", { bot_name: "Tên khác" }, /chưa áp dụng đúng Persona/i],
     ["wrong provider", { provider_id: "claude-code" }, /chưa thể xác minh/i],
     ["wrong model", { model_id: "other" }, /chưa thể xác minh/i],

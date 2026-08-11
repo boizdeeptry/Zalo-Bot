@@ -423,7 +423,7 @@ export function createOnboardingPage({
       if (!owns(run)) return false;
       const name = validDisplayName(response?.display_name);
       if (!isRecord(response) || response.ready !== true || name !== payload.display_name
-        || response.onboarding_phase !== "test"
+        || !Array.isArray(response.placeholders) || response.placeholders.length !== 0 || response.onboarding_phase !== "test"
         || response.onboarding_revision !== successorRevision(expected.revision)) {
         personaBusy = false;
         renderSafeError();
@@ -604,7 +604,7 @@ export function createOnboardingPage({
       if (!owns(run) || requestController.signal.aborted) return false;
       testBusy = false;
       clearReceipt();
-      testError = "Chưa thể trò chuyện thử. Vui lòng thử lại.";
+      testError = error?.code === "ONBOARDING_PERSONA_NOT_APPLIED" ? "Bot đã phản hồi nhưng chưa áp dụng đúng Persona." : "Chưa thể trò chuyện thử. Vui lòng thử lại.";
       renderTest();
       return false;
     } finally {
