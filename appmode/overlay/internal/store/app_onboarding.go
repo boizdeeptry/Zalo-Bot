@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const CurrentOnboardingVersion int64 = 1
@@ -24,6 +26,7 @@ var (
 	ErrOnboardingProviderUnsupported     = errors.New("unsupported onboarding provider")
 	ErrOnboardingInvalidPhase            = errors.New("invalid onboarding phase")
 	ErrOnboardingInvalidStagingOwnership = errors.New("invalid onboarding staging ownership")
+	ErrOnboardingModelUnavailable        = errors.New("onboarding model is unavailable")
 )
 
 type OnboardingState struct {
@@ -47,6 +50,13 @@ type OnboardingStagingAccount struct {
 	ProviderID   string
 	ProviderKind string
 	ConfigDir    string
+}
+
+// OnboardingSetup is the staged Auto-combo descriptor. It deliberately is not a live LLMCombo:
+// setup persists only the singleton fields, while completion owns all live routing writes.
+type OnboardingSetup struct {
+	OnboardingState
+	ComboName string
 }
 
 func IsOnboardingProviderKind(kind string) bool {
@@ -224,6 +234,154 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 		return OnboardingState{}, fmt.Errorf("commit onboarding Account bind: %w", err)
 	}
 	return updated, nil
+}
+
+// StageOnboardingSetup atomically records the selected model and a fresh Combo UUID, then advances
+// setup to persona. The original request is idempotent only across the exact one-revision lost-
+// response window; all other stale or mismatched calls fail closed.
+func (s *Store) StageOnboardingSetup(
+	expectedRevision int64,
+	accountID string,
+	modelID string,
+) (OnboardingSetup, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingSetup{}, fmt.Errorf("begin onboarding setup staging: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingSetup{}, err
+	}
+	if state.Revision == expectedRevision+1 {
+		if !onboardingSetupRetryMatches(state, expectedRevision, accountID, modelID) {
+			return OnboardingSetup{}, onboardingConflict(expectedRevision, state.Revision)
+		}
+		if _, err := onboardingStagingAccountInTx(tx, state); err != nil {
+			return OnboardingSetup{}, err
+		}
+		comboName, err := onboardingComboName(state.ProviderKind)
+		if err != nil {
+			return OnboardingSetup{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OnboardingSetup{}, fmt.Errorf("commit onboarding setup retry: %w", err)
+		}
+		return OnboardingSetup{OnboardingState: state, ComboName: comboName}, nil
+	}
+	if state.Revision != expectedRevision {
+		return OnboardingSetup{}, onboardingConflict(expectedRevision, state.Revision)
+	}
+	if state.Phase != OnboardingPhaseSetup {
+		return OnboardingSetup{}, fmt.Errorf(
+			"stage onboarding setup from %q: %w",
+			state.Phase,
+			ErrOnboardingInvalidPhase,
+		)
+	}
+	if accountID == "" || accountID != state.AccountID || modelID == "" ||
+		!onboardingSetupStateIsClean(state) {
+		return OnboardingSetup{}, fmt.Errorf(
+			"%w: onboarding setup request does not match the staged state",
+			ErrOnboardingInvalidStagingOwnership,
+		)
+	}
+	if _, err := onboardingStagingAccountInTx(tx, state); err != nil {
+		return OnboardingSetup{}, err
+	}
+	var available int64
+	err = tx.QueryRow(`SELECT available FROM llm_models
+WHERE provider_id = ? AND model_id = ?`, state.ProviderID, modelID).Scan(&available)
+	if errors.Is(err, sql.ErrNoRows) {
+		return OnboardingSetup{}, fmt.Errorf(
+			"%w: selected model is not available for the staged Provider",
+			ErrOnboardingModelUnavailable,
+		)
+	}
+	if err != nil {
+		return OnboardingSetup{}, fmt.Errorf(
+			"read onboarding model %q/%q: %w",
+			state.ProviderID,
+			modelID,
+			err,
+		)
+	}
+	if available != 1 {
+		return OnboardingSetup{}, fmt.Errorf(
+			"%w: selected model is not available for the staged Provider",
+			ErrOnboardingModelUnavailable,
+		)
+	}
+	comboName, err := onboardingComboName(state.ProviderKind)
+	if err != nil {
+		return OnboardingSetup{}, err
+	}
+	comboID := uuid.NewString()
+	updatedAt := ts(time.Now())
+	result, err := tx.Exec(`UPDATE app_onboarding_state SET
+phase = ?, model_id = ?, staged_combo_id = ?, revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
+  AND provider_id = ? AND account_id = ? AND model_id = '' AND staged_combo_id = ''
+  AND persona_fingerprint = '' AND test_nonce_hash = '' AND test_expires_at = ''`,
+		OnboardingPhasePersona,
+		modelID,
+		comboID,
+		updatedAt,
+		expectedRevision,
+		OnboardingPhaseSetup,
+		state.ProviderKind,
+		state.ProviderID,
+		accountID,
+	)
+	if err != nil {
+		return OnboardingSetup{}, fmt.Errorf("update onboarding setup staging: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return OnboardingSetup{}, fmt.Errorf("read onboarding setup staging result: %w", err)
+	}
+	if changed != 1 {
+		return OnboardingSetup{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingSetup{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingSetup{}, fmt.Errorf("commit onboarding setup staging: %w", err)
+	}
+	return OnboardingSetup{OnboardingState: updated, ComboName: comboName}, nil
+}
+
+func onboardingSetupStateIsClean(state OnboardingState) bool {
+	return IsOnboardingProviderKind(state.ProviderKind) && state.ProviderID != "" &&
+		state.AccountID != "" && state.ModelID == "" && state.StagedComboID == "" &&
+		state.PersonaFingerprint == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
+}
+
+func onboardingSetupRetryMatches(
+	state OnboardingState,
+	expectedRevision int64,
+	accountID string,
+	modelID string,
+) bool {
+	return expectedRevision > 0 && state.Phase == OnboardingPhasePersona &&
+		IsOnboardingProviderKind(state.ProviderKind) && state.ProviderID != "" &&
+		accountID != "" && state.AccountID == accountID && modelID != "" &&
+		state.ModelID == modelID && state.StagedComboID != "" &&
+		state.PersonaFingerprint == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
+}
+
+func onboardingComboName(kind string) (string, error) {
+	switch kind {
+	case "codex":
+		return "Mặc định · Codex", nil
+	case "claude-code":
+		return "Mặc định · Claude", nil
+	default:
+		return "", fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
+	}
 }
 
 func onboardingConnectStateIsClean(state OnboardingState) bool {

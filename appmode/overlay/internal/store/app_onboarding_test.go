@@ -3,8 +3,11 @@ package store
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func openAppStoreForTest(t *testing.T) *Store {
@@ -971,6 +974,190 @@ func TestSelectOnboardingProviderAfterRestartPreservesRestartMarkers(t *testing.
 		got.Revision != restarted.Revision+1 {
 		t.Fatalf("provider-after-restart state = %+v", got)
 	}
+}
+
+func TestStageOnboardingSetupStagesDescriptorWithoutLiveRoutingMutation(t *testing.T) {
+	st := openAppStoreForTest(t)
+	insertOnboardingProviderForTest(t, st, "live-provider", "openai")
+	if err := st.AddLLMModel(LLMModel{
+		ProviderID: "live-provider", ModelID: "live-model", Name: "Live model",
+		Source: LLMModelManual, Available: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	combo, err := st.CreateLLMCombo("Live combo", "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReplaceLLMComboMembers(combo.ID, combo.Revision, "fallback", []LLMRouteEntry{{
+		ProviderID: "live-provider", ModelID: "live-model", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetActiveLLMCombo(combo.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`INSERT INTO llm_route_entries(position, provider_id, model_id, enabled)
+VALUES (0, 'live-provider', 'live-model', 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	seedStageOnboardingSetupForTest(t, st, "codex", "staged-account", "gpt-5.6-terra", true, 7)
+	beforeLive := onboardingLiveRoutingBytesForTest(t, st)
+
+	got, err := st.StageOnboardingSetup(7, "staged-account", "gpt-5.6-terra")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Phase != OnboardingPhasePersona || got.Revision != 8 || got.ProviderKind != "codex" ||
+		got.ProviderID != "codex" || got.AccountID != "staged-account" ||
+		got.ModelID != "gpt-5.6-terra" || got.ComboName != "Mặc định · Codex" {
+		t.Fatalf("StageOnboardingSetup() = %+v", got)
+	}
+	if _, err := uuid.Parse(got.StagedComboID); err != nil {
+		t.Fatalf("staged combo id %q is not a UUID: %v", got.StagedComboID, err)
+	}
+	if afterLive := onboardingLiveRoutingBytesForTest(t, st); afterLive != beforeLive {
+		t.Fatalf("StageOnboardingSetup changed live routing rows:\nbefore=%q\nafter=%q", beforeLive, afterLive)
+	}
+}
+
+func TestStageOnboardingSetupLostResponseRetryReturnsExactDescriptor(t *testing.T) {
+	st := openAppStoreForTest(t)
+	seedStageOnboardingSetupForTest(t, st, "claude-code", "staged-account", "sonnet", true, 11)
+
+	first, err := st.StageOnboardingSetup(11, "staged-account", "sonnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := st.StageOnboardingSetup(11, "staged-account", "sonnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry != first {
+		t.Fatalf("retry = %+v; want exact original %+v", retry, first)
+	}
+	if state := mustOnboardingStateForTest(t, st); state.Revision != 12 {
+		t.Fatalf("retry revision = %d; want 12", state.Revision)
+	}
+
+	before := mustOnboardingStateForTest(t, st)
+	if _, err := st.StageOnboardingSetup(11, "different-account", "sonnet"); !errors.Is(err, ErrOnboardingConflict) {
+		t.Fatalf("mismatched retry error = %v; want ErrOnboardingConflict", err)
+	}
+	if after := mustOnboardingStateForTest(t, st); after != before {
+		t.Fatalf("mismatched retry changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestStageOnboardingSetupRejectsInvalidStateWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name             string
+		phase            string
+		expectedRevision int64
+		requestAccount   string
+		accountEnabled   bool
+		modelAvailable   bool
+		wantErr          error
+	}{
+		{name: "wrong account", phase: OnboardingPhaseSetup, expectedRevision: 5, requestAccount: "other", modelAvailable: true, wantErr: ErrOnboardingInvalidStagingOwnership},
+		{name: "enabled account", phase: OnboardingPhaseSetup, expectedRevision: 5, requestAccount: "staged-account", accountEnabled: true, modelAvailable: true, wantErr: ErrOnboardingInvalidStagingOwnership},
+		{name: "stale revision", phase: OnboardingPhaseSetup, expectedRevision: 4, requestAccount: "staged-account", modelAvailable: true, wantErr: ErrOnboardingConflict},
+		{name: "wrong phase", phase: OnboardingPhaseConnect, expectedRevision: 5, requestAccount: "staged-account", modelAvailable: true, wantErr: ErrOnboardingInvalidPhase},
+		{name: "unavailable model", phase: OnboardingPhaseSetup, expectedRevision: 5, requestAccount: "staged-account", wantErr: ErrOnboardingModelUnavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			seedStageOnboardingSetupForTest(t, st, "codex", "staged-account", "gpt-5.6-terra", tt.modelAvailable, 5)
+			if tt.accountEnabled {
+				if _, err := st.db.Exec(`UPDATE llm_accounts SET enabled = 1 WHERE id = 'staged-account'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			state := mustOnboardingStateForTest(t, st)
+			state.Phase = tt.phase
+			setOnboardingStateForTest(t, st, state)
+			beforeState := mustOnboardingStateForTest(t, st)
+			beforeLive := onboardingLiveRoutingBytesForTest(t, st)
+
+			if _, err := st.StageOnboardingSetup(tt.expectedRevision, tt.requestAccount, "gpt-5.6-terra"); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("StageOnboardingSetup error = %v; want %v", err, tt.wantErr)
+			}
+			if after := mustOnboardingStateForTest(t, st); after != beforeState {
+				t.Fatalf("rejected setup changed state: before=%+v after=%+v", beforeState, after)
+			}
+			if afterLive := onboardingLiveRoutingBytesForTest(t, st); afterLive != beforeLive {
+				t.Fatalf("rejected setup changed live routing: before=%q after=%q", beforeLive, afterLive)
+			}
+		})
+	}
+}
+
+func seedStageOnboardingSetupForTest(
+	t *testing.T,
+	st *Store,
+	kind, accountID, modelID string,
+	modelAvailable bool,
+	revision int64,
+) {
+	t.Helper()
+	if kind != "claude-code" {
+		insertOnboardingProviderForTest(t, st, kind, kind)
+	}
+	insertOnboardingAccountForTest(t, st, accountID, kind, false, "D:/onboarding/"+accountID)
+	if err := st.AddLLMModel(LLMModel{
+		ProviderID: kind, ModelID: modelID, Name: modelID,
+		Source: LLMModelManual, Available: modelAvailable,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseSetup, ProviderKind: kind, ProviderID: kind,
+		AccountID: accountID, Revision: revision,
+	})
+}
+
+func onboardingLiveRoutingBytesForTest(t *testing.T, st *Store) string {
+	t.Helper()
+	queries := []string{
+		`SELECT id, name, type, active, revision FROM llm_combos ORDER BY id`,
+		`SELECT combo_id, position, provider_id, model_id, enabled FROM llm_combo_members ORDER BY combo_id, position`,
+		`SELECT position, provider_id, model_id, enabled FROM llm_route_entries ORDER BY position`,
+	}
+	var snapshot strings.Builder
+	for _, query := range queries {
+		rows, err := st.db.Query(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&snapshot, "%s|", query)
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			fmt.Fprintf(&snapshot, "%#v;", values)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return snapshot.String()
 }
 
 func insertOnboardingProviderForTest(t *testing.T, st *Store, id, kind string) {

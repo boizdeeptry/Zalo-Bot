@@ -43,6 +43,21 @@ type appOnboardingRestartRequest struct {
 	Confirmed bool  `json:"confirmed"`
 }
 
+type appOnboardingSetupRequest struct {
+	Revision  int64  `json:"revision"`
+	AccountID string `json:"account_id"`
+}
+
+type appOnboardingSetupResponse struct {
+	Revision      int64  `json:"revision"`
+	ProviderKind  string `json:"provider_kind"`
+	ProviderID    string `json:"provider_id"`
+	AccountID     string `json:"account_id"`
+	ModelID       string `json:"model_id"`
+	StagedComboID string `json:"staged_combo_id"`
+	ComboName     string `json:"combo_name"`
+}
+
 // appOnboardingStatusResponse is deliberately a projection rather than an alias of the Store
 // state. Internal paths, staging ids, persona fingerprints and test receipts therefore cannot be
 // exposed by accidentally adding a json tag to the persistence struct later.
@@ -188,6 +203,124 @@ func (a *api) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.writeOnboardingStatus(w, updated)
+}
+
+func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
+	var request appOnboardingSetupRequest
+	if !a.decodeOnboardingBody(w, r, &request) {
+		return
+	}
+	if !a.requireOnboardingRevision(w, request.Revision) {
+		return
+	}
+	if request.AccountID == "" {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
+		return
+	}
+
+	onboardingMutationMu.Lock()
+	defer onboardingMutationMu.Unlock()
+	if r.Context().Err() != nil {
+		a.writeLLMErr(w, http.StatusRequestTimeout, "ONBOARDING_REQUEST_CANCELED",
+			"Yêu cầu thiết lập đã bị huỷ", nil)
+		return
+	}
+
+	state, err := a.st.OnboardingState()
+	if err != nil {
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	if err := validateOnboardingState(state); err != nil {
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	if state.Revision == request.Revision+1 {
+		if state.Phase != store.OnboardingPhasePersona || state.AccountID != request.AccountID {
+			a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
+			return
+		}
+		staged, err := a.st.StageOnboardingSetup(
+			request.Revision,
+			request.AccountID,
+			state.ModelID,
+		)
+		if err != nil {
+			a.writeOnboardingStoreError(w, err)
+			return
+		}
+		a.writeOnboardingSetup(w, staged)
+		return
+	}
+	if state.Revision != request.Revision {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
+		return
+	}
+	if state.Phase != store.OnboardingPhaseSetup {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidPhase)
+		return
+	}
+	if state.AccountID != request.AccountID {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
+		return
+	}
+	if _, err := a.st.OnboardingStagingAccount(request.Revision); err != nil {
+		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	modelID, err := selectOnboardingModel(a.st, state.ProviderKind, state.ProviderID)
+	if err != nil {
+		if errors.Is(err, store.ErrOnboardingModelUnavailable) {
+			a.writeOnboardingStoreError(w, err)
+			return
+		}
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	staged, err := a.st.StageOnboardingSetup(request.Revision, request.AccountID, modelID)
+	if err != nil {
+		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	a.writeOnboardingSetup(w, staged)
+}
+
+func selectOnboardingModel(st *store.Store, kind, providerID string) (string, error) {
+	descriptor, ok := cliDescriptors[kind]
+	if !ok || descriptor.onboardingModel == "" || providerID == "" {
+		return "", store.ErrOnboardingModelUnavailable
+	}
+	models, err := st.LLMModels(providerID)
+	if err != nil {
+		return "", err
+	}
+	available := make(map[string]bool, len(models))
+	for _, model := range models {
+		if model.ProviderID == providerID && model.Available {
+			available[model.ModelID] = true
+		}
+	}
+	if available[descriptor.onboardingModel] {
+		return descriptor.onboardingModel, nil
+	}
+	for _, seed := range descriptor.modelSeeds {
+		if available[seed.id] {
+			return seed.id, nil
+		}
+	}
+	return "", store.ErrOnboardingModelUnavailable
+}
+
+func (a *api) writeOnboardingSetup(w http.ResponseWriter, staged store.OnboardingSetup) {
+	a.writeJSON(w, http.StatusOK, appOnboardingSetupResponse{
+		Revision:      staged.Revision,
+		ProviderKind:  staged.ProviderKind,
+		ProviderID:    staged.ProviderID,
+		AccountID:     staged.AccountID,
+		ModelID:       staged.ModelID,
+		StagedComboID: staged.StagedComboID,
+		ComboName:     staged.ComboName,
+	})
 }
 
 // decodeOnboardingBody accepts exactly one bounded JSON object. Error details are intentionally
@@ -489,6 +622,9 @@ func (a *api) writeOnboardingStoreError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrOnboardingInvalidStagingOwnership):
 		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_STAGING_INVALID",
 			"Dữ liệu kết nối tạm đã thay đổi; hãy tải lại rồi thử tiếp", nil)
+	case errors.Is(err, store.ErrOnboardingModelUnavailable):
+		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_NO_MODEL",
+			"Không có model khả dụng cho nhà cung cấp đã kết nối", nil)
 	default:
 		a.writeOnboardingStateUnavailable(w, err)
 	}
