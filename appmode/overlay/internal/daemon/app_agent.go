@@ -14,13 +14,19 @@ package daemon
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -39,7 +45,34 @@ var placeholderRe = regexp.MustCompile(`\{\{([^{}]+)\}\}`)
 // nên một chuỗi dài là một cách bơm chỉ dẫn vào prompt của chính mình mà không ai thấy.
 const maxPlaceholderValue = 60
 
-var writeAgentFileAtomic = writeAppFileAtomic
+const (
+	agentPersonaRecoverySuffix  = ".agentdc-recovery"
+	agentPersonaRecoveryVersion = 2
+	agentPersonaRecoveryDomain  = "agentdc/agent-persona-recovery/v2"
+)
+
+var (
+	writeAgentFileAtomic   = writeAppFileAtomic
+	restoreAgentFileAtomic = writeAppFileAtomic
+
+	errAgentPersonaRecoveryPending = errors.New("agent persona recovery is pending")
+)
+
+type agentPersonaRecoveryRecord struct {
+	Version         int    `json:"version"`
+	Domain          string `json:"domain"`
+	Token           string `json:"token"`
+	PreviousToken   string `json:"previous_token"`
+	PersonaBinding  string `json:"persona_binding"`
+	Original        []byte `json:"original"`
+	OriginalHash    string `json:"original_sha256"`
+	ReplacementHash string `json:"replacement_sha256"`
+}
+
+type agentPersonaRecoveryJournal struct {
+	record agentPersonaRecoveryRecord
+	info   os.FileInfo
+}
 
 func writeAppTemp(path string, data []byte, mode os.FileMode) (tempPath string, err error) {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
@@ -118,6 +151,254 @@ func writeAppBackupOnceWith(path string, data []byte, mode os.FileMode, publish 
 	return nil
 }
 
+func agentPersonaRecoveryPath(personaPath string) string {
+	return personaPath + agentPersonaRecoverySuffix
+}
+
+func agentPersonaRecoveryBinding(personaPath string) (string, error) {
+	absolute, err := filepath.Abs(personaPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve persona recovery identity: %w", err)
+	}
+	canonical := filepath.Clean(absolute)
+	if runtime.GOOS == "windows" {
+		canonical = strings.ToLower(canonical)
+	}
+	return agentFramedSHA256(agentPersonaRecoveryDomain+"/path", []byte(canonical)), nil
+}
+
+func (a *api) prepareAgentPersonaRecovery(
+	personaPath string,
+	original []byte,
+	replacement []byte,
+) (string, error) {
+	if a.st == nil {
+		return "", fmt.Errorf("prepare persona recovery without Store")
+	}
+	if len(original) > maxPersonaBytes || len(replacement) > maxPersonaBytes {
+		return "", fmt.Errorf("persona recovery document is oversized")
+	}
+	previousToken, err := a.st.AgentPersonaRecoveryToken()
+	if err != nil {
+		return "", fmt.Errorf("read previous persona recovery token: %w", err)
+	}
+	if previousToken != "" && !validAgentRecoveryToken(previousToken) {
+		return "", fmt.Errorf("previous persona recovery token is invalid")
+	}
+	binding, err := agentPersonaRecoveryBinding(personaPath)
+	if err != nil {
+		return "", err
+	}
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", fmt.Errorf("create persona recovery token: %w", err)
+	}
+	record := agentPersonaRecoveryRecord{
+		Version:         agentPersonaRecoveryVersion,
+		Domain:          agentPersonaRecoveryDomain,
+		Token:           hex.EncodeToString(tokenBytes),
+		PreviousToken:   previousToken,
+		PersonaBinding:  binding,
+		Original:        append([]byte(nil), original...),
+		OriginalHash:    agentFramedSHA256(agentPersonaRecoveryDomain+"/original", original),
+		ReplacementHash: agentFramedSHA256(agentPersonaRecoveryDomain+"/replacement", replacement),
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return "", fmt.Errorf("encode persona recovery obligation: %w", err)
+	}
+	if len(encoded) > maxPersonaBytes*2 {
+		return "", fmt.Errorf("persona recovery obligation is oversized")
+	}
+	sidecarPath := agentPersonaRecoveryPath(personaPath)
+	if _, err := os.Lstat(sidecarPath); err == nil {
+		return "", fmt.Errorf("persona recovery obligation already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect persona recovery obligation: %w", err)
+	}
+	if err := writeAppFileAtomic(sidecarPath, encoded, 0o600); err != nil {
+		return "", fmt.Errorf("write persona recovery obligation: %w", err)
+	}
+	return record.Token, nil
+}
+
+func readAgentPersonaRecovery(personaPath string) (agentPersonaRecoveryJournal, error) {
+	sidecarPath := agentPersonaRecoveryPath(personaPath)
+	before, err := os.Lstat(sidecarPath)
+	if err != nil {
+		return agentPersonaRecoveryJournal{}, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() ||
+		(runtime.GOOS != "windows" && before.Mode().Perm()&0o077 != 0) {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("persona recovery obligation is not a regular file")
+	}
+	if before.Size() < 0 || before.Size() > maxPersonaBytes*2 {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("persona recovery obligation is oversized")
+	}
+	file, err := os.Open(sidecarPath)
+	if err != nil {
+		return agentPersonaRecoveryJournal{}, err
+	}
+	defer func() { _ = file.Close() }()
+	opened, err := file.Stat()
+	if err != nil {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("inspect opened persona recovery obligation: %w", err)
+	}
+	after, err := os.Lstat(sidecarPath)
+	if err != nil {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("recheck persona recovery obligation: %w", err)
+	}
+	if !opened.Mode().IsRegular() || after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() ||
+		!os.SameFile(before, opened) || !os.SameFile(after, opened) {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("persona recovery obligation changed while opening")
+	}
+	encoded, err := io.ReadAll(io.LimitReader(file, int64(maxPersonaBytes*2)+1))
+	if err != nil {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("read persona recovery obligation: %w", err)
+	}
+	if len(encoded) > maxPersonaBytes*2 {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("persona recovery obligation is oversized")
+	}
+	var record agentPersonaRecoveryRecord
+	if err := json.Unmarshal(encoded, &record); err != nil {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("decode persona recovery obligation: %w", err)
+	}
+	binding, err := agentPersonaRecoveryBinding(personaPath)
+	if err != nil {
+		return agentPersonaRecoveryJournal{}, err
+	}
+	if !validAgentRecoveryToken(record.Token) ||
+		(record.PreviousToken != "" && !validAgentRecoveryToken(record.PreviousToken)) ||
+		record.Version != agentPersonaRecoveryVersion || record.Domain != agentPersonaRecoveryDomain ||
+		len(record.Original) > maxPersonaBytes || record.PersonaBinding != binding ||
+		record.OriginalHash != agentFramedSHA256(agentPersonaRecoveryDomain+"/original", record.Original) ||
+		!validAgentRecoveryHash(record.ReplacementHash) {
+		return agentPersonaRecoveryJournal{}, fmt.Errorf("persona recovery obligation is invalid")
+	}
+	return agentPersonaRecoveryJournal{record: record, info: opened}, nil
+}
+
+func (a *api) resolveAgentPersonaRecovery(personaPath string) error {
+	journal, err := readAgentPersonaRecovery(personaPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %v", errAgentPersonaRecoveryPending, err)
+	}
+	if a.st == nil {
+		return fmt.Errorf("%w: Store is unavailable", errAgentPersonaRecoveryPending)
+	}
+	record := journal.record
+	storedToken, err := a.st.AgentPersonaRecoveryToken()
+	if err != nil {
+		return fmt.Errorf("%w: inspect Store token: %v", errAgentPersonaRecoveryPending, err)
+	}
+	current, err := os.ReadFile(personaPath)
+	if err != nil {
+		return fmt.Errorf("%w: read current persona: %v", errAgentPersonaRecoveryPending, err)
+	}
+	matchesOriginal := record.OriginalHash == agentFramedSHA256(
+		agentPersonaRecoveryDomain+"/original",
+		current,
+	)
+	matchesReplacement := record.ReplacementHash == agentFramedSHA256(
+		agentPersonaRecoveryDomain+"/replacement",
+		current,
+	)
+
+	finalDomain := agentPersonaRecoveryDomain + "/original"
+	finalHash := record.OriginalHash
+	switch storedToken {
+	case record.Token:
+		if !matchesReplacement {
+			return fmt.Errorf("%w: committed persona bytes do not match recovery obligation", errAgentPersonaRecoveryPending)
+		}
+		finalDomain = agentPersonaRecoveryDomain + "/replacement"
+		finalHash = record.ReplacementHash
+	case record.PreviousToken:
+		switch {
+		case matchesOriginal:
+			// The filesystem write never happened, or restoration completed before a
+			// crash. Nothing should overwrite these already-authoritative bytes.
+		case matchesReplacement:
+			if err := restoreAgentFileAtomic(personaPath, record.Original, 0o600); err != nil {
+				return fmt.Errorf("%w: restore original bytes: %v", errAgentPersonaRecoveryPending, err)
+			}
+		default:
+			return fmt.Errorf("%w: uncommitted persona bytes do not match recovery obligation", errAgentPersonaRecoveryPending)
+		}
+	default:
+		return fmt.Errorf("%w: stale persona recovery token lineage", errAgentPersonaRecoveryPending)
+	}
+	if ok, err := agentPersonaMatchesRecoveryHash(personaPath, finalDomain, finalHash); err != nil || !ok {
+		return fmt.Errorf("%w: persona bytes changed before recovery finalization", errAgentPersonaRecoveryPending)
+	}
+	if err := removeAgentPersonaRecoveryJournal(personaPath, journal.info); err != nil {
+		return fmt.Errorf("%w: clear recovery obligation: %v", errAgentPersonaRecoveryPending, err)
+	}
+	return nil
+}
+
+func agentPersonaRecoveryPending(personaPath string) bool {
+	_, err := os.Lstat(agentPersonaRecoveryPath(personaPath))
+	return err == nil || !errors.Is(err, os.ErrNotExist)
+}
+
+func validAgentRecoveryToken(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 16
+}
+
+func validAgentRecoveryHash(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func agentPersonaMatchesRecoveryHash(personaPath, domain, want string) (bool, error) {
+	current, err := os.ReadFile(personaPath)
+	if err != nil {
+		return false, err
+	}
+	return agentFramedSHA256(domain, current) == want, nil
+}
+
+func removeAgentPersonaRecoveryJournal(personaPath string, expected os.FileInfo) error {
+	sidecarPath := agentPersonaRecoveryPath(personaPath)
+	current, err := os.Lstat(sidecarPath)
+	if err != nil {
+		return err
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+		!os.SameFile(current, expected) {
+		return fmt.Errorf("persona recovery obligation changed before removal")
+	}
+	return os.Remove(sidecarPath)
+}
+
+func (a *api) writeAgentRollbackFailed(w http.ResponseWriter, cause error) {
+	_ = cause
+	if a.logger != nil {
+		// The recovery journal can contain customer-authored prompt bytes and its
+		// errors can contain an absolute installation path. Keep both out of logs.
+		a.logger.Error("agent persona recovery pending")
+	}
+	a.writeLLMErr(w, http.StatusInternalServerError, "AGENT_ROLLBACK_FAILED",
+		"Văn phong đang chờ khôi phục an toàn; chưa thể ghi thay đổi khác", nil)
+}
+
+func (a *api) rollbackAgentPersona(
+	w http.ResponseWriter,
+	personaPath string,
+	storeErr error,
+) {
+	if err := a.resolveAgentPersonaRecovery(personaPath); err != nil {
+		a.writeAgentRollbackFailed(w, fmt.Errorf("Store update failed: %v; recovery failed: %v", storeErr, err))
+		return
+	}
+	a.writeOnboardingStoreError(w, storeErr)
+}
+
 // personaPath lấy đường persona đang được nạp.
 func (a *api) personaPath() (string, error) {
 	if a.zalo == nil {
@@ -144,16 +425,45 @@ type placeholder struct {
 // Dòng ví dụ là phần quan trọng: "TEN_CHUYEN_GIA" một mình không nói được nó là ai. Dòng
 // "Gọi người truyền tri thức: {{TEN_CHUYEN_GIA}}" thì nói được, và người điền không phải đoán.
 func scanPlaceholders(text string) []placeholder {
+	return analyzePersona(text).Placeholders
+}
+
+type personaAnalysis struct {
+	Placeholders    []placeholder
+	ValidationError string
+}
+
+func analyzePersona(text string) personaAnalysis {
 	counts := map[string]int{}
 	sample := map[string]string{}
-	for _, line := range strings.Split(text, "\n") {
-		for _, m := range placeholderRe.FindAllStringSubmatch(line, -1) {
-			k := m[1]
-			counts[k]++
-			if _, ok := sample[k]; !ok {
-				sample[k] = clip(strings.TrimSpace(strings.TrimLeft(line, "-* \t")), 160)
-			}
+	malformed := false
+	matches := placeholderRe.FindAllStringSubmatchIndex(text, -1)
+	var unmatched strings.Builder
+	previousEnd := 0
+	for _, match := range matches {
+		unmatched.WriteString(text[previousEnd:match[0]])
+		previousEnd = match[1]
+		key := text[match[2]:match[3]]
+		if strings.ContainsAny(key, "\r\n") {
+			malformed = true
+			continue
 		}
+		counts[key]++
+		if _, ok := sample[key]; !ok {
+			lineStart := strings.LastIndex(text[:match[0]], "\n") + 1
+			lineEnd := strings.Index(text[match[1]:], "\n")
+			if lineEnd < 0 {
+				lineEnd = len(text)
+			} else {
+				lineEnd += match[1]
+			}
+			line := text[lineStart:lineEnd]
+			sample[key] = clip(strings.TrimSpace(strings.TrimLeft(line, "-* \t")), 160)
+		}
+	}
+	unmatched.WriteString(text[previousEnd:])
+	if strings.Contains(unmatched.String(), "{{") || strings.Contains(unmatched.String(), "}}") {
+		malformed = true
 	}
 	out := make([]placeholder, 0, len(counts))
 	for k, n := range counts {
@@ -161,15 +471,31 @@ func scanPlaceholders(text string) []placeholder {
 	}
 	// Thứ tự ổn định theo tên: một danh sách nhảy chỗ giữa hai lần tải làm người dùng mất chỗ.
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	return out
+	validationError := ""
+	if malformed {
+		validationError = "văn phong có dấu {{ }} lỗi hoặc đi qua nhiều dòng"
+	}
+	return personaAnalysis{Placeholders: out, ValidationError: validationError}
 }
 
 func personaValidationError(text string) string {
-	withoutClosedHoles := placeholderRe.ReplaceAllString(text, "")
-	if strings.Contains(withoutClosedHoles, "{{") {
-		return "văn phong còn dấu {{ chưa đóng"
+	return analyzePersona(text).ValidationError
+}
+
+func agentPersonaFingerprint(persona []byte, displayName string) string {
+	return agentFramedSHA256("agentdc/agent-persona-fingerprint/v1", persona, []byte(displayName))
+}
+
+func agentFramedSHA256(domain string, fields ...[]byte) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(domain + "\x00"))
+	for _, field := range fields {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(field)))
+		_, _ = h.Write(size[:])
+		_, _ = h.Write(field)
 	}
-	return ""
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // handleAgentGet: mọi thứ trang AI Agents cần, trong một lời gọi.
@@ -185,8 +511,9 @@ func (a *api) handleAgentGet(w http.ResponseWriter, _ *http.Request) {
 		a.writeErr(w, http.StatusInternalServerError, "không đọc được văn phong")
 		return
 	}
-	holes := scanPlaceholders(string(b))
+	analysis := analyzePersona(string(b))
 	displayName := ""
+	displayNameError := "chưa có tên hiển thị của bot"
 	if a.st != nil {
 		displayName, err = a.st.AgentDisplayName()
 		if err != nil {
@@ -195,7 +522,22 @@ func (a *api) handleAgentGet(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 	}
-	validationError := personaValidationError(string(b))
+	if displayName != "" {
+		normalized, nameErr := normalizeAgentNameValue("tên hiển thị", displayName)
+		if nameErr == nil {
+			displayName = normalized
+			displayNameError = ""
+		} else {
+			displayNameError = "tên hiển thị của bot không hợp lệ"
+		}
+	}
+	validationError := analysis.ValidationError
+	if validationError == "" {
+		validationError = displayNameError
+	}
+	if agentPersonaRecoveryPending(p) {
+		validationError = "văn phong đang chờ khôi phục an toàn"
+	}
 	roster, overlay := "", ""
 	if a.zalo != nil {
 		roster, overlay = a.zalo.cfg.RosterPath, a.zalo.cfg.OverlayDir
@@ -206,10 +548,10 @@ func (a *api) handleAgentGet(w http.ResponseWriter, _ *http.Request) {
 		"persona_size": len(b),
 		"roster_path":  roster,
 		"overlay_dir":  overlay,
-		"placeholders": holes,
+		"placeholders": analysis.Placeholders,
 		// ready là câu trả lời cho "mở cho khách thật được chưa". Một cờ, không một danh sách,
 		// vì trang cần đổi màu theo nó.
-		"ready":            len(holes) == 0 && validationError == "",
+		"ready":            len(analysis.Placeholders) == 0 && validationError == "",
 		"display_name":     displayName,
 		"validation_error": validationError,
 		"model":            a.zalo.cfg.Model,
@@ -327,10 +669,25 @@ func normalizeAgentNameValue(label, raw string) (string, error) {
 }
 
 func (a *api) handleAgentNormalPut(w http.ResponseWriter, values map[string]string, displayName string) {
+	onboardingMutationMu.Lock()
+	defer onboardingMutationMu.Unlock()
+
 	p, err := a.personaPath()
 	if err != nil {
 		a.writeErr(w, http.StatusPreconditionFailed, err.Error())
 		return
+	}
+	if err := a.resolveAgentPersonaRecovery(p); err != nil {
+		a.writeAgentRollbackFailed(w, err)
+		return
+	}
+	if displayName == "" && a.st != nil {
+		displayName, err = a.st.AgentDisplayName()
+		if err != nil {
+			a.logger.Error("agent: đọc tên hiển thị trước khi lưu", "err", err)
+			a.writeErr(w, http.StatusInternalServerError, "không đọc được tên bot")
+			return
+		}
 	}
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -368,27 +725,46 @@ func (a *api) handleAgentNormalPut(w http.ResponseWriter, values map[string]stri
 		a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
 		return
 	}
+	recoveryToken := ""
+	if a.st != nil {
+		recoveryToken, err = a.prepareAgentPersonaRecovery(p, b, []byte(text))
+		if err != nil {
+			a.logger.Error("agent: chuẩn bị khôi phục persona", "err", err)
+			a.writeErr(w, http.StatusInternalServerError, "không chuẩn bị được bản khôi phục, chưa ghi gì")
+			return
+		}
+	}
 	if err := writeAgentFileAtomic(p, []byte(text), 0o600); err != nil {
+		if recoveryToken != "" {
+			if cleanupErr := a.resolveAgentPersonaRecovery(p); cleanupErr != nil {
+				a.writeAgentRollbackFailed(w, cleanupErr)
+				return
+			}
+		}
 		a.logger.Error("agent: ghi persona", "path", p, "err", err)
 		a.writeErr(w, http.StatusInternalServerError, "không ghi được văn phong")
 		return
 	}
-	if displayName != "" && a.st != nil {
-		if err := a.st.SetAgentDisplayName(displayName); err != nil {
-			if restoreErr := writeAppFileAtomic(p, b, 0o600); restoreErr != nil {
-				a.logger.Error("agent: khôi phục persona sau lỗi tên hiển thị", "path", p, "err", restoreErr)
-			}
-			a.logger.Error("agent: lưu tên hiển thị", "err", err)
-			a.writeErr(w, http.StatusInternalServerError, "không lưu được tên bot")
+	if a.st != nil {
+		if _, err := a.st.UpdateAgentPersona(displayName, recoveryToken); err != nil {
+			a.rollbackAgentPersona(w, p, err)
+			return
+		}
+		if err := a.resolveAgentPersonaRecovery(p); err != nil {
+			a.writeAgentRollbackFailed(w, err)
 			return
 		}
 	}
-	left := scanPlaceholders(text)
-	validationError := personaValidationError(text)
-	a.zlog.add(ipc.ZaloLogInfo, "", fmt.Sprintf("văn phong: đã điền %d chỗ, còn %d", len(keys), len(left)))
+	analysis := analyzePersona(text)
+	_, displayNameErr := normalizeAgentNameValue("tên hiển thị", displayName)
+	validationError := analysis.ValidationError
+	if validationError == "" && displayNameErr != nil {
+		validationError = "tên hiển thị của bot không hợp lệ"
+	}
+	a.zlog.add(ipc.ZaloLogInfo, "", fmt.Sprintf("văn phong: đã điền %d chỗ, còn %d", len(keys), len(analysis.Placeholders)))
 	a.writeJSON(w, http.StatusOK, map[string]any{
-		"placeholders":     left,
-		"ready":            len(left) == 0 && validationError == "",
+		"placeholders":     analysis.Placeholders,
+		"ready":            len(analysis.Placeholders) == 0 && validationError == "",
 		"display_name":     displayName,
 		"validation_error": validationError,
 	})
@@ -403,17 +779,21 @@ func (a *api) handleAgentCompletePut(
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
 
+	p, err := a.personaPath()
+	if err != nil {
+		a.writeErr(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
+	if err := a.resolveAgentPersonaRecovery(p); err != nil {
+		a.writeAgentRollbackFailed(w, err)
+		return
+	}
 	state, ok := a.onboardingMutationState(w, expectedRevision)
 	if !ok {
 		return
 	}
 	if state.Phase != store.OnboardingPhasePersona {
 		a.writeOnboardingStoreError(w, fmt.Errorf("complete persona from %q: %w", state.Phase, store.ErrOnboardingInvalidPhase))
-		return
-	}
-	p, err := a.personaPath()
-	if err != nil {
-		a.writeErr(w, http.StatusPreconditionFailed, err.Error())
 		return
 	}
 	original, err := os.ReadFile(p)
@@ -425,10 +805,9 @@ func (a *api) handleAgentCompletePut(
 	if !ok {
 		return
 	}
-	left := scanPlaceholders(text)
-	validationError := personaValidationError(text)
-	if len(left) != 0 || validationError != "" {
-		fields := safeMissingPlaceholderFields(left)
+	analysis := analyzePersona(text)
+	if len(analysis.Placeholders) != 0 || analysis.ValidationError != "" {
+		fields := safeMissingPlaceholderFields(analysis.Placeholders)
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "AGENT_PLACEHOLDERS_REMAIN",
 			"Văn phong vẫn còn chỗ trống hoặc dấu {{ chưa đóng", fields)
 		return
@@ -436,30 +815,55 @@ func (a *api) handleAgentCompletePut(
 
 	finalBytes := []byte(text)
 	changed := !bytes.Equal(original, finalBytes)
+	recoveryToken := ""
 	if changed {
 		if err := writeAppBackupOnce(p+".goc", original, 0o600); err != nil {
 			a.logger.Error("agent: ghi bản gốc persona", "path", p+".goc", "err", err)
 			a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
 			return
 		}
+		recoveryToken, err = a.prepareAgentPersonaRecovery(p, original, finalBytes)
+		if err != nil {
+			a.logger.Error("agent: chuẩn bị khôi phục persona", "err", err)
+			a.writeErr(w, http.StatusInternalServerError, "không chuẩn bị được bản khôi phục, chưa ghi gì")
+			return
+		}
 		if err := writeAgentFileAtomic(p, finalBytes, 0o600); err != nil {
+			if cleanupErr := a.resolveAgentPersonaRecovery(p); cleanupErr != nil {
+				a.writeAgentRollbackFailed(w, cleanupErr)
+				return
+			}
 			a.logger.Error("agent: ghi persona hoàn chỉnh", "path", p, "err", err)
 			a.writeErr(w, http.StatusInternalServerError, "không ghi được văn phong")
 			return
 		}
 	}
 
-	fingerprintBytes := append(append([]byte(nil), finalBytes...), []byte(displayName)...)
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256(fingerprintBytes))
-	updated, err := a.st.AdvanceOnboardingPersona(expectedRevision, fingerprint, displayName)
+	fingerprint := agentPersonaFingerprint(finalBytes, displayName)
+	var updated store.OnboardingState
+	if recoveryToken != "" {
+		updated, err = a.st.AdvanceOnboardingPersonaWithRecovery(
+			expectedRevision,
+			fingerprint,
+			displayName,
+			recoveryToken,
+		)
+	} else {
+		updated, err = a.st.AdvanceOnboardingPersona(expectedRevision, fingerprint, displayName)
+	}
 	if err != nil {
 		if changed {
-			if restoreErr := writeAppFileAtomic(p, original, 0o600); restoreErr != nil {
-				a.logger.Error("agent: khôi phục persona sau lỗi onboarding", "path", p, "err", restoreErr)
-			}
+			a.rollbackAgentPersona(w, p, err)
+			return
 		}
 		a.writeOnboardingStoreError(w, err)
 		return
+	}
+	if recoveryToken != "" {
+		if err := a.resolveAgentPersonaRecovery(p); err != nil {
+			a.writeAgentRollbackFailed(w, err)
+			return
+		}
 	}
 	a.zlog.add(ipc.ZaloLogInfo, "", fmt.Sprintf("văn phong: đã điền %d chỗ, sẵn sàng kiểm tra", len(keys)))
 	a.writeJSON(w, http.StatusOK, map[string]any{

@@ -211,6 +211,87 @@ func TestInvalidateOnboardingPersonaClearsCompletedReceiptWithoutReopeningFlow(t
 	}
 }
 
+func TestUpdateAgentPersonaStoresNameAndInvalidatesReceiptInOneTransaction(t *testing.T) {
+	st := openAppStoreForTest(t)
+	if err := st.SetAgentDisplayName("Old"); err != nil {
+		t.Fatal(err)
+	}
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: "fingerprint", TestNonceHash: "receipt",
+		TestExpiresAt: "2026-08-11T08:00:00Z", Revision: 7,
+	})
+
+	got, err := st.UpdateAgentPersona("New", "recovery-token")
+	if err != nil {
+		t.Fatalf("UpdateAgentPersona() = %v", err)
+	}
+	if got.Phase != OnboardingPhasePersona || got.Revision != 8 ||
+		got.PersonaFingerprint != "" || got.TestNonceHash != "" || got.TestExpiresAt != "" {
+		t.Fatalf("updated state = %+v", got)
+	}
+	if name, err := st.AgentDisplayName(); err != nil || name != "New" {
+		t.Fatalf("AgentDisplayName() = %q, %v", name, err)
+	}
+	if committed, err := st.AgentPersonaRecoveryCommitted("recovery-token"); err != nil || !committed {
+		t.Fatalf("AgentPersonaRecoveryCommitted() = %t, %v", committed, err)
+	}
+}
+
+func TestUpdateAgentPersonaPreservesCompletedState(t *testing.T) {
+	st := openAppStoreForTest(t)
+	setOnboardingStateForTest(t, st, OnboardingState{
+		CompletedVersion: CurrentOnboardingVersion,
+		Phase:            OnboardingPhaseCompleted,
+		Revision:         12,
+	})
+	before := mustOnboardingStateForTest(t, st)
+
+	got, err := st.UpdateAgentPersona("New", "completed-token")
+	if err != nil {
+		t.Fatalf("UpdateAgentPersona() = %v", err)
+	}
+	if got != before {
+		t.Fatalf("completed state changed: before=%+v after=%+v", before, got)
+	}
+	if name, err := st.AgentDisplayName(); err != nil || name != "New" {
+		t.Fatalf("AgentDisplayName() = %q, %v", name, err)
+	}
+	if committed, err := st.AgentPersonaRecoveryCommitted("completed-token"); err != nil || !committed {
+		t.Fatalf("AgentPersonaRecoveryCommitted() = %t, %v", committed, err)
+	}
+}
+
+func TestUpdateAgentPersonaFailureRollsBackNameTokenAndState(t *testing.T) {
+	st := openAppStoreForTest(t)
+	if err := st.SetAgentDisplayName("Old"); err != nil {
+		t.Fatal(err)
+	}
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseTest, ProviderKind: "codex",
+		PersonaFingerprint: "fingerprint", TestNonceHash: "receipt", Revision: 4,
+	})
+	before := mustOnboardingStateForTest(t, st)
+	if _, err := st.db.Exec(`CREATE TRIGGER fail_agent_edit_state
+BEFORE UPDATE ON app_onboarding_state
+BEGIN SELECT RAISE(ABORT, 'injected agent edit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.UpdateAgentPersona("New", "failed-token"); err == nil {
+		t.Fatal("UpdateAgentPersona() error = nil; want injected failure")
+	}
+	if after := mustOnboardingStateForTest(t, st); after != before {
+		t.Fatalf("failed update changed state: before=%+v after=%+v", before, after)
+	}
+	if name, err := st.AgentDisplayName(); err != nil || name != "Old" {
+		t.Fatalf("failed update changed name to %q (%v)", name, err)
+	}
+	if committed, err := st.AgentPersonaRecoveryCommitted("failed-token"); err != nil || committed {
+		t.Fatalf("failed token committed = %t, %v", committed, err)
+	}
+}
+
 func TestBindOnboardingAccountStagesDisabledAccountAndAdvancesOnce(t *testing.T) {
 	st := openAppStoreForTest(t)
 	insertOnboardingProviderForTest(t, st, "codex", "codex")

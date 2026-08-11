@@ -164,6 +164,72 @@ func TestAppAgentUnclosedMustacheIsNotReady(t *testing.T) {
 	}
 }
 
+func TestAppAgentReadyRequiresValidStoredDisplayName(t *testing.T) {
+	tests := []struct {
+		name        string
+		displayName string
+		wantReady   bool
+	}{
+		{name: "missing name", wantReady: false},
+		{name: "valid name", displayName: "An Nhiên", wantReady: true},
+		{name: "newline name", displayName: "An\nNhiên", wantReady: false},
+		{name: "delimiter name", displayName: "An {{Nhiên", wantReady: false},
+		{name: "overlong name", displayName: strings.Repeat("ệ", 61), wantReady: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			persona := filepath.Join(dir, "persona.md")
+			if err := os.WriteFile(persona, []byte("Persona hoàn chỉnh.\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+			if tt.displayName != "" {
+				if err := a.st.SetAgentDisplayName(tt.displayName); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			rr := appAgentRequest(t, a, http.MethodGet, "/agent", nil)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("GET /agent status = %d body=%s", rr.Code, rr.Body.String())
+			}
+			got := decodeAppRouteJSON[struct {
+				Ready           bool   `json:"ready"`
+				ValidationError string `json:"validation_error"`
+			}](t, rr.Body.Bytes())
+			if got.Ready != tt.wantReady {
+				t.Fatalf("ready = %t; want %t; response=%s", got.Ready, tt.wantReady, rr.Body.String())
+			}
+			if !tt.wantReady && got.ValidationError == "" {
+				t.Fatalf("invalid display name has no validation_error: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAppAgentMultilineMustacheIsMalformedNotPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	persona := filepath.Join(dir, "persona.md")
+	if err := os.WriteFile(persona, []byte("Tên {{foo\nbar}}.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+	if err := a.st.SetAgentDisplayName("An Nhiên"); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := appAgentRequest(t, a, http.MethodGet, "/agent", nil)
+	got := decodeAppRouteJSON[struct {
+		Ready           bool          `json:"ready"`
+		Placeholders    []placeholder `json:"placeholders"`
+		ValidationError string        `json:"validation_error"`
+	}](t, rr.Body.Bytes())
+	if got.Ready || len(got.Placeholders) != 0 || got.ValidationError == "" {
+		t.Fatalf("multiline mustache response = %+v", got)
+	}
+}
+
 func TestAppAgentRejectsInvalidValuesWithoutWrites(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -376,7 +442,10 @@ func TestAppPersonaWritesUTF8WithoutBOMAndRefreshesReadiness(t *testing.T) {
 	if err := os.WriteFile(persona, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a := newAppAgentTestAPI(persona, filepath.Join(dir, "roster.md"))
+	a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+	if err := a.st.SetAgentDisplayName("An Nhiên"); err != nil {
+		t.Fatal(err)
+	}
 
 	req := httptest.NewRequest(http.MethodPut, "/agent/persona/persona", bytes.NewBufferString(
 		`{"text":"Tên bot: An Nhiên\r\nGiọng nói: thân thiện — rõ ràng\r\n"}`,

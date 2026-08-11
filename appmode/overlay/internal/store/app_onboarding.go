@@ -362,6 +362,26 @@ func (s *Store) AdvanceOnboardingPersona(
 	fingerprint string,
 	displayName string,
 ) (OnboardingState, error) {
+	return s.advanceOnboardingPersona(expectedRevision, fingerprint, displayName, "")
+}
+
+// AdvanceOnboardingPersonaWithRecovery additionally commits the filesystem
+// recovery token in the same transaction as the name and phase transition.
+func (s *Store) AdvanceOnboardingPersonaWithRecovery(
+	expectedRevision int64,
+	fingerprint string,
+	displayName string,
+	recoveryToken string,
+) (OnboardingState, error) {
+	return s.advanceOnboardingPersona(expectedRevision, fingerprint, displayName, recoveryToken)
+}
+
+func (s *Store) advanceOnboardingPersona(
+	expectedRevision int64,
+	fingerprint string,
+	displayName string,
+	recoveryToken string,
+) (OnboardingState, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return OnboardingState{}, fmt.Errorf("begin onboarding persona advance: %w", err)
@@ -385,9 +405,8 @@ func (s *Store) AdvanceOnboardingPersona(
 	if fingerprint == "" || displayName == "" {
 		return OnboardingState{}, fmt.Errorf("advance onboarding persona: fingerprint and display name are required")
 	}
-	if _, err := tx.Exec(`INSERT INTO app_meta(key, value) VALUES (?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value`, agentDisplayNameMetaKey, displayName); err != nil {
-		return OnboardingState{}, fmt.Errorf("store onboarding agent display name: %w", err)
+	if err := setAgentPersonaMetaInTx(tx, displayName, recoveryToken); err != nil {
+		return OnboardingState{}, fmt.Errorf("store onboarding persona metadata: %w", err)
 	}
 
 	updatedAt := ts(time.Now())
@@ -419,6 +438,62 @@ WHERE id = 1 AND revision = ? AND phase = ?`,
 		return OnboardingState{}, fmt.Errorf("commit onboarding persona advance: %w", err)
 	}
 	return updated, nil
+}
+
+// UpdateAgentPersona atomically stores the display name and invalidates any
+// active onboarding persona/test result after a normal persona edit. Completed
+// onboarding remains completed unless it still carries a stale receipt.
+func (s *Store) UpdateAgentPersona(displayName, recoveryToken string) (OnboardingState, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("begin agent persona update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if err := setAgentPersonaMetaInTx(tx, displayName, recoveryToken); err != nil {
+		return OnboardingState{}, err
+	}
+
+	dirtyReceipt := state.PersonaFingerprint != "" || state.TestNonceHash != "" || state.TestExpiresAt != ""
+	activePersona := state.Phase == OnboardingPhasePersona || state.Phase == OnboardingPhaseTest
+	if activePersona || dirtyReceipt {
+		targetPhase := state.Phase
+		if activePersona {
+			targetPhase = OnboardingPhasePersona
+		}
+		updatedAt := ts(time.Now())
+		result, err := tx.Exec(`UPDATE app_onboarding_state SET
+phase = ?, persona_fingerprint = '', test_nonce_hash = '', test_expires_at = '',
+revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ? AND phase = ?`,
+			targetPhase,
+			updatedAt,
+			state.Revision,
+			state.Phase,
+		)
+		if err != nil {
+			return OnboardingState{}, fmt.Errorf("invalidate onboarding after agent persona update: %w", err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return OnboardingState{}, fmt.Errorf("read agent persona invalidation result: %w", err)
+		}
+		if changed != 1 {
+			return OnboardingState{}, ErrOnboardingConflict
+		}
+		state, err = onboardingStateInTx(tx)
+		if err != nil {
+			return OnboardingState{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingState{}, fmt.Errorf("commit agent persona update: %w", err)
+	}
+	return state, nil
 }
 
 // InvalidateOnboardingPersona returns a tested active onboarding flow to its
