@@ -1,8 +1,13 @@
 import { requestJSON } from "../core/api.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
+import {
+  MAX_PERSONA_VALUE_CODE_POINTS,
+  createPersonaFields,
+  validatePersonaValue,
+} from "../components/persona-fields.js";
 
 const PLACEHOLDER_PATTERN = /\{\{([A-Z][A-Z_]*)\}\}/g;
-const MAX_PLACEHOLDER_VALUE = 60;
+const MAX_PLACEHOLDER_VALUE = MAX_PERSONA_VALUE_CODE_POINTS;
 const EDITABLE_DOCUMENTS = Object.freeze({
   persona: Object.freeze({ label: "Văn phong" }),
   roster: Object.freeze({ label: "Sổ tay thành viên" }),
@@ -29,18 +34,21 @@ export function createAgentService(request = requestJSON) {
   if (typeof request !== "function") throw new TypeError("Agent service requires an API request function");
   return Object.freeze({
     load: () => request("/agent"),
-    fill: (values) => request("/agent", { method: "PUT", body: { values } }),
+    fill: (values, displayName) => request("/agent", {
+      method: "PUT",
+      body: displayName === undefined
+        ? { values }
+        : { values, display_name: displayName },
+    }),
     loadDocument: (name) => request(documentPath(name)),
     saveDocument: (name, text) => request(documentPath(name), { method: "PUT", body: { text } }),
   });
 }
 
 function validateQuickValue(key, rawValue) {
-  const value = String(rawValue ?? "").trim();
-  if (!value) throw new Error(`{{${key}}} chưa được điền.`);
-  if ([...value].length > MAX_PLACEHOLDER_VALUE) throw new Error(`{{${key}}} không được dài quá ${MAX_PLACEHOLDER_VALUE} ký tự.`);
-  if (/[\r\n]/.test(value) || value.includes("{{") || value.includes("}}")) throw new Error(`{{${key}}} không được chứa xuống dòng hay dấu {{ }}.`);
-  return value;
+  const result = validatePersonaValue(rawValue);
+  if (!result.ok) throw new Error(`{{${key}}} ${result.error}`);
+  return result.value;
 }
 
 export function fillHoles(text, values) {
@@ -94,42 +102,37 @@ function agentFacts(agent, openDocument) {
 }
 
 function quickFill(agent, onSave) {
-  const holes = Array.isArray(agent.placeholders) ? agent.placeholders : [];
-  if (!holes.length) return null;
-  const inputs = new Map();
-  const usedInputIds = new Set();
   const note = element("span", { className: "note", attributes: { "aria-live": "polite" } });
   const save = element("button", { className: "btn go", attributes: { type: "submit" }, text: "Lưu văn phong" });
-  const fields = holes.map((hole) => {
-    const stem = String(hole.key ?? "value").replace(/[^A-Za-z0-9_-]/g, "-") || "value";
-    const baseId = `agent-hole-${stem}`;
-    let inputId = baseId;
-    let duplicate = 2;
-    while (usedInputIds.has(inputId)) inputId = `${baseId}-${duplicate++}`;
-    usedInputIds.add(inputId);
-    const input = element("input", { attributes: { id: inputId, type: "text", maxlength: MAX_PLACEHOLDER_VALUE, placeholder: HINTS[hole.key] || "điền giá trị", required: true } });
-    inputs.set(hole.key, input);
-    return element("div", { className: "field" },
-      element("label", { attributes: { for: inputId } }, element("span", { className: "fk", text: `{{${hole.key}}}` }), element("span", { className: "fc", text: `${hole.count} chỗ trong tệp` })),
-      input,
-      hole.sample && element("div", { className: "fs", text: hole.sample }),
-    );
-  });
-  return element("form", {
-    on: { submit: async (event) => {
-      event.preventDefault();
-      note.textContent = "";
-      try {
-        const values = Object.fromEntries([...inputs].map(([key, input]) => [key, validateQuickValue(key, input.value)]));
-        save.disabled = true;
-        note.textContent = "đang lưu…";
-        await onSave(values);
-      } catch (error) {
-        note.textContent = `không lưu được: ${error instanceof Error ? error.message : String(error)}`;
-        save.disabled = false;
-      }
-    } },
-  }, element("div", { attributes: { style: "max-width:660px" } }, fields), element("div", { className: "row" }, save, note));
+  let saving = false;
+  let form;
+  let fields;
+  const submit = async () => {
+    if (saving) return;
+    note.textContent = "";
+    const validation = fields.validate();
+    if (!validation.ok) {
+      note.textContent = `không lưu được: ${validation.errors[validation.firstErrorKey]}`;
+      fields.focusFirstError(validation);
+      return;
+    }
+    saving = true;
+    save.disabled = true;
+    note.textContent = "đang lưu…";
+    try {
+      await onSave(validation.values, validation.displayName);
+    } catch (error) {
+      saving = false;
+      note.textContent = `không lưu được: ${error instanceof Error ? error.message : String(error)}`;
+      save.disabled = false;
+      fields.focusFirst();
+    }
+  };
+  fields = createPersonaFields({ agent, onLastEnter: () => { void submit(); } });
+  form = element("form", {
+    on: { submit(event) { event.preventDefault(); void submit(); } },
+  }, fields.element, element("div", { className: "row" }, save, note));
+  return Object.freeze({ node: form, dispose: fields.dispose });
 }
 
 function documentEditor(name, data, { onCancel, onSave }, editorId) {
@@ -204,10 +207,13 @@ export function createAgentsPage({ request = requestJSON } = {}) {
     let refreshRevision = 0;
     let editorRevision = 0;
     let dismissEditor = () => {};
+    let disposeQuickFill = () => {};
     container.append(root);
     const header = () => pageHeader("AI Agents", "Một agent: con trả lời tin nhắn Zalo. Giọng nói của nó nằm trong tệp văn phong.");
     const refresh = async () => {
       const revision = ++refreshRevision;
+      disposeQuickFill();
+      disposeQuickFill = () => {};
       root.replaceChildren(header(), element("div", { className: "hint", text: "Đang đọc văn phong và các chỗ cần hoàn thiện…" }));
       try {
         const agent = await service.load();
@@ -270,13 +276,18 @@ export function createAgentsPage({ request = requestJSON } = {}) {
             if (!disposed && current === editorRevision && error?.name !== "AbortError") root.append(errorPanel(error));
           }
         };
-        root.replaceChildren(header(), banner, quickFill(agent, async (values) => { await service.fill(values); await refresh(); }), agentFacts(agent, openDocument), element("div", { className: "hint", text: "Phạm vi quyền cố định là chỉ-đọc, và đó là chủ đích: agent này tự động trả lời khách, nên nó không có quyền ghi hay xoá bất cứ gì. Con agent biên soạn wiki ở mục Knowledge mới có quyền ghi." }));
+        const personaFields = quickFill(agent, async (values, displayName) => {
+          await service.fill(values, displayName);
+          if (!disposed) await refresh();
+        });
+        disposeQuickFill = personaFields.dispose;
+        root.replaceChildren(header(), banner, personaFields.node, agentFacts(agent, openDocument), element("div", { className: "hint", text: "Phạm vi quyền cố định là chỉ-đọc, và đó là chủ đích: agent này tự động trả lời khách, nên nó không có quyền ghi hay xoá bất cứ gì. Con agent biên soạn wiki ở mục Knowledge mới có quyền ghi." }));
       } catch (error) {
         if (!disposed && revision === refreshRevision && error?.name !== "AbortError") root.replaceChildren(header(), errorPanel(error));
       }
     };
     void refresh();
-    return { dispose() { disposed = true; refreshRevision++; editorRevision++; dismissEditor(); controller.abort(); } };
+    return { dispose() { disposed = true; refreshRevision++; editorRevision++; disposeQuickFill(); dismissEditor(); controller.abort(); } };
   } });
 }
 
