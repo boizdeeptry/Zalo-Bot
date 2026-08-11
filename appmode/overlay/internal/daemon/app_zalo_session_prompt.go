@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"hash"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"agentdc/internal/ipc"
@@ -176,6 +177,30 @@ func appAgentIdentityPromptNormalized(displayName string) string {
 
 func appZaloNormalizeAgentDisplayName(displayName string) string {
 	return strings.TrimSpace(displayName)
+}
+
+func appZaloNormalizeAndValidateAgentDisplayName(displayName string) (string, bool) {
+	if !utf8.ValidString(displayName) {
+		return "", false
+	}
+	normalized := strings.TrimSpace(displayName)
+	if normalized == "" {
+		return "", true
+	}
+	// Keep this trusted prompt boundary aligned with Task 6's authoritative
+	// display-name rules while preserving the legacy-empty exception above.
+	if len([]rune(normalized)) > maxPlaceholderValue ||
+		strings.ContainsAny(normalized, "\r\n") ||
+		strings.Contains(normalized, "{{") ||
+		strings.Contains(normalized, "}}") {
+		return "", false
+	}
+	for _, r := range normalized {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return "", false
+		}
+	}
+	return normalized, true
 }
 
 func appZaloAppendMemoryContract(prompt string) string {

@@ -30,6 +30,18 @@ var appZaloReadAgentDisplayName = func(st *store.Store) (string, error) {
 	return st.AgentDisplayName()
 }
 
+func appZaloReadValidatedAgentDisplayName(st *store.Store) (string, error) {
+	displayName, err := appZaloReadAgentDisplayName(st)
+	if err != nil {
+		return "", err
+	}
+	displayName, valid := appZaloNormalizeAndValidateAgentDisplayName(displayName)
+	if !valid {
+		return "", errAppZaloAgentDisplayNameRead
+	}
+	return displayName, nil
+}
+
 var (
 	errAppZaloSessionStateUpdate   = errors.New(appZaloErrorStateUpdate)
 	errAppZaloAgentDisplayNameRead = errors.New(appZaloErrorAgentDisplayNameRead)
@@ -349,7 +361,7 @@ func (a *api) appCaptureZaloTurnSnapshot(
 	currentFiles []ipc.ZaloAttachment,
 ) appZaloTurnSnapshot {
 	directFiles := slices.Clone(currentFiles)
-	displayName, err := appZaloReadAgentDisplayName(a.st)
+	displayName, err := appZaloReadValidatedAgentDisplayName(a.st)
 	if err != nil {
 		a.logger.Warn("zalo session: could not read agent display name",
 			"thread", threadID, "code", appZaloErrorAgentDisplayNameRead,
@@ -360,7 +372,6 @@ func (a *api) appCaptureZaloTurnSnapshot(
 			hasAttachments:      true,
 		}
 	}
-	displayName = appZaloNormalizeAgentDisplayName(displayName)
 	history, err := a.st.ZaloMessages(threadID, zaloHistoryTurns)
 	if err != nil {
 		a.logger.Warn("llm route: không đọc được lịch sử, lượt này đi thẳng local CLI",
@@ -530,14 +541,13 @@ func (a *api) appRunZalo(
 		agentDisplayName = captured.appZaloCapturedAgentDisplayName()
 	} else {
 		var err error
-		agentDisplayName, err = appZaloReadAgentDisplayName(a.st)
+		agentDisplayName, err = appZaloReadValidatedAgentDisplayName(a.st)
 		if err != nil {
 			a.logger.Warn("zalo session: could not read agent display name",
 				"thread", threadID, "code", appZaloErrorAgentDisplayNameRead,
 				"error_type", fmt.Sprintf("%T", err))
 			return "", errAppZaloAgentDisplayNameRead
 		}
-		agentDisplayName = appZaloNormalizeAgentDisplayName(agentDisplayName)
 	}
 	var binding appZaloClaudeBinding
 	run, zc, binding, err := a.appResolveZaloSessionRoute(ctx, run, zc, threadID)
