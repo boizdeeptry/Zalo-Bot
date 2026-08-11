@@ -29,13 +29,15 @@ func TestAgentCompletesOnboardingWithAuthoritativeNameAndFingerprint(t *testing.
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	got := decodeOnboardingResponse[struct {
-		Ready           bool   `json:"ready"`
-		DisplayName     string `json:"display_name"`
-		OnboardingPhase string `json:"onboarding_phase"`
-		Revision        int64  `json:"revision"`
+		Ready              bool   `json:"ready"`
+		DisplayName        string `json:"display_name"`
+		OnboardingPhase    string `json:"onboarding_phase"`
+		OnboardingRevision int64  `json:"onboarding_revision"`
+		LegacyRevision     *int64 `json:"revision"`
 	}](t, rr)
 	if !got.Ready || got.DisplayName != "An Nhiên" ||
-		got.OnboardingPhase != store.OnboardingPhaseTest || got.Revision != 10 {
+		got.OnboardingPhase != store.OnboardingPhaseTest || got.OnboardingRevision != 10 ||
+		got.LegacyRevision != nil {
 		t.Fatalf("completion response = %+v", got)
 	}
 	finalBytes, err := os.ReadFile(persona)

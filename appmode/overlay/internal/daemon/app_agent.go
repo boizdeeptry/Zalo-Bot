@@ -463,11 +463,11 @@ func (a *api) handleAgentCompletePut(
 	}
 	a.zlog.add(ipc.ZaloLogInfo, "", fmt.Sprintf("văn phong: đã điền %d chỗ, sẵn sàng kiểm tra", len(keys)))
 	a.writeJSON(w, http.StatusOK, map[string]any{
-		"placeholders":     []placeholder{},
-		"ready":            true,
-		"display_name":     displayName,
-		"onboarding_phase": updated.Phase,
-		"revision":         updated.Revision,
+		"placeholders":        []placeholder{},
+		"ready":               true,
+		"display_name":        displayName,
+		"onboarding_phase":    updated.Phase,
+		"onboarding_revision": updated.Revision,
 	})
 }
 
