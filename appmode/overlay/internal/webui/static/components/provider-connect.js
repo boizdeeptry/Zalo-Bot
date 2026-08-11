@@ -294,6 +294,13 @@ export function createProviderConnect({
     const logLine = connect.message
       ? element("div", { className: "pv-connect-log", text: connect.message })
       : null;
+    const cancelWarning = connect.cancelWarning
+      ? element("div", {
+          className: "pv-connect-log pv-connect-warning",
+          attributes: { role: "status" },
+          text: connect.cancelWarning,
+        })
+      : null;
     const cancel = listen(element("button", {
       className: "pv-btn",
       attributes: { type: "button" },
@@ -303,6 +310,7 @@ export function createProviderConnect({
       "div",
       { className: "pv-connect-live" },
       renderProgress(false),
+      cancelWarning,
       logLine,
       element(
         "div",
@@ -433,6 +441,55 @@ export function createProviderConnect({
     }
   }
 
+  function cancelWarningText(detail) {
+    const message = safeLogLine(detail || "Không thể xác nhận yêu cầu huỷ kết nối.");
+    return safeLogLine(`${message} Tiếp tục theo dõi kết nối.`);
+  }
+
+  async function reconcileCanceledRun(run) {
+    for (;;) {
+      if (!ownsRun(run)) return;
+      try {
+        const status = await service.connectStatus(providerKind);
+        if (!ownsRun(run)) return;
+        if (status?.phase === "connected"
+          && (!String(status?.providerId ?? "").trim() || !String(status?.accountId ?? "").trim())) {
+          await finishConnected(status);
+          return;
+        }
+        setStatus(status);
+        if (status?.phase === "connected") {
+          await finishConnected(status);
+          return;
+        }
+        if (status?.phase === "error" || status?.phase === "canceled") {
+          generation++;
+          stopTimers();
+          return;
+        }
+      } catch (error) {
+        if (!ownsRun(run)) return;
+        connect = {
+          ...connect,
+          cancelWarning: cancelWarningText(error?.message),
+        };
+        render();
+      }
+      if (!await waitToPoll(run)) return;
+    }
+  }
+
+  function startCancelReconciliation(canceledState, detail) {
+    const run = ++generation;
+    connect = {
+      ...canceledState,
+      cancelWarning: cancelWarningText(detail),
+    };
+    startConnectTimer();
+    render();
+    void reconcileCanceledRun(run);
+  }
+
   function cancelConnect() {
     if (disposed) return Promise.resolve(false);
     if (!connect || connect.phase === "prompt" || TERMINAL_PHASES.has(connect.phase)) {
@@ -449,24 +506,20 @@ export function createProviderConnect({
         const result = await service.connectCancel(providerKind);
         if (disposed || generation !== cancellation) return false;
         cancelPromise = null;
-        connect = result?.ok === true
-          ? { ...canceledState, phase: "canceled" }
-          : {
-              ...canceledState,
-              phase: "error",
-              message: safeLogLine(result?.message || result?.error || "Không thể huỷ kết nối."),
-            };
-        render();
-        return result?.ok === true;
+        if (result?.ok === true) {
+          connect = { ...canceledState, phase: "canceled" };
+          render();
+          return true;
+        }
+        startCancelReconciliation(
+          canceledState,
+          result?.message || result?.error || "Không thể huỷ kết nối.",
+        );
+        return false;
       } catch (error) {
-        if (disposed || generation !== cancellation || error?.name === "AbortError") return false;
+        if (disposed || generation !== cancellation) return false;
         cancelPromise = null;
-        connect = {
-          ...canceledState,
-          phase: "error",
-          message: safeLogLine(error?.message || "Không thể huỷ kết nối."),
-        };
-        render();
+        startCancelReconciliation(canceledState, error?.message || "Không thể huỷ kết nối.");
         return false;
       }
     })();

@@ -279,6 +279,228 @@ test("an accepted cancel preserves the last backend message like the Providers U
   assert.ok(hasClass(find(slot, (node) => hasClass(node, "pv-progress")), "pv-progress--error"));
 });
 
+test("ok:false reconciles an authoritative connected result exactly once", async (t) => {
+  const staleStatus = deferred();
+  const connected = [];
+  let statusCalls = 0;
+  const { controller, slot } = mountConnect(t, {
+    pollDelayMs: 0,
+    service: {
+      connectStart: () => Promise.resolve({ phase: "detecting" }),
+      connectStatus: () => {
+        statusCalls++;
+        if (statusCalls === 1) return staleStatus.promise;
+        return Promise.resolve({ phase: "connected", providerId: "codex", accountId: "reconciled" });
+      },
+      connectCancel: () => Promise.resolve({ ok: false }),
+    },
+    onConnected: (result) => connected.push(result),
+  });
+
+  controller.start({ label: "Completed during cancel" });
+  button(slot, "Bắt đầu").click();
+  await flush();
+  button(slot, "Huỷ").click();
+  await flush();
+  await flush();
+
+  assert.equal(statusCalls, 2, "cancel starts a fresh authoritative status generation");
+  assert.deepEqual(connected, [{ kind: "codex", providerId: "codex", accountId: "reconciled" }]);
+
+  staleStatus.resolve({ phase: "connected", providerId: "codex", accountId: "stale" });
+  await flush();
+  assert.equal(connected.length, 1, "the invalidated pre-cancel poll cannot also complete");
+});
+
+test("ok:false warns through a nonterminal reconciliation and keeps polling to connected", async (t) => {
+  const clock = createClock();
+  const staleStatus = deferred();
+  const connected = [];
+  let statusCalls = 0;
+  const { controller, slot } = mountConnect(t, {
+    service: {
+      connectStart: () => Promise.resolve({ phase: "detecting" }),
+      connectStatus: () => {
+        statusCalls++;
+        if (statusCalls === 1) return staleStatus.promise;
+        if (statusCalls === 2) {
+          return Promise.resolve({ phase: "polling", message: "Kết nối vẫn đang được hoàn tất." });
+        }
+        return Promise.resolve({ phase: "connected", providerId: "codex", accountId: "after-warning" });
+      },
+      connectCancel: () => Promise.resolve({ ok: false, message: "Tác vụ đã đổi trạng thái." }),
+    },
+    onConnected: (result) => connected.push(result),
+    ...clock,
+  });
+
+  controller.start({ label: "Reconcile" });
+  button(slot, "Bắt đầu").click();
+  await flush();
+  button(slot, "Huỷ").click();
+  await flush();
+  await flush();
+
+  const warning = find(slot, (node) => hasClass(node, "pv-connect-warning"));
+  assert.ok(warning, "a rejected ownership claim remains visibly nonterminal");
+  assert.match(text(warning), /Tiếp tục theo dõi kết nối/);
+  assert.match(text(slot), /Kết nối vẫn đang được hoàn tất/);
+  assert.equal(clock.timeoutCount, 1, "the fresh generation waits at normal poll cadence");
+
+  clock.runTimeouts();
+  await flush();
+  assert.deepEqual(connected, [{ kind: "codex", providerId: "codex", accountId: "after-warning" }]);
+
+  staleStatus.resolve({ phase: "connected", providerId: "codex", accountId: "stale" });
+  await flush();
+  assert.equal(connected.length, 1);
+});
+
+test("a DELETE transport error warns and continues authoritative polling", async (t) => {
+  const clock = createClock();
+  const connected = [];
+  let statusCalls = 0;
+  const { controller, slot } = mountConnect(t, {
+    service: {
+      connectStart: () => Promise.resolve({ phase: "detecting" }),
+      connectStatus: () => {
+        statusCalls++;
+        if (statusCalls < 3) return Promise.resolve({ phase: "polling", message: "Đang chờ đăng nhập." });
+        return Promise.resolve({ phase: "connected", providerId: "codex", accountId: "after-delete-error" });
+      },
+      connectCancel: () => Promise.reject(new Error("Không thể huỷ kết nối")),
+    },
+    onConnected: (result) => connected.push(result),
+    ...clock,
+  });
+
+  controller.start({ label: "DELETE error" });
+  button(slot, "Bắt đầu").click();
+  await flush();
+  button(slot, "Huỷ").click();
+  await flush();
+  await flush();
+
+  const warning = find(slot, (node) => hasClass(node, "pv-connect-warning"));
+  assert.match(text(warning), /Không thể huỷ kết nối/);
+  assert.match(text(warning), /Tiếp tục theo dõi kết nối/);
+  assert.match(text(slot), /Đang chờ đăng nhập/);
+  assert.equal(statusCalls, 2, "the failed DELETE starts a fresh status request");
+  assert.equal(clock.timeoutCount, 1);
+
+  clock.runTimeouts();
+  await flush();
+  assert.deepEqual(connected, [{ kind: "codex", providerId: "codex", accountId: "after-delete-error" }]);
+});
+
+test("a failed first reconciliation fetch preserves live state, warns, and retries", async (t) => {
+  const clock = createClock();
+  const connected = [];
+  let statusCalls = 0;
+  const { controller, slot } = mountConnect(t, {
+    service: {
+      connectStart: () => Promise.resolve({ phase: "detecting" }),
+      connectStatus: () => {
+        statusCalls++;
+        if (statusCalls === 1) return Promise.resolve({ phase: "polling", message: "Đăng nhập vẫn đang chờ xác nhận." });
+        if (statusCalls === 2) return Promise.reject(new Error("Không đọc được trạng thái sau khi huỷ"));
+        return Promise.resolve({ phase: "connected", providerId: "codex", accountId: "after-get-error" });
+      },
+      connectCancel: () => Promise.resolve({ ok: false }),
+    },
+    onConnected: (result) => connected.push(result),
+    ...clock,
+  });
+
+  controller.start({ label: "GET error" });
+  button(slot, "Bắt đầu").click();
+  await flush();
+  button(slot, "Huỷ").click();
+  await flush();
+  await flush();
+
+  const warning = find(slot, (node) => hasClass(node, "pv-connect-warning"));
+  assert.match(text(warning), /Không đọc được trạng thái sau khi huỷ/);
+  assert.match(text(slot), /Đăng nhập vẫn đang chờ xác nhận/);
+  assert.equal(clock.timeoutCount, 1, "a reconciliation failure schedules an authoritative retry");
+
+  clock.runTimeouts();
+  await flush();
+  assert.deepEqual(connected, [{ kind: "codex", providerId: "codex", accountId: "after-get-error" }]);
+});
+
+test("a newer manual retry suppresses an in-flight cancel reconciliation callback", async (t) => {
+  const reconciliation = deferred();
+  const connected = [];
+  let statusCalls = 0;
+  const { controller, slot } = mountConnect(t, {
+    service: {
+      connectStart: () => Promise.resolve({ phase: "detecting" }),
+      connectStatus: () => {
+        statusCalls++;
+        if (statusCalls === 1) return Promise.resolve({ phase: "polling" });
+        if (statusCalls === 2) return reconciliation.promise;
+        return Promise.resolve({ phase: "connected", providerId: "codex", accountId: "new-run" });
+      },
+      connectCancel: () => Promise.resolve({ ok: false }),
+    },
+    onConnected: (result) => connected.push(result),
+    pollDelayMs: 60_000,
+  });
+
+  controller.start({ label: "Old run" });
+  button(slot, "Bắt đầu").click();
+  await flush();
+  button(slot, "Huỷ").click();
+  await flush();
+  assert.equal(statusCalls, 2);
+
+  controller.start({ label: "New run" });
+  reconciliation.resolve({ phase: "connected", providerId: "codex", accountId: "stale-reconcile" });
+  await flush();
+  assert.deepEqual(connected, []);
+  assert.match(text(slot), /Bắt đầu kết nối/);
+
+  button(slot, "Bắt đầu").click();
+  await flush();
+  assert.deepEqual(connected, [{ kind: "codex", providerId: "codex", accountId: "new-run" }]);
+});
+
+test("dispose suppresses an in-flight cancel reconciliation callback and retry", async (t) => {
+  const reconciliation = deferred();
+  const connected = [];
+  let statusCalls = 0;
+  const clock = createClock();
+  const { controller, slot } = mountConnect(t, {
+    service: {
+      connectStart: () => Promise.resolve({ phase: "detecting" }),
+      connectStatus: () => {
+        statusCalls++;
+        return statusCalls === 1 ? Promise.resolve({ phase: "polling" }) : reconciliation.promise;
+      },
+      connectCancel: () => Promise.resolve({ ok: false }),
+    },
+    onConnected: (result) => connected.push(result),
+    ...clock,
+  });
+
+  controller.start({ label: "Dispose race" });
+  button(slot, "Bắt đầu").click();
+  await flush();
+  button(slot, "Huỷ").click();
+  await flush();
+  assert.equal(statusCalls, 2);
+
+  controller.dispose();
+  reconciliation.resolve({ phase: "connected", providerId: "codex", accountId: "late" });
+  await flush();
+
+  assert.deepEqual(connected, []);
+  assert.equal(clock.intervalCount, 0);
+  assert.equal(clock.timeoutCount, 0);
+  assert.equal(text(slot), "");
+});
+
 test("a retry is isolated from a stale status result from the prior run", async (t) => {
   const firstStatus = deferred();
   const secondStatus = deferred();
