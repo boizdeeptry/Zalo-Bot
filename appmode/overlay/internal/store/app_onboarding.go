@@ -111,20 +111,29 @@ func (s *Store) SelectOnboardingProvider(
 	if !IsOnboardingProviderKind(kind) {
 		return OnboardingState{}, fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
 	}
-	return s.transitionOnboarding(expectedRevision, cleanedAccountID, func(state *OnboardingState) error {
+	return s.transitionOnboarding(expectedRevision, cleanedAccountID, func(state *OnboardingState) (bool, error) {
+		upgrade := state.Phase == OnboardingPhaseCompleted &&
+			state.CompletedVersion < CurrentOnboardingVersion && !state.RestartInProgress
 		switch state.Phase {
 		case OnboardingPhaseProvider,
 			OnboardingPhaseConnect,
 			OnboardingPhaseSetup,
 			OnboardingPhasePersona,
 			OnboardingPhaseTest:
+		case OnboardingPhaseCompleted:
+			if !upgrade {
+				return false, fmt.Errorf("select onboarding provider from %q: %w", state.Phase, ErrOnboardingInvalidPhase)
+			}
 		default:
-			return fmt.Errorf("select onboarding provider from %q: %w", state.Phase, ErrOnboardingInvalidPhase)
+			return false, fmt.Errorf("select onboarding provider from %q: %w", state.Phase, ErrOnboardingInvalidPhase)
 		}
 		state.Phase = OnboardingPhaseConnect
 		state.ProviderKind = kind
 		clearOnboardingStaging(state)
-		return nil
+		// A completed older-version flow may point at an enabled live Account. It is historical
+		// active configuration, not disposable onboarding staging, so starting the upgrade clears
+		// only the singleton fields and never asks the caller to delete its Account or directory.
+		return !upgrade, nil
 	})
 }
 
@@ -134,17 +143,19 @@ func (s *Store) RestartOnboarding(
 	expectedRevision int64,
 	cleanedAccountID string,
 ) (OnboardingState, error) {
-	return s.transitionOnboarding(expectedRevision, cleanedAccountID, func(state *OnboardingState) error {
+	return s.transitionOnboarding(expectedRevision, cleanedAccountID, func(state *OnboardingState) (bool, error) {
 		if state.Phase != OnboardingPhaseCompleted ||
-			state.CompletedVersion < CurrentOnboardingVersion ||
+			state.CompletedVersion != CurrentOnboardingVersion ||
 			state.RestartInProgress {
-			return fmt.Errorf("restart onboarding from phase %q: %w", state.Phase, ErrOnboardingInvalidPhase)
+			return false, fmt.Errorf("restart onboarding from phase %q: %w", state.Phase, ErrOnboardingInvalidPhase)
 		}
 		state.Phase = OnboardingPhaseProvider
 		state.ProviderKind = ""
 		state.RestartInProgress = true
 		clearOnboardingStaging(state)
-		return nil
+		// The completed Account and route are live service data, not disposable staging. Restart
+		// begins a replacement flow while the old configuration keeps serving until Complete.
+		return false, nil
 	})
 }
 
@@ -237,7 +248,7 @@ WHERE a.id = ?`, state.AccountID).Scan(
 func (s *Store) transitionOnboarding(
 	expectedRevision int64,
 	cleanedAccountID string,
-	apply func(*OnboardingState) error,
+	apply func(*OnboardingState) (cleanupOwnedStaging bool, err error),
 ) (OnboardingState, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -253,11 +264,20 @@ func (s *Store) transitionOnboarding(
 		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
 	}
 	ownedState := state
-	if err := apply(&state); err != nil {
+	cleanupOwnedStaging, err := apply(&state)
+	if err != nil {
 		return OnboardingState{}, err
 	}
-	if err := deleteOnboardingStagingAccount(tx, ownedState, cleanedAccountID); err != nil {
-		return OnboardingState{}, err
+	if cleanupOwnedStaging {
+		if err := deleteOnboardingStagingAccount(tx, ownedState, cleanedAccountID); err != nil {
+			return OnboardingState{}, err
+		}
+	} else if cleanedAccountID != "" {
+		return OnboardingState{}, fmt.Errorf(
+			"%w: transition owns no disposable staging Account but cleanup named %q",
+			ErrOnboardingInvalidStagingOwnership,
+			cleanedAccountID,
+		)
 	}
 
 	state.Revision++

@@ -904,7 +904,18 @@ func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 	if label == "" {
 		label = "Tài khoản"
 	}
+	// Admission shares the onboarding mutation gate. The lock order is always onboarding first,
+	// then connectManager.mu inside start/cancel, so a new Connect cannot appear between onboarding
+	// cancel/cleanup and its committed state transition.
+	onboardingMutationMu.Lock()
+	if r.Context().Err() != nil {
+		onboardingMutationMu.Unlock()
+		a.writeLLMErr(w, http.StatusRequestTimeout, "CONNECT_REQUEST_CANCELED",
+			"yêu cầu kết nối đã bị huỷ", nil)
+		return
+	}
 	st, err := connectMgr.start(kind, label)
+	onboardingMutationMu.Unlock()
 	if errors.Is(err, errConnectBusy) {
 		// Reachable now that codex and claude-code are both subscription kinds: starting one while
 		// the other is mid-connect returns errConnectBusy (a second POST of the SAME kind returns

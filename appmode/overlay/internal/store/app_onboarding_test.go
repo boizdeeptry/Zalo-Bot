@@ -302,6 +302,47 @@ func TestSelectOnboardingProviderRejectsCompletedPhase(t *testing.T) {
 	}
 }
 
+func TestOnboardingUpgradeSelectPreservesLiveAccountAndCompletion(t *testing.T) {
+	st := openAppStoreForTest(t)
+	insertOnboardingProviderForTest(t, st, "provider-live", "codex")
+	insertOnboardingAccountForTest(t, st, "live-account", "provider-live", true, "D:/live/codex")
+	setOnboardingStateForTest(t, st, OnboardingState{
+		CompletedVersion:   CurrentOnboardingVersion - 1,
+		Phase:              OnboardingPhaseCompleted,
+		ProviderKind:       "codex",
+		ProviderID:         "provider-live",
+		AccountID:          "live-account",
+		ModelID:            "live-model",
+		StagedComboID:      "live-combo",
+		PersonaFingerprint: "live-persona",
+		TestNonceHash:      "live-receipt",
+		TestExpiresAt:      "2026-08-11T08:00:00Z",
+		Revision:           7,
+	})
+	before := mustOnboardingStateForTest(t, st)
+
+	got, err := st.SelectOnboardingProvider(before.Revision, "claude-code", "")
+	if err != nil {
+		t.Fatalf("SelectOnboardingProvider(upgrade) = %v", err)
+	}
+	if got.CompletedVersion != before.CompletedVersion || got.Phase != OnboardingPhaseConnect ||
+		got.ProviderKind != "claude-code" || got.Revision != before.Revision+1 || got.RestartInProgress {
+		t.Fatalf("upgrade state = %+v", got)
+	}
+	assertOnboardingStagingClearedForTest(t, got, false)
+	if !onboardingAccountExistsForTest(t, st, "live-account") {
+		t.Fatal("upgrade selection deleted the previously completed live Account")
+	}
+	var enabled int
+	var configDir string
+	if err := st.db.QueryRow(`SELECT enabled, config_dir FROM llm_accounts WHERE id = 'live-account'`).Scan(&enabled, &configDir); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 || configDir != "D:/live/codex" {
+		t.Fatalf("live Account changed: enabled=%d config_dir=%q", enabled, configDir)
+	}
+}
+
 func TestSelectOnboardingProviderRequiresExactCleanedAccountID(t *testing.T) {
 	for _, cleanedAccountID := range []string{"", "other-account", " old-account"} {
 		t.Run(fmt.Sprintf("cleaned_%q", cleanedAccountID), func(t *testing.T) {
@@ -482,6 +523,7 @@ func TestRestartOnboardingRejectsBeforeCurrentCompletion(t *testing.T) {
 	}{
 		{name: "pre-completion phase", phase: OnboardingPhaseTest, completedVersion: 0},
 		{name: "old completed version", phase: OnboardingPhaseCompleted, completedVersion: CurrentOnboardingVersion - 1},
+		{name: "future completed version", phase: OnboardingPhaseCompleted, completedVersion: CurrentOnboardingVersion + 1},
 		{name: "already restarting", phase: OnboardingPhaseCompleted, completedVersion: CurrentOnboardingVersion, restartInProgress: true},
 	}
 	for _, tt := range tests {
@@ -505,18 +547,36 @@ func TestRestartOnboardingRejectsBeforeCurrentCompletion(t *testing.T) {
 	}
 }
 
-func TestRestartOnboardingPreservesCompletionAndClearsStaging(t *testing.T) {
+func TestRestartOnboardingPreservesLiveAccountAndRouting(t *testing.T) {
 	st := openAppStoreForTest(t)
-	insertOnboardingProviderForTest(t, st, "provider-old", "claude-code")
-	insertOnboardingAccountForTest(t, st, "old-account", "provider-old", false, "D:/onboarding/old")
+	insertOnboardingProviderForTest(t, st, "provider-live", "codex")
+	if err := st.AddLLMModel(LLMModel{
+		ProviderID: "provider-live", ModelID: "model-live", Name: "Live model",
+		Source: LLMModelManual, Available: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	insertOnboardingAccountForTest(t, st, "live-account", "provider-live", true, "D:/live/account")
+	combo, err := st.CreateLLMCombo("live combo", "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReplaceLLMComboMembers(combo.ID, combo.Revision, "fallback", []LLMRouteEntry{{
+		ProviderID: "provider-live", ModelID: "model-live", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetActiveLLMCombo(combo.ID); err != nil {
+		t.Fatal(err)
+	}
 	setOnboardingStateForTest(t, st, OnboardingState{
-		CompletedVersion:   CurrentOnboardingVersion + 2,
+		CompletedVersion:   CurrentOnboardingVersion,
 		Phase:              OnboardingPhaseCompleted,
-		ProviderKind:       "claude-code",
-		ProviderID:         "provider-old",
-		AccountID:          "old-account",
-		ModelID:            "model-old",
-		StagedComboID:      "combo-old",
+		ProviderKind:       "codex",
+		ProviderID:         "provider-live",
+		AccountID:          "live-account",
+		ModelID:            "model-live",
+		StagedComboID:      combo.ID,
 		PersonaFingerprint: "persona-old",
 		TestNonceHash:      "nonce-old",
 		TestExpiresAt:      "2026-08-11T08:00:00Z",
@@ -524,12 +584,9 @@ func TestRestartOnboardingPreservesCompletionAndClearsStaging(t *testing.T) {
 		UpdatedAt:          "2026-08-11T07:00:00Z",
 	})
 	old := mustOnboardingStateForTest(t, st)
-	cleanup, err := st.OnboardingStagingAccount(old.Revision)
-	if err != nil {
-		t.Fatal(err)
-	}
+	beforeRouting := onboardingRoutingDigestForTest(t, st)
 
-	got, err := st.RestartOnboarding(old.Revision, cleanup.AccountID)
+	got, err := st.RestartOnboarding(old.Revision, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -538,8 +595,16 @@ func TestRestartOnboardingPreservesCompletionAndClearsStaging(t *testing.T) {
 		t.Fatalf("restart state = %+v; old = %+v", got, old)
 	}
 	assertOnboardingStagingClearedForTest(t, got, true)
-	if onboardingAccountExistsForTest(t, st, "old-account") {
-		t.Fatal("owned staging account survived restart")
+	accounts, err := st.LLMAccounts("provider-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != "live-account" || !accounts[0].Enabled ||
+		accounts[0].ConfigDir != "D:/live/account" {
+		t.Fatalf("restart changed live Account: %+v", accounts)
+	}
+	if afterRouting := onboardingRoutingDigestForTest(t, st); afterRouting != beforeRouting {
+		t.Fatalf("restart changed Combo/route data:\nbefore=%s\nafter=%s", beforeRouting, afterRouting)
 	}
 	if _, err := st.RestartOnboarding(old.Revision, ""); !errors.Is(err, ErrOnboardingConflict) {
 		t.Fatalf("repeated stale restart error = %v; want ErrOnboardingConflict", err)
@@ -552,70 +617,43 @@ func TestRestartOnboardingPreservesCompletionAndClearsStaging(t *testing.T) {
 	}
 }
 
-func TestRestartOnboardingRequiresExactStagingOwnership(t *testing.T) {
+func TestRestartOnboardingRejectsCleanupOwnershipForLiveAccount(t *testing.T) {
 	st := openAppStoreForTest(t)
-	insertOnboardingProviderForTest(t, st, "provider-old", "claude-code")
-	insertOnboardingAccountForTest(t, st, "old-account", "provider-old", false, "D:/onboarding/old")
+	insertOnboardingProviderForTest(t, st, "provider-live", "codex")
+	insertOnboardingAccountForTest(t, st, "live-account", "provider-live", true, "D:/live/account")
 	setOnboardingStateForTest(t, st, OnboardingState{
 		CompletedVersion: CurrentOnboardingVersion,
 		Phase:            OnboardingPhaseCompleted,
-		ProviderKind:     "claude-code",
-		ProviderID:       "provider-old",
-		AccountID:        "old-account",
+		ProviderKind:     "codex",
+		ProviderID:       "provider-live",
+		AccountID:        "live-account",
 		Revision:         15,
 		UpdatedAt:        "2026-08-11T07:00:00Z",
 	})
 	before := mustOnboardingStateForTest(t, st)
-	for _, cleanedAccountID := range []string{"", "other-account"} {
-		if _, err := st.RestartOnboarding(before.Revision, cleanedAccountID); !errors.Is(err, ErrOnboardingInvalidStagingOwnership) {
-			t.Fatalf("RestartOnboarding(%q) error = %v; want ErrOnboardingInvalidStagingOwnership", cleanedAccountID, err)
-		}
+	beforeAccounts, err := st.LLMAccounts("provider-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RestartOnboarding(before.Revision, "live-account"); !errors.Is(err, ErrOnboardingInvalidStagingOwnership) {
+		t.Fatalf("RestartOnboarding(nonempty cleanup) error = %v; want ErrOnboardingInvalidStagingOwnership", err)
 	}
 	if after := mustOnboardingStateForTest(t, st); after != before {
 		t.Fatalf("invalid restart cleanup mutated state: before=%+v after=%+v", before, after)
 	}
-	if !onboardingAccountExistsForTest(t, st, "old-account") {
-		t.Fatal("invalid restart cleanup deleted the staging account")
-	}
-}
-
-func TestRestartOnboardingRollsBackAccountDeleteOnCASFailure(t *testing.T) {
-	st := openAppStoreForTest(t)
-	insertOnboardingProviderForTest(t, st, "provider-old", "claude-code")
-	insertOnboardingAccountForTest(t, st, "old-account", "provider-old", false, "D:/onboarding/old")
-	setOnboardingStateForTest(t, st, OnboardingState{
-		CompletedVersion: CurrentOnboardingVersion,
-		Phase:            OnboardingPhaseCompleted,
-		ProviderKind:     "claude-code",
-		ProviderID:       "provider-old",
-		AccountID:        "old-account",
-		Revision:         16,
-		UpdatedAt:        "2026-08-11T07:00:00Z",
-	})
-	before := mustOnboardingStateForTest(t, st)
-	if _, err := st.db.Exec(`CREATE TRIGGER onboarding_restart_test_force_cas_failure
-BEFORE DELETE ON llm_accounts WHEN OLD.id = 'old-account'
-BEGIN
-  UPDATE app_onboarding_state SET revision = revision + 1 WHERE id = 1;
-END`); err != nil {
+	afterAccounts, err := st.LLMAccounts("provider-live")
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	if _, err := st.RestartOnboarding(before.Revision, "old-account"); !errors.Is(err, ErrOnboardingConflict) {
-		t.Fatalf("error = %v; want ErrOnboardingConflict", err)
-	}
-	if after := mustOnboardingStateForTest(t, st); after != before {
-		t.Fatalf("failed restart CAS changed state: before=%+v after=%+v", before, after)
-	}
-	if !onboardingAccountExistsForTest(t, st, "old-account") {
-		t.Fatal("account deletion survived restart CAS rollback")
+	if fmt.Sprintf("%#v", afterAccounts) != fmt.Sprintf("%#v", beforeAccounts) {
+		t.Fatalf("invalid restart cleanup changed live Account: before=%+v after=%+v", beforeAccounts, afterAccounts)
 	}
 }
 
 func TestSelectOnboardingProviderAfterRestartPreservesRestartMarkers(t *testing.T) {
 	st := openAppStoreForTest(t)
 	setOnboardingStateForTest(t, st, OnboardingState{
-		CompletedVersion: CurrentOnboardingVersion + 1,
+		CompletedVersion: CurrentOnboardingVersion,
 		Phase:            OnboardingPhaseCompleted,
 		Revision:         30,
 		UpdatedAt:        "2026-08-11T07:00:00Z",
@@ -705,6 +743,19 @@ func onboardingAccountExistsForTest(t *testing.T, st *Store, accountID string) b
 		t.Fatal(err)
 	}
 	return count == 1
+}
+
+func onboardingRoutingDigestForTest(t *testing.T, st *Store) string {
+	t.Helper()
+	combos, err := st.LLMCombos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, err := st.LLMRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("combos=%#v route=%#v", combos, route)
 }
 
 func assertOnboardingStagingClearedForTest(t *testing.T, state OnboardingState, clearProviderKind bool) {
