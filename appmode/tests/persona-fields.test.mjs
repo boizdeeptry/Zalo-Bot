@@ -48,6 +48,55 @@ test("persona values use backend normalization and Unicode limits", () => {
   );
 });
 
+test("persona normalization matches Go whitespace edges and rejects internal controls", () => {
+  const goSpaces = [
+    "\u0009",
+    "\u0085",
+    "\u00a0",
+    "\u1680",
+    "\u2007",
+    "\u2028",
+    "\u2029",
+    "\u202f",
+    "\u205f",
+    "\u3000",
+  ];
+  for (const space of goSpaces) {
+    assert.deepEqual(validatePersonaValue(`${space}Bé Mi${space}`), {
+      ok: true,
+      value: "Bé Mi",
+      error: "",
+    });
+  }
+  assert.equal(validatePersonaValue("\u0085").error, "chưa điền");
+
+  for (const value of [
+    "Bé\u0085Mi",
+    "Bé\u0000Mi",
+    "Bé\tMi",
+    "Bé\u001bMi",
+    "Bé\u2028Mi",
+    "Bé\u2029Mi",
+  ]) {
+    const result = validatePersonaValue(value);
+    assert.equal(result.ok, false, JSON.stringify(value));
+    assert.notEqual(result.error, "", JSON.stringify(value));
+  }
+});
+
+test("persona validation preserves combining marks and ZWJ emoji while counting code points", () => {
+  assert.deepEqual(validatePersonaValue("  a\u0301o  "), {
+    ok: true,
+    value: "a\u0301o",
+    error: "",
+  });
+  const family = "👨‍👩‍👧‍👦";
+  const exactlySixty = `${family.repeat(8)}🙂🙂🙂🙂`;
+  assert.equal([...exactlySixty].length, 60);
+  assert.equal(validatePersonaValue(exactlySixty).ok, true);
+  assert.equal(validatePersonaValue(`${exactlySixty}a`).ok, false);
+});
+
 test("field model preserves every server record and key while humanizing only labels", () => {
   const dangerousKey = `vai-trò_đặc biệt"><img src=x>`;
   const model = createPersonaFieldModel({
@@ -67,10 +116,10 @@ test("field model preserves every server record and key while humanizing only la
     dangerousKey,
   ]);
   assert.deepEqual(model.fields.map(({ id }) => id), [
-    "hole:0:TEN_BOT",
-    `hole:1:${dangerousKey}`,
-    "hole:2:TEN_CHUYEN_GIA",
-    `hole:3:${dangerousKey}`,
+    "hole:0",
+    "hole:1",
+    "hole:2",
+    "hole:3",
   ]);
   assert.equal(model.fields[0].label, "Tên bot");
   assert.equal(model.fields[0].sample, "Mẫu từ máy chủ");
@@ -161,6 +210,43 @@ test("legacy-ready persona renders and validates only a dedicated display-name f
   });
 });
 
+test("valid persisted display name stays authoritative without a duplicate field", () => {
+  const model = createPersonaFieldModel({
+    display_name: "\u0085  Trợ lý An \u3000",
+    placeholders: [{ key: "don-vi", count: 1 }],
+  });
+  assert.deepEqual(model.fields.map(({ kind, key }) => ({ kind, key })), [
+    { kind: "persona", key: "don-vi" },
+  ]);
+  assert.deepEqual(model.validate({ values: { "don-vi": " Công ty Mở " } }), {
+    ok: true,
+    values: { "don-vi": "Công ty Mở" },
+    displayName: "Trợ lý An",
+    errors: {},
+    fieldErrors: {},
+    remaining: 0,
+    firstErrorKey: null,
+    firstErrorId: null,
+  });
+
+  const ready = createPersonaFieldModel({ display_name: "  Trợ lý An  ", placeholders: [] });
+  assert.equal(ready.fields.length, 0);
+  assert.equal(ready.validate().displayName, "Trợ lý An");
+  assert.equal(ready.validate().ok, true);
+});
+
+test("invalid persisted display name fails closed with an editable dedicated field", () => {
+  const model = createPersonaFieldModel({
+    display_name: "Tên\u0000bot",
+    placeholders: [{ key: "don-vi", count: 1 }],
+  });
+  assert.deepEqual(model.fields.map(({ kind }) => kind), ["persona", "display-name"]);
+  const result = model.validate({ values: { "don-vi": "Công ty Mở" } });
+  assert.equal(result.ok, false);
+  assert.equal(result.firstErrorKey, "display_name");
+  assert.equal(result.firstErrorId, "display-name");
+});
+
 test("synthetic display name stays distinct from legitimate display_name holes", () => {
   const model = createPersonaFieldModel({
     placeholders: [
@@ -169,8 +255,8 @@ test("synthetic display name stays distinct from legitimate display_name holes",
     ],
   });
   assert.deepEqual(model.fields.map(({ id, key }) => ({ id, key })), [
-    { id: "hole:0:display_name", key: "display_name" },
-    { id: "hole:1:display_name", key: "display_name" },
+    { id: "hole:0", key: "display_name" },
+    { id: "hole:1", key: "display_name" },
     { id: "display-name", key: "display_name" },
   ]);
 
@@ -191,10 +277,10 @@ test("synthetic display name stays distinct from legitimate display_name holes",
   });
   assert.equal(missingHoles.remaining, 2);
   assert.equal(missingHoles.firstErrorKey, "display_name");
-  assert.equal(missingHoles.firstErrorId, "hole:0:display_name");
+  assert.equal(missingHoles.firstErrorId, "hole:0");
   assert.deepEqual(Object.keys(missingHoles.fieldErrors), [
-    "hole:0:display_name",
-    "hole:1:display_name",
+    "hole:0",
+    "hole:1",
   ]);
 });
 
@@ -219,7 +305,12 @@ test("DOM controller renders safely, updates the counter, advances Enter, and fo
 
   const inputs = findAll(host, (node) => node.tagName === "INPUT");
   assert.equal(inputs.length, 2);
-  assert.equal(inputs[0].getAttribute("data-persona-key"), unsafeKey);
+  assert.equal(inputs[0].getAttribute("data-persona-key"), null);
+  assert.equal(inputs[0].getAttribute("data-persona-field-id"), "hole:0");
+  assert.equal(
+    [...inputs[0].attributes.values()].some((value) => value.includes(unsafeKey)),
+    false,
+  );
   assert.equal(inputs[0].getAttribute("placeholder"), "điền giá trị");
   assert.equal(text(host).includes("<img src=x onerror=alert(1)>") , true);
   assert.equal(findAll(host, (node) => node.tagName === "IMG" || node.tagName === "SVG").length, 0);
@@ -231,10 +322,33 @@ test("DOM controller renders safely, updates the counter, advances Enter, and fo
   assert.equal(changes.at(-1).displayName, "Bé Mi");
 
   inputs[0].focus();
+  const composingFirst = { type: "keydown", key: "Enter", isComposing: true };
+  inputs[0].dispatchEvent(composingFirst);
+  assert.equal(composingFirst.defaultPrevented, false);
+  assert.equal(document.activeElement, inputs[0]);
+  assert.equal(finalEnters, 0);
+
+  const imeFirst = { type: "keydown", key: "Enter", keyCode: 229 };
+  inputs[0].dispatchEvent(imeFirst);
+  assert.equal(imeFirst.defaultPrevented, false);
+  assert.equal(document.activeElement, inputs[0]);
+
   const firstEnter = { type: "keydown", key: "Enter" };
   inputs[0].dispatchEvent(firstEnter);
   assert.equal(firstEnter.defaultPrevented, true);
   assert.equal(document.activeElement, inputs[1]);
+
+  const composingFinal = { type: "keydown", key: "Enter", isComposing: true };
+  inputs[1].dispatchEvent(composingFinal);
+  assert.equal(composingFinal.defaultPrevented, false);
+  assert.equal(document.activeElement, inputs[1]);
+  assert.equal(finalEnters, 0);
+
+  const imeFinal = { type: "keydown", key: "Enter", keyCode: 229 };
+  inputs[1].dispatchEvent(imeFinal);
+  assert.equal(imeFinal.defaultPrevented, false);
+  assert.equal(document.activeElement, inputs[1]);
+  assert.equal(finalEnters, 0);
 
   const finalEnter = { type: "keydown", key: "Enter" };
   inputs[1].dispatchEvent(finalEnter);
@@ -278,7 +392,7 @@ test("DOM controller synchronizes repeated keys and focuses collision errors by 
   inputs[1].dispatchEvent({ type: "input" });
   assert.equal(inputs[0].value, "");
   result = controller.validate();
-  assert.equal(result.firstErrorId, "hole:0:display_name");
+  assert.equal(result.firstErrorId, "hole:0");
   controller.focusFirstError(result);
   assert.equal(document.activeElement, inputs[0]);
 });
@@ -321,11 +435,11 @@ test("DOM controller read/render/dispose removes stale listeners and callbacks",
   staleInput.value = "Cũ";
   assert.deepEqual(controller.read(), { values: { TEN_BOT: "Cũ" }, displayName: "Cũ" });
 
-  controller.render({ placeholders: [], display_name: "Tên mới" });
+  controller.render({ placeholders: [], display_name: "" });
   staleInput.dispatchEvent({ type: "input" });
   assert.equal(changes, 0);
   const currentInput = find(host, (node) => node.tagName === "INPUT");
-  assert.equal(currentInput.value, "Tên mới");
+  assert.equal(currentInput.value, "");
   currentInput.dispatchEvent({ type: "input" });
   assert.equal(changes, 1);
 

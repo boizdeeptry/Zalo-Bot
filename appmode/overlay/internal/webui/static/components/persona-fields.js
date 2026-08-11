@@ -3,6 +3,8 @@ export const MAX_PERSONA_VALUE_CODE_POINTS = 60;
 const MAX_LABEL_CODE_POINTS = 80;
 const MAX_SAMPLE_CODE_POINTS = 160;
 const DISPLAY_NAME_KEY = "display_name";
+const GO_EDGE_WHITESPACE_PATTERN = /^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
+const UNSAFE_CONTROL_PATTERN = /[\p{Cc}\p{Zl}\p{Zp}]/u;
 const FRIENDLY_FIELDS = Object.freeze({
   TEN_BOT: Object.freeze({
     label: "Tên bot",
@@ -66,7 +68,7 @@ function initialRawValue(input, field) {
 }
 
 export function validatePersonaValue(rawValue) {
-  const value = String(rawValue ?? "").trim();
+  const value = String(rawValue ?? "").replace(GO_EDGE_WHITESPACE_PATTERN, "");
   if (!value) return { ok: false, value, error: "chưa điền" };
   if ([...value].length > MAX_PERSONA_VALUE_CODE_POINTS) {
     return {
@@ -78,11 +80,15 @@ export function validatePersonaValue(rawValue) {
   if (/[\r\n]/u.test(value) || value.includes("{{") || value.includes("}}")) {
     return { ok: false, value, error: "không được chứa xuống dòng hay {{ }}" };
   }
+  if (UNSAFE_CONTROL_PATTERN.test(value)) {
+    return { ok: false, value, error: "không được chứa ký tự điều khiển hay dấu xuống dòng" };
+  }
   return { ok: true, value, error: "" };
 }
 
 export function createPersonaFieldModel(agent = {}) {
   const displayName = typeof agent?.display_name === "string" ? agent.display_name : "";
+  const persistedDisplayName = validatePersonaValue(displayName);
   const holes = normalizedHoles(agent);
   const hasBotName = holes.some(({ key }) => key === "TEN_BOT");
   const firstValues = new Map();
@@ -93,7 +99,7 @@ export function createPersonaFieldModel(agent = {}) {
     const candidate = ownValue || (hole.key === "TEN_BOT" ? displayName : "");
     if (!firstValues.has(hole.key)) firstValues.set(hole.key, candidate);
     return Object.freeze({
-      id: `hole:${index}:${hole.key}`,
+      id: `hole:${index}`,
       kind: "persona",
       key: hole.key,
       label: friendly?.label ?? humanizeKey(hole.key),
@@ -103,7 +109,7 @@ export function createPersonaFieldModel(agent = {}) {
       initialValue: firstValues.get(hole.key),
     });
   });
-  if (!hasBotName) {
+  if (!hasBotName && !persistedDisplayName.ok) {
     fields.push(Object.freeze({
       id: "display-name",
       kind: "display-name",
@@ -122,7 +128,9 @@ export function createPersonaFieldModel(agent = {}) {
     const fieldErrorEntries = [];
     const recordedValues = new Set();
     const recordedErrors = new Set();
-    let authoritativeDisplayName = "";
+    let authoritativeDisplayName = !hasBotName && persistedDisplayName.ok
+      ? persistedDisplayName.value
+      : "";
     let firstErrorKey = null;
     let firstErrorId = null;
     for (const field of fields) {
@@ -222,8 +230,6 @@ export function createPersonaFields({
     for (const { field, input } of entries) {
       const invalid = Object.hasOwn(result.fieldErrors, field.id);
       input.setAttribute("aria-invalid", String(invalid));
-      if (invalid) input.setAttribute("data-persona-error", result.fieldErrors[field.id]);
-      else input.removeAttribute("data-persona-error");
     }
     return result;
   }
@@ -259,7 +265,6 @@ export function createPersonaFields({
           type: "text",
           placeholder: field.placeholder,
           required: true,
-          "data-persona-key": field.key,
           "data-persona-kind": field.kind,
           "data-persona-field-id": field.id,
         },
@@ -278,7 +283,7 @@ export function createPersonaFields({
         onChange(result);
       };
       const onKeydown = (event) => {
-        if (disposed || event?.key !== "Enter") return;
+        if (disposed || event?.key !== "Enter" || event.isComposing || event.keyCode === 229) return;
         event.preventDefault();
         const next = entries[index + 1]?.input;
         if (next) next.focus();
