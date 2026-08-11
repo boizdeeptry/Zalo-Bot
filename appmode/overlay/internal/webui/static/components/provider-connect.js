@@ -73,7 +73,7 @@ function validateService(service) {
   }
 }
 
-function normalizeServiceSnapshot(snapshot, shape = "status") {
+function normalizeServiceSnapshot(snapshot, shape = "status", providerKind = "") {
   const value = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
     ? snapshot
     : {};
@@ -95,6 +95,12 @@ function normalizeServiceSnapshot(snapshot, shape = "status") {
     providerId: safeIdentifier(value.providerId),
     accountId: safeIdentifier(value.accountId),
   };
+  if ((Object.hasOwn(value, "kind") && value.kind !== providerKind)
+    || (value.phase === "connected"
+      && typeof value.providerId === "string"
+      && value.providerId !== providerKind)) {
+    return { ...normalized, phase: "error", message: PROTOCOL_ERROR_MESSAGE, error: "" };
+  }
   if (value.phase === "idle") {
     return { ...normalized, phase: "error", message: IDLE_MESSAGE, error: "" };
   }
@@ -458,7 +464,7 @@ export function createProviderConnect({
   }
 
   async function applyServiceStatus(run, snapshot) {
-    const status = normalizeServiceSnapshot(snapshot);
+    const status = normalizeServiceSnapshot(snapshot, "status", providerKind);
     if (!ownsRun(run)) return true;
     if (status.phase === "connected"
       && (!status.providerId || !status.accountId)) {

@@ -325,6 +325,40 @@ test("a connected snapshot without terminal ids cannot refresh the Provider deta
     "an invalid connected snapshot never paints completed progress");
 });
 
+test("a contradictory connected identity cannot refresh the Provider detail", async (t) => {
+  let listCalls = 0;
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) {
+      listCalls++;
+      return { providers: [], kinds: [] };
+    }
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") {
+      return { kind: "codex", phase: "detecting" };
+    }
+    if (path === "/llm/providers/codex/connect" && !options.method) {
+      return {
+        kind: "claude-code",
+        phase: "connected",
+        providerId: "claude-code",
+        accountId: "foreign-account",
+      };
+    }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
+  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && /Bắt đầu/.test(text(node))).click();
+  for (let turn = 0; turn < 20; turn++) await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(listCalls, 1, "a foreign connected identity never invokes the account refresh callback");
+  assert.match(text(main), /phản hồi trạng thái kết nối không hợp lệ/i);
+  assert.notEqual(find(main, (node) => hasClass(node, "pv-progress"))?.getAttribute("aria-valuenow"), "100",
+    "a contradictory identity never paints completed progress");
+});
+
 // The backend sets loginUrl/code exactly as it flips awaiting_login -> polling, so the URL+code
 // must render during POLLING, not only awaiting_login (a real E2E bug: gating the display on
 // phase==="awaiting_login" meant the user never saw the code they must type). Mock stuck on

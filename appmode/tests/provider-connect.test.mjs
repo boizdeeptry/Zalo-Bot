@@ -316,11 +316,11 @@ test("connected snapshots with non-string terminal ids never invoke the callback
 
 test("control-bearing and oversized terminal ids are rejected instead of rewritten", async (t) => {
   const cases = [
-    ["control-bearing provider id", "codex\nforged", "a1"],
-    ["oversized account id", "codex", "a".repeat(MAX_CONNECT_LOG_LENGTH + 1)],
+    ["control-bearing provider id", "codex\nforged", "a1", /phản hồi trạng thái kết nối không hợp lệ/i],
+    ["oversized account id", "codex", "a".repeat(MAX_CONNECT_LOG_LENGTH + 1), /thiếu định danh Provider hoặc tài khoản/],
   ];
 
-  for (const [name, providerId, accountId] of cases) {
+  for (const [name, providerId, accountId, expectedMessage] of cases) {
     await t.test(name, async (subtest) => {
       const clock = createClock();
       const connected = [];
@@ -335,11 +335,197 @@ test("control-bearing and oversized terminal ids are rejected instead of rewritt
       await flush();
 
       assert.deepEqual(connected, []);
-      assert.match(text(slot), /thiếu định danh Provider hoặc tài khoản/);
+      assert.match(text(slot), expectedMessage);
       assert.equal(clock.intervalCount, 0);
       assert.equal(clock.timeoutCount, 0);
     });
   }
+});
+
+test("start and ordinary status snapshots reject contradictory provider identities", async (t) => {
+  const cases = [
+    [
+      "immediate nonterminal start kind mismatch",
+      "start",
+      "codex",
+      { kind: "claude-code", phase: "polling" },
+    ],
+    [
+      "immediate start kind mismatch",
+      "start",
+      "codex",
+      { kind: "claude-code", phase: "connected", providerId: "codex", accountId: "a1" },
+    ],
+    [
+      "immediate start provider id mismatch",
+      "start",
+      "codex",
+      { kind: "codex", phase: "connected", providerId: "claude-code", accountId: "a1" },
+    ],
+    [
+      "ordinary status swaps Claude for Codex",
+      "status",
+      "claude-code",
+      { kind: "codex", phase: "connected", providerId: "codex", accountId: "a1" },
+    ],
+    [
+      "ordinary status changes kind case",
+      "status",
+      "codex",
+      { kind: "Codex", phase: "connected", providerId: "codex", accountId: "a1" },
+    ],
+    [
+      "ordinary status pads the provider id",
+      "status",
+      "codex",
+      { kind: "codex", phase: "connected", providerId: " codex", accountId: "a1" },
+    ],
+  ];
+
+  for (const [name, path, kind, snapshot] of cases) {
+    await t.test(name, async (subtest) => {
+      const clock = createClock();
+      const connected = [];
+      const unhandled = captureUnhandledRejections(subtest);
+      let statusCalls = 0;
+      const { controller, slot } = mountConnect(subtest, {
+        kind,
+        service: {
+          connectStart: () => Promise.resolve(
+            path === "start" ? snapshot : { kind, phase: "detecting" },
+          ),
+          connectStatus: () => {
+            statusCalls++;
+            return Promise.resolve(snapshot);
+          },
+          connectCancel: () => Promise.resolve({ ok: true }),
+        },
+        onConnected: (result) => connected.push(result),
+        ...clock,
+      });
+
+      controller.start({ label: name });
+      button(slot, "Bắt đầu").click();
+      await flush();
+      await flush();
+
+      assert.deepEqual(connected, []);
+      assert.match(text(slot), /phản hồi trạng thái kết nối không hợp lệ/i);
+      assert.ok(hasClass(find(slot, (node) => hasClass(node, "pv-progress")), "pv-progress--error"));
+      assert.equal(statusCalls, path === "status" ? 1 : 0);
+      assert.equal(clock.intervalCount, 0);
+      assert.equal(clock.timeoutCount, 0);
+      assert.deepEqual(unhandled, []);
+    });
+  }
+});
+
+test("cancel reconciliation rejects contradictory provider identities on every recovery branch", async (t) => {
+  const cases = [
+    [
+      "ok:false reconciliation pads kind",
+      "rejected",
+      { kind: "codex ", phase: "connected", providerId: "codex", accountId: "a1" },
+    ],
+    [
+      "ok:false reconciliation controls provider id",
+      "rejected",
+      { kind: "codex", phase: "connected", providerId: "codex\n", accountId: "a1" },
+    ],
+    [
+      "DELETE error reconciliation controls kind",
+      "transport",
+      { kind: "codex\u0000", phase: "connected", providerId: "codex", accountId: "a1" },
+    ],
+    [
+      "DELETE error reconciliation changes provider id case",
+      "transport",
+      { kind: "codex", phase: "connected", providerId: "Codex", accountId: "a1" },
+    ],
+  ];
+
+  for (const [name, cancelMode, snapshot] of cases) {
+    await t.test(name, async (subtest) => {
+      const clock = createClock();
+      const staleStatus = deferred();
+      const connected = [];
+      const unhandled = captureUnhandledRejections(subtest);
+      let statusCalls = 0;
+      const { controller, slot } = mountConnect(subtest, {
+        service: {
+          connectStart: () => Promise.resolve({ kind: "codex", phase: "detecting" }),
+          connectStatus: () => {
+            statusCalls++;
+            return statusCalls === 1 ? staleStatus.promise : Promise.resolve(snapshot);
+          },
+          connectCancel: () => cancelMode === "rejected"
+            ? Promise.resolve({ ok: false })
+            : Promise.reject(new Error("DELETE failed")),
+        },
+        onConnected: (result) => connected.push(result),
+        ...clock,
+      });
+
+      controller.start({ label: name });
+      button(slot, "Bắt đầu").click();
+      await flush();
+      button(slot, "Huỷ").click();
+      await flush();
+      await flush();
+
+      assert.equal(statusCalls, 2);
+      assert.deepEqual(connected, []);
+      assert.match(text(slot), /phản hồi trạng thái kết nối không hợp lệ/i);
+      assert.ok(hasClass(find(slot, (node) => hasClass(node, "pv-progress")), "pv-progress--error"));
+      assert.equal(clock.intervalCount, 0);
+      assert.equal(clock.timeoutCount, 0);
+      assert.deepEqual(unhandled, []);
+
+      staleStatus.resolve({
+        kind: "codex",
+        phase: "connected",
+        providerId: "codex",
+        accountId: "stale",
+      });
+      await flush();
+      assert.deepEqual(connected, []);
+      assert.deepEqual(unhandled, []);
+    });
+  }
+});
+
+test("an exact immediate connected identity invokes the callback once", async (t) => {
+  const clock = createClock();
+  const connected = [];
+  const unhandled = captureUnhandledRejections(t);
+  let statusCalls = 0;
+  const { controller, slot } = mountConnect(t, {
+    service: {
+      connectStart: () => Promise.resolve({
+        kind: "codex",
+        phase: "connected",
+        providerId: "codex",
+        accountId: "a1",
+      }),
+      connectStatus: () => {
+        statusCalls++;
+        return Promise.resolve({ phase: "connected", providerId: "codex", accountId: "duplicate" });
+      },
+      connectCancel: () => Promise.resolve({ ok: true }),
+    },
+    onConnected: (result) => connected.push(result),
+    ...clock,
+  });
+
+  controller.start({ label: "Exact identity" });
+  button(slot, "Bắt đầu").click();
+  await flush();
+
+  assert.deepEqual(connected, [{ kind: "codex", providerId: "codex", accountId: "a1" }]);
+  assert.equal(statusCalls, 0);
+  assert.equal(clock.intervalCount, 0);
+  assert.equal(clock.timeoutCount, 0);
+  assert.deepEqual(unhandled, []);
 });
 
 test("malformed cancel and reconciliation snapshots stay safe, retry, and never reject unhandled", async (t) => {
