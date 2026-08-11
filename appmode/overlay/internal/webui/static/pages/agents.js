@@ -102,6 +102,8 @@ function agentFacts(agent, openDocument) {
 }
 
 function quickFill(agent, onSave) {
+  const holes = Array.isArray(agent?.placeholders) ? agent.placeholders : [];
+  if (!holes.some((hole) => hole && typeof hole.key === "string" && hole.key)) return null;
   const note = element("span", { className: "note", attributes: { "aria-live": "polite" } });
   const save = element("button", { className: "btn go", attributes: { type: "submit" }, text: "Lưu văn phong" });
   let saving = false;
@@ -112,7 +114,7 @@ function quickFill(agent, onSave) {
     note.textContent = "";
     const validation = fields.validate();
     if (!validation.ok) {
-      note.textContent = `không lưu được: ${validation.errors[validation.firstErrorKey]}`;
+      note.textContent = `không lưu được: ${validation.fieldErrors[validation.firstErrorId]}`;
       fields.focusFirstError(validation);
       return;
     }
@@ -280,8 +282,11 @@ export function createAgentsPage({ request = requestJSON } = {}) {
           await service.fill(values, displayName);
           if (!disposed) await refresh();
         });
-        disposeQuickFill = personaFields.dispose;
-        root.replaceChildren(header(), banner, personaFields.node, agentFacts(agent, openDocument), element("div", { className: "hint", text: "Phạm vi quyền cố định là chỉ-đọc, và đó là chủ đích: agent này tự động trả lời khách, nên nó không có quyền ghi hay xoá bất cứ gì. Con agent biên soạn wiki ở mục Knowledge mới có quyền ghi." }));
+        if (personaFields) disposeQuickFill = personaFields.dispose;
+        const children = [header(), banner];
+        if (personaFields) children.push(personaFields.node);
+        children.push(agentFacts(agent, openDocument), element("div", { className: "hint", text: "Phạm vi quyền cố định là chỉ-đọc, và đó là chủ đích: agent này tự động trả lời khách, nên nó không có quyền ghi hay xoá bất cứ gì. Con agent biên soạn wiki ở mục Knowledge mới có quyền ghi." }));
+        root.replaceChildren(...children);
       } catch (error) {
         if (!disposed && revision === refreshRevision && error?.name !== "AbortError") root.replaceChildren(header(), errorPanel(error));
       }

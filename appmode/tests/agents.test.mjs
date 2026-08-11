@@ -59,7 +59,6 @@ test("agent service uses the shared API contract for quick fill and persona save
   await service.load();
   await service.fill({ TEN_BOT: "An Nhiên" });
   await service.fill({ TEN_BOT: "Bé Mi" }, "Bé Mi");
-  await service.fill({}, "Tên legacy");
   await service.loadDocument("persona");
   await service.saveDocument("persona", "Giọng Việt — UTF-8");
 
@@ -67,7 +66,6 @@ test("agent service uses the shared API contract for quick fill and persona save
     { path: "/agent", options: {} },
     { path: "/agent", options: { method: "PUT", body: { values: { TEN_BOT: "An Nhiên" } } } },
     { path: "/agent", options: { method: "PUT", body: { values: { TEN_BOT: "Bé Mi" }, display_name: "Bé Mi" } } },
-    { path: "/agent", options: { method: "PUT", body: { values: {}, display_name: "Tên legacy" } } },
     { path: "/agent/persona/persona", options: {} },
     { path: "/agent/persona/persona", options: { method: "PUT", body: { text: "Giọng Việt — UTF-8" } } },
   ]);
@@ -110,7 +108,18 @@ test("Agent page keeps its quick-fill layout and sends normalized values plus di
   assert.equal(inputs.length, 2);
   assert.equal(form.firstElementChild.getAttribute("style"), "max-width:660px");
   assert.equal(find(form, (node) => hasClass(node, "row")).children[0].className, "btn go");
-  assert.equal(inputs[0].getAttribute("placeholder"), "Tên bot từ tệp");
+  assert.deepEqual(
+    findAll(form, (node) => hasClass(node, "fk")).map((node) => text(node)),
+    ["Tên bot", "Don vi"],
+  );
+  assert.deepEqual(inputs.map((input) => input.getAttribute("placeholder")), [
+    "ví dụ: trợ lý An — tên bot tự gọi mình",
+    "điền giá trị",
+  ]);
+  assert.deepEqual(
+    findAll(form, (node) => hasClass(node, "fs")).map((node) => text(node)),
+    ["Tên bot từ tệp", "Đơn vị {{don-vi}}"],
+  );
   inputs[0].value = "  Bé Mi  ";
   inputs[1].value = "  Công ty Mở  ";
   form.dispatchEvent({ type: "submit" });
@@ -126,14 +135,16 @@ test("Agent page keeps its quick-fill layout and sends normalized values plus di
   assert.equal(loads, 2);
 });
 
-test("Agent page supports a legacy display-name-only save without a duplicate TEN_BOT input", async (t) => {
+test("Agent page preserves the legacy ready state without an incompatible display-name-only form", async (t) => {
   const dom = installDOM();
   t.after(dom.restore);
   const requests = [];
   const page = createAgentsPage({
     request: async (path, options = {}) => {
       requests.push({ path, options });
-      if (path === "/agent" && options.method === "PUT") return { ready: true };
+      if (path === "/agent" && options.method === "PUT") {
+        throw new Error("normal Agent page must not PUT an empty values object");
+      }
       if (path === "/agent") return {
         ready: true,
         display_name: "Tên cũ",
@@ -150,16 +161,12 @@ test("Agent page supports a legacy display-name-only save without a duplicate TE
   await flush();
 
   const form = find(main, (node) => node.tagName === "FORM");
-  const inputs = findAll(form, (node) => node.tagName === "INPUT");
-  assert.equal(inputs.length, 1);
-  assert.equal(inputs[0].getAttribute("data-persona-kind"), "display-name");
-  assert.equal(inputs[0].value, "Tên cũ");
-  inputs[0].value = "  Tên mới  ";
-  form.dispatchEvent({ type: "submit" });
-  await flush();
-
-  const put = requests.find(({ options }) => options.method === "PUT");
-  assert.deepEqual(put.options.body, { values: {}, display_name: "Tên mới" });
+  assert.equal(form, null);
+  assert.equal(
+    text(find(main, (node) => hasClass(node, "banner"))),
+    "Sẵn sàng nói chuyện với kháchKhông còn chỗ trống nào trong tệp văn phong.",
+  );
+  assert.equal(requests.filter(({ options }) => options.method === "PUT").length, 0);
 });
 
 test("Agent page prevents double save, reports failures, and restores field focus", async (t) => {

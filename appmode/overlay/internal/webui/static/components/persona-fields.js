@@ -9,7 +9,7 @@ const FRIENDLY_FIELDS = Object.freeze({
     placeholder: "ví dụ: trợ lý An — tên bot tự gọi mình",
   }),
   TEN_CHUYEN_GIA: Object.freeze({
-    label: "Tên chuyên gia",
+    label: "Chuyên gia",
     placeholder: "ví dụ: Anh Nam — người mà tri thức thuộc về",
   }),
 });
@@ -40,12 +40,9 @@ function normalizedCount(value) {
 
 function normalizedHoles(agent) {
   const holes = Array.isArray(agent?.placeholders) ? agent.placeholders : [];
-  const seen = new Set();
   const result = [];
   for (const hole of holes) {
     if (!hole || typeof hole !== "object" || typeof hole.key !== "string" || !hole.key) continue;
-    if (seen.has(hole.key)) continue;
-    seen.add(hole.key);
     result.push(hole);
   }
   return result;
@@ -88,24 +85,27 @@ export function createPersonaFieldModel(agent = {}) {
   const displayName = typeof agent?.display_name === "string" ? agent.display_name : "";
   const holes = normalizedHoles(agent);
   const hasBotName = holes.some(({ key }) => key === "TEN_BOT");
-  const fields = holes.map((hole) => {
+  const firstValues = new Map();
+  const fields = holes.map((hole, index) => {
     const friendly = FRIENDLY_FIELDS[hole.key];
     const hasServerSample = typeof hole.sample === "string" && hole.sample.length > 0;
     const ownValue = typeof hole.value === "string" ? hole.value : "";
+    const candidate = ownValue || (hole.key === "TEN_BOT" ? displayName : "");
+    if (!firstValues.has(hole.key)) firstValues.set(hole.key, candidate);
     return Object.freeze({
+      id: `hole:${index}:${hole.key}`,
       kind: "persona",
       key: hole.key,
       label: friendly?.label ?? humanizeKey(hole.key),
       count: normalizedCount(hole.count),
       sample: hasServerSample ? clipCodePoints(hole.sample, MAX_SAMPLE_CODE_POINTS) : "",
-      placeholder: hasServerSample
-        ? clipCodePoints(hole.sample, MAX_SAMPLE_CODE_POINTS)
-        : (friendly?.placeholder ?? "điền giá trị"),
-      initialValue: ownValue || (hole.key === "TEN_BOT" ? displayName : ""),
+      placeholder: friendly?.placeholder ?? "điền giá trị",
+      initialValue: firstValues.get(hole.key),
     });
   });
   if (!hasBotName) {
     fields.push(Object.freeze({
+      id: "display-name",
       kind: "display-name",
       key: DISPLAY_NAME_KEY,
       label: DISPLAY_NAME_FIELD.label,
@@ -119,27 +119,43 @@ export function createPersonaFieldModel(agent = {}) {
   function validate(input = {}) {
     const valueEntries = [];
     const errorEntries = [];
+    const fieldErrorEntries = [];
+    const recordedValues = new Set();
+    const recordedErrors = new Set();
     let authoritativeDisplayName = "";
     let firstErrorKey = null;
+    let firstErrorId = null;
     for (const field of fields) {
       const result = validatePersonaValue(initialRawValue(input, field));
-      if (field.kind === "persona") valueEntries.push([field.key, result.value]);
+      if (field.kind === "persona" && !recordedValues.has(field.key)) {
+        valueEntries.push([field.key, result.value]);
+        recordedValues.add(field.key);
+      }
       if (field.key === "TEN_BOT" || field.kind === "display-name") {
         authoritativeDisplayName = result.value;
       }
       if (!result.ok) {
-        errorEntries.push([field.key, `${fieldErrorLabel(field)} ${result.error}`]);
-        if (firstErrorKey === null) firstErrorKey = field.key;
+        const message = `${fieldErrorLabel(field)} ${result.error}`;
+        fieldErrorEntries.push([field.id, message]);
+        if (!recordedErrors.has(field.key)) {
+          errorEntries.push([field.key, message]);
+          recordedErrors.add(field.key);
+        }
+        if (firstErrorId === null) {
+          firstErrorKey = field.key;
+          firstErrorId = field.id;
+        }
       }
     }
-    const errors = Object.fromEntries(errorEntries);
     return {
-      ok: errorEntries.length === 0,
+      ok: fieldErrorEntries.length === 0,
       values: Object.fromEntries(valueEntries),
       displayName: authoritativeDisplayName,
-      errors,
-      remaining: errorEntries.length,
+      errors: Object.fromEntries(errorEntries),
+      fieldErrors: Object.fromEntries(fieldErrorEntries),
+      remaining: fieldErrorEntries.length,
       firstErrorKey,
+      firstErrorId,
     };
   }
 
@@ -204,9 +220,9 @@ export function createPersonaFields({
     remaining = result.remaining;
     root.setAttribute("data-persona-remaining", remaining);
     for (const { field, input } of entries) {
-      const invalid = Object.hasOwn(result.errors, field.key);
+      const invalid = Object.hasOwn(result.fieldErrors, field.id);
       input.setAttribute("aria-invalid", String(invalid));
-      if (invalid) input.setAttribute("data-persona-error", result.errors[field.key]);
+      if (invalid) input.setAttribute("data-persona-error", result.fieldErrors[field.id]);
       else input.removeAttribute("data-persona-error");
     }
     return result;
@@ -217,8 +233,8 @@ export function createPersonaFields({
   }
 
   function focusFirstError(result = validate()) {
-    if (!result?.firstErrorKey) return false;
-    const entry = entries.find(({ field }) => field.key === result.firstErrorKey);
+    if (!result?.firstErrorId) return false;
+    const entry = entries.find(({ field }) => field.id === result.firstErrorId);
     entry?.input.focus();
     return Boolean(entry);
   }
@@ -241,16 +257,23 @@ export function createPersonaFields({
         attributes: {
           id: inputId,
           type: "text",
-          maxlength: MAX_PERSONA_VALUE_CODE_POINTS,
           placeholder: field.placeholder,
           required: true,
           "data-persona-key": field.key,
           "data-persona-kind": field.kind,
+          "data-persona-field-id": field.id,
         },
       });
       input.value = field.initialValue;
       const onInput = () => {
         if (disposed) return;
+        if (field.kind === "persona") {
+          for (const entry of entries) {
+            if (entry.input !== input && entry.field.kind === "persona" && entry.field.key === field.key) {
+              entry.input.value = input.value;
+            }
+          }
+        }
         const result = validate();
         onChange(result);
       };
