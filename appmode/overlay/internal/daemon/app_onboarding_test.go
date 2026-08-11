@@ -749,11 +749,73 @@ func TestAppOnboardingTestChatPostflightRejectsMutationsWhileRunnerIsBlocked(t *
 	}
 }
 
-func TestAppOnboardingProviderCancelsRunningTestWithoutWaitingForRunnerBudget(t *testing.T) {
+func TestAppOnboardingProviderStaleRevisionDoesNotCancelRunningTest(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 33)
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRunner := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseRunner()
+	withAppOnboardingTestSeams(t,
+		func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+			close(entered)
+			select {
+			case <-ctx.Done():
+				close(canceled)
+				return "", ctx.Err()
+			case <-release:
+				return "Xin chào, tôi là Bé Mi.", nil
+			}
+		},
+		time.Now,
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+		120*time.Second,
+	)
+	testDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		testDone <- env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":33,"message":"xin chào"}`)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("runner was not entered")
+	}
+
+	provider := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":32,"kind":"claude-code"}`)
+	requireOnboardingCode(t, provider, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT")
+	select {
+	case <-canceled:
+		t.Fatal("stale provider request canceled the valid running test")
+	default:
+	}
+
+	releaseRunner()
+	select {
+	case rr := <-testDone:
+		if rr.Code != http.StatusOK {
+			t.Fatalf("test chat status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		response := decodeOnboardingResponse[appOnboardingTestChatResponse](t, rr)
+		if response.Revision != 34 || response.TestToken == "" {
+			t.Fatalf("test chat receipt = %+v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("test chat did not finish after runner release")
+	}
+	state := env.state(t)
+	if state.Revision != 34 || state.ProviderKind != "codex" || state.TestNonceHash == "" || state.TestExpiresAt == "" {
+		t.Fatalf("stale provider request changed or suppressed valid receipt: %+v", state)
+	}
+}
+
+func TestAppOnboardingProviderCancelsAndWaitsForRunningTestBeforeTransition(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	seedAppOnboardingTestChat(t, env, "codex", 33)
 	configDir := accountConfigDir(env.dataDir, "codex", "staged-account")
 	entered := make(chan struct{})
+	canceled := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseRunner := func() { releaseOnce.Do(func() { close(release) }) }
@@ -766,6 +828,8 @@ func TestAppOnboardingProviderCancelsRunningTestWithoutWaitingForRunnerBudget(t 
 				if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
 					t.Errorf("provider cleanup raced the active runner: info=%v err=%v", info, err)
 				}
+				close(canceled)
+				<-release
 				return "", ctx.Err()
 			case <-release:
 				return "Xin chào, tôi là Bé Mi.", nil
@@ -790,14 +854,24 @@ func TestAppOnboardingProviderCancelsRunningTestWithoutWaitingForRunnerBudget(t 
 		providerDone <- env.serve(http.MethodPut, "/onboarding/provider", `{"revision":33,"kind":"claude-code"}`)
 	}()
 	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		releaseRunner()
+		t.Fatal("provider mutation did not cancel the external runner")
+	}
+	select {
+	case rr := <-providerDone:
+		t.Fatalf("provider mutation finished before runner cleanup: status=%d body=%s", rr.Code, rr.Body.String())
+	default:
+	}
+	releaseRunner()
+	select {
 	case rr := <-providerDone:
 		if rr.Code != http.StatusOK {
 			t.Fatalf("provider mutation status=%d body=%s", rr.Code, rr.Body.String())
 		}
 	case <-time.After(time.Second):
-		releaseRunner()
-		<-providerDone
-		t.Fatal("provider mutation remained blocked behind the external runner")
+		t.Fatal("provider mutation did not finish after runner cleanup")
 	}
 	select {
 	case rr := <-testDone:
@@ -810,6 +884,74 @@ func TestAppOnboardingProviderCancelsRunningTestWithoutWaitingForRunnerBudget(t 
 	}
 	if _, err := os.Stat(configDir); !os.IsNotExist(err) {
 		t.Fatalf("provider cleanup did not remove staging config after runner exit: %v", err)
+	}
+}
+
+func TestAppOnboardingProviderCanceledWaiterDoesNotMutate(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 35)
+	before := env.state(t)
+	configDir := accountConfigDir(env.dataDir, "codex", "staged-account")
+	entered := make(chan struct{})
+	runnerCanceled := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRunner := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseRunner()
+	withAppOnboardingTestSeams(t,
+		func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+			close(entered)
+			<-ctx.Done()
+			close(runnerCanceled)
+			<-release
+			return "", ctx.Err()
+		},
+		time.Now,
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+		120*time.Second,
+	)
+	testDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		testDone <- env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":35,"message":"xin chào"}`)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("runner was not entered")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPut, "/onboarding/provider", strings.NewReader(`{"revision":35,"kind":"claude-code"}`)).WithContext(ctx)
+	providerDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { providerDone <- env.serveRequest(request) }()
+	select {
+	case <-runnerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("provider request did not reach the cancellation wait")
+	}
+	cancel()
+	select {
+	case rr := <-providerDone:
+		requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_CLEANUP_FAILED")
+	case <-time.After(time.Second):
+		t.Fatal("context-canceled provider waiter did not return promptly")
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("context-canceled provider waiter mutated state: before=%+v after=%+v", before, after)
+	}
+	if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
+		t.Fatalf("context-canceled provider waiter removed config: info=%v err=%v", info, err)
+	}
+
+	releaseRunner()
+	select {
+	case rr := <-testDone:
+		requireOnboardingCode(t, rr, http.StatusRequestTimeout, "ONBOARDING_REQUEST_CANCELED")
+	case <-time.After(time.Second):
+		t.Fatal("test chat did not finish after runner cleanup")
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("canceled test or waiter mutated state: before=%+v after=%+v", before, after)
 	}
 }
 

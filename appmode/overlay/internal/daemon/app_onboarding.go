@@ -158,6 +158,26 @@ func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject stale or otherwise invalid transitions before they can disturb a
+	// valid Test Chat. Do not wait for the external runner while holding the
+	// mutation lock: the runner's handler must reacquire it to finish.
+	onboardingMutationMu.Lock()
+	if r.Context().Err() != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingCleanupFailed(w, r.Context().Err())
+		return
+	}
+	if _, _, _, ok := a.preflightOnboardingProviderMutation(w, request.Revision); !ok {
+		onboardingMutationMu.Unlock()
+		return
+	}
+	if r.Context().Err() != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingCleanupFailed(w, r.Context().Err())
+		return
+	}
+	onboardingMutationMu.Unlock()
+
 	if !cancelAndWaitAppOnboardingTest(r.Context()) {
 		a.writeOnboardingCleanupFailed(w, r.Context().Err())
 		return
@@ -169,13 +189,8 @@ func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, ok := a.onboardingMutationState(w, request.Revision)
+	state, upgrade, owned, ok := a.preflightOnboardingProviderMutation(w, request.Revision)
 	if !ok {
-		return
-	}
-	upgrade, err := preflightOnboardingProvider(state)
-	if err != nil {
-		a.writeOnboardingStoreError(w, err)
 		return
 	}
 	if r.Context().Err() != nil {
@@ -194,12 +209,12 @@ func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
 	if !a.cancelOnboardingConnect(w, r.Context(), state) {
 		return
 	}
-	if _, ok := a.onboardingMutationState(w, request.Revision); !ok {
+	if r.Context().Err() != nil {
+		a.writeOnboardingCleanupFailed(w, r.Context().Err())
 		return
 	}
-	owned, err := a.st.OnboardingStagingAccount(request.Revision)
-	if err != nil {
-		a.writeOnboardingStoreError(w, err)
+	_, _, owned, ok = a.preflightOnboardingProviderMutation(w, request.Revision)
+	if !ok {
 		return
 	}
 	if r.Context().Err() != nil {
@@ -856,6 +871,33 @@ func preflightOnboardingProvider(state store.OnboardingState) (upgrade bool, err
 		}
 	}
 	return false, store.ErrOnboardingInvalidPhase
+}
+
+// preflightOnboardingProviderMutation performs every side-effect-free check
+// needed before a provider transition. Callers hold onboardingMutationMu so
+// the state snapshot remains authoritative until they deliberately release it.
+func (a *api) preflightOnboardingProviderMutation(
+	w http.ResponseWriter,
+	expectedRevision int64,
+) (store.OnboardingState, bool, store.OnboardingStagingAccount, bool) {
+	state, ok := a.onboardingMutationState(w, expectedRevision)
+	if !ok {
+		return store.OnboardingState{}, false, store.OnboardingStagingAccount{}, false
+	}
+	upgrade, err := preflightOnboardingProvider(state)
+	if err != nil {
+		a.writeOnboardingStoreError(w, err)
+		return store.OnboardingState{}, false, store.OnboardingStagingAccount{}, false
+	}
+	if upgrade {
+		return state, true, store.OnboardingStagingAccount{}, true
+	}
+	owned, err := a.st.OnboardingStagingAccount(expectedRevision)
+	if err != nil {
+		a.writeOnboardingStoreError(w, err)
+		return store.OnboardingState{}, false, store.OnboardingStagingAccount{}, false
+	}
+	return state, false, owned, true
 }
 
 func preflightOnboardingRestart(state store.OnboardingState) error {
