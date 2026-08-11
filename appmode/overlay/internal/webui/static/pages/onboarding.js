@@ -1,215 +1,20 @@
 import { createProviderConnect } from "../components/provider-connect.js";
-import { requestJSON as sharedRequestJSON } from "../core/api.js";
 import { element } from "../core/ui.js";
 import { createProviderService } from "./providers.js";
-
-const SUPPORTED_PROVIDERS = new Set(["codex", "claude-code"]);
-const SUPPORTED_PHASES = new Set([
-  "provider", "connect", "setup", "persona", "test", "completed",
-]);
-const STATUS_FIELDS = Object.freeze([
-  "required", "current_version", "completed_version", "phase", "provider_kind",
-  "suggested_provider_kind", "provider_id", "account_id", "model_id",
-  "restart_in_progress", "revision",
-]);
-const IDENTIFIER_LIMIT = 1_000;
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
-const STEP_LABELS = Object.freeze(["Kết nối", "Cá nhân hoá", "Trò chuyện thử"]);
-const SAFE_ERROR = "Không thể tiếp tục thiết lập. Trạng thái chưa hợp lệ hoặc đã thay đổi.";
-const SAFE_SETUP_ERROR = "Chưa thể chuẩn bị cấu hình. Vui lòng thử lại.";
-const isRecord = (value) => Boolean(value)
-  && typeof value === "object" && !Array.isArray(value);
-const positiveRevision = (value) => Number.isSafeInteger(value) && value > 0 ? value : 0;
-const successorRevision = (value) => positiveRevision(value)
-  && value < Number.MAX_SAFE_INTEGER ? value + 1 : 0;
-
-function semanticString(value, { allowEmpty = false } = {}) {
-  if (typeof value !== "string"
-    || value.length > IDENTIFIER_LIMIT
-    || value.trim() !== value
-    || CONTROL_CHARACTERS.test(value)
-    || (!allowEmpty && !value)) {
-    return null;
-  }
-  return value;
-}
-function optionalSemanticString(record, field) {
-  if (!Object.hasOwn(record, field)) return "";
-  return semanticString(record[field], { allowEmpty: true });
-}
-function projectStatus(value) {
-  if (!isRecord(value)) return value;
-  const projected = {};
-  for (const field of STATUS_FIELDS) {
-    if (Object.hasOwn(value, field)) projected[field] = value[field];
-  }
-  return projected;
-}
-function requireProviderKind(kind) {
-  if (!SUPPORTED_PROVIDERS.has(kind)) {
-    throw new RangeError("Onboarding provider kind is not supported");
-  }
-  return kind;
-}
-function requireRevision(revision) {
-  const valid = positiveRevision(revision);
-  if (!valid) throw new RangeError("Onboarding revision must be a positive safe integer");
-  return valid;
-}
-function requireAccountID(accountId) {
-  const valid = semanticString(accountId);
-  if (!valid) throw new TypeError("Onboarding account id is invalid");
-  return valid;
-}
-function requireSuccessor(revision) {
-  const successor = successorRevision(revision);
-  if (!successor) throw new RangeError("Onboarding revision has no safe successor");
-  return successor;
-}
-function normalizeSetupResponse(response, { accountID, revision, providerKind = "" }) {
-  if (!isRecord(response)) return null;
-  const kind = semanticString(response.provider_kind);
-  const providerID = semanticString(response.provider_id);
-  const returnedAccountID = semanticString(response.account_id);
-  const modelID = semanticString(response.model_id);
-  const stagedComboID = semanticString(response.staged_combo_id);
-  const comboName = semanticString(response.combo_name);
-  if (response.revision !== successorRevision(revision)
-    || (Object.hasOwn(response, "phase") && response.phase !== "persona")
-    || !SUPPORTED_PROVIDERS.has(kind)
-    || (providerKind && kind !== providerKind)
-    || providerID !== kind || returnedAccountID !== accountID
-    || !modelID || !stagedComboID || !comboName) return null;
-  return {
-    phase: "persona", revision: response.revision, provider_kind: kind,
-    provider_id: providerID, account_id: returnedAccountID, model_id: modelID,
-    staged_combo_id: stagedComboID, combo_name: comboName,
-  };
-}
-export function createOnboardingService({ requestJSON = sharedRequestJSON } = {}) {
-  if (typeof requestJSON !== "function") {
-    throw new TypeError("Onboarding service requires a requestJSON function");
-  }
-  return Object.freeze({
-    status(signal) {
-      return Promise.resolve(requestJSON("/onboarding/status", { signal })).then(projectStatus);
-    },
-    selectProvider(kind, revision, signal) {
-      const providerKind = requireProviderKind(kind), currentRevision = requireRevision(revision);
-      requireSuccessor(currentRevision);
-      return Promise.resolve(requestJSON("/onboarding/provider", {
-        method: "PUT", body: { kind: providerKind, revision: currentRevision }, signal,
-      })).then((response) => {
-        const normalized = normalizeProviderSelection(response, { providerKind, revision: currentRevision });
-        if (!normalized) throw new TypeError("Invalid onboarding provider response");
-        return normalized;
-      });
-    },
-    setup(accountId, revision, signal) {
-      const exactAccountID = requireAccountID(accountId);
-      const currentRevision = requireRevision(revision);
-      requireSuccessor(currentRevision);
-      return Promise.resolve(requestJSON("/onboarding/setup", {
-        method: "POST",
-        body: { account_id: exactAccountID, revision: currentRevision },
-        signal,
-      })).then((response) => {
-        const normalized = normalizeSetupResponse(response, {
-          accountID: exactAccountID, revision: currentRevision,
-        });
-        if (!normalized) throw new TypeError("Invalid onboarding setup response");
-        return normalized;
-      });
-    },
-  });
-}
-function normalizeStatus(snapshot) {
-  if (!isRecord(snapshot)
-    || snapshot.required !== true
-    || !SUPPORTED_PHASES.has(snapshot.phase)) {
-    return null;
-  }
-  const revision = positiveRevision(snapshot.revision);
-  const providerKindValue = optionalSemanticString(snapshot, "provider_kind");
-  const suggestionValue = optionalSemanticString(snapshot, "suggested_provider_kind");
-  const providerID = optionalSemanticString(snapshot, "provider_id");
-  const accountID = optionalSemanticString(snapshot, "account_id");
-  const modelID = optionalSemanticString(snapshot, "model_id");
-  if (!revision
-    || providerKindValue === null
-    || suggestionValue === null
-    || providerID === null
-    || accountID === null
-    || modelID === null) {
-    return null;
-  }
-  const providerKind = SUPPORTED_PROVIDERS.has(providerKindValue) ? providerKindValue : "";
-  const suggestedProviderKind = SUPPORTED_PROVIDERS.has(suggestionValue) ? suggestionValue : "";
-  if (snapshot.phase !== "provider" && snapshot.phase !== "completed"
-    && !providerKind) {
-    return null;
-  }
-  if ((snapshot.phase === "setup" || snapshot.phase === "persona")
-    && (!accountID || !providerID || providerID !== providerKind)) {
-    return null;
-  }
-  if (snapshot.phase === "persona" && !modelID) return null;
-  return {
-    required: true,
-    phase: snapshot.phase,
-    provider_kind: providerKind,
-    suggested_provider_kind: suggestedProviderKind,
-    provider_id: providerID,
-    account_id: accountID,
-    model_id: modelID,
-    revision,
-  };
-}
-function normalizeProviderSelection(snapshot, { providerKind, revision }) {
-  const normalized = normalizeStatus(snapshot);
-  if (!normalized || normalized.phase !== "connect"
-    || normalized.provider_kind !== providerKind
-    || normalized.revision !== successorRevision(revision)
-    || normalized.provider_id || normalized.account_id || normalized.model_id) return null;
-  return normalized;
-}
-function normalizeConnectedSetup(snapshot, { providerKind, accountID, revision }) {
-  const normalized = normalizeStatus(snapshot);
-  if (!normalized || normalized.phase !== "setup"
-    || normalized.provider_kind !== providerKind || normalized.provider_id !== providerKind
-    || normalized.account_id !== accountID || normalized.model_id
-    || normalized.revision !== successorRevision(revision)) return null;
-  return normalized;
-}
-function normalizeSetupResult(result, expected) {
-  const normalized = normalizeSetupResponse(result, {
-    accountID: expected.accountID,
-    revision: expected.revision,
-    providerKind: expected.providerKind,
-  });
-  if (!normalized || normalized.provider_id !== expected.providerID) return null;
-  return { required: true, suggested_provider_kind: "", ...normalized };
-}
-const providerName = (kind) => kind === "claude-code" ? "Claude Code" : "Codex";
-function currentStepIndex(phase) {
-  if (phase === "persona") return 1;
-  if (phase === "test" || phase === "completed") return 2;
-  return 0;
-}
-function validatePageService(service) {
-  for (const method of ["status", "selectProvider", "setup"]) {
-    if (typeof service?.[method] !== "function") {
-      throw new TypeError(`Onboarding page service requires ${method}()`);
-    }
-  }
-}
-function validateConnectController(controller) {
-  for (const method of ["mount", "start", "cancel", "dispose"]) {
-    if (typeof controller?.[method] !== "function") {
-      throw new TypeError(`Provider Connect controller requires ${method}()`);
-    }
-  }
-}
+import {
+  SAFE_ERROR, SAFE_SETUP_ERROR, SUPPORTED_PROVIDERS, createOnboardingService, isRecord,
+  normalizeAgentResponse, normalizeCompleteResponse, normalizeConnectedSetup,
+  normalizeProviderSelection, normalizeSetupResult, normalizeStatus, normalizeTestMessage,
+  normalizeTestResponse, positiveRevision, safeServerFieldCount, semanticString, successorRevision,
+  terminalIdentity, testResponseError, validDisplayName, validateConnectController,
+  validateOnboardingPageService,
+} from "./onboarding-contract.js";
+import { createDoneStage, createPersonaStage, createTestStage } from "./onboarding-late-view.js";
+import {
+  createConnectStage, createLoadingStatus, createRetryButton, createSafeErrorStage,
+  createSetupStage, createWelcomeStage, renderOnboardingShell,
+} from "./onboarding-early-view.js";
+export { createOnboardingService };
 export function createOnboardingPage({
   initialStatus,
   service = createOnboardingService(),
@@ -219,28 +24,25 @@ export function createOnboardingPage({
   setupSuccessDelayMs = 0,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
+  nowFn = Date.now,
   connectOptions = {},
 } = {}) {
-  validatePageService(service);
+  validateOnboardingPageService(service);
   if (typeof connectFactory !== "function") {
     throw new TypeError("Onboarding page requires a connect factory");
   }
   if (typeof onComplete !== "function") throw new TypeError("onComplete must be a function");
+  if (typeof nowFn !== "function") throw new TypeError("nowFn must be a function");
   let state = normalizeStatus(initialStatus);
   let selectedProvider = state?.phase === "provider"
     ? state.provider_kind || state.suggested_provider_kind
     : "";
-  let host = null;
-  let root = null;
-  let disposed = false;
-  let generation = 0;
-  let activeController = null;
-  let personaTimer = null;
-  let connectController = null;
-  let connectKey = "";
-  let connectBackPromise = null;
-  let connectTerminalPromise = null;
-  let setupInFlight = null;
+  let host = null, root = null, activeController = null, personaTimer = null;
+  let connectController = null, connectBackPromise = null, connectTerminalPromise = null;
+  let setupInFlight = null, personaView = null, testView = null, doneView = null;
+  let disposed = false, generation = 0, connectKey = "", agentName = "";
+  let testMessage = "Xin chào", testResult = null, testError = "", testToken = "", testExpiresAt = 0, receiptTimer = null;
+  let personaBusy = false, testBusy = false, completeBusy = false, handoffDone = false;
   const listeners = new Set();
   function listen(node, type, listener) {
     node.addEventListener(type, listener);
@@ -257,6 +59,19 @@ export function createOnboardingPage({
     if (personaTimer === null) return;
     clearTimeoutFn(personaTimer);
     personaTimer = null;
+  }
+  function disposePersonaView() {
+    personaView?.dispose();
+    personaView = null;
+  }
+  function clearReceipt({ clearResult = true } = {}) {
+    testToken = "";
+    testExpiresAt = 0;
+    if (receiptTimer !== null) {
+      clearTimeoutFn(receiptTimer);
+      receiptTimer = null;
+    }
+    if (clearResult) testResult = null;
   }
   function abortActive() {
     activeController?.abort();
@@ -280,7 +95,6 @@ export function createOnboardingPage({
   function releaseOperation(run, controller) {
     if (generation === run && activeController === controller) activeController = null;
   }
-
   function disposeConnect() {
     const instance = connectController;
     connectController = null;
@@ -293,148 +107,45 @@ export function createOnboardingPage({
       // A broken child controller must not retain the onboarding host.
     }
   }
-
-  function rail(phase) {
-    const current = currentStepIndex(phase);
-    return element(
-      "nav",
-      { className: "onboarding-rail", attributes: { "aria-label": "Tiến trình thiết lập" } },
-      element("ol", { className: "onboarding-step-list" }, STEP_LABELS.map((label, index) => {
-        const attributes = index === current ? { "aria-current": "step" } : {};
-        return element(
-          "li",
-          {
-            className: `onboarding-step${index === current ? " is-current" : ""}`,
-            attributes,
-          },
-          element("span", { className: "onboarding-step-index", text: index + 1 }),
-          element("span", { className: "onboarding-step-label", text: label }),
-        );
-      })),
-    );
-  }
-
   function shell(phase, content) {
-    root.replaceChildren(
-      element(
-        "div",
-        { className: "onboarding-shell" },
-        element(
-          "aside",
-          { className: "onboarding-sidebar" },
-          element("div", { className: "onboarding-brand", text: "TuvanZalo" }),
-          rail(phase),
-        ),
-        element("main", { className: "onboarding-main" }, content),
-      ),
-    );
+    renderOnboardingShell(root, phase, content);
   }
-
-  function retryButton(action) {
-    return listen(element("button", {
-      className: "onboarding-button onboarding-button--secondary",
-      attributes: { type: "button" },
-      text: "Thử lại",
-    }), "click", () => { void action(); });
-  }
-
   function renderSafeError(message = SAFE_ERROR, retry = refreshStatus) {
+    disposePersonaView();
     disposeConnect();
     clearListeners();
-    shell(
-      state?.phase || "provider",
-      element(
-        "section",
-        { className: "onboarding-stage onboarding-error-stage" },
-        element("h1", { text: "Chưa thể tiếp tục" }),
-        element("p", {
-          className: "onboarding-error",
-          attributes: { role: "alert" },
-          text: message,
-        }),
-        retryButton(retry),
-      ),
-    );
+    shell(state?.phase || "provider", createSafeErrorStage(
+      message, createRetryButton(listen, retry),
+    ));
   }
-
   function renderLoading() {
+    disposePersonaView();
     connectTerminalPromise = null;
     disposeConnect();
     clearListeners();
-    shell(
-      state?.phase || "provider",
-      element("p", {
-        className: "onboarding-status",
-        attributes: { role: "status" },
-        text: "Đang tải lại trạng thái…",
-      }),
-    );
+    shell(state?.phase || "provider", createLoadingStatus("Đang tải lại trạng thái…"));
   }
-
   function renderWelcome(message = "") {
+    disposePersonaView();
     connectTerminalPromise = null;
     disposeConnect();
     clearListeners();
-    const cards = [
-      ["codex", "Codex"],
-      ["claude-code", "Claude Code"],
-    ].map(([kind, label]) => listen(element("button", {
-      className: `onboarding-provider-card${selectedProvider === kind ? " is-selected" : ""}`,
-      attributes: {
-        type: "button",
-        "data-provider-kind": kind,
-        "aria-pressed": String(selectedProvider === kind),
+    shell("provider", createWelcomeStage({
+      selectedProvider,
+      message,
+      listen,
+      onSelect(kind) {
+        selectedProvider = kind;
+        renderWelcome(message);
       },
-      text: label,
-    }), "click", () => {
-      selectedProvider = kind;
-      renderWelcome(message);
+      onProceed: () => { void selectProvider(); },
+      onRetry: refreshStatus,
     }));
-    const proceed = element("button", {
-      className: "onboarding-button onboarding-button--primary",
-      attributes: { type: "button", disabled: !selectedProvider },
-      text: "Tiếp tục",
-    });
-    let selecting = false;
-    listen(proceed, "click", () => {
-      if (selecting || !selectedProvider) return;
-      selecting = true;
-      proceed.disabled = true;
-      for (const card of cards) card.disabled = true;
-      void selectProvider();
-    });
-    const error = message
-      ? element("p", {
-          className: "onboarding-error",
-          attributes: { role: "alert" },
-          text: message,
-        })
-      : null;
-    const retry = message ? retryButton(refreshStatus) : null;
-    shell(
-      "provider",
-      element(
-        "section",
-        { className: "onboarding-stage onboarding-provider-stage" },
-        element("p", { className: "onboarding-eyebrow", text: "Chào mừng" }),
-        element("h1", { text: "Chọn nhà cung cấp" }),
-        element("p", {
-          className: "onboarding-provider-intro",
-          text: "Chọn công cụ AI bạn muốn dùng cho trợ lý.",
-        }),
-        element("div", { className: "onboarding-provider-grid" }, cards),
-        element("p", {
-          className: "onboarding-provider-warning",
-          text: "Bạn cần đăng nhập. Cấu hình đang dùng chỉ thay đổi sau khi kết nối được xác minh và bạn bấm Hoàn tất.",
-        }),
-        error,
-        element("div", { className: "onboarding-actions" }, retry, proceed),
-      ),
-    );
   }
-
   async function selectProvider() {
     if (!state || !selectedProvider || !SUPPORTED_PROVIDERS.has(selectedProvider)) return false;
+    clearReceipt();
+    agentName = "";
     if (!successorRevision(state.revision)) {
       renderSafeError();
       return false;
@@ -465,16 +176,6 @@ export function createOnboardingPage({
       releaseOperation(run, controller);
     }
   }
-
-  function terminalIdentity(terminal, expectedKind) {
-    if (!isRecord(terminal)) return null;
-    const kind = semanticString(terminal.kind);
-    const providerID = semanticString(terminal.providerId);
-    const accountID = semanticString(terminal.accountId);
-    if (kind !== expectedKind || providerID !== expectedKind || !accountID) return null;
-    return { kind, providerID, accountID };
-  }
-
   async function reconcileConnected(stageRun, connectRevision, terminal) {
     if (!owns(stageRun)) return false;
     if (!successorRevision(connectRevision)) {
@@ -504,7 +205,6 @@ export function createOnboardingPage({
       releaseOperation(run, controller);
     }
   }
-
   function handleConnected(stageRun, expectedKind, connectRevision, terminal) {
     if (connectTerminalPromise) return connectTerminalPromise;
     if (!owns(stageRun)) return Promise.resolve(false);
@@ -516,10 +216,11 @@ export function createOnboardingPage({
     connectTerminalPromise = reconcileConnected(stageRun, connectRevision, identity);
     return connectTerminalPromise;
   }
-
   function goBackFromConnect(stageRun) {
     if (connectBackPromise) return connectBackPromise;
     if (!owns(stageRun)) return Promise.resolve(false);
+    clearReceipt();
+    agentName = "";
     const run = invalidate();
     const instance = connectController;
     connectBackPromise = (async () => {
@@ -549,25 +250,13 @@ export function createOnboardingPage({
     })();
     return connectBackPromise;
   }
-
   function renderConnect() {
+    disposePersonaView();
     clearListeners();
     const kind = state.provider_kind;
     const key = `${kind}\u0000${state.revision}`;
     const slot = element("div", { className: "onboarding-connect-slot" });
-    shell(
-      "connect",
-      element(
-        "section",
-        { className: "onboarding-stage onboarding-connect-stage" },
-        element("h1", { text: `Kết nối ${providerName(kind)}` }),
-        element("p", {
-          className: "onboarding-connect-intro",
-          text: "Đăng nhập và chờ hệ thống xác minh tài khoản.",
-        }),
-        slot,
-      ),
-    );
+    shell("connect", createConnectStage(kind, slot));
     if (connectController && connectKey === key) {
       connectController.mount(slot);
       return;
@@ -595,34 +284,13 @@ export function createOnboardingPage({
       renderSafeError();
     }
   }
-
   function renderSetup(status, message = "") {
+    disposePersonaView();
     disposeConnect();
     clearListeners();
-    const complete = status === "complete";
-    const error = status === "error";
-    const statusText = complete ? "✓" : "Đang chuẩn bị cấu hình…";
-    shell(
-      "setup",
-      element(
-        "section",
-        { className: "onboarding-stage onboarding-setup-stage" },
-        element("h1", { text: "Kết nối nhà cung cấp" }),
-        element("p", {
-          className: `onboarding-setup-status${complete ? " is-complete" : ""}`,
-          attributes: { role: "status" },
-          text: statusText,
-        }),
-        error ? element("p", {
-          className: "onboarding-error",
-          attributes: { role: "alert" },
-          text: message || SAFE_SETUP_ERROR,
-        }) : null,
-        error ? retryButton(refreshStatus) : null,
-      ),
-    );
+    const retry = status === "error" ? createRetryButton(listen, refreshStatus) : null;
+    shell("setup", createSetupStage(status, message || SAFE_SETUP_ERROR, retry));
   }
-
   function startSetup(snapshot) {
     const accountID = semanticString(snapshot?.account_id);
     const revision = positiveRevision(snapshot?.revision);
@@ -677,46 +345,365 @@ export function createOnboardingPage({
     setupInFlight = { key, promise };
     return promise;
   }
-
+  function renderStageLoading(phase, message) {
+    disposePersonaView();
+    disposeConnect();
+    clearListeners();
+    shell(phase, createLoadingStatus(message));
+  }
+  function mountPersona(agent) {
+    disposePersonaView();
+    disposeConnect();
+    clearListeners();
+    personaBusy = false;
+    personaView = createPersonaStage({
+      agent,
+      listen,
+      onChange(result) {
+        clearReceipt();
+        testError = "";
+        personaBusy = false;
+        invalidate();
+        personaView?.setValidation(result);
+      },
+      onSubmit: savePersona,
+      onBack: backFromPersona,
+    });
+    shell("persona", personaView.content);
+  }
+  async function loadAgent(phase, loadingMessage, consume, fail) {
+    const { run, controller: requestController } = beginOperation();
+    renderStageLoading(phase, loadingMessage);
+    try {
+      const response = await service.loadAgent({ signal: requestController.signal });
+      if (!owns(run)) return false;
+      const authoritative = normalizeAgentResponse(response);
+      if (!authoritative || consume(authoritative) === false) return fail(false);
+      return true;
+    } catch (error) {
+      if (!owns(run) || requestController.signal.aborted) return false;
+      return fail(true);
+    } finally {
+      releaseOperation(run, requestController);
+    }
+  }
   function renderPersona() {
+    clearReceipt();
+    testError = "";
+    return loadAgent("persona", "Đang tải Persona…", (authoritative) => {
+      agentName = validDisplayName(authoritative.display_name);
+      mountPersona(authoritative);
+    }, () => { renderSafeError(); return false; });
+  }
+  async function savePersona(result) {
+    clearReceipt();
+    if (personaBusy || !personaView) return false;
+    const current = result ?? personaView.fields.validate();
+    if (!current.ok) {
+      personaView.setValidation(current);
+      personaView.fields.focusFirstError(current);
+      return false;
+    }
+    const expected = { ...state };
+    if (!["persona", "test"].includes(expected?.phase) || !successorRevision(expected.revision)) {
+      renderSafeError();
+      return false;
+    }
+    const payload = {
+      values: current.values,
+      display_name: current.displayName,
+      require_complete: true,
+      onboarding_revision: expected.revision,
+    };
+    personaBusy = true;
+    personaView.setBusy(true);
+    const { run, controller: requestController } = beginOperation();
+    try {
+      const response = await service.saveAgent(payload, { signal: requestController.signal });
+      if (!owns(run)) return false;
+      const name = validDisplayName(response?.display_name);
+      if (!isRecord(response) || response.ready !== true || name !== payload.display_name
+        || response.onboarding_phase !== "test"
+        || response.onboarding_revision !== successorRevision(expected.revision)) {
+        personaBusy = false;
+        renderSafeError();
+        return false;
+      }
+      state = { ...expected, phase: "test", revision: response.onboarding_revision };
+      agentName = name;
+      testMessage = "Xin chào";
+      personaBusy = false;
+      renderTest();
+      return true;
+    } catch (error) {
+      if (!owns(run) || requestController.signal.aborted) return false;
+      personaBusy = false;
+      if (["ONBOARDING_REVISION_CONFLICT", "ONBOARDING_CONFIGURATION_CHANGED"].includes(error?.code)) {
+        return refreshStatus();
+      }
+      const remaining = safeServerFieldCount(error);
+      personaView?.setBusy(false);
+      personaView?.setError(
+        remaining ? "Persona vẫn còn mục cần điền. Vui lòng kiểm tra lại." : "Chưa thể lưu Persona. Vui lòng thử lại.",
+        remaining,
+      );
+      if (!personaView?.fields.focusFirstError()) personaView?.fields.focusFirst();
+      return false;
+    } finally {
+      releaseOperation(run, requestController);
+    }
+  }
+  function backFromPersona() {
+    clearReceipt();
+    agentName = "";
+    personaBusy = false;
+    invalidate();
+    disposePersonaView();
+    state = { ...state, phase: "provider" };
+    selectedProvider = SUPPORTED_PROVIDERS.has(state.provider_kind) ? state.provider_kind : "";
+    renderWelcome();
+  }
+  function scheduleReceiptExpiry() {
+    if (!testToken || !testExpiresAt) return;
+    const delay = Math.min(Math.max(0, testExpiresAt - nowFn()), 2_147_483_647);
+    receiptTimer = setTimeoutFn(() => {
+      receiptTimer = null;
+      if (disposed || !testToken) return;
+      if (nowFn() < testExpiresAt) {
+        scheduleReceiptExpiry();
+        return;
+      }
+      clearReceipt();
+      testError = "Kết quả thử đã hết hạn. Vui lòng thử lại.";
+      renderTest();
+    }, delay);
+  }
+  function renderTestUnavailable(message) {
+    disposePersonaView();
     disposeConnect();
     clearListeners();
-    shell(
-      "persona",
-      element(
-        "section",
-        { className: "onboarding-stage onboarding-persona-stage" },
-        element("p", { className: "onboarding-eyebrow", text: "Cá nhân hoá" }),
-        element("h1", { text: "Trợ lý của bạn là ai" }),
-        element("p", {
-          className: "onboarding-placeholder",
-          text: "Bước cá nhân hoá sẽ xuất hiện tại đây.",
-        }),
-      ),
-    );
+    testView = createTestStage({
+      displayName: "trợ lý",
+      message: testMessage,
+      result: null,
+      errorMessage: message,
+      busy: false,
+      canComplete: false,
+      listen,
+      onInput: (value) => { testMessage = value; },
+      onSend: () => { void loadTestAgent(); },
+      onRetry: () => { void loadTestAgent(); },
+      onBack: () => { void backFromTest(); },
+      onComplete: () => {},
+    });
+    shell("test", testView.content);
   }
-
-  function renderLaterPlaceholder(phase) {
-    connectTerminalPromise = null;
+  async function loadTestAgent() {
+    clearReceipt();
+    return loadAgent("test", "Đang tải tên trợ lý…", (authoritative) => {
+      const name = validDisplayName(authoritative?.display_name);
+      if (authoritative.ready !== true || authoritative.placeholders.length !== 0 || !name) {
+        agentName = "";
+        return false;
+      }
+      agentName = name;
+      renderTest();
+    }, (requestFailed) => {
+      renderTestUnavailable(requestFailed
+        ? "Chưa thể tải tên trợ lý. Vui lòng thử lại."
+        : "Chưa thể xác minh tên trợ lý. Vui lòng thử lại hoặc chỉnh Persona.");
+      return false;
+    });
+  }
+  function renderTest() {
+    if (!agentName) {
+      void loadTestAgent();
+      return;
+    }
+    if (testToken && nowFn() >= testExpiresAt) {
+      clearReceipt();
+      testError = "Kết quả thử đã hết hạn. Vui lòng thử lại.";
+    }
+    disposePersonaView();
     disposeConnect();
     clearListeners();
-    const completed = phase === "completed";
-    shell(
-      phase,
-      element(
-        "section",
-        { className: "onboarding-stage onboarding-placeholder-stage" },
-        element("h1", { text: completed ? "Thiết lập đã hoàn tất" : "Trò chuyện thử" }),
-        element("p", {
-          className: "onboarding-placeholder",
-          text: completed
-            ? "Trợ lý đã sẵn sàng."
-            : "Bước trò chuyện thử sẽ xuất hiện tại đây.",
-        }),
-      ),
-    );
+    testView = createTestStage({
+      displayName: agentName,
+      message: testMessage,
+      result: testResult,
+      errorMessage: testError,
+      busy: testBusy || completeBusy,
+      canComplete: Boolean(testToken),
+      listen,
+      onInput(value) {
+        testMessage = value;
+        if (testToken || testResult || testBusy || completeBusy) {
+          invalidate();
+          clearReceipt();
+          testError = "";
+          testBusy = false; completeBusy = false;
+          renderTest();
+        }
+      },
+      onSend: (value, field) => { void startTest(value, field); },
+      onRetry: () => { void startTest(testMessage); },
+      onBack: () => { void backFromTest(); },
+      onComplete: () => { void completeOnboarding(); },
+    });
+    shell("test", testView.content);
   }
-
+  async function startTest(rawMessage, focusTarget = null) {
+    if (testBusy || completeBusy || !agentName) return false;
+    const message = normalizeTestMessage(rawMessage);
+    testMessage = rawMessage;
+    if (!message) {
+      clearReceipt();
+      testError = "Tin nhắn cần từ 1 đến 500 ký tự hợp lệ.";
+      testView?.showError(testError);
+      focusTarget?.focus?.();
+      return false;
+    }
+    const expected = { ...state };
+    if (expected.phase !== "test" || !successorRevision(expected.revision)) {
+      renderSafeError();
+      return false;
+    }
+    clearReceipt();
+    testResult = null;
+    testError = "";
+    testBusy = true;
+    testView?.setBusy(true);
+    testView?.showError("");
+    const { run, controller: requestController } = beginOperation();
+    try {
+      const response = await service.testChat(message, expected.revision, {
+        signal: requestController.signal,
+      });
+      if (!owns(run)) return false;
+      const result = normalizeTestResponse(response, {
+        displayName: agentName,
+        snapshot: expected,
+        now: nowFn(),
+      });
+      if (!result) {
+        testBusy = false;
+        testError = testResponseError(response, agentName, nowFn());
+        renderTest();
+        return false;
+      }
+      state = { ...expected, revision: result.revision };
+      testMessage = message;
+      testResult = { message, answer: result.answer };
+      testToken = result.token;
+      testExpiresAt = result.expiresAt;
+      testBusy = false;
+      scheduleReceiptExpiry();
+      renderTest();
+      return true;
+    } catch (error) {
+      if (!owns(run) || requestController.signal.aborted) return false;
+      testBusy = false;
+      clearReceipt();
+      testError = "Chưa thể trò chuyện thử. Vui lòng thử lại.";
+      renderTest();
+      return false;
+    } finally {
+      releaseOperation(run, requestController);
+    }
+  }
+  async function backFromTest() {
+    clearReceipt();
+    testBusy = false;
+    completeBusy = false;
+    invalidate();
+    return renderPersona();
+  }
+  async function completeOnboarding() {
+    if (completeBusy || testBusy || !testToken) return false;
+    if (nowFn() >= testExpiresAt) {
+      clearReceipt();
+      testError = "Kết quả thử đã hết hạn. Vui lòng thử lại.";
+      renderTest();
+      return false;
+    }
+    const expected = { ...state };
+    const receipt = testToken;
+    completeBusy = true;
+    testView?.setBusy(true);
+    const { run, controller: requestController } = beginOperation();
+    try {
+      const response = await service.complete(receipt, expected.revision, {
+        signal: requestController.signal,
+      });
+      if (!owns(run)) return false;
+      if (!normalizeCompleteResponse(response)) {
+        completeBusy = false;
+        testError = "Chưa thể hoàn tất an toàn. Vui lòng thử lại.";
+        renderTest();
+        return false;
+      }
+      clearReceipt();
+      completeBusy = false;
+      state = { ...expected, required: false, phase: "completed" };
+      renderDone();
+      return true;
+    } catch (error) {
+      if (!owns(run) || requestController.signal.aborted) return false;
+      completeBusy = false;
+      if (["ONBOARDING_TEST_EXPIRED", "ONBOARDING_TEST_REQUIRED"].includes(error?.code)) {
+        clearReceipt();
+        testError = "Kết quả thử không còn hợp lệ. Vui lòng thử lại.";
+        renderTest();
+        return false;
+      }
+      if (["ONBOARDING_REVISION_CONFLICT", "ONBOARDING_CONFIGURATION_CHANGED"].includes(error?.code)) {
+        clearReceipt();
+        agentName = "";
+        return refreshStatus();
+      }
+      testError = "Chưa thể hoàn tất an toàn. Cấu hình cũ vẫn được giữ nguyên.";
+      renderTest();
+      return false;
+    } finally {
+      releaseOperation(run, requestController);
+    }
+  }
+  function handoff(destination) {
+    if (disposed || handoffDone || state?.phase !== "completed") return;
+    handoffDone = true;
+    doneView?.disable();
+    try {
+      Promise.resolve(onComplete({ destination })).catch(() => {});
+    } catch {
+      // A host callback cannot revive or duplicate a completed onboarding handoff.
+    }
+  }
+  function renderDone() {
+    if (!agentName) {
+      void loadCompletedAgent();
+      return;
+    }
+    clearReceipt();
+    disposePersonaView();
+    disposeConnect();
+    clearListeners();
+    doneView = createDoneStage({
+      displayName: agentName,
+      listen,
+      onPortal: () => handoff("portal"),
+      onKnowledge: () => handoff("knowledge"),
+    });
+    shell("completed", doneView.content);
+  }
+  async function loadCompletedAgent() {
+    clearReceipt();
+    return loadAgent("completed", "Đang tải tên trợ lý…", (authoritative) => {
+      const name = validDisplayName(authoritative?.display_name);
+      if (!name) return false;
+      agentName = name;
+      renderDone();
+    }, () => { renderSafeError(); return false; });
+  }
   function renderCurrent() {
     if (!root || disposed) return;
     if (!state) {
@@ -727,14 +714,17 @@ export function createOnboardingPage({
       case "provider": renderWelcome(); break;
       case "connect": renderConnect(); break;
       case "setup": void startSetup(state); break;
-      case "persona": renderPersona(); break;
-      case "test":
-      case "completed": renderLaterPlaceholder(state.phase); break;
+      case "persona": void renderPersona(); break;
+      case "test": renderTest(); break;
+      case "completed": renderDone(); break;
       default: renderSafeError();
     }
   }
-
   async function refreshStatus() {
+    clearReceipt();
+    agentName = "";
+    testBusy = false;
+    completeBusy = false;
     const { run, controller } = beginOperation();
     renderLoading();
     try {
@@ -760,17 +750,25 @@ export function createOnboardingPage({
       releaseOperation(run, controller);
     }
   }
-
   function mount(container) {
-    if (!container || typeof container.replaceChildren !== "function") {
-      throw new TypeError("Onboarding page mount requires a host");
-    }
+    if (!container || typeof container.replaceChildren !== "function") throw new TypeError("Onboarding page mount requires a host");
     if (disposed) return controller;
-    if (host === container && root?.parentNode === container) return controller;
+    const hadReceipt = Boolean(testToken);
+    const resetTest = state?.phase === "test" && (hadReceipt || testBusy || completeBusy);
+    clearReceipt();
+    if (resetTest) {
+      invalidate();
+      completeBusy = false; testBusy = false;
+    }
+    if (host === container && root?.parentNode === container) {
+      if (resetTest) renderTest();
+      return controller;
+    }
     if (root && host && host !== container) {
       root.remove();
       host = container;
       host.replaceChildren(root);
+      if (resetTest) renderTest();
       return controller;
     }
     host = container;
@@ -779,12 +777,17 @@ export function createOnboardingPage({
     renderCurrent();
     return controller;
   }
-
   function dispose() {
     if (disposed) return;
     disposed = true;
+    clearReceipt();
+    agentName = "";
+    personaBusy = false;
+    testBusy = false;
+    completeBusy = false;
     invalidate();
     clearListeners();
+    disposePersonaView();
     disposeConnect();
     connectTerminalPromise = null;
     setupInFlight = null;
@@ -792,7 +795,6 @@ export function createOnboardingPage({
     root = null;
     host = null;
   }
-
   const controller = Object.freeze({ mount, dispose });
   return controller;
 }

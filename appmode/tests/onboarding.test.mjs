@@ -1,800 +1,731 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createOnboardingPage, createOnboardingService } from "../overlay/internal/webui/static/pages/onboarding.js";
+
+import {
+  createOnboardingPage,
+  createOnboardingService,
+} from "../overlay/internal/webui/static/pages/onboarding.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
-const flush = () => new Promise((resolve) => setImmediate(resolve)); const microtask = () => Promise.resolve();
+
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
 function deferred() {
-  let resolve; let reject;
-  const promise = new Promise((onResolve, onReject) => { resolve = onResolve; reject = onReject; });
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
   return { promise, resolve, reject };
 }
+
 const hasClass = (node, name) => Boolean(node?.classList?.contains(name));
 const button = (root, label) => find(root, (node) => node.tagName === "BUTTON"
   && text(node).includes(label));
+const input = (root) => find(root, (node) => node.tagName === "INPUT");
 const byClass = (root, name) => find(root, (node) => hasClass(node, name));
-function providerCard(root, kind) {
-  return find(root, (node) => hasClass(node, "onboarding-provider-card") && node.dataset.providerKind === kind);
-}
-function providerStatus(overrides = {}) {
+const futureExpiry = () => new Date(Date.now() + 600_000).toISOString();
+
+function testStatus(overrides = {}) {
   return {
-    required: true, phase: "provider", provider_kind: "", suggested_provider_kind: "",
-    provider_id: "", account_id: "", model_id: "", revision: 1, ...overrides,
-  };
-}
-function connectStatus(overrides = {}) {
-  return providerStatus({
-    phase: "connect", provider_kind: "codex", revision: 2, ...overrides,
-  });
-}
-function setupStatus(overrides = {}) {
-  return providerStatus({
-    phase: "setup", provider_kind: "codex", provider_id: "codex",
-    account_id: "account-1", revision: 3, ...overrides,
-  });
-}
-function personaStatus(overrides = {}) {
-  return providerStatus({
-    phase: "persona", provider_kind: "codex", provider_id: "codex",
-    account_id: "account-1", model_id: "gpt-5.6-terra", revision: 4, ...overrides,
-  });
-}
-function setupResult(overrides = {}) {
-  return {
-    revision: 4, provider_kind: "codex", provider_id: "codex", account_id: "account-1",
-    model_id: "gpt-5.6-terra", staged_combo_id: "combo-staged",
-    combo_name: "Codex mặc định", ...overrides,
-  };
-}
-function baseService(overrides = {}) {
-  return {
-    status: () => Promise.resolve(providerStatus()),
-    selectProvider: () => Promise.resolve(connectStatus()),
-    setup: () => Promise.resolve(setupResult()),
+    required: true,
+    phase: "test",
+    provider_kind: "codex",
+    suggested_provider_kind: "",
+    provider_id: "codex",
+    account_id: "account-1",
+    model_id: "gpt-5.6-terra",
+    revision: 7,
     ...overrides,
   };
 }
-function idleConnectService() {
+
+function personaStatus(overrides = {}) {
+  return { ...testStatus({ phase: "persona", revision: 4 }), ...overrides };
+}
+
+function agent(overrides = {}) {
   return {
-    connectStart: () => Promise.resolve({ kind: "codex", phase: "detecting" }),
-    connectStatus: () => new Promise(() => {}),
-    connectCancel: () => Promise.resolve({ ok: true }),
+    ready: true,
+    display_name: "Bé Mi",
+    placeholders: [],
+    ...overrides,
   };
 }
-function fakeConnectFactory(log = []) {
-  const instances = [];
-  const factory = (options) => {
-    const instance = {
-      options, slot: null, starts: [],
-      mount(slot) {
-        this.slot = slot; log.push("mount"); return this;
-      },
-      start(value) {
-        this.starts.push(value); log.push("start"); return true;
-      },
-      cancel() { log.push("cancel"); return Promise.resolve(true); },
-      dispose() {
-        log.push("dispose"); this.slot?.replaceChildren();
-      },
-    };
-    instances.push(instance);
-    log.push("create");
-    return instance;
-  };
-  factory.instances = instances;
-  return factory;
-}
-function controlledTimers() {
-  let nextID = 1;
-  const timers = new Map();
+
+function testResult(overrides = {}) {
   return {
-    setTimeoutFn(callback) {
-      const id = nextID++; timers.set(id, callback); return id;
-    },
-    clearTimeoutFn(id) { timers.delete(id); },
-    runAll() {
-      for (const [id, callback] of [...timers]) {
-        timers.delete(id); callback();
-      }
-    },
-    get size() { return timers.size; },
+    answer: "Xin chào, mình là Bé Mi.",
+    bot_name: "Bé Mi",
+    provider_id: "codex",
+    model_id: "gpt-5.6-terra",
+    test_token: "opaque-test-token",
+    expires_at: futureExpiry(),
+    revision: 8,
+    ...overrides,
   };
 }
+
+function baseService(overrides = {}) {
+  return {
+    status: () => Promise.resolve(testStatus()),
+    selectProvider: () => Promise.reject(new Error("not used")),
+    setup: () => Promise.reject(new Error("not used")),
+    loadAgent: () => Promise.resolve(agent()),
+    saveAgent: () => Promise.resolve({
+      ready: true,
+      display_name: "Bé Mi",
+      onboarding_phase: "test",
+      onboarding_revision: 5,
+    }),
+    testChat: (_message, revision) => Promise.resolve(testResult({ revision: revision + 1 })),
+    complete: () => Promise.resolve({
+      completed: true,
+      onboarding_version: 1,
+      combo_id: "combo-new",
+    }),
+    ...overrides,
+  };
+}
+
 function mountPage(t, options = {}) {
   const dom = installDOM();
   const host = document.createElement("div");
   const page = createOnboardingPage({
-    initialStatus: providerStatus(),
+    initialStatus: testStatus(),
     service: baseService(),
-    connectService: idleConnectService(),
     ...options,
   });
   page.mount(host);
-  t.after(() => { page.dispose(); dom.restore(); });
+  t.after(() => {
+    page.dispose();
+    dom.restore();
+  });
   return { page, host };
 }
-test("onboarding service sends exact paths, bodies, and AbortSignals", async () => {
+
+function setInputValue(field, value) {
+  field.value = value;
+  field.dispatchEvent({ type: "input" });
+}
+
+function submit(form) {
+  form.dispatchEvent({ type: "submit" });
+}
+
+function assertNoSkip(root) {
+  assert.equal(button(root, "Bỏ qua"), null);
+  assert.equal(button(root, "Skip"), null);
+  assert.doesNotMatch(text(root), /Bỏ qua|Skip/u);
+}
+
+function domAttributes(root) {
+  const values = [];
+  for (const node of findAll(root, (candidate) => candidate?.attributes instanceof Map)) {
+    for (const [name, value] of node.attributes) values.push(`${name}=${value}`);
+  }
+  return values.join("\n");
+}
+
+test("late-stage service sends exact paths, bodies, and AbortSignals", async () => {
   const calls = [];
   const signal = new AbortController().signal;
   const service = createOnboardingService({
-    requestJSON: async (path, options = {}) => {
+    requestJSON(path, options = {}) {
       calls.push({ path, options });
-      if (path === "/onboarding/provider") return connectStatus({ revision: 8 });
-      if (path === "/onboarding/setup") {
-        return {
-          revision: 9, provider_kind: "codex", provider_id: "codex",
-          account_id: "account-7", model_id: "gpt-5.6-terra",
-          staged_combo_id: "combo-7", combo_name: "Codex chính",
-          access_token: "SECRET", config_dir: "C:/secret",
-        };
-      }
-      return { ok: true };
+      return Promise.resolve({ ok: true });
     },
   });
-  assert.ok(Object.isFrozen(service));
-  await service.status(signal);
-  await service.selectProvider("codex", 7, signal);
-  const setup = await service.setup("account-7", 8, signal);
+  const payload = { values: { TEN_BOT: "Bé Mi" }, display_name: "Bé Mi" };
+
+  await service.loadAgent({ signal });
+  await service.saveAgent(payload, { signal });
+  await service.testChat("Xin chào", 7, { signal });
+  await service.complete("opaque", 8, { signal });
+
   assert.deepEqual(calls, [
-    { path: "/onboarding/status", options: { signal } },
+    { path: "/agent", options: { signal } },
+    { path: "/agent", options: { method: "PUT", body: payload, signal } },
     {
-      path: "/onboarding/provider",
-      options: { method: "PUT", body: { kind: "codex", revision: 7 }, signal },
+      path: "/onboarding/test-chat",
+      options: { method: "POST", body: { message: "Xin chào", revision: 7 }, signal },
     },
     {
-      path: "/onboarding/setup",
-      options: { method: "POST", body: { account_id: "account-7", revision: 8 }, signal },
+      path: "/onboarding/complete",
+      options: { method: "POST", body: { test_token: "opaque", revision: 8 }, signal },
     },
   ]);
-  assert.deepEqual(setup, {
-    phase: "persona", revision: 9, provider_kind: "codex", provider_id: "codex",
-    account_id: "account-7", model_id: "gpt-5.6-terra",
-    staged_combo_id: "combo-7", combo_name: "Codex chính",
-  });
-  assert.throws(() => service.selectProvider("Codex", 7), /supported/i);
-  assert.throws(() => service.selectProvider("openai", 7), /supported/i);
-  assert.throws(() => service.setup(" account-7 ", 8), /account/i);
-  assert.throws(() => service.setup("account-7", 0), /revision/i);
 });
-test("Setup service rejects every non-successor or incomplete backend response", async (t) => {
-  const invalid = [
-    ["unchanged revision", { revision: 8 }], ["lower revision", { revision: 7 }],
-    ["revision jump", { revision: 10 }], ["unsafe revision", { revision: Number.MAX_SAFE_INTEGER + 1 }],
-    ["wrong account", { account_id: "other" }],
-    ["kind and provider differ", { provider_id: "claude-code" }],
-    ["missing model", { model_id: "" }], ["missing staged combo", { staged_combo_id: undefined }],
-    ["missing combo name", { combo_name: "" }], ["contradictory phase", { phase: "setup" }],
-    ["unsafe staging id", { staged_combo_id: "bad\u0000id" }],
-  ];
-  for (const [name, overrides] of invalid) {
-    await t.test(name, async () => {
-      const service = createOnboardingService({
-        requestJSON: () => Promise.resolve(setupResult({
-          revision: 9, account_id: "account-7", ...overrides,
-        })),
-      });
-      await assert.rejects(service.setup("account-7", 8), /setup response/i);
-    });
-  }
-  let requests = 0;
-  const service = createOnboardingService({ requestJSON: () => { requests++; } });
-  assert.throws(() => service.setup("account-7", Number.MAX_SAFE_INTEGER), /revision/i);
-  assert.equal(requests, 0);
-});
-test("Welcome renders only two provider cards, an exact three-step rail, and guarded warning", (t) => {
-  const { host } = mountPage(t);
-  const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
-  const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
-  const continueButton = button(host, "Tiếp tục");
-  assert.deepEqual(cards.map((card) => text(card)), ["Codex", "Claude Code"]);
-  assert.deepEqual(steps.map((step) => text(step)), [
-    "Kết nối", "Cá nhân hoá", "Trò chuyện thử",
-  ]);
-  assert.equal(steps.some((step) => /setup|chuẩn bị/i.test(text(step))), false);
-  assert.equal(continueButton.disabled, true);
-  assert.match(text(byClass(host, "onboarding-provider-warning")), /đăng nhập/i);
-  assert.match(text(byClass(host, "onboarding-provider-warning")), /xác minh/i);
-  assert.match(text(byClass(host, "onboarding-provider-warning")), /Hoàn tất/i);
-  providerCard(host, "codex").click();
-  assert.equal(providerCard(host, "codex").getAttribute("aria-pressed"), "true");
-  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "false");
-  assert.equal(button(host, "Tiếp tục").disabled, false);
-});
-test("Welcome preselects an eligible persisted provider before a suggestion", (t) => {
-  const { host } = mountPage(t, {
-    initialStatus: providerStatus({
-      provider_kind: "claude-code",
-      suggested_provider_kind: "codex",
-    }),
-  });
-  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "true");
-  assert.equal(button(host, "Tiếp tục").disabled, false);
-});
-test("Welcome ignores unsupported suggestions and keeps Continue disabled", (t) => {
-  const { host } = mountPage(t, {
-    initialStatus: providerStatus({ suggested_provider_kind: "openai" }),
-  });
-  assert.equal(providerCard(host, "codex").getAttribute("aria-pressed"), "false");
-  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "false");
-  assert.equal(button(host, "Tiếp tục").disabled, true);
-});
-test("provider selection uses the current revision once and adopts the server Connect snapshot", async (t) => {
-  const selection = deferred();
+
+test("Persona mounts shared dynamic fields, updates counter, focuses errors, and saves exact payload", async (t) => {
   const calls = [];
-  const connectFactory = fakeConnectFactory();
-  const { host } = mountPage(t, {
-    initialStatus: providerStatus({ revision: 11, suggested_provider_kind: "codex" }),
-    service: baseService({
-      selectProvider(kind, revision, signal) {
-        calls.push({ kind, revision, signal });
-        return selection.promise;
-      },
-    }),
-    connectFactory,
-  });
-  const retainedContinue = button(host, "Tiếp tục");
-  retainedContinue.click();
-  retainedContinue.click();
-  assert.equal(calls.length, 1);
-  assert.deepEqual({ kind: calls[0].kind, revision: calls[0].revision }, {
-    kind: "codex",
-    revision: 11,
-  });
-  assert.ok(calls[0].signal instanceof AbortSignal);
-  assert.equal(retainedContinue.disabled, true);
-  selection.resolve(connectStatus({ revision: 12, provider_kind: "codex" }));
-  await flush();
-  assert.equal(connectFactory.instances.length, 1);
-  assert.equal(connectFactory.instances[0].options.kind, "codex");
-  assert.deepEqual(connectFactory.instances[0].starts, [{
-    label: "Onboarding",
-    onboardingRevision: 12,
-  }]);
-  assert.match(text(host), /Kết nối Codex/);
-});
-test("provider selection rejects non-successor, wrong-phase, wrong-kind, and staged responses", async (t) => {
-  const invalid = [
-    ["unchanged", { revision: 11 }], ["lower", { revision: 10 }],
-    ["jump", { revision: 13 }], ["unsafe", { revision: Number.MAX_SAFE_INTEGER + 1 }],
-    ["wrong phase", { phase: "setup", provider_id: "codex", account_id: "a" }],
-    ["wrong kind", { provider_kind: "claude-code" }], ["not required", { required: false }],
-    ["staged provider", { provider_id: "codex" }], ["staged account", { account_id: "a" }],
-    ["staged model", { model_id: "gpt" }],
-  ];
-  for (const [name, overrides] of invalid) {
-    await t.test(name, async (subtest) => {
-      let selects = 0;
-      const response = connectStatus({ revision: 12, ...overrides });
-      const apiService = createOnboardingService({ requestJSON: () => Promise.resolve(response) });
-      await assert.rejects(apiService.selectProvider("codex", 11), /provider response/i);
-      const connectFactory = fakeConnectFactory();
-      const { host } = mountPage(subtest, {
-        initialStatus: providerStatus({ revision: 11, suggested_provider_kind: "codex" }),
-        service: baseService({ selectProvider: () => {
-          selects++; return Promise.resolve(response);
-        } }),
-        connectFactory,
-      });
-      button(host, "Tiếp tục").click();
-      await flush();
-      assert.equal(selects, 1); assert.equal(connectFactory.instances.length, 0); assert.ok(byClass(host, "onboarding-error"));
-    });
-  }
-  await t.test("maximum safe revision never mutates", (subtest) => {
-    let selects = 0; const apiService = createOnboardingService({ requestJSON: () => { selects++; } });
-    assert.throws(() => apiService.selectProvider("codex", Number.MAX_SAFE_INTEGER), /revision/i);
-    const { host } = mountPage(subtest, {
-      initialStatus: providerStatus({ revision: Number.MAX_SAFE_INTEGER, suggested_provider_kind: "codex" }),
-      service: baseService({ selectProvider: () => { selects++; } }),
-    });
-    button(host, "Tiếp tục").click(); assert.equal(selects, 0);
-    assert.ok(byClass(host, "onboarding-error"));
-  });
-});
-test("disposed and stale provider selections cannot render Connect", async (t) => {
-  const selection = deferred();
-  const connectFactory = fakeConnectFactory();
-  const { page, host } = mountPage(t, {
-    initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
-    service: baseService({ selectProvider: () => selection.promise }),
-    connectFactory,
-  });
-  button(host, "Tiếp tục").click();
-  page.dispose();
-  selection.resolve(connectStatus());
-  await flush();
-  assert.equal(connectFactory.instances.length, 0);
-  assert.equal(text(host), "");
-});
-test("selection errors fail safely and Retry reloads an authoritative status", async (t) => {
-  const selectCalls = [];
-  let statusCalls = 0;
-  const { host } = mountPage(t, {
-    initialStatus: providerStatus({ revision: 3, suggested_provider_kind: "codex" }),
-    service: baseService({
-      selectProvider(kind, revision) {
-        selectCalls.push({ kind, revision });
-        if (selectCalls.length === 1) return Promise.reject(new Error("SECRET token=abc"));
-        return Promise.resolve(connectStatus({ revision: 10 }));
-      },
-      status() {
-        statusCalls++;
-        return Promise.resolve(providerStatus({ revision: 9, suggested_provider_kind: "codex" }));
-      },
-    }),
-    connectFactory: fakeConnectFactory(),
-  });
-  button(host, "Tiếp tục").click();
-  await flush();
-  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
-  assert.doesNotMatch(text(host), /SECRET|token=abc/);
-  button(host, "Thử lại").click();
-  await flush();
-  assert.equal(statusCalls, 1);
-  button(host, "Tiếp tục").click();
-  await flush();
-  assert.deepEqual(selectCalls[1], { kind: "codex", revision: 9 });
-});
-test("Connect resume creates and starts exactly one component without re-PUT", (t) => {
-  let selects = 0;
-  const connectFactory = fakeConnectFactory();
-  const { page, host } = mountPage(t, {
-    initialStatus: connectStatus({ revision: 6, provider_kind: "claude-code" }),
-    service: baseService({ selectProvider: () => { selects++; } }),
-    connectFactory,
-  });
-  page.mount(host);
-  assert.equal(selects, 0);
-  assert.equal(connectFactory.instances.length, 1);
-  assert.deepEqual(connectFactory.instances[0].starts, [{
-    label: "Onboarding",
-    onboardingRevision: 6,
-  }]);
-  assert.equal(connectFactory.instances[0].options.kind, "claude-code");
-});
-test("Back invalidates first, then cancels and disposes; a late terminal cannot call Setup", async (t) => {
-  const order = [];
-  const cancelGate = deferred();
-  let setupCalls = 0;
-  let statusCalls = 0;
-  let captured;
-  const connectFactory = (options) => {
-    captured = options;
-    return {
-      mount: () => { order.push("mount"); },
-      start: () => { order.push("start"); },
-      cancel: () => { order.push("cancel"); return cancelGate.promise; },
-      dispose: () => { order.push("dispose"); },
-    };
-  };
-  const { host } = mountPage(t, {
-    initialStatus: connectStatus({ revision: 6 }),
-    service: baseService({
-      status: () => { statusCalls++; return Promise.resolve(setupStatus()); },
-      setup: () => { setupCalls++; return Promise.resolve({}); },
-    }),
-    connectFactory,
-  });
-  const backPromise = captured.onBack();
-  const lateTerminal = captured.onConnected({
-    kind: "codex",
-    providerId: "codex",
-    accountId: "account-1",
-  });
-  await microtask();
-  assert.equal(statusCalls, 0);
-  assert.equal(setupCalls, 0);
-  cancelGate.resolve(true);
-  await Promise.all([backPromise, lateTerminal]);
-  assert.deepEqual(order.slice(-2), ["cancel", "dispose"]);
-  assert.match(text(host), /Chọn nhà cung cấp/);
-  assert.equal(statusCalls, 0);
-  assert.equal(setupCalls, 0);
-});
-test("a connected terminal reconciles authoritative Setup and deduplicates the POST", async (t) => {
-  const setupGate = deferred();
-  const timers = controlledTimers();
-  const calls = [];
-  let captured;
-  const { host } = mountPage(t, {
-    initialStatus: connectStatus({ revision: 6 }),
-    service: baseService({
-      status(signal) {
-        calls.push({ op: "status", signal });
-        return Promise.resolve(setupStatus({ revision: 7 }));
-      },
-      setup(accountId, revision, signal) {
-        calls.push({ op: "setup", accountId, revision, signal });
-        return setupGate.promise;
-      },
-    }),
-    connectFactory(options) {
-      captured = options;
-      return { mount() {}, start() {}, cancel: () => Promise.resolve(true), dispose() {} };
-    },
-    ...timers,
-  });
-  const terminal = { kind: "codex", providerId: "codex", accountId: "account-1" };
-  const first = captured.onConnected(terminal);
-  const duplicate = captured.onConnected(terminal);
-  assert.equal(first, duplicate);
-  await flush();
-  const whileSetupIsPending = captured.onConnected(terminal);
-  assert.equal(whileSetupIsPending, first);
-  assert.deepEqual(calls.map((call) => call.op), ["status", "setup"]);
-  assert.deepEqual(
-    { accountId: calls[1].accountId, revision: calls[1].revision },
-    { accountId: "account-1", revision: 7 },
-  );
-  assert.match(text(host), /Đang chuẩn bị cấu hình…/);
-  setupGate.resolve(setupResult({ revision: 8 }));
-  await microtask();
-  await microtask();
-  assert.match(text(host), /✓/);
-  assert.equal(timers.size, 1);
-  timers.runAll();
-  assert.match(text(host), /Trợ lý của bạn là ai/);
-  await Promise.all([first, duplicate, whileSetupIsPending]);
-});
-test("Connect reconciliation accepts only the exact successor Setup snapshot", async (t) => {
-  const invalid = [
-    ["unchanged", { revision: 6 }], ["lower", { revision: 5 }], ["jump", { revision: 8 }],
-    ["unsafe", { revision: Number.MAX_SAFE_INTEGER + 1 }],
-    ["wrong phase", { phase: "persona", model_id: "gpt" }],
-    ["wrong kind", { provider_kind: "claude-code", provider_id: "claude-code" }],
-    ["wrong provider", { provider_id: "claude-code" }],
-    ["wrong account", { account_id: "other" }], ["not required", { required: false }],
-    ["already modeled", { model_id: "gpt" }],
-  ];
-  for (const [name, overrides] of invalid) {
-    await t.test(name, async (subtest) => {
-      let setups = 0;
-      const connectFactory = fakeConnectFactory();
-      const { host } = mountPage(subtest, {
-        initialStatus: connectStatus({ revision: 6 }),
-        service: baseService({
-          status: () => Promise.resolve(setupStatus({ revision: 7, ...overrides })),
-          setup: () => { setups++; },
-        }),
-        connectFactory,
-      });
-      await connectFactory.instances[0].options.onConnected({
-        kind: "codex", providerId: "codex", accountId: "account-1",
-      });
-      assert.equal(setups, 0);
-      assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
-    });
-  }
-  await t.test("maximum Connect revision never fetches status", async (subtest) => {
-    let statuses = 0;
-    const connectFactory = fakeConnectFactory();
-    const { host } = mountPage(subtest, {
-      initialStatus: connectStatus({ revision: Number.MAX_SAFE_INTEGER }),
-      service: baseService({ status: () => { statuses++; } }),
-      connectFactory,
-    });
-    await connectFactory.instances[0].options.onConnected({
-      kind: "codex", providerId: "codex", accountId: "account-1",
-    });
-    assert.equal(statuses, 0);
-    assert.ok(byClass(host, "onboarding-error"));
-  });
-});
-test("Setup page rejects every invalid response without rendering Persona", async (t) => {
-  const invalid = [
-    ["unchanged", { revision: 3 }], ["lower", { revision: 2 }], ["jump", { revision: 5 }],
-    ["unsafe", { revision: Number.MAX_SAFE_INTEGER + 1 }], ["wrong phase", { phase: "setup" }],
-    ["wrong kind", { provider_kind: "claude-code", provider_id: "claude-code" }],
-    ["wrong provider", { provider_id: "claude-code" }], ["wrong account", { account_id: "other" }],
-    ["missing model", { model_id: "" }], ["missing staging", { staged_combo_id: undefined }],
-    ["missing combo name", { combo_name: "" }], ["unsafe combo", { combo_name: "bad\u0000name" }],
-  ];
-  for (const [name, overrides] of invalid) {
-    await t.test(name, async (subtest) => {
-      let setups = 0;
-      const { host } = mountPage(subtest, {
-        initialStatus: setupStatus({ revision: 3 }),
-        service: baseService({ setup: () => {
-          setups++;
-          return Promise.resolve(setupResult({ revision: 4, ...overrides }));
-        } }),
-      });
-      await flush();
-      assert.equal(setups, 1);
-      assert.equal(byClass(host, "onboarding-persona-stage"), null);
-      assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
-    });
-  }
-  await t.test("maximum Setup revision never posts", (subtest) => {
-    let setups = 0;
-    const { host } = mountPage(subtest, {
-      initialStatus: setupStatus({ revision: Number.MAX_SAFE_INTEGER }),
-      service: baseService({ setup: () => { setups++; } }),
-    });
-    assert.equal(setups, 0);
-    assert.ok(byClass(host, "onboarding-error"));
-  });
-});
-test("Setup resume auto-runs once, shows failure, and Retry starts exactly one new request", async (t) => {
-  const first = deferred();
-  const second = deferred();
-  const calls = [];
-  let statusCalls = 0;
-  const { host } = mountPage(t, {
-    initialStatus: setupStatus({ revision: 21, account_id: "resume-account" }),
-    service: baseService({
-      status() {
-        statusCalls++;
-        return Promise.resolve(setupStatus({ revision: 21, account_id: "resume-account" }));
-      },
-      setup(accountId, revision, signal) {
-        calls.push({ accountId, revision, signal });
-        return calls.length === 1 ? first.promise : second.promise;
-      },
-    }),
-  });
-  assert.equal(calls.length, 1);
-  assert.deepEqual(
-    { accountId: calls[0].accountId, revision: calls[0].revision },
-    { accountId: "resume-account", revision: 21 },
-  );
-  assert.match(text(host), /Đang chuẩn bị cấu hình…/);
-  first.reject(new Error("private config path"));
-  await flush();
-  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
-  assert.doesNotMatch(text(host), /private config path/);
-  const retry = button(host, "Thử lại");
-  retry.click();
-  retry.click();
-  await flush();
-  assert.equal(statusCalls, 1);
-  assert.equal(calls.length, 2);
-  second.resolve(setupResult({ revision: 22, account_id: "resume-account" }));
-  await flush();
-});
-test("Setup Retry renders an authoritative non-Setup phase without stale POST", async (t) => {
-  const cases = [
-    ["persona", personaStatus({ revision: 9 }), "onboarding-persona-stage", "Trợ lý của bạn là ai"],
-    ["test", { ...personaStatus({ revision: 9 }), phase: "test" }, "onboarding-placeholder-stage", "Trò chuyện thử"],
-    ["completed", providerStatus({ phase: "completed", revision: 9 }), "onboarding-placeholder-stage", "Thiết lập đã hoàn tất"],
-    ["provider", providerStatus({ revision: 9 }), "onboarding-provider-stage", "Chọn nhà cung cấp"],
-    ["connect", connectStatus({ revision: 9 }), "onboarding-connect-stage", "Kết nối Codex"],
-  ];
-  for (const [name, authoritative, className, heading] of cases) {
-    await t.test(name, async (subtest) => {
-      let setups = 0;
-      let statuses = 0;
-      const { host } = mountPage(subtest, {
-        initialStatus: setupStatus({ revision: 3 }),
-        service: baseService({
-          setup: () => { setups++; return Promise.reject(new Error("conflict")); },
-          status: () => { statuses++; return Promise.resolve(authoritative); },
-        }),
-        connectFactory: fakeConnectFactory(),
-      });
-      await flush();
-      button(host, "Thử lại").click();
-      await flush();
-      assert.equal(statuses, 1);
-      assert.equal(setups, 1);
-      assert.ok(byClass(host, className));
-      assert.equal(text(find(host, (node) => node.tagName === "H1")), heading);
-    });
-  }
-});
-test("Setup Retry uses the refreshed revision and provider/account identity exactly once", async (t) => {
-  const cases = [
-    ["revision advanced", setupStatus({ revision: 9 })],
-    ["identity changed", setupStatus({
-      revision: 12, provider_kind: "claude-code", provider_id: "claude-code", account_id: "claude-account",
-    })],
-  ];
-  for (const [name, authoritative] of cases) {
-    await t.test(name, async (subtest) => {
-      const calls = [];
-      const { host } = mountPage(subtest, {
-        initialStatus: setupStatus({ revision: 3 }),
-        service: baseService({
-          status: () => Promise.resolve(authoritative),
-          setup(accountId, revision) {
-            calls.push({ accountId, revision });
-            if (calls.length === 1) return Promise.reject(new Error("stale"));
-            return Promise.resolve(setupResult({
-              revision: revision + 1,
-              provider_kind: authoritative.provider_kind,
-              provider_id: authoritative.provider_id,
-              account_id: authoritative.account_id,
-            }));
-          },
-        }),
-      });
-      await flush();
-      const retry = button(host, "Thử lại");
-      retry.click();
-      retry.click();
-      await flush();
-      assert.deepEqual(calls, [
-        { accountId: "account-1", revision: 3 },
-        { accountId: authoritative.account_id, revision: authoritative.revision },
-      ]);
-    });
-  }
-});
-test("Setup Retry survives a status error, retries GET, and suppresses a disposed stale status", async (t) => {
-  let statuses = 0; let setups = 0;
-  const staleStatus = deferred();
-  const { page, host } = mountPage(t, {
-    initialStatus: setupStatus({ revision: 3 }),
-    service: baseService({
-      setup: () => { setups++; return Promise.reject(new Error("setup failed")); },
-      status: () => {
-        statuses++;
-        if (statuses === 1) return Promise.reject(new Error("status failed"));
-        return staleStatus.promise;
-      },
-    }),
-  });
-  await flush();
-  button(host, "Thử lại").click();
-  await flush();
-  assert.equal(statuses, 1); assert.equal(setups, 1);
-  button(host, "Thử lại").click();
-  await flush();
-  assert.equal(statuses, 2);
-  page.dispose();
-  staleStatus.resolve(setupStatus({ revision: 9 }));
-  await flush();
-  assert.equal(setups, 1); assert.equal(text(host), "");
-});
-test("malformed Setup resume fails closed until status Retry supplies an account", async (t) => {
-  let setupCalls = 0;
-  let statusCalls = 0;
-  const { host } = mountPage(t, {
-    initialStatus: setupStatus({ account_id: "" }),
-    service: baseService({
-      status: () => {
-        statusCalls++; return Promise.resolve(setupStatus({
-          account_id: "restored-account", revision: 30,
-        }));
-      },
-      setup: () => { setupCalls++; return new Promise(() => {}); },
-    }),
-  });
-  assert.equal(setupCalls, 0);
-  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
-  button(host, "Thử lại").click();
-  await flush();
-  assert.equal(statusCalls, 1); assert.equal(setupCalls, 1);
-});
-test("Persona resume renders directly without PUT, Connect, or Setup", (t) => {
-  let selects = 0; let setups = 0;
-  const connectFactory = fakeConnectFactory();
+  const saveGate = deferred();
   const { host } = mountPage(t, {
     initialStatus: personaStatus(),
     service: baseService({
-      selectProvider: () => { selects++; },
-      setup: () => { setups++; },
+      loadAgent(options) {
+        calls.push({ op: "load", options });
+        return Promise.resolve(agent({
+          ready: false,
+          display_name: "",
+          placeholders: [
+            { key: "TEN_BOT", count: 2, sample: "Tên trong lời giới thiệu" },
+            { key: "vai-tro", count: 1, sample: "Vai trò {{vai-tro}}" },
+          ],
+        }));
+      },
+      saveAgent(payload, options) {
+        calls.push({ op: "save", payload, options });
+        return saveGate.promise;
+      },
     }),
-    connectFactory,
   });
-  assert.match(text(host), /Trợ lý của bạn là ai/);
-  assert.equal(selects, 0); assert.equal(setups, 0);
-  assert.equal(connectFactory.instances.length, 0);
+  await flush();
+
+  const form = find(host, (node) => node.tagName === "FORM");
+  const fields = findAll(form, (node) => node.tagName === "INPUT");
+  assert.deepEqual(findAll(form, (node) => hasClass(node, "fk")).map(text), ["Tên bot", "Vai tro"]);
+  assert.deepEqual(findAll(form, (node) => hasClass(node, "fs")).map(text), [
+    "Tên trong lời giới thiệu", "Vai trò {{vai-tro}}",
+  ]);
+  assert.match(text(byClass(form, "onboarding-persona-counter")), /Còn 2 mục cần điền/);
+  assert.equal(button(form, "Tiếp tục").disabled, true);
+  submit(form);
+  assert.equal(calls.filter(({ op }) => op === "save").length, 0);
+  assert.equal(document.activeElement, fields[0]);
+
+  setInputValue(fields[0], "  Bé Mi  ");
+  assert.match(text(byClass(form, "onboarding-persona-counter")), /Còn 1 mục cần điền/);
+  setInputValue(fields[1], "  Tư vấn viên  ");
+  assert.match(text(byClass(form, "onboarding-persona-counter")), /Còn 0 mục cần điền/);
+  assert.equal(button(form, "Tiếp tục").disabled, false);
+  submit(form);
+  submit(form);
+  assert.equal(calls.filter(({ op }) => op === "save").length, 1);
+  const save = calls.find(({ op }) => op === "save");
+  assert.deepEqual(save.payload, {
+    values: { TEN_BOT: "Bé Mi", "vai-tro": "Tư vấn viên" },
+    display_name: "Bé Mi",
+    require_complete: true,
+    onboarding_revision: 4,
+  });
+  assert.ok(save.options.signal instanceof AbortSignal);
+  assert.equal(button(form, "Tiếp tục").disabled, true);
+
+  saveGate.resolve({
+    ready: true,
+    display_name: "Bé Mi",
+    onboarding_phase: "test",
+    onboarding_revision: 5,
+  });
+  await flush();
+  assert.equal(input(host).value, "Xin chào");
+  assertNoSkip(host);
 });
-test("unknown, non-required, and malformed initial snapshots show retryable safe errors", async (t) => {
-  for (const [name, initialStatus] of [
-    ["unknown", providerStatus({ phase: "invented", secret: "DO-NOT-RENDER" })],
-    ["not required", providerStatus({ required: false })],
-    ["bad revision", providerStatus({ revision: 0 })],
-  ]) {
-    await t.test(name, async (subtest) => {
-      let retries = 0;
+
+test("Persona supports legacy display-only state, retains valid names, and handles safe 422 errors", async (t) => {
+  await t.test("missing legacy name", async (subtest) => {
+    const saves = [];
+    const error = Object.assign(new Error("private {{raw}}"), {
+      status: 422,
+      code: "AGENT_PLACEHOLDERS_REMAIN",
+      fields: { "vai-trò": "private detail", "bad\nkey": "SECRET" },
+    });
+    const { host } = mountPage(subtest, {
+      initialStatus: personaStatus(),
+      service: baseService({
+        loadAgent: () => Promise.resolve(agent({ display_name: "" })),
+        saveAgent(payload) {
+          saves.push(payload);
+          return saves.length === 1 ? Promise.reject(error) : Promise.resolve({
+            ready: true,
+            display_name: "Bot Cũ",
+            onboarding_phase: "test",
+            onboarding_revision: 5,
+          });
+        },
+      }),
+    });
+    await flush();
+    const form = find(host, (node) => node.tagName === "FORM");
+    const onlyInput = input(form);
+    assert.equal(onlyInput.getAttribute("data-persona-kind"), "display-name");
+    setInputValue(onlyInput, " Bot Cũ ");
+    submit(form);
+    await flush();
+    assert.equal(document.activeElement, onlyInput);
+    assert.match(text(form), /Còn 1 mục cần điền/);
+    assert.doesNotMatch(text(form), /private|SECRET|bad/u);
+    assert.deepEqual(saves[0], {
+      values: {}, display_name: "Bot Cũ", require_complete: true, onboarding_revision: 4,
+    });
+  });
+
+  await t.test("valid legacy name remains hidden and retained", async (subtest) => {
+    let payload;
+    const { host } = mountPage(subtest, {
+      initialStatus: personaStatus(),
+      service: baseService({
+        loadAgent: () => Promise.resolve(agent({ display_name: "Trợ lý An" })),
+        saveAgent(value) {
+          payload = value;
+          return Promise.resolve({
+            ready: true,
+            display_name: "Trợ lý An",
+            onboarding_phase: "test",
+            onboarding_revision: 5,
+          });
+        },
+      }),
+    });
+    await flush();
+    const form = find(host, (node) => node.tagName === "FORM");
+    assert.equal(input(form), null);
+    submit(form);
+    await flush();
+    assert.deepEqual(payload, {
+      values: {}, display_name: "Trợ lý An", require_complete: true, onboarding_revision: 4,
+    });
+  });
+});
+
+test("Persona malformed successors fail closed without entering Test", async (t) => {
+  const invalid = [
+    { ready: false, display_name: "Bé Mi", onboarding_phase: "test", onboarding_revision: 5 },
+    { ready: true, display_name: "Tên khác", onboarding_phase: "test", onboarding_revision: 5 },
+    { ready: true, display_name: "Bé Mi", onboarding_phase: "persona", onboarding_revision: 5 },
+    { ready: true, display_name: "Bé Mi", onboarding_phase: "test", onboarding_revision: 4 },
+    { ready: true, display_name: "Bé Mi", onboarding_phase: "test", onboarding_revision: 6 },
+  ];
+  for (const response of invalid) {
+    await t.test(JSON.stringify(response), async (subtest) => {
       const { host } = mountPage(subtest, {
-        initialStatus,
-        service: baseService({
-          status: () => {
-            retries++; return Promise.resolve(providerStatus({ phase: "still-invalid" }));
-          },
-        }),
+        initialStatus: personaStatus(),
+        service: baseService({ saveAgent: () => Promise.resolve(response) }),
       });
-      assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
-      assert.doesNotMatch(text(host), /DO-NOT-RENDER|invented|still-invalid/);
-      button(host, "Thử lại").click();
       await flush();
-      assert.equal(retries, 1);
-      assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+      submit(find(host, (node) => node.tagName === "FORM"));
+      await flush();
+      assert.ok(byClass(host, "onboarding-error-stage"));
+      assert.equal(byClass(host, "onboarding-test-stage"), null);
     });
   }
 });
-test("later Test and Completed phases render safe placeholders without a fourth step", async (t) => {
-  for (const phase of ["test", "completed"]) {
-    await t.test(phase, (subtest) => {
-      const { host } = mountPage(subtest, {
-        initialStatus: phase === "test"
-          ? { ...personaStatus({ revision: 40 }), phase: "test" }
-          : providerStatus({ phase: "completed", revision: 40 }),
-      });
-      const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
-      assert.equal(steps.length, 3);
-      assert.ok(byClass(host, "onboarding-placeholder-stage"));
-      assert.equal(text(find(host, (node) => node.tagName === "H1")),
-        phase === "test" ? "Trò chuyện thử" : "Thiết lập đã hoàn tất");
-    });
-  }
-});
-test("dispose aborts Setup, clears timers/listeners, and suppresses stale rendering and callbacks", async (t) => {
-  const gate = deferred();
-  const timers = controlledTimers();
-  let signal;
-  let completions = 0;
-  const { page, host } = mountPage(t, {
-    initialStatus: setupStatus(),
+
+test("Back from Test reloads Agent and the frontend re-saves against the Test revision", async (t) => {
+  let loads = 0;
+  const saves = [];
+  const { host } = mountPage(t, {
     service: baseService({
-      setup(_accountId, _revision, setupSignal) {
-        signal = setupSignal;
+      loadAgent: () => {
+        loads++;
+        return Promise.resolve(agent({ display_name: "Tên mới" }));
+      },
+      testChat: (_message, revision) => Promise.resolve(testResult({
+        answer: "Xin chào, mình là Tên mới.", bot_name: "Tên mới", revision: revision + 1,
+      })),
+      saveAgent(payload) {
+        saves.push(payload);
+        return Promise.resolve({
+          ready: true, display_name: "Tên mới",
+          onboarding_phase: "test", onboarding_revision: 9,
+        });
+      },
+    }),
+  });
+  await flush();
+  submit(find(host, (node) => node.tagName === "FORM"));
+  await flush();
+  button(host, "Quay lại chỉnh Persona").click();
+  await flush();
+  assert.equal(loads, 2);
+  assert.match(text(host), /Trợ lý của bạn là ai/);
+  assert.equal(input(host), null, "authoritative valid name is retained without a duplicate input");
+  submit(find(host, (node) => node.tagName === "FORM"));
+  await flush();
+  assert.deepEqual(saves, [{
+    values: {}, display_name: "Tên mới", require_complete: true, onboarding_revision: 8,
+  }]);
+  assert.equal(input(host).value, "Xin chào");
+});
+
+test("Test Chat starts with Xin chào, enforces 500 Unicode points, and is IME-safe", async (t) => {
+  const calls = [];
+  const gate = deferred();
+  const { host } = mountPage(t, {
+    service: baseService({
+      testChat(message, revision, options) {
+        calls.push({ message, revision, options });
         return gate.promise;
       },
     }),
-    onComplete: () => { completions++; },
-    ...timers,
   });
-  page.dispose();
-  page.dispose();
-  assert.equal(signal.aborted, true);
-  gate.resolve(setupResult());
   await flush();
-  assert.equal(text(host), "");
-  assert.equal(timers.size, 0);
-  assert.equal(completions, 0);
-  assert.equal(page.mount(host), page);
-  assert.equal(text(host), "");
+  const field = input(host);
+  const form = find(host, (node) => node.tagName === "FORM");
+  assert.equal(field.value, "Xin chào");
+  assert.equal(field.hasAttribute("maxlength"), false);
+  assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+  assertNoSkip(host);
+
+  setInputValue(field, "🙂".repeat(501));
+  submit(form);
+  assert.equal(calls.length, 0);
+  assert.equal(document.activeElement, field);
+  setInputValue(field, "🙂".repeat(500));
+  field.dispatchEvent({ type: "keydown", key: "Enter", isComposing: true, keyCode: 229 });
+  assert.equal(calls.length, 0);
+  field.dispatchEvent({ type: "keydown", key: "Enter", isComposing: false, keyCode: 13 });
+  field.dispatchEvent({ type: "keydown", key: "Enter", isComposing: false, keyCode: 13 });
+  assert.equal(calls.length, 1);
+  assert.equal([...calls[0].message].length, 500);
+  assert.deepEqual({ revision: calls[0].revision }, { revision: 7 });
+  assert.ok(calls[0].options.signal instanceof AbortSignal);
+  assert.equal(button(host, "Gửi thử").disabled, true);
+  gate.resolve(testResult());
+  await flush();
 });
-test("same-host remount does not duplicate provider listeners", async (t) => {
-  let selects = 0;
-  const gate = deferred();
-  const { page, host } = mountPage(t, {
-    initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
-    service: baseService({
-      selectProvider: () => { selects++; return gate.promise; },
-    }),
-  });
-  const retained = button(host, "Tiếp tục");
-  page.mount(host);
-  retained.click();
-  retained.click();
-  assert.equal(selects, 1);
+
+test("Test Chat validates receipt identity, revision, expiry, name, and every required field", async (t) => {
+  const invalid = [
+    ["empty answer", { answer: "" }, /chưa thể xác minh/i],
+    ["wrong name", { bot_name: "Tên khác" }, /chưa áp dụng đúng Persona/i],
+    ["wrong provider", { provider_id: "claude-code" }, /chưa thể xác minh/i],
+    ["wrong model", { model_id: "other" }, /chưa thể xác minh/i],
+    ["missing token", { test_token: "" }, /chưa thể xác minh/i],
+    ["unchanged revision", { revision: 7 }, /chưa thể xác minh/i],
+    ["jumped revision", { revision: 9 }, /chưa thể xác minh/i],
+    ["invalid expiry", { expires_at: "tomorrow" }, /chưa thể xác minh/i],
+    ["expired", { expires_at: new Date(Date.now() - 1_000).toISOString() }, /hết hạn/i],
+  ];
+  for (const [name, override, expected] of invalid) {
+    await t.test(name, async (subtest) => {
+      const { host } = mountPage(subtest, {
+        service: baseService({ testChat: () => Promise.resolve(testResult(override)) }),
+      });
+      await flush();
+      submit(find(host, (node) => node.tagName === "FORM"));
+      await flush();
+      assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+      assert.ok(button(host, "Thử lại"));
+      assert.ok(button(host, "Quay lại chỉnh Persona"));
+      assert.match(text(host), expected);
+    });
+  }
 });
-test("the real Provider Connect owns the explicit start action and receives onboarding revision", async (t) => {
-  const connectCalls = [];
-  const setupCalls = [];
-  const timers = controlledTimers();
+
+test("a successful receipt renders labeled bubbles but never auto-completes", async (t) => {
+  let completes = 0;
   const { host } = mountPage(t, {
-    initialStatus: connectStatus({ revision: 51 }),
-    connectService: {
-      connectStart(kind, label, onboardingRevision) {
-        connectCalls.push({ kind, label, onboardingRevision });
-        return Promise.resolve({
-          kind, phase: "connected", providerId: kind, accountId: "actual-account",
-        });
-      },
-      connectStatus: () => Promise.reject(new Error("must not poll after terminal start")),
-      connectCancel: () => Promise.resolve({ ok: true }),
-    },
-    service: baseService({
-      status: () => Promise.resolve(setupStatus({ revision: 52, account_id: "actual-account" })),
-      setup(accountId, revision) {
-        setupCalls.push({ accountId, revision });
-        return Promise.resolve(setupResult({ revision: 53, account_id: accountId }));
-      },
-    }),
-    ...timers,
+    service: baseService({ complete: () => { completes++; } }),
   });
-  assert.equal(connectCalls.length, 0, "mounting only prepares the component prompt");
-  const starts = findAll(host, (node) => node.tagName === "BUTTON"
-    && text(node).includes("Bắt đầu kết nối"));
-  assert.equal(starts.length, 1, "the shared component owns the sole start action");
-  starts[0].click();
   await flush();
+  submit(find(host, (node) => node.tagName === "FORM"));
   await flush();
-  assert.deepEqual(connectCalls, [{ kind: "codex", label: "Onboarding", onboardingRevision: 51 }]);
-  assert.deepEqual(setupCalls, [{ accountId: "actual-account", revision: 52 }]);
+
+  assert.equal(completes, 0);
+  assert.match(text(byClass(host, "onboarding-chat-user")), /Bạn.*Xin chào/u);
+  assert.match(text(byClass(host, "onboarding-chat-bot")), /Bé Mi.*mình là Bé Mi/u);
+  assert.equal(byClass(host, "onboarding-chat-transcript").getAttribute("aria-live"), "polite");
+  assert.ok(button(host, "Ổn, dùng cấu hình này"));
+  assertNoSkip(host);
+});
+
+test("editing, remounting, retrying, Back, rejection, and cancellation invalidate volatile receipts", async (t) => {
+  await t.test("editing and remount", async (subtest) => {
+    const { page, host } = mountPage(subtest);
+    await flush();
+    submit(find(host, (node) => node.tagName === "FORM"));
+    await flush();
+    setInputValue(input(host), "Câu khác");
+    assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+    submit(find(host, (node) => node.tagName === "FORM"));
+    await flush();
+    assert.ok(button(host, "Ổn, dùng cấu hình này"));
+    page.mount(host);
+    assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+  });
+
+  await t.test("failed retry and Back cancellation", async (subtest) => {
+    const pending = deferred();
+    let calls = 0;
+    let abortedSignal;
+    const { host } = mountPage(subtest, {
+      service: baseService({
+        testChat(_message, _revision, options) {
+          calls++;
+          if (calls === 1) return Promise.reject(new Error("timeout SECRET"));
+          abortedSignal = options.signal;
+          return pending.promise;
+        },
+      }),
+    });
+    await flush();
+    submit(find(host, (node) => node.tagName === "FORM"));
+    await flush();
+    assert.doesNotMatch(text(host), /SECRET/u);
+    button(host, "Thử lại").click();
+    assert.equal(calls, 2);
+    button(host, "Quay lại chỉnh Persona").click();
+    assert.equal(abortedSignal.aborted, true);
+    pending.resolve(testResult());
+    await flush();
+    assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+    assert.match(text(host), /Trợ lý của bạn là ai/);
+  });
+
+  await t.test("editing cancels pending Test and pending Complete", async (subtest) => {
+    const testGate = deferred();
+    const completeGate = deferred();
+    let testSignal;
+    let completeSignal;
+    let tests = 0;
+    const { host } = mountPage(subtest, {
+      service: baseService({
+        testChat(_message, revision, options) {
+          tests++;
+          testSignal = options.signal;
+          return tests === 1 ? testGate.promise : Promise.resolve(testResult({ revision: revision + 1 }));
+        },
+        complete(_token, _revision, options) {
+          completeSignal = options.signal;
+          return completeGate.promise;
+        },
+      }),
+    });
+    await flush();
+    submit(find(host, (node) => node.tagName === "FORM"));
+    setInputValue(input(host), "Đổi khi đang gửi");
+    assert.equal(testSignal.aborted, true);
+    testGate.resolve(testResult());
+    await flush();
+    assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+
+    submit(find(host, (node) => node.tagName === "FORM"));
+    await flush();
+    button(host, "Ổn, dùng cấu hình này").click();
+    setInputValue(input(host), "Đổi khi đang hoàn tất");
+    assert.equal(completeSignal.aborted, true);
+    completeGate.resolve({ completed: true, onboarding_version: 1, combo_id: "late" });
+    await flush();
+    assert.doesNotMatch(text(host), /đã sẵn sàng/u);
+    assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+  });
+});
+
+test("the raw test token never enters DOM attributes, storage, URL, status, or logs", async (t) => {
+  const token = "TOKEN-SENTINEL-DO-NOT-RENDER";
+  const storageCalls = [];
+  const savedLocal = globalThis.localStorage;
+  const savedSession = globalThis.sessionStorage;
+  const savedLog = console.log;
+  globalThis.localStorage = { setItem: (...args) => storageCalls.push(["local", ...args]) };
+  globalThis.sessionStorage = { setItem: (...args) => storageCalls.push(["session", ...args]) };
+  const logs = [];
+  console.log = (...args) => logs.push(args);
+  t.after(() => {
+    console.log = savedLog;
+    if (savedLocal === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = savedLocal;
+    if (savedSession === undefined) delete globalThis.sessionStorage;
+    else globalThis.sessionStorage = savedSession;
+  });
+  const { host } = mountPage(t, {
+    service: baseService({ testChat: () => Promise.resolve(testResult({ test_token: token })) }),
+  });
+  await flush();
+  submit(find(host, (node) => node.tagName === "FORM"));
+  await flush();
+
+  assert.doesNotMatch(text(host), new RegExp(token));
+  assert.doesNotMatch(domAttributes(host), new RegExp(token));
+  assert.equal(storageCalls.length, 0);
+  assert.equal(JSON.stringify(logs).includes(token), false);
+  assert.equal(String(globalThis.location ?? "").includes(token), false);
+});
+
+test("Complete is manual, one-flight, validates success, and hands off once per CTA", async (t) => {
+  for (const [label, destination] of [
+    ["Vào Portal", "portal"],
+    ["Thêm kiến thức ngay", "knowledge"],
+  ]) {
+    await t.test(destination, async (subtest) => {
+      const completeGate = deferred();
+      const calls = [];
+      const handoffs = [];
+      const { host } = mountPage(subtest, {
+        service: baseService({
+          complete(token, revision, options) {
+            calls.push({ token, revision, options });
+            return completeGate.promise;
+          },
+        }),
+        onComplete: (payload) => handoffs.push(payload),
+      });
+      await flush();
+      submit(find(host, (node) => node.tagName === "FORM"));
+      await flush();
+      const confirm = button(host, "Ổn, dùng cấu hình này");
+      confirm.click();
+      confirm.click();
+      assert.equal(calls.length, 1);
+      assert.deepEqual({ token: calls[0].token, revision: calls[0].revision }, {
+        token: "opaque-test-token", revision: 8,
+      });
+      assert.ok(calls[0].options.signal instanceof AbortSignal);
+      assert.equal(handoffs.length, 0);
+      completeGate.resolve({ completed: true, onboarding_version: 1, combo_id: "combo-new" });
+      await flush();
+      assert.match(text(host), /Bé Mi đã sẵn sàng!/u);
+      assert.match(text(host), /bổ sung tài liệu.*Kiến thức/u);
+      const cta = button(host, label);
+      cta.click();
+      cta.click();
+      button(host, destination === "portal" ? "Thêm kiến thức ngay" : "Vào Portal").click();
+      assert.deepEqual(handoffs, [{ destination }]);
+    });
+  }
+});
+
+test("Complete recovery clears expired receipts, refreshes conflicts, and safely retries generic errors", async (t) => {
+  await t.test("expired/test-required", async (subtest) => {
+    for (const code of ["ONBOARDING_TEST_EXPIRED", "ONBOARDING_TEST_REQUIRED"]) {
+      await subtest.test(code, async (caseTest) => {
+        let completes = 0;
+        const { host } = mountPage(caseTest, {
+          service: baseService({
+            complete() {
+              completes++;
+              return Promise.reject(Object.assign(new Error("secret"), { code, status: 409 }));
+            },
+          }),
+        });
+        await flush();
+        submit(find(host, (node) => node.tagName === "FORM"));
+        await flush();
+        button(host, "Ổn, dùng cấu hình này").click();
+        await flush();
+        assert.equal(completes, 1);
+        assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+        assert.ok(button(host, "Thử lại"));
+        assert.doesNotMatch(text(host), /secret/u);
+      });
+    }
+  });
+
+  await t.test("revision/config conflict", async (subtest) => {
+    for (const code of ["ONBOARDING_REVISION_CONFLICT", "ONBOARDING_CONFIGURATION_CHANGED"]) {
+      await subtest.test(code, async (caseTest) => {
+        let statuses = 0;
+        const { host } = mountPage(caseTest, {
+          service: baseService({
+            complete: () => Promise.reject(Object.assign(new Error("conflict"), { code, status: 409 })),
+            status() {
+              statuses++;
+              return Promise.resolve(testStatus({ revision: 20 }));
+            },
+          }),
+        });
+        await flush();
+        submit(find(host, (node) => node.tagName === "FORM"));
+        await flush();
+        button(host, "Ổn, dùng cấu hình này").click();
+        await flush();
+        assert.equal(statuses, 1);
+        assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+        assert.equal(input(host).value, "Xin chào");
+      });
+    }
+  });
+
+  await t.test("generic retry", async (subtest) => {
+    let completes = 0;
+    const { host } = mountPage(subtest, {
+      service: baseService({
+        complete() {
+          completes++;
+          if (completes === 1) return Promise.reject(new Error("TOKEN-SHOULD-STAY-PRIVATE"));
+          return Promise.resolve({ completed: true, onboarding_version: 1, combo_id: "combo-ok" });
+        },
+      }),
+    });
+    await flush();
+    submit(find(host, (node) => node.tagName === "FORM"));
+    await flush();
+    button(host, "Ổn, dùng cấu hình này").click();
+    await flush();
+    assert.ok(button(host, "Ổn, dùng cấu hình này"));
+    assert.doesNotMatch(text(host), /TOKEN-SHOULD-STAY-PRIVATE/u);
+    button(host, "Ổn, dùng cấu hình này").click();
+    await flush();
+    assert.equal(completes, 2);
+    assert.match(text(host), /đã sẵn sàng/u);
+  });
+});
+
+test("malformed Complete responses and stale disposal never render Done or call handoff", async (t) => {
+  const invalid = [
+    { completed: false, onboarding_version: 1, combo_id: "combo" },
+    { completed: true, onboarding_version: 2, combo_id: "combo" },
+    { completed: true, onboarding_version: 1, combo_id: "" },
+  ];
+  for (const response of invalid) {
+    await t.test(JSON.stringify(response), async (subtest) => {
+      let handoffs = 0;
+      const { host } = mountPage(subtest, {
+        service: baseService({ complete: () => Promise.resolve(response) }),
+        onComplete: () => { handoffs++; },
+      });
+      await flush();
+      submit(find(host, (node) => node.tagName === "FORM"));
+      await flush();
+      button(host, "Ổn, dùng cấu hình này").click();
+      await flush();
+      assert.doesNotMatch(text(host), /đã sẵn sàng/u);
+      assert.equal(handoffs, 0);
+    });
+  }
+
+  await t.test("disposed late success", async (subtest) => {
+    const gate = deferred();
+    let handoffs = 0;
+    const { page, host } = mountPage(subtest, {
+      service: baseService({ complete: () => gate.promise }),
+      onComplete: () => { handoffs++; },
+    });
+    await flush();
+    submit(find(host, (node) => node.tagName === "FORM"));
+    await flush();
+    button(host, "Ổn, dùng cấu hình này").click();
+    page.dispose();
+    gate.resolve({ completed: true, onboarding_version: 1, combo_id: "combo" });
+    await flush();
+    assert.equal(text(host), "");
+    assert.equal(handoffs, 0);
+  });
+});
+
+test("Test resume has no receipt and completed resume requires an authoritative Agent name", async (t) => {
+  await t.test("test resume", async (subtest) => {
+    const { host } = mountPage(subtest);
+    await flush();
+    assert.equal(input(host).value, "Xin chào");
+    assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
+  });
+
+  await t.test("completed resume", async (subtest) => {
+    let loads = 0;
+    const { host } = mountPage(subtest, {
+      initialStatus: testStatus({ required: false, phase: "completed", revision: 9 }),
+      service: baseService({
+        loadAgent: () => {
+          loads++;
+          return Promise.resolve(agent({ display_name: "Trợ lý An" }));
+        },
+      }),
+    });
+    await flush();
+    assert.equal(loads, 1);
+    assert.match(text(host), /Trợ lý An đã sẵn sàng!/u);
+  });
 });
