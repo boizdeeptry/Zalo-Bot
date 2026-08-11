@@ -140,6 +140,31 @@ func TestMakeAccountEnvPenalizeOnlyOnRateLimit(t *testing.T) {
 	}
 }
 
+func TestOnboardingPinnedAccountResolversIgnoreLiveSelection(t *testing.T) {
+	staged := store.OnboardingStagingAccount{
+		AccountID: "staged", ProviderID: "codex", ProviderKind: "codex",
+		ConfigDir: `C:\onboarding\staged`,
+	}
+	pick := makeOnboardingPinnedConfigDir(staged)
+	for i := 0; i < 3; i++ {
+		configDir, penalize, ok := pick()
+		if !ok || configDir != staged.ConfigDir || penalize == nil {
+			t.Fatalf("pinned config call %d = %q, penalize-nil=%t, ok=%t; want staged directory", i, configDir, penalize == nil, ok)
+		}
+		penalize(true)
+	}
+
+	envFn := makeOnboardingPinnedAccountEnv(staged)
+	env, penalize, ok := envFn()
+	if !ok || penalize == nil {
+		t.Fatalf("pinned env = _, penalize-nil=%t, ok=%t; want exact staged account", penalize == nil, ok)
+	}
+	want := "CODEX_HOME=" + staged.ConfigDir
+	if !slices.Contains(env, want) {
+		t.Fatalf("pinned env lacks %q: %v", want, env)
+	}
+}
+
 // TestSpawnSetsAccountEnvAndPenalizesOnRateLimit ghim seam accountEnv trên đường TEST (a.run):
 // spawn phải wire penalize TRƯỚC nhánh a.run, nên một lỗi rate_limit từ CLI phải gọi penalize(true).
 func TestSpawnSetsAccountEnvAndPenalizesOnRateLimit(t *testing.T) {

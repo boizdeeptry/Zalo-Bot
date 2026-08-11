@@ -2,10 +2,16 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +24,496 @@ import (
 
 	"agentdc/internal/store"
 )
+
+func TestAppOnboardingTestChatPersistsHashOnlyReceipt(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	state, persona := seedAppOnboardingTestChat(t, env, "codex", 41)
+	const message = "Hãy giới thiệu bạn với tôi"
+	const answer = "Xin chào, tôi là BÉ\n\tMI và rất vui được gặp bạn."
+	fixedNow := time.Date(2026, 8, 11, 8, 0, 0, 123456789, time.UTC)
+	randomBytes := make([]byte, 32)
+	for i := range randomBytes {
+		randomBytes[i] = byte(i)
+	}
+
+	var gotState store.OnboardingState
+	var gotAccount store.OnboardingStagingAccount
+	var gotPrompt string
+	var logs syncLogBuffer
+	env.a.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	withAppOnboardingTestSeams(t,
+		func(ctx context.Context, _ *api, state store.OnboardingState, account store.OnboardingStagingAccount, prompt string) (string, error) {
+			gotState, gotAccount, gotPrompt = state, account, prompt
+			return answer, nil
+		},
+		func() time.Time { return fixedNow },
+		bytes.NewReader(randomBytes),
+		120*time.Second,
+	)
+	beforeSideEffects := appOnboardingTestSideEffectDigest(t, env)
+
+	rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":41,"message":"  Hãy giới thiệu bạn với tôi  "}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	got := decodeOnboardingResponse[appOnboardingTestChatResponse](t, rr)
+	wantToken := base64.RawURLEncoding.EncodeToString(randomBytes)
+	wantExpiry := fixedNow.Add(10 * time.Minute).Format(time.RFC3339Nano)
+	if got.Answer != answer || got.BotName != "Bé Mi" || got.ProviderID != "codex" ||
+		got.ModelID != "gpt-5.6-terra" || got.TestToken != wantToken ||
+		got.ExpiresAt != wantExpiry || got.Revision != 42 {
+		t.Fatalf("test-chat response = %+v", got)
+	}
+	if len(got.TestToken) != 43 || strings.ContainsAny(got.TestToken, "+/=") {
+		t.Fatalf("test token is not 256-bit Base64URL-no-padding: %q", got.TestToken)
+	}
+	if gotState != state || gotAccount.AccountID != "staged-account" ||
+		gotAccount.ConfigDir != "D:/onboarding/staged-account" {
+		t.Fatalf("executor staging = state %+v account %+v", gotState, gotAccount)
+	}
+	if !strings.Contains(gotPrompt, persona) || !strings.Contains(gotPrompt, `"display_name":"Bé Mi"`) ||
+		!strings.Contains(gotPrompt, message) || !strings.Contains(strings.ToLower(gotPrompt), "tiếng việt") {
+		t.Fatalf("prompt lacks full persona, structured identity, message, or Vietnamese request: %q", gotPrompt)
+	}
+	if strings.Contains(logs.String(), persona) || strings.Contains(logs.String(), message) || strings.Contains(logs.String(), answer) {
+		t.Fatalf("test-chat content leaked to logs: %q", logs.String())
+	}
+
+	after := env.state(t)
+	wantHashBytes := sha256.Sum256([]byte(wantToken))
+	wantHash := hex.EncodeToString(wantHashBytes[:])
+	if after.Revision != state.Revision+1 || after.TestNonceHash != wantHash ||
+		after.TestExpiresAt != wantExpiry || after.PersonaFingerprint != state.PersonaFingerprint {
+		t.Fatalf("persisted receipt = %+v; want hash %q", after, wantHash)
+	}
+	serializedState, err := json.Marshal(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{wantToken, message, answer, "Bé Mi"} {
+		if strings.Contains(string(serializedState), forbidden) {
+			t.Fatalf("persisted state contains plaintext %q: %s", forbidden, serializedState)
+		}
+	}
+	if afterSideEffects := appOnboardingTestSideEffectDigest(t, env); afterSideEffects != beforeSideEffects {
+		t.Fatalf("test chat changed production side effects:\nbefore=%q\nafter=%q", beforeSideEffects, afterSideEffects)
+	}
+}
+
+func TestAppOnboardingTestChatStrictMessageValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "empty", body: []byte(`{"revision":2,"message":"  "}`)},
+		{name: "too long unicode", body: []byte(`{"revision":2,"message":"` + strings.Repeat("ạ", 501) + `"}`)},
+		{name: "control", body: []byte(`{"revision":2,"message":"xin\u0000chao"}`)},
+		{name: "newline", body: []byte(`{"revision":2,"message":"xin\nchao"}`)},
+		{name: "invalid utf8", body: append([]byte(`{"revision":2,"message":"`), append([]byte{0xff}, []byte(`"}`)...)...)},
+		{name: "unknown field", body: []byte(`{"revision":2,"message":"xin chao","extra":true}`)},
+		{name: "trailing json", body: []byte(`{"revision":2,"message":"xin chao"}{}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			before := env.state(t)
+			calls := 0
+			withAppOnboardingTestSeams(t,
+				func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+					calls++
+					return "unexpected", nil
+				},
+				time.Now,
+				bytes.NewReader(make([]byte, 32)),
+				120*time.Second,
+			)
+			req := httptest.NewRequest(http.MethodPost, "/onboarding/test-chat", bytes.NewReader(tt.body))
+			rr := env.serveRequest(req)
+			wantCode := "ONBOARDING_TEST_MESSAGE_INVALID"
+			if tt.name == "unknown field" || tt.name == "trailing json" || tt.name == "invalid utf8" {
+				wantCode = "ONBOARDING_REQUEST_INVALID"
+			}
+			requireOnboardingCode(t, rr, http.StatusBadRequest, wantCode)
+			if calls != 0 {
+				t.Fatalf("invalid request called runner %d times", calls)
+			}
+			if after := env.state(t); after != before {
+				t.Fatalf("invalid request changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingTestChatRejectsInvalidStagingBeforeRunner(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(*onboardingRouteTestEnv, *store.OnboardingState)
+		body     string
+		wantCode string
+	}{
+		{name: "stale revision", body: `{"revision":40,"message":"xin chào"}`, wantCode: "ONBOARDING_REVISION_CONFLICT"},
+		{name: "wrong phase", body: `{"revision":41,"message":"xin chào"}`, wantCode: "ONBOARDING_PHASE_INVALID", mutate: func(_ *onboardingRouteTestEnv, state *store.OnboardingState) {
+			state.Phase = store.OnboardingPhasePersona
+		}},
+		{name: "fingerprint changed", body: `{"revision":41,"message":"xin chào"}`, wantCode: "ONBOARDING_PERSONA_CHANGED", mutate: func(env *onboardingRouteTestEnv, _ *store.OnboardingState) {
+			_ = os.WriteFile(env.a.zalo.cfg.PersonaPath, []byte("persona changed"), 0o600)
+		}},
+		{name: "wrong provider id", body: `{"revision":41,"message":"xin chào"}`, wantCode: "ONBOARDING_STAGING_INVALID", mutate: func(_ *onboardingRouteTestEnv, state *store.OnboardingState) { state.ProviderID = "other" }},
+		{name: "enabled account", body: `{"revision":41,"message":"xin chào"}`, wantCode: "ONBOARDING_STAGING_INVALID", mutate: func(env *onboardingRouteTestEnv, _ *store.OnboardingState) {
+			_, _ = env.db.Exec(`UPDATE llm_accounts SET enabled = 1 WHERE id = 'staged-account'`)
+		}},
+		{name: "unavailable model", body: `{"revision":41,"message":"xin chào"}`, wantCode: "ONBOARDING_NO_MODEL", mutate: func(env *onboardingRouteTestEnv, _ *store.OnboardingState) {
+			_, _ = env.db.Exec(`UPDATE llm_models SET available = 0 WHERE provider_id = 'codex'`)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			state, _ := seedAppOnboardingTestChat(t, env, "codex", 41)
+			if tt.mutate != nil {
+				tt.mutate(env, &state)
+				env.setState(t, state)
+			}
+			before := env.state(t)
+			calls := 0
+			withAppOnboardingTestSeams(t,
+				func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+					calls++
+					return "unexpected", nil
+				},
+				time.Now,
+				bytes.NewReader(make([]byte, 32)),
+				120*time.Second,
+			)
+			rr := env.serve(http.MethodPost, "/onboarding/test-chat", tt.body)
+			wantStatus := http.StatusConflict
+			if tt.wantCode == "ONBOARDING_NO_MODEL" {
+				wantStatus = http.StatusUnprocessableEntity
+			}
+			requireOnboardingCode(t, rr, wantStatus, tt.wantCode)
+			if calls != 0 {
+				t.Fatalf("invalid staging called runner %d times", calls)
+			}
+			if after := env.state(t); after != before {
+				t.Fatalf("invalid staging changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingTestChatRejectsEmptyOrMissingNameAnswer(t *testing.T) {
+	tests := []struct {
+		name, answer string
+	}{
+		{name: "empty", answer: " \n\t "},
+		{name: "missing name", answer: "Xin chào, tôi là trợ lý của bạn."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			seedAppOnboardingTestChat(t, env, "codex", 9)
+			before := env.state(t)
+			withAppOnboardingTestSeams(t,
+				func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+					return tt.answer, nil
+				},
+				time.Now,
+				bytes.NewReader(make([]byte, 32)),
+				120*time.Second,
+			)
+			rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":9,"message":"xin chào"}`)
+			requireOnboardingCode(t, rr, http.StatusUnprocessableEntity, "ONBOARDING_TEST_ANSWER_INVALID")
+			if after := env.state(t); after != before {
+				t.Fatalf("invalid answer changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingTestChatBusySkipsSecondRunner(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 12)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	var callsMu sync.Mutex
+	withAppOnboardingTestSeams(t,
+		func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+			callsMu.Lock()
+			calls++
+			call := calls
+			callsMu.Unlock()
+			if call > 1 {
+				return "unexpected second runner", nil
+			}
+			close(entered)
+			select {
+			case <-release:
+				return "Xin chào, tôi là Bé Mi.", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+		time.Now,
+		bytes.NewReader(make([]byte, 32)),
+		120*time.Second,
+	)
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":12,"message":"xin chào"}`)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first Test Chat did not enter runner")
+	}
+	second := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":12,"message":"xin chào lần hai"}`)
+	requireOnboardingCode(t, second, http.StatusConflict, "ONBOARDING_TEST_BUSY")
+	close(release)
+	select {
+	case first := <-firstDone:
+		if first.Code != http.StatusOK {
+			t.Fatalf("first Test Chat status=%d body=%s", first.Code, first.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Test Chat did not finish")
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("runner calls = %d; want exactly 1", calls)
+	}
+}
+
+func TestAppOnboardingTestChatCancellationAndTimeoutDoNotPersist(t *testing.T) {
+	tests := []struct {
+		name       string
+		timeout    time.Duration
+		cancel     bool
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "client cancel", timeout: time.Second, cancel: true, wantStatus: http.StatusRequestTimeout, wantCode: "ONBOARDING_REQUEST_CANCELED"},
+		{name: "hard timeout", timeout: 10 * time.Millisecond, wantStatus: http.StatusGatewayTimeout, wantCode: "ONBOARDING_TEST_TIMEOUT"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			seedAppOnboardingTestChat(t, env, "codex", 15)
+			before := env.state(t)
+			childEntered := make(chan struct{})
+			childCanceled := make(chan error, 1)
+			withAppOnboardingTestSeams(t,
+				func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+					close(childEntered)
+					<-ctx.Done()
+					childCanceled <- ctx.Err()
+					return "", ctx.Err()
+				},
+				time.Now,
+				bytes.NewReader(make([]byte, 32)),
+				tt.timeout,
+			)
+			ctx := context.Background()
+			var cancel context.CancelFunc
+			if tt.cancel {
+				ctx, cancel = context.WithCancel(ctx)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/onboarding/test-chat", strings.NewReader(`{"revision":15,"message":"xin chào"}`)).WithContext(ctx)
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() { done <- env.serveRequest(req) }()
+			select {
+			case <-childEntered:
+			case <-time.After(time.Second):
+				t.Fatal("runner child did not start")
+			}
+			if cancel != nil {
+				cancel()
+			}
+			var rr *httptest.ResponseRecorder
+			select {
+			case rr = <-done:
+			case <-time.After(time.Second):
+				t.Fatal("canceled handler did not return")
+			}
+			requireOnboardingCode(t, rr, tt.wantStatus, tt.wantCode)
+			select {
+			case <-childCanceled:
+			case <-time.After(time.Second):
+				t.Fatal("runner child did not observe cancellation")
+			}
+			if after := env.state(t); after != before {
+				t.Fatalf("canceled test changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingTestChatRejectsLateSuccessAfterHardTimeout(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 16)
+	before := env.state(t)
+	withAppOnboardingTestSeams(t,
+		func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+			<-ctx.Done()
+			return "Xin chào, tôi là Bé Mi.", nil
+		},
+		time.Now,
+		bytes.NewReader(make([]byte, 32)),
+		10*time.Millisecond,
+	)
+
+	rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":16,"message":"xin chào"}`)
+	requireOnboardingCode(t, rr, http.StatusGatewayTimeout, "ONBOARDING_TEST_TIMEOUT")
+	if after := env.state(t); after != before {
+		t.Fatalf("late success changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAppOnboardingTestChatRunnerFailureIsSafeAndDoesNotPersist(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 18)
+	before := env.state(t)
+	withAppOnboardingTestSeams(t,
+		func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+			return "", errors.New("RUNNER_SECRET prompt and account path")
+		},
+		time.Now,
+		bytes.NewReader(make([]byte, 32)),
+		120*time.Second,
+	)
+
+	rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":18,"message":"xin chào"}`)
+	requireOnboardingCode(t, rr, http.StatusBadGateway, "ONBOARDING_TEST_FAILED")
+	if strings.Contains(rr.Body.String(), "RUNNER_SECRET") {
+		t.Fatalf("runner failure leaked internal details: %s", rr.Body.String())
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("runner failure changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAppOnboardingTestChatRandomAndStoreFailuresDoNotPersist(t *testing.T) {
+	tests := []struct {
+		name      string
+		random    io.Reader
+		failStore bool
+		wantCode  string
+	}{
+		{name: "random", random: errorReader{err: errors.New("RANDOM_SECRET")}, wantCode: "ONBOARDING_TEST_TOKEN_FAILED"},
+		{name: "store", random: bytes.NewReader(make([]byte, 32)), failStore: true, wantCode: "ONBOARDING_STATE_UNAVAILABLE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			seedAppOnboardingTestChat(t, env, "codex", 23)
+			before := env.state(t)
+			if tt.failStore {
+				if _, err := env.db.Exec(`CREATE TRIGGER fail_test_chat_receipt
+BEFORE UPDATE ON app_onboarding_state
+BEGIN SELECT RAISE(ABORT, 'STORE_SECRET'); END`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			withAppOnboardingTestSeams(t,
+				func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+					return "Xin chào, tôi là Bé Mi.", nil
+				},
+				time.Now,
+				tt.random,
+				120*time.Second,
+			)
+			rr := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":23,"message":"xin chào"}`)
+			requireOnboardingCode(t, rr, http.StatusInternalServerError, tt.wantCode)
+			if strings.Contains(rr.Body.String(), "SECRET") {
+				t.Fatalf("failure leaked internal details: %s", rr.Body.String())
+			}
+			if after := env.state(t); after != before {
+				t.Fatalf("failed test changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func withAppOnboardingTestSeams(
+	t *testing.T,
+	execute appOnboardingTestExecutor,
+	now func() time.Time,
+	random io.Reader,
+	timeout time.Duration,
+) {
+	t.Helper()
+	oldExecute := appOnboardingTestExecute
+	oldNow := appOnboardingTestNow
+	oldRandom := appOnboardingTestRandom
+	oldTimeout := appOnboardingTestTimeout
+	appOnboardingTestExecute = execute
+	appOnboardingTestNow = now
+	appOnboardingTestRandom = random
+	appOnboardingTestTimeout = timeout
+	t.Cleanup(func() {
+		appOnboardingTestExecute = oldExecute
+		appOnboardingTestNow = oldNow
+		appOnboardingTestRandom = oldRandom
+		appOnboardingTestTimeout = oldTimeout
+	})
+}
+
+func seedAppOnboardingTestChat(
+	t *testing.T,
+	env *onboardingRouteTestEnv,
+	kind string,
+	revision int64,
+) (store.OnboardingState, string) {
+	t.Helper()
+	seedAppOnboardingSetup(t, env, kind, "staged-account", false, revision, []store.LLMModel{{
+		ModelID:   map[string]string{"codex": "gpt-5.6-terra", "claude-code": "sonnet"}[kind],
+		Available: true,
+	}})
+	const persona = "PERSONA-SECRET: nói ngắn gọn, chân thành."
+	configureAgentPersonaForOnboardingTest(t, env, persona)
+	if err := env.a.st.SetAgentDisplayName("Bé Mi"); err != nil {
+		t.Fatal(err)
+	}
+	state := env.state(t)
+	state.Phase = store.OnboardingPhaseTest
+	state.ModelID = map[string]string{"codex": "gpt-5.6-terra", "claude-code": "sonnet"}[kind]
+	state.StagedComboID = "staged-combo"
+	state.PersonaFingerprint = agentPersonaFingerprint([]byte(persona), "Bé Mi")
+	env.setState(t, state)
+	return env.state(t), persona
+}
+
+func appOnboardingTestSideEffectDigest(t *testing.T, env *onboardingRouteTestEnv) string {
+	t.Helper()
+	queries := []string{
+		`SELECT COUNT(*) FROM llm_attempts`,
+		`SELECT COUNT(*) FROM app_zalo_cli_sessions`,
+		`SELECT COUNT(*) FROM app_memory_revisions`,
+		`SELECT COUNT(*) FROM app_memory_subject_revisions`,
+		`SELECT COUNT(*) FROM zalo_threads`,
+		`SELECT COUNT(*) FROM zalo_messages`,
+		`SELECT COUNT(*) FROM zalo_memory`,
+		`SELECT COUNT(*) FROM zalo_lessons`,
+		`SELECT COALESCE(group_concat(id || ':' || enabled, ','), '') FROM llm_accounts`,
+		`SELECT COALESCE(group_concat(id || ':' || enabled, ','), '') FROM llm_providers`,
+		`SELECT COALESCE(group_concat(provider_id || ':' || model_id || ':' || available, ','), '') FROM llm_models`,
+	}
+	var digest strings.Builder
+	digest.WriteString(appOnboardingLiveRoutingBytes(t, env))
+	for _, query := range queries {
+		var value string
+		if err := env.db.QueryRow(query).Scan(&value); err != nil {
+			t.Fatalf("side-effect digest query %q: %v", query, err)
+		}
+		fmt.Fprintf(&digest, "|%s=%s", query, value)
+	}
+	return digest.String()
+}
 
 func TestAgentCompletesOnboardingWithAuthoritativeNameAndFingerprint(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)

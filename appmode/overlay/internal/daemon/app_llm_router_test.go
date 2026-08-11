@@ -2345,3 +2345,77 @@ func TestChainFallsFromHTTPToCLI(t *testing.T) {
 			status.LastErrorKind, status.LastErrorProviderID)
 	}
 }
+
+func TestOnboardingPinnedAccountRouterUsesOnlyStagedCodexConfigAndModel(t *testing.T) {
+	state := store.OnboardingState{
+		Phase: store.OnboardingPhaseTest, ProviderKind: "codex", ProviderID: "codex",
+		AccountID: "staged", ModelID: "gpt-5.6-terra", StagedComboID: "staged-combo",
+		PersonaFingerprint: strings.Repeat("a", 64), Revision: 9,
+	}
+	staged := store.OnboardingStagingAccount{
+		AccountID: "staged", ProviderID: "codex", ProviderKind: "codex",
+		ConfigDir: `C:\accounts\staged`,
+	}
+	runner, err := newAppOnboardingTestRunner(
+		context.Background(),
+		&api{logger: slog.New(slog.DiscardHandler)},
+		state,
+		staged,
+	)
+	if err != nil {
+		t.Fatalf("newAppOnboardingTestRunner() = %v", err)
+	}
+	if runner.cfg.Route.Type != "fallback" || runner.cfg.Route.ComboID != "staged-combo" ||
+		len(runner.cfg.Route.Entries) != 1 {
+		t.Fatalf("isolated route = %+v", runner.cfg.Route)
+	}
+	entry := runner.cfg.Route.Entries[0]
+	if entry.Position != 0 || entry.ProviderID != "codex" ||
+		entry.ModelID != "gpt-5.6-terra" || !entry.Enabled {
+		t.Fatalf("isolated route entry = %+v", entry)
+	}
+	if len(runner.cfg.Adapters) != 1 || runner.cfg.Disabled["codex"] {
+		t.Fatalf("isolated adapters/disabled = %v/%v", runner.cfg.Adapters, runner.cfg.Disabled)
+	}
+	adapter, ok := runner.cfg.Adapters["codex"].(*codexProxyAdapter)
+	if !ok {
+		t.Fatalf("codex adapter = %T; want *codexProxyAdapter", runner.cfg.Adapters["codex"])
+	}
+	for i := 0; i < 3; i++ {
+		configDir, penalize, ok := adapter.pickConfigDir()
+		if !ok || configDir != staged.ConfigDir || penalize == nil {
+			t.Fatalf("pinned config %d = %q, penalize-nil=%t, ok=%t", i, configDir, penalize == nil, ok)
+		}
+		penalize(true)
+	}
+	if _, ok := runner.cfg.Store.(appOnboardingNoopAttemptStore); !ok {
+		t.Fatalf("attempt sink = %T; want onboarding no-op", runner.cfg.Store)
+	}
+}
+
+func TestOnboardingPinnedAccountClaudeRunnerReceivesExactAccount(t *testing.T) {
+	staged := store.OnboardingStagingAccount{
+		AccountID: "staged-claude", ProviderID: "claude-code", ProviderKind: "claude-code",
+		ConfigDir: `C:\accounts\staged-claude`,
+	}
+	base := zaloConfig{
+		ConfigDir: `C:\accounts\live-selected`, Model: "haiku",
+		Program: "live-claude.exe", ProgramPrefixArgs: []string{"live-prefix"},
+	}
+	got := appOnboardingPinnedClaudeRunner(
+		base,
+		staged,
+		"sonnet",
+		"staged-claude.exe",
+		[]string{"staged-prefix"},
+		slog.New(slog.DiscardHandler),
+	)
+	runner, ok := got.(execZaloRunner)
+	if !ok {
+		t.Fatalf("pinned Claude runner = %T; want execZaloRunner", got)
+	}
+	if runner.cfg.ConfigDir != staged.ConfigDir || runner.cfg.Model != "sonnet" ||
+		runner.cfg.Program != "staged-claude.exe" || !slices.Equal(runner.cfg.ProgramPrefixArgs, []string{"staged-prefix"}) {
+		t.Fatalf("pinned Claude config = %+v", runner.cfg)
+	}
+}

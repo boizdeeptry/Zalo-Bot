@@ -2,8 +2,10 @@ package store
 
 import (
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,6 +29,8 @@ var (
 	ErrOnboardingInvalidPhase            = errors.New("invalid onboarding phase")
 	ErrOnboardingInvalidStagingOwnership = errors.New("invalid onboarding staging ownership")
 	ErrOnboardingModelUnavailable        = errors.New("onboarding model is unavailable")
+	ErrOnboardingPersonaMismatch         = errors.New("onboarding persona fingerprint changed")
+	ErrOnboardingInvalidTestReceipt      = errors.New("invalid onboarding test receipt")
 )
 
 type OnboardingState struct {
@@ -550,6 +554,127 @@ WHERE id = 1 AND revision = ? AND phase = ?`,
 		return OnboardingState{}, fmt.Errorf("commit onboarding persona invalidation: %w", err)
 	}
 	return updated, nil
+}
+
+// SaveOnboardingTestReceipt atomically records proof that the exact staged
+// provider/model/persona revision produced an acceptable test answer. Only the
+// SHA-256 digest of the opaque receipt enters the database.
+func (s *Store) SaveOnboardingTestReceipt(
+	expectedRevision int64,
+	personaFingerprint string,
+	nonceHash string,
+	expiresAt time.Time,
+) (OnboardingState, error) {
+	if !validOnboardingSHA256Hex(nonceHash) || expiresAt.IsZero() {
+		return OnboardingState{}, ErrOnboardingInvalidTestReceipt
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("begin onboarding test receipt: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if state.Revision != expectedRevision {
+		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
+	}
+	if state.Phase != OnboardingPhaseTest ||
+		(state.CompletedVersion >= CurrentOnboardingVersion && !state.RestartInProgress) {
+		return OnboardingState{}, fmt.Errorf(
+			"save onboarding test receipt from %q: %w",
+			state.Phase,
+			ErrOnboardingInvalidPhase,
+		)
+	}
+	if personaFingerprint == "" || state.PersonaFingerprint != personaFingerprint {
+		return OnboardingState{}, ErrOnboardingPersonaMismatch
+	}
+	if !IsOnboardingProviderKind(state.ProviderKind) ||
+		state.ProviderID == "" || state.ProviderID != state.ProviderKind ||
+		state.AccountID == "" || state.ModelID == "" || state.StagedComboID == "" {
+		return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
+	}
+	if _, err := onboardingStagingAccountInTx(tx, state); err != nil {
+		return OnboardingState{}, err
+	}
+
+	var available int64
+	err = tx.QueryRow(`SELECT available FROM llm_models
+WHERE provider_id = ? AND model_id = ?`, state.ProviderID, state.ModelID).Scan(&available)
+	if errors.Is(err, sql.ErrNoRows) {
+		return OnboardingState{}, ErrOnboardingModelUnavailable
+	}
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf(
+			"read onboarding test model %q/%q: %w",
+			state.ProviderID,
+			state.ModelID,
+			err,
+		)
+	}
+	if available != 1 {
+		return OnboardingState{}, ErrOnboardingModelUnavailable
+	}
+	var displayName string
+	if err := tx.QueryRow(`SELECT value FROM app_meta WHERE key = ?`, agentDisplayNameMetaKey).Scan(&displayName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
+		}
+		return OnboardingState{}, fmt.Errorf("read onboarding test display name: %w", err)
+	}
+	if strings.TrimSpace(displayName) == "" {
+		return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
+	}
+
+	expiresText := expiresAt.UTC().Format(time.RFC3339Nano)
+	updatedAt := ts(time.Now())
+	result, err := tx.Exec(`UPDATE app_onboarding_state SET
+test_nonce_hash = ?, test_expires_at = ?, revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
+  AND provider_id = ? AND account_id = ? AND model_id = ? AND staged_combo_id = ?
+  AND persona_fingerprint = ?`,
+		nonceHash,
+		expiresText,
+		updatedAt,
+		expectedRevision,
+		OnboardingPhaseTest,
+		state.ProviderKind,
+		state.ProviderID,
+		state.AccountID,
+		state.ModelID,
+		state.StagedComboID,
+		personaFingerprint,
+	)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("save onboarding test receipt: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read onboarding test receipt result: %w", err)
+	}
+	if changed != 1 {
+		return OnboardingState{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingStateInTx(tx)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingState{}, fmt.Errorf("commit onboarding test receipt: %w", err)
+	}
+	return updated, nil
+}
+
+func validOnboardingSHA256Hex(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32
 }
 
 func onboardingSetupStateIsClean(state OnboardingState) bool {

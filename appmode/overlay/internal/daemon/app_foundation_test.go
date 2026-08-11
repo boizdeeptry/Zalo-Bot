@@ -38,6 +38,7 @@ func appRouteTestCases() []appRouteTestCase {
 		{"GET /onboarding/status", "/onboarding/status"},
 		{"PUT /onboarding/provider", "/onboarding/provider"},
 		{"POST /onboarding/setup", "/onboarding/setup"},
+		{"POST /onboarding/test-chat", "/onboarding/test-chat"},
 		{"POST /onboarding/restart", "/onboarding/restart"},
 		{"GET /agent", "/agent"},
 		{"PUT /agent", "/agent"},

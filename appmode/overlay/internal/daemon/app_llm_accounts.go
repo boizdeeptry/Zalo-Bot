@@ -157,3 +157,28 @@ func makeAccountConfigDir(st *store.Store, sel *accountSelector, providerID, kin
 		return acc.ConfigDir, penalize, true
 	}
 }
+
+// makeOnboardingPinnedConfigDir resolves one already-validated disabled staging
+// Account without consulting the live selector or enabled Account set.
+func makeOnboardingPinnedConfigDir(staged store.OnboardingStagingAccount) func() (string, func(bool), bool) {
+	return func() (string, func(bool), bool) {
+		if staged.ConfigDir == "" {
+			return "", nil, false
+		}
+		return staged.ConfigDir, func(bool) {}, true
+	}
+}
+
+// makeOnboardingPinnedAccountEnv is the CLI counterpart of
+// makeOnboardingPinnedConfigDir. It deliberately exposes only the staging
+// Account's environment directory and never participates in cooldown/rotation.
+func makeOnboardingPinnedAccountEnv(staged store.OnboardingStagingAccount) func() ([]string, func(bool), bool) {
+	return func() ([]string, func(bool), bool) {
+		varName, ok := envVarFor(staged.ProviderKind)
+		if !ok || staged.ConfigDir == "" {
+			return nil, nil, false
+		}
+		env := append(os.Environ(), varName+"="+staged.ConfigDir)
+		return env, func(bool) {}, true
+	}
+}

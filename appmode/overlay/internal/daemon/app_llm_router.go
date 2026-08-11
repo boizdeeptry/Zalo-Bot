@@ -142,6 +142,100 @@ func newAppLLMRunner(cfg appLLMRunnerConfig) *appLLMRunner {
 	return &appLLMRunner{cfg: cfg}
 }
 
+// appOnboardingNoopAttemptStore keeps Test Chat outside production telemetry.
+// The router still follows its normal attempt-recording semantics, but this
+// isolated sink deliberately commits nothing.
+type appOnboardingNoopAttemptStore struct{}
+
+func (appOnboardingNoopAttemptStore) RecordLLMAttempt(store.LLMAttempt) error { return nil }
+
+// newAppOnboardingTestRunner constructs a real router over a synthetic snapshot
+// containing exactly the disabled staging Account/model selected by onboarding.
+// It never reads the live route or live Account selector.
+func newAppOnboardingTestRunner(
+	ctx context.Context,
+	a *api,
+	state store.OnboardingState,
+	staged store.OnboardingStagingAccount,
+) (*appLLMRunner, error) {
+	if state.ProviderID == "" || state.ProviderID != state.ProviderKind ||
+		state.ProviderID != staged.ProviderID || state.ProviderKind != staged.ProviderKind ||
+		state.AccountID == "" || state.AccountID != staged.AccountID ||
+		state.ModelID == "" || state.StagedComboID == "" || staged.ConfigDir == "" {
+		return nil, store.ErrOnboardingInvalidStagingOwnership
+	}
+	logger := a.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	cfg := appLLMRunnerConfig{
+		Route: store.LLMRouteSnapshot{
+			Type:    "fallback",
+			ComboID: state.StagedComboID,
+			Entries: []store.LLMRouteEntry{{
+				Position: 0, ProviderID: state.ProviderID, ModelID: state.ModelID, Enabled: true,
+			}},
+		},
+		Store:          appOnboardingNoopAttemptStore{},
+		Adapters:       map[string]providerAdapter{},
+		Disabled:       map[string]bool{},
+		Credential:     func(string) ([]byte, error) { return nil, nil },
+		Claude:         func(string) zaloRunner { return silentZaloRunner{} },
+		HasAttachments: false,
+		Logger:         logger,
+	}
+
+	switch state.ProviderKind {
+	case "codex":
+		adapter, ok := newLLMAdapter(state.ProviderKind, state.ProviderID,
+			&http.Client{Timeout: defaultLLMProviderTimeout}, logger)
+		if !ok {
+			return nil, fmt.Errorf("onboarding test: staged Provider has no adapter")
+		}
+		switch pinned := adapter.(type) {
+		case *codexProxyAdapter:
+			pinned.pickConfigDir = makeOnboardingPinnedConfigDir(staged)
+		case *cliAdapter:
+			pinned.accountEnv = makeOnboardingPinnedAccountEnv(staged)
+		default:
+			return nil, fmt.Errorf("onboarding test: staged Codex adapter has unexpected type")
+		}
+		cfg.Adapters[state.ProviderID] = adapter
+	case "claude-code":
+		if a.zalo == nil {
+			return nil, fmt.Errorf("onboarding test: persona runtime is unavailable")
+		}
+		program, prefixArgs, err := resolveCLIProgramContext(ctx, cliDescriptors["claude-code"])
+		if err != nil {
+			return nil, fmt.Errorf("onboarding test: resolve staged Claude program: %w", err)
+		}
+		claude := appOnboardingPinnedClaudeRunner(
+			a.zalo.cfg, staged, state.ModelID, program, prefixArgs, logger,
+		)
+		cfg.Claude = func(string) zaloRunner { return claude }
+	default:
+		return nil, store.ErrOnboardingProviderUnsupported
+	}
+	return newAppLLMRunner(cfg), nil
+}
+
+// appOnboardingPinnedClaudeRunner receives the exact validated staging Account
+// directly. There is no round-robin or live-session selector on this path.
+func appOnboardingPinnedClaudeRunner(
+	base zaloConfig,
+	staged store.OnboardingStagingAccount,
+	model string,
+	program string,
+	prefixArgs []string,
+	logger *slog.Logger,
+) zaloRunner {
+	base.ConfigDir = staged.ConfigDir
+	base.Model = model
+	base.Program = program
+	base.ProgramPrefixArgs = slices.Clone(prefixArgs)
+	return execZaloRunner{cfg: base, logger: logger}
+}
+
 // Run trả lời một lượt bằng snapshot đã chụp khi dựng runner.
 //
 // Một lần lưu route sau constructor vì thế không đổi đường đi của lượt đang chạy; runner/lượt kế
