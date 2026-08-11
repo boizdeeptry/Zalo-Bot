@@ -20,6 +20,8 @@ const CurrentOnboardingVersion int64 = 1
 
 const onboardingTestReceiptTTL = 10 * time.Minute
 
+const maxOnboardingRouteRevision int64 = 1<<63 - 1
+
 const (
 	OnboardingPhaseProvider  = "provider"
 	OnboardingPhaseConnect   = "connect"
@@ -44,6 +46,9 @@ var (
 	ErrOnboardingCommitFailed            = errors.New("onboarding completion commit failed")
 	onboardingTestReceiptBeforeCommit    = func(context.Context) {}
 	onboardingCompleteFailpoint          = func(string) error { return nil }
+	// Test seam around the actual Commit call. The production default delegates directly to
+	// tx.Commit; tests replace it only serially and restore it before returning.
+	onboardingCompleteCommit = func(tx *sql.Tx) error { return tx.Commit() }
 )
 
 const (
@@ -55,7 +60,7 @@ const (
 	onboardingCompleteStageMemberInsert      = "member-insert"
 	onboardingCompleteStageRouteSync         = "route-projection-revision-sync"
 	onboardingCompleteStageStateUpdate       = "final-state-update"
-	onboardingCompleteStageCommit            = "commit"
+	onboardingCompleteStageBeforeCommit      = "before-commit"
 )
 
 // OnboardingTestReceiptPolicy binds receipt validity to the one clock reading
@@ -886,8 +891,31 @@ WHERE provider_id = ? AND model_id = ?`, state.ProviderID, state.ModelID).Scan(
 		return OnboardingState{}, onboardingCompleteCommitError("read route revision", err)
 	}
 	routeRevision, err := strconv.ParseInt(routeRevisionText, 10, 64)
-	if err != nil || routeRevision < 0 || routeRevision == int64(^uint64(0)>>1) {
+	if err != nil || routeRevision < 0 || routeRevision == maxOnboardingRouteRevision {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
+	}
+	var comboCount, maximumComboRevision int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(revision), 0)
+FROM llm_combos`).Scan(&comboCount, &maximumComboRevision); err != nil {
+		return OnboardingState{}, onboardingCompleteCommitError("read maximum Combo revision", err)
+	}
+	if comboCount < 0 || maximumComboRevision < 0 || maximumComboRevision == maxOnboardingRouteRevision {
+		return OnboardingState{}, ErrOnboardingConfigurationChanged
+	}
+	var legacyRouteCount int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM llm_route_entries`).Scan(&legacyRouteCount); err != nil {
+		return OnboardingState{}, onboardingCompleteCommitError("read legacy route projection count", err)
+	}
+	nextRouteRevision := int64(1)
+	// app_meta is seeded to revision 1 before a first route exists. That one pristine shape may
+	// create revision 1; any materialized route state or later metadata is revision history and
+	// must advance monotonically even if projection rows were externally removed.
+	if comboCount > 0 || legacyRouteCount > 0 || routeRevision > 1 {
+		maximumRouteRevision := routeRevision
+		if maximumComboRevision > maximumRouteRevision {
+			maximumRouteRevision = maximumComboRevision
+		}
+		nextRouteRevision = maximumRouteRevision + 1
 	}
 
 	if _, err := tx.ExecContext(ctx, `UPDATE llm_providers SET enabled = 1 WHERE id = ?`, state.ProviderID); err != nil {
@@ -924,7 +952,7 @@ WHERE id = ? AND provider_id = ? AND enabled = 0`, state.AccountID, state.Provid
 		return OnboardingState{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO llm_combos(id, name, type, active, revision)
-VALUES (?, ?, 'fallback', 1, 1)`, state.StagedComboID, comboName); err != nil {
+	VALUES (?, ?, 'fallback', 1, ?)`, state.StagedComboID, comboName, nextRouteRevision); err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("insert completed Combo", err)
 	}
 	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageComboInsert); err != nil {
@@ -944,7 +972,7 @@ position, provider_id, model_id, enabled
 		return OnboardingState{}, onboardingCompleteCommitError("insert legacy route projection", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE app_meta SET value = ?
-WHERE key = 'llm_route_revision'`, strconv.FormatInt(routeRevision+1, 10)); err != nil {
+	WHERE key = 'llm_route_revision'`, strconv.FormatInt(nextRouteRevision, 10)); err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("advance route revision", err)
 	}
 	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageRouteSync); err != nil {
@@ -989,13 +1017,13 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageStateUpdate); err != nil {
 		return OnboardingState{}, err
 	}
-	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageCommit); err != nil {
+	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageBeforeCommit); err != nil {
 		return OnboardingState{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("request canceled before commit", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := onboardingCompleteCommit(tx); err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("commit transaction", err)
 	}
 	return updated, nil

@@ -1850,9 +1850,10 @@ func TestCompleteOnboardingActivatesVerifiedReceiptAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantRouteRevision := beforeRevision + 1
 	if len(combos) != 1 || combos[0].ID != onboardingCompletionComboIDForTest ||
 		combos[0].Name != "Mặc định · Codex" || combos[0].Type != "fallback" ||
-		!combos[0].Active || combos[0].Revision != 1 || len(combos[0].Members) != 1 {
+		!combos[0].Active || combos[0].Revision != wantRouteRevision || len(combos[0].Members) != 1 {
 		t.Fatalf("completed combos = %+v", combos)
 	}
 	wantMember := LLMRouteEntry{Position: 0, ProviderID: "codex", ModelID: "gpt-5.6-terra", Enabled: true}
@@ -1864,14 +1865,14 @@ func TestCompleteOnboardingActivatesVerifiedReceiptAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	if route.ComboID != onboardingCompletionComboIDForTest || route.Type != "fallback" ||
-		route.Revision != 1 || len(route.Entries) != 1 || route.Entries[0] != wantMember {
+		route.Revision != wantRouteRevision || len(route.Entries) != 1 || route.Entries[0] != wantMember {
 		t.Fatalf("completed route = %+v", route)
 	}
 	if projection := onboardingLegacyRouteForTest(t, st); projection != "0:codex:gpt-5.6-terra:1" {
 		t.Fatalf("legacy route projection = %q", projection)
 	}
-	if revision := onboardingRouteRevisionForTest(t, st); revision != beforeRevision+1 {
-		t.Fatalf("legacy route revision = %d; want %d", revision, beforeRevision+1)
+	if revision := onboardingRouteRevisionForTest(t, st); revision != wantRouteRevision {
+		t.Fatalf("legacy route revision = %d; want %d", revision, wantRouteRevision)
 	}
 
 	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
@@ -1879,6 +1880,179 @@ func TestCompleteOnboardingActivatesVerifiedReceiptAtomically(t *testing.T) {
 		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
 	}); !errors.Is(err, ErrOnboardingConflict) {
 		t.Fatalf("one-time retry error = %v; want ErrOnboardingConflict", err)
+	}
+}
+
+func TestCompleteOnboardingRouteRevisionCannotABAStaleDraft(t *testing.T) {
+	st := openAppStoreForTest(t)
+	now := seedCompleteOnboardingForTest(t, st, false, 53)
+	oldRoute, err := st.LLMRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleDraft := []LLMRouteEntry{{
+		ProviderID: "other-provider", ModelID: "old-model", Enabled: true,
+	}}
+	legacyRevision := onboardingRouteRevisionForTest(t, st)
+
+	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+		Revision: 53, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := st.LLMRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRevision := legacyRevision + 1
+	if completed.Revision != wantRevision || completed.Revision <= oldRoute.Revision ||
+		onboardingRouteRevisionForTest(t, st) != wantRevision {
+		t.Fatalf("route revisions old=%d legacy=%d completed=%d; want completed=%d",
+			oldRoute.Revision, legacyRevision, completed.Revision, wantRevision)
+	}
+	beforeStaleWrite := completeOnboardingDigestForTest(t, st)
+	if _, err := st.ReplaceLLMRoute(oldRoute.Revision, staleDraft); !errors.Is(err, ErrLLMRouteConflict) {
+		t.Fatalf("ReplaceLLMRoute(stale revision %d) = %v; want ErrLLMRouteConflict", oldRoute.Revision, err)
+	}
+	if after := completeOnboardingDigestForTest(t, st); after != beforeStaleWrite {
+		t.Fatalf("stale route draft changed completed projection:\nbefore=%s\nafter=%s", beforeStaleWrite, after)
+	}
+}
+
+func TestCompleteOnboardingRouteRevisionUsesDivergentMaximum(t *testing.T) {
+	for _, tt := range []struct {
+		name                string
+		comboRevision, meta int64
+		want                int64
+	}{
+		{name: "legacy ahead", comboRevision: 7, meta: 44, want: 45},
+		{name: "combo ahead", comboRevision: 88, meta: 3, want: 89},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			now := seedCompleteOnboardingForTest(t, st, false, 54)
+			if _, err := st.db.Exec(`UPDATE llm_combos SET revision = ?`, tt.comboRevision); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.db.Exec(`UPDATE app_meta SET value = ? WHERE key = 'llm_route_revision'`,
+				fmt.Sprintf("%d", tt.meta)); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+				Revision: 54, TestNonceHash: completeOnboardingHashForTest(),
+				PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			route, err := st.LLMRoute()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if route.Revision != tt.want || onboardingRouteRevisionForTest(t, st) != tt.want {
+				t.Fatalf("completed route/meta revisions = %d/%d; want %d",
+					route.Revision, onboardingRouteRevisionForTest(t, st), tt.want)
+			}
+		})
+	}
+}
+
+func TestCompleteOnboardingFreshRouteStartsAtRevisionOne(t *testing.T) {
+	st := openAppStoreForTest(t)
+	now := seedCompleteOnboardingForTest(t, st, false, 55)
+	if _, err := st.db.Exec(`DELETE FROM llm_combo_members`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`DELETE FROM llm_combos`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`DELETE FROM llm_route_entries`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE app_meta SET value = '1' WHERE key = 'llm_route_revision'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+		Revision: 55, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	route, err := st.LLMRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.Revision != 1 || onboardingRouteRevisionForTest(t, st) != 1 {
+		t.Fatalf("fresh route/meta revisions = %d/%d; want 1/1",
+			route.Revision, onboardingRouteRevisionForTest(t, st))
+	}
+}
+
+func TestCompleteOnboardingPreservesLegacyRevisionWithoutProjectionRows(t *testing.T) {
+	st := openAppStoreForTest(t)
+	now := seedCompleteOnboardingForTest(t, st, false, 57)
+	if _, err := st.db.Exec(`DELETE FROM llm_combo_members`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`DELETE FROM llm_combos`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`DELETE FROM llm_route_entries`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE app_meta SET value = '44' WHERE key = 'llm_route_revision'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+		Revision: 57, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	route, err := st.LLMRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.Revision != 45 || onboardingRouteRevisionForTest(t, st) != 45 {
+		t.Fatalf("historical route/meta revisions = %d/%d; want 45/45",
+			route.Revision, onboardingRouteRevisionForTest(t, st))
+	}
+}
+
+func TestCompleteOnboardingRouteRevisionOverflowRollsBack(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(*Store) error
+	}{
+		{name: "legacy maximum", mutate: func(st *Store) error {
+			_, err := st.db.Exec(`UPDATE app_meta SET value = '9223372036854775807' WHERE key = 'llm_route_revision'`)
+			return err
+		}},
+		{name: "combo maximum", mutate: func(st *Store) error {
+			_, err := st.db.Exec(`UPDATE llm_combos SET revision = 9223372036854775807`)
+			return err
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			now := seedCompleteOnboardingForTest(t, st, false, 56)
+			if err := tt.mutate(st); err != nil {
+				t.Fatal(err)
+			}
+			before := completeOnboardingDigestForTest(t, st)
+			if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+				Revision: 56, TestNonceHash: completeOnboardingHashForTest(),
+				PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+			}); !errors.Is(err, ErrOnboardingConfigurationChanged) {
+				t.Fatalf("CompleteOnboarding() error = %v; want ErrOnboardingConfigurationChanged", err)
+			}
+			if after := completeOnboardingDigestForTest(t, st); after != before {
+				t.Fatalf("overflow changed complete digest:\nbefore=%s\nafter=%s", before, after)
+			}
+		})
 	}
 }
 
@@ -1900,7 +2074,7 @@ func TestCompleteOnboardingRestartReplacesLiveRouteOnlyAtCommit(t *testing.T) {
 
 	oldFailpoint := onboardingCompleteFailpoint
 	onboardingCompleteFailpoint = func(stage string) error {
-		if stage != onboardingCompleteStageCommit {
+		if stage != onboardingCompleteStageBeforeCommit {
 			return nil
 		}
 		if during := completeOnboardingDigestFromDBForTest(t, raw); during != before {
@@ -1935,7 +2109,7 @@ func TestCompleteOnboardingRollsBackEveryStatementGroup(t *testing.T) {
 		onboardingCompleteStageMemberInsert,
 		onboardingCompleteStageRouteSync,
 		onboardingCompleteStageStateUpdate,
-		onboardingCompleteStageCommit,
+		onboardingCompleteStageBeforeCommit,
 	}
 	for _, stage := range stages {
 		t.Run(stage, func(t *testing.T) {
@@ -1962,6 +2136,50 @@ func TestCompleteOnboardingRollsBackEveryStatementGroup(t *testing.T) {
 				t.Fatalf("stage %q escaped rollback:\nbefore=%s\nafter=%s", stage, before, after)
 			}
 		})
+	}
+}
+
+func TestCompleteOnboardingActualCommitErrorRollsBackAndReceiptCanRetry(t *testing.T) {
+	// This test intentionally stays nonparallel because it replaces the package-level Commit seam.
+	st := openAppStoreForTest(t)
+	now := seedCompleteOnboardingForTest(t, st, false, 72)
+	before := completeOnboardingDigestForTest(t, st)
+	oldCommit := onboardingCompleteCommit
+	commitCalls := 0
+	onboardingCompleteCommit = func(*sql.Tx) error {
+		commitCalls++
+		return errors.New("injected actual Commit error")
+	}
+	t.Cleanup(func() { onboardingCompleteCommit = oldCommit })
+	input := CompleteOnboardingInput{
+		Revision: 72, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+	}
+
+	if _, err := st.CompleteOnboarding(context.Background(), input); !errors.Is(err, ErrOnboardingCommitFailed) {
+		t.Fatalf("CompleteOnboarding() actual Commit error = %v; want ErrOnboardingCommitFailed", err)
+	}
+	if commitCalls != 1 {
+		t.Fatalf("actual Commit seam calls = %d; want 1", commitCalls)
+	}
+	if after := completeOnboardingDigestForTest(t, st); after != before {
+		t.Fatalf("actual Commit error escaped rollback:\nbefore=%s\nafter=%s", before, after)
+	}
+	state := mustOnboardingStateForTest(t, st)
+	if state.TestNonceHash != completeOnboardingHashForTest() || state.TestExpiresAt == "" || state.Revision != 72 {
+		t.Fatalf("actual Commit error consumed reusable receipt: %+v", state)
+	}
+	if _, err := st.LLMRoute(); err != nil {
+		t.Fatalf("Store unusable after actual Commit error: %v", err)
+	}
+
+	onboardingCompleteCommit = oldCommit
+	completed, err := st.CompleteOnboarding(context.Background(), input)
+	if err != nil {
+		t.Fatalf("retry after actual Commit error = %v", err)
+	}
+	if completed.Phase != OnboardingPhaseCompleted || completed.Revision != 73 {
+		t.Fatalf("retry completion = %+v", completed)
 	}
 }
 
