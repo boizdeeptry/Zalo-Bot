@@ -810,6 +810,118 @@ func TestAppOnboardingProviderStaleRevisionDoesNotCancelRunningTest(t *testing.T
 	}
 }
 
+func TestAppOnboardingProviderFenceRejectsTestStartedAfterCancellationSnapshot(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 37)
+	gapEntered := make(chan struct{})
+	releaseGap := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseProvider := func() { releaseOnce.Do(func() { close(releaseGap) }) }
+	defer releaseProvider()
+	withAppOnboardingProviderAfterTestWait(t, func() {
+		close(gapEntered)
+		<-releaseGap
+	})
+	runnerCalled := make(chan struct{}, 1)
+	withAppOnboardingTestSeams(t,
+		func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+			runnerCalled <- struct{}{}
+			return "", errors.New("test chat crossed provider-transition fence")
+		},
+		time.Now,
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+		120*time.Second,
+	)
+
+	providerDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		providerDone <- env.serve(http.MethodPut, "/onboarding/provider", `{"revision":37,"kind":"claude-code"}`)
+	}()
+	select {
+	case <-gapEntered:
+	case <-time.After(time.Second):
+		t.Fatal("provider transition did not reach the post-snapshot gap")
+	}
+
+	testChat := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":37,"message":"xin chào"}`)
+	requireOnboardingCode(t, testChat, http.StatusConflict, "ONBOARDING_TEST_BUSY")
+	select {
+	case <-runnerCalled:
+		t.Fatal("test chat ran while the provider-transition fence was active")
+	default:
+	}
+
+	releaseProvider()
+	select {
+	case rr := <-providerDone:
+		if rr.Code != http.StatusOK {
+			t.Fatalf("provider mutation status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider mutation deadlocked after releasing the gap")
+	}
+	state := env.state(t)
+	if state.Revision != 38 || state.Phase != store.OnboardingPhaseConnect ||
+		state.ProviderKind != "claude-code" || state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		t.Fatalf("provider transition state = %+v", state)
+	}
+	after := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":38,"message":"xin chào"}`)
+	requireOnboardingCode(t, after, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
+}
+
+func TestAppOnboardingProviderFenceReleasedAfterPostwaitConflict(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedAppOnboardingTestChat(t, env, "codex", 39)
+	gapEntered := make(chan struct{})
+	releaseGap := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseProvider := func() { releaseOnce.Do(func() { close(releaseGap) }) }
+	defer releaseProvider()
+	withAppOnboardingProviderAfterTestWait(t, func() {
+		close(gapEntered)
+		<-releaseGap
+	})
+	withAppOnboardingTestSeams(t,
+		func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error) {
+			return "Xin chào, tôi là Bé Mi.", nil
+		},
+		time.Now,
+		appOnboardingRandomFromReader(bytes.NewReader(bytes.Repeat([]byte{0x39}, 32))),
+		120*time.Second,
+	)
+
+	providerDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		providerDone <- env.serve(http.MethodPut, "/onboarding/provider", `{"revision":39,"kind":"claude-code"}`)
+	}()
+	select {
+	case <-gapEntered:
+	case <-time.After(time.Second):
+		t.Fatal("provider transition did not reach the post-snapshot gap")
+	}
+	blocked := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":39,"message":"xin chào"}`)
+	requireOnboardingCode(t, blocked, http.StatusConflict, "ONBOARDING_TEST_BUSY")
+	if _, err := env.db.Exec(`UPDATE app_onboarding_state SET revision = 40 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	releaseProvider()
+	select {
+	case rr := <-providerDone:
+		requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT")
+	case <-time.After(time.Second):
+		t.Fatal("provider mutation deadlocked after postwait conflict")
+	}
+
+	after := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":40,"message":"xin chào"}`)
+	if after.Code != http.StatusOK {
+		t.Fatalf("test chat remained fenced after conflict: status=%d body=%s", after.Code, after.Body.String())
+	}
+	response := decodeOnboardingResponse[appOnboardingTestChatResponse](t, after)
+	if response.Revision != 41 || response.TestToken == "" {
+		t.Fatalf("post-conflict receipt = %+v", response)
+	}
+}
+
 func TestAppOnboardingProviderCancelsAndWaitsForRunningTestBeforeTransition(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	seedAppOnboardingTestChat(t, env, "codex", 33)
@@ -898,8 +1010,17 @@ func TestAppOnboardingProviderCanceledWaiterDoesNotMutate(t *testing.T) {
 	var releaseOnce sync.Once
 	releaseRunner := func() { releaseOnce.Do(func() { close(release) }) }
 	defer releaseRunner()
+	var runnerCallsMu sync.Mutex
+	runnerCalls := 0
 	withAppOnboardingTestSeams(t,
 		func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+			runnerCallsMu.Lock()
+			runnerCalls++
+			call := runnerCalls
+			runnerCallsMu.Unlock()
+			if call > 1 {
+				return "Xin chào, tôi là Bé Mi.", nil
+			}
 			close(entered)
 			<-ctx.Done()
 			close(runnerCanceled)
@@ -952,6 +1073,14 @@ func TestAppOnboardingProviderCanceledWaiterDoesNotMutate(t *testing.T) {
 	}
 	if after := env.state(t); after != before {
 		t.Fatalf("canceled test or waiter mutated state: before=%+v after=%+v", before, after)
+	}
+	retry := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":35,"message":"xin chào"}`)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("test chat remained fenced after canceled waiter: status=%d body=%s", retry.Code, retry.Body.String())
+	}
+	receipt := decodeOnboardingResponse[appOnboardingTestChatResponse](t, retry)
+	if receipt.Revision != 36 || receipt.TestToken == "" {
+		t.Fatalf("post-cancellation receipt = %+v", receipt)
 	}
 }
 
@@ -1181,6 +1310,13 @@ func withAppOnboardingTestSeams(
 		appOnboardingTestTimeout = oldTimeout
 		appOnboardingTestAfterCommit = oldAfterCommit
 	})
+}
+
+func withAppOnboardingProviderAfterTestWait(t *testing.T, hook func()) {
+	t.Helper()
+	oldHook := appOnboardingProviderAfterTestWait
+	appOnboardingProviderAfterTestWait = hook
+	t.Cleanup(func() { appOnboardingProviderAfterTestWait = oldHook })
 }
 
 func seedAppOnboardingTestChat(

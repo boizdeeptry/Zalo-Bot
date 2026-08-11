@@ -32,6 +32,7 @@ var (
 	onboardingTestDone            chan struct{}
 	onboardingTestCancel          context.CancelFunc
 	onboardingTestCancelRequested bool
+	onboardingProviderTransition  *appOnboardingProviderTransitionLease
 
 	errOnboardingUnsafeAccountPath = errors.New("unsafe onboarding account path")
 
@@ -42,11 +43,12 @@ var (
 	}
 	appOnboardingConnectCancelWait = 12 * time.Second
 
-	appOnboardingTestNow                                   = time.Now
-	appOnboardingTestRandom                                = defaultAppOnboardingTestRandom
-	appOnboardingTestTimeout                               = 120 * time.Second
-	appOnboardingTestExecute     appOnboardingTestExecutor = defaultAppOnboardingTestExecute
-	appOnboardingTestAfterCommit                           = func() {}
+	appOnboardingTestNow                                         = time.Now
+	appOnboardingTestRandom                                      = defaultAppOnboardingTestRandom
+	appOnboardingTestTimeout                                     = 120 * time.Second
+	appOnboardingTestExecute           appOnboardingTestExecutor = defaultAppOnboardingTestExecute
+	appOnboardingTestAfterCommit                                 = func() {}
+	appOnboardingProviderAfterTestWait                           = func() {}
 )
 
 const appOnboardingReceiptCompensationTimeout = 5 * time.Second
@@ -60,6 +62,14 @@ type appOnboardingTestExecutor func(
 ) (string, error)
 
 type appOnboardingTestRandomFunc func(context.Context, []byte) error
+
+// appOnboardingProviderTransitionLease closes Test Chat admission across the
+// provider transition's intentional mutation-lock gap. cancel and done are an
+// atomic snapshot of the previously active test, captured under onboardingTestMu.
+type appOnboardingProviderTransitionLease struct {
+	cancel context.CancelFunc
+	done   <-chan struct{}
+}
 
 func defaultAppOnboardingTestRandom(ctx context.Context, dst []byte) error {
 	if err := ctx.Err(); err != nil {
@@ -176,12 +186,21 @@ func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingCleanupFailed(w, r.Context().Err())
 		return
 	}
+	transition, ok := acquireAppOnboardingProviderTransitionLease()
+	if !ok {
+		onboardingMutationMu.Unlock()
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_TEST_BUSY",
+			"Một lượt kiểm tra hoặc chuyển nhà cung cấp khác đang chạy; hãy đợi thao tác đó hoàn tất", nil)
+		return
+	}
+	defer transition.release()
 	onboardingMutationMu.Unlock()
 
-	if !cancelAndWaitAppOnboardingTest(r.Context()) {
+	if !transition.cancelAndWait(r.Context()) {
 		a.writeOnboardingCleanupFailed(w, r.Context().Err())
 		return
 	}
+	appOnboardingProviderAfterTestWait()
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
 	if r.Context().Err() != nil {
@@ -498,7 +517,7 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 func beginAppOnboardingTest() bool {
 	onboardingTestMu.Lock()
 	defer onboardingTestMu.Unlock()
-	if onboardingTestActive {
+	if onboardingTestActive || onboardingProviderTransition != nil {
 		return false
 	}
 	onboardingTestActive = true
@@ -536,25 +555,46 @@ func bindAppOnboardingTestCancel(cancel context.CancelFunc) {
 	}
 }
 
-func cancelAndWaitAppOnboardingTest(ctx context.Context) bool {
+// acquireAppOnboardingProviderTransitionLease is called while holding
+// onboardingMutationMu. This is the only nested lock order: mutation then test.
+// Test Chat releases onboardingTestMu before it ever takes onboardingMutationMu.
+func acquireAppOnboardingProviderTransitionLease() (*appOnboardingProviderTransitionLease, bool) {
 	onboardingTestMu.Lock()
-	if !onboardingTestActive {
-		onboardingTestMu.Unlock()
-		return true
+	defer onboardingTestMu.Unlock()
+	if onboardingProviderTransition != nil {
+		return nil, false
 	}
-	onboardingTestCancelRequested = true
-	cancel := onboardingTestCancel
-	done := onboardingTestDone
-	onboardingTestMu.Unlock()
-	if cancel != nil {
-		cancel()
+	transition := &appOnboardingProviderTransitionLease{}
+	onboardingProviderTransition = transition
+	if onboardingTestActive {
+		onboardingTestCancelRequested = true
+		transition.cancel = onboardingTestCancel
+		transition.done = onboardingTestDone
+	}
+	return transition, true
+}
+
+func (transition *appOnboardingProviderTransitionLease) cancelAndWait(ctx context.Context) bool {
+	if transition.cancel != nil {
+		transition.cancel()
+	}
+	if transition.done == nil {
+		return ctx.Err() == nil
 	}
 	select {
-	case <-done:
+	case <-transition.done:
 		return true
 	case <-ctx.Done():
 		return false
 	}
+}
+
+func (transition *appOnboardingProviderTransitionLease) release() {
+	onboardingTestMu.Lock()
+	if onboardingProviderTransition == transition {
+		onboardingProviderTransition = nil
+	}
+	onboardingTestMu.Unlock()
 }
 
 func normalizeOnboardingTestMessage(raw string) (string, bool) {
