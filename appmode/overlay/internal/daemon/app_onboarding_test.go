@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -2458,4 +2459,293 @@ func appOnboardingLiveRoutingBytes(t *testing.T, env *onboardingRouteTestEnv) st
 		}
 	}
 	return snapshot.String()
+}
+
+const appOnboardingCompletionComboIDForTest = "5f9967c7-93cf-4ac8-9da8-f6a7c1af8801"
+
+func TestAppOnboardingCompleteActivatesVerifiedReceiptWithExactPrivateResponse(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedOnboardingRoute(t, env, "live-provider", "openai", true)
+	if _, err := env.db.Exec(`INSERT INTO llm_route_entries(position, provider_id, model_id, enabled)
+VALUES (0, 'live-provider', 'model', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	token, now := seedAppOnboardingCompletion(t, env, 101, false)
+	hash := sha256.Sum256([]byte(token))
+	var comparedLeft, comparedRight []byte
+	oldCompare := appOnboardingCompleteConstantTimeCompare
+	appOnboardingCompleteConstantTimeCompare = func(left, right []byte) int {
+		comparedLeft = slices.Clone(left)
+		comparedRight = slices.Clone(right)
+		return subtle.ConstantTimeCompare(left, right)
+	}
+	oldNow := appOnboardingCompleteNow
+	appOnboardingCompleteNow = func() time.Time { return now }
+	t.Cleanup(func() {
+		appOnboardingCompleteConstantTimeCompare = oldCompare
+		appOnboardingCompleteNow = oldNow
+	})
+	var logs syncLogBuffer
+	env.a.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	rr := env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(
+		`{"revision":101,"test_token":%q}`, token,
+	))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	wantBody := `{"completed":true,"onboarding_version":1,"combo_id":"` + appOnboardingCompletionComboIDForTest + `"}`
+	if strings.TrimSpace(rr.Body.String()) != wantBody {
+		t.Fatalf("response = %q; want exact %q", strings.TrimSpace(rr.Body.String()), wantBody)
+	}
+	if !bytes.Equal(comparedLeft, hash[:]) || !bytes.Equal(comparedRight, hash[:]) ||
+		len(comparedLeft) != sha256.Size || len(comparedRight) != sha256.Size {
+		t.Fatalf("constant-time compare inputs = %x / %x; want exact SHA-256 bytes", comparedLeft, comparedRight)
+	}
+	state := env.state(t)
+	if state.Phase != store.OnboardingPhaseCompleted || state.CompletedVersion != store.CurrentOnboardingVersion ||
+		state.Revision != 102 || state.RestartInProgress || state.TestNonceHash != "" ||
+		state.TestExpiresAt != "" || state.PersonaFingerprint != "" || state.StagedComboID != "" {
+		t.Fatalf("completed state = %+v", state)
+	}
+	status := env.serve(http.MethodGet, "/onboarding/status", "")
+	projected := decodeOnboardingResponse[appOnboardingStatusResponse](t, status)
+	if projected.Required || projected.ProviderID != "codex" || projected.AccountID != "staged-account" ||
+		projected.ModelID != "gpt-5.6-terra" {
+		t.Fatalf("completed status projection = %+v", projected)
+	}
+	for _, forbidden := range []string{token, fmt.Sprintf("%x", hash[:]), "persona-fingerprint", accountConfigDir(env.dataDir, "codex", "staged-account")} {
+		if strings.Contains(rr.Body.String(), forbidden) || strings.Contains(logs.String(), forbidden) {
+			t.Fatal("completion leaked a private receipt/config value in response or logs")
+		}
+	}
+	combos, err := env.a.st.LLMCombos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combos) != 1 || combos[0].ID != appOnboardingCompletionComboIDForTest ||
+		!combos[0].Active || len(combos[0].Members) != 1 {
+		t.Fatalf("completed live combo = %+v", combos)
+	}
+}
+
+func TestAppOnboardingCompleteRejectsReceiptAndConfigurationDriftWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     func(string) string
+		mutate   func(*onboardingRouteTestEnv, time.Time)
+		wantCode string
+	}{
+		{name: "stale revision", wantCode: "ONBOARDING_REVISION_CONFLICT", body: func(token string) string { return fmt.Sprintf(`{"revision":100,"test_token":%q}`, token) }},
+		{name: "missing receipt", wantCode: "ONBOARDING_TEST_REQUIRED", mutate: func(env *onboardingRouteTestEnv, _ time.Time) {
+			_, _ = env.db.Exec(`UPDATE app_onboarding_state SET test_nonce_hash = ''`)
+		}},
+		{name: "expired receipt", wantCode: "ONBOARDING_TEST_EXPIRED", mutate: func(env *onboardingRouteTestEnv, now time.Time) {
+			_, _ = env.db.Exec(`UPDATE app_onboarding_state SET test_expires_at = ?`, now.Format(time.RFC3339Nano))
+		}},
+		{name: "wrong token", wantCode: "ONBOARDING_TEST_REQUIRED", body: func(string) string {
+			return `{"revision":101,"test_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`
+		}},
+		{name: "malformed token", wantCode: "ONBOARDING_TEST_REQUIRED", body: func(string) string { return `{"revision":101,"test_token":"not_base64=="}` }},
+		{name: "wrong phase", wantCode: "ONBOARDING_TEST_REQUIRED", mutate: func(env *onboardingRouteTestEnv, _ time.Time) {
+			_, _ = env.db.Exec(`UPDATE app_onboarding_state SET phase = 'persona'`)
+		}},
+		{name: "persona direct mutation", wantCode: "ONBOARDING_CONFIGURATION_CHANGED", mutate: func(env *onboardingRouteTestEnv, _ time.Time) {
+			_ = os.WriteFile(env.a.zalo.cfg.PersonaPath, []byte("changed persona"), 0o600)
+		}},
+		{name: "name direct mutation", wantCode: "ONBOARDING_CONFIGURATION_CHANGED", mutate: func(env *onboardingRouteTestEnv, _ time.Time) { _ = env.a.st.SetAgentDisplayName("Tên khác") }},
+		{name: "config direct mutation", wantCode: "ONBOARDING_CONFIGURATION_CHANGED", mutate: func(env *onboardingRouteTestEnv, _ time.Time) {
+			_, _ = env.db.Exec(`UPDATE llm_accounts SET config_dir = ? WHERE id = 'staged-account'`, t.TempDir())
+		}},
+		{name: "account enabled drift", wantCode: "ONBOARDING_CONFIGURATION_CHANGED", mutate: func(env *onboardingRouteTestEnv, _ time.Time) {
+			_, _ = env.db.Exec(`UPDATE llm_accounts SET enabled = 1 WHERE id = 'staged-account'`)
+		}},
+		{name: "model drift", wantCode: "ONBOARDING_CONFIGURATION_CHANGED", mutate: func(env *onboardingRouteTestEnv, _ time.Time) {
+			_, _ = env.db.Exec(`UPDATE llm_models SET available = 0 WHERE provider_id = 'codex'`)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			token, now := seedAppOnboardingCompletion(t, env, 101, false)
+			if tt.mutate != nil {
+				tt.mutate(env, now)
+			}
+			beforeState := env.state(t)
+			beforeSideEffects := appOnboardingTestSideEffectDigest(t, env)
+			oldNow := appOnboardingCompleteNow
+			appOnboardingCompleteNow = func() time.Time { return now }
+			t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+			body := fmt.Sprintf(`{"revision":101,"test_token":%q}`, token)
+			if tt.body != nil {
+				body = tt.body(token)
+			}
+			rr := env.serve(http.MethodPost, "/onboarding/complete", body)
+			requireOnboardingCode(t, rr, http.StatusConflict, tt.wantCode)
+			if after := env.state(t); after != beforeState {
+				t.Fatalf("rejected completion changed state: before=%+v after=%+v", beforeState, after)
+			}
+			if after := appOnboardingTestSideEffectDigest(t, env); after != beforeSideEffects {
+				t.Fatalf("rejected completion changed live data:\nbefore=%s\nafter=%s", beforeSideEffects, after)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingCompleteStrictJSONAndPositiveRevision(t *testing.T) {
+	tests := []struct {
+		name, body, code string
+		status           int
+	}{
+		{name: "unknown field", body: `{"revision":1,"test_token":"x","extra":true}`, status: http.StatusBadRequest, code: "ONBOARDING_REQUEST_INVALID"},
+		{name: "trailing JSON", body: `{"revision":1,"test_token":"x"}{}`, status: http.StatusBadRequest, code: "ONBOARDING_REQUEST_INVALID"},
+		{name: "zero revision", body: `{"revision":0,"test_token":"x"}`, status: http.StatusUnprocessableEntity, code: "ONBOARDING_REVISION_INVALID"},
+		{name: "negative revision", body: `{"revision":-1,"test_token":"x"}`, status: http.StatusUnprocessableEntity, code: "ONBOARDING_REVISION_INVALID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			before := env.state(t)
+			rr := env.serve(http.MethodPost, "/onboarding/complete", tt.body)
+			requireOnboardingCode(t, rr, tt.status, tt.code)
+			if after := env.state(t); after != before {
+				t.Fatalf("invalid request changed state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingCompleteCommitFailureRollsBackAndIsPrivate(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	token, now := seedAppOnboardingCompletion(t, env, 111, true)
+	beforeState := env.state(t)
+	beforeSideEffects := appOnboardingTestSideEffectDigest(t, env)
+	if _, err := env.db.Exec(`CREATE TRIGGER fail_onboarding_complete_combo
+BEFORE INSERT ON llm_combos BEGIN SELECT RAISE(ABORT, 'COMMIT_SECRET'); END`); err != nil {
+		t.Fatal(err)
+	}
+	var logs syncLogBuffer
+	env.a.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	oldNow := appOnboardingCompleteNow
+	appOnboardingCompleteNow = func() time.Time { return now }
+	t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+
+	rr := env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(`{"revision":111,"test_token":%q}`, token))
+	requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_COMMIT_FAILED")
+	if strings.Contains(rr.Body.String(), "COMMIT_SECRET") || strings.Contains(rr.Body.String(), token) {
+		t.Fatalf("commit error leaked internals: %s", rr.Body.String())
+	}
+	if after := env.state(t); after != beforeState {
+		t.Fatalf("failed commit changed state: before=%+v after=%+v", beforeState, after)
+	}
+	if after := appOnboardingTestSideEffectDigest(t, env); after != beforeSideEffects {
+		t.Fatalf("failed commit changed live data:\nbefore=%s\nafter=%s", beforeSideEffects, after)
+	}
+}
+
+func TestAppOnboardingCompleteAllowsOneConcurrentWinner(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	token, now := seedAppOnboardingCompletion(t, env, 121, false)
+	oldNow := appOnboardingCompleteNow
+	appOnboardingCompleteNow = func() time.Time { return now }
+	t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+	body := fmt.Sprintf(`{"revision":121,"test_token":%q}`, token)
+	start := make(chan struct{})
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() {
+			<-start
+			responses <- env.serve(http.MethodPost, "/onboarding/complete", body)
+		}()
+	}
+	close(start)
+	first, second := <-responses, <-responses
+	codes := []int{first.Code, second.Code}
+	slices.Sort(codes)
+	if !slices.Equal(codes, []int{http.StatusOK, http.StatusConflict}) {
+		t.Fatalf("concurrent completion statuses = %v; bodies=%s / %s", codes, first.Body.String(), second.Body.String())
+	}
+}
+
+func TestAppOnboardingCompleteFencesActiveAndNewTestChat(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	token, now := seedAppOnboardingCompletion(t, env, 131, false)
+	oldNow := appOnboardingCompleteNow
+	appOnboardingCompleteNow = func() time.Time { return now }
+	t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	withAppOnboardingTestSeams(t,
+		func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+			close(entered)
+			<-ctx.Done()
+			close(canceled)
+			<-release
+			return "", ctx.Err()
+		},
+		func() time.Time { return now },
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+		time.Second,
+	)
+	testDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		testDone <- env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":131,"message":"xin chào"}`)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("active Test Chat did not enter runner")
+	}
+	completeDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		completeDone <- env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(
+			`{"revision":131,"test_token":%q}`, token,
+		))
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("Complete did not cancel active Test Chat")
+	}
+	blocked := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":131,"message":"xin chào"}`)
+	requireOnboardingCode(t, blocked, http.StatusConflict, "ONBOARDING_TEST_BUSY")
+	close(release)
+	select {
+	case rr := <-testDone:
+		requireOnboardingCode(t, rr, http.StatusRequestTimeout, "ONBOARDING_REQUEST_CANCELED")
+	case <-time.After(time.Second):
+		t.Fatal("canceled Test Chat did not finish")
+	}
+	select {
+	case rr := <-completeDone:
+		if rr.Code != http.StatusOK {
+			t.Fatalf("completion status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completion did not finish after Test Chat cleanup")
+	}
+}
+
+func seedAppOnboardingCompletion(
+	t *testing.T,
+	env *onboardingRouteTestEnv,
+	revision int64,
+	restart bool,
+) (string, time.Time) {
+	t.Helper()
+	state, _ := seedAppOnboardingTestChat(t, env, "codex", revision)
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 32))
+	digest := sha256.Sum256([]byte(token))
+	now := time.Date(2026, 8, 11, 12, 0, 0, 123, time.UTC)
+	state.StagedComboID = appOnboardingCompletionComboIDForTest
+	state.TestNonceHash = fmt.Sprintf("%x", digest[:])
+	state.TestExpiresAt = now.Add(time.Minute).Format(time.RFC3339Nano)
+	state.RestartInProgress = restart
+	if restart {
+		state.CompletedVersion = store.CurrentOnboardingVersion
+	}
+	env.setState(t, state)
+	return token, now
 }

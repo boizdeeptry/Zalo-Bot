@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,12 +45,14 @@ var (
 	}
 	appOnboardingConnectCancelWait = 12 * time.Second
 
-	appOnboardingTestNow                                         = time.Now
-	appOnboardingTestRandom                                      = defaultAppOnboardingTestRandom
-	appOnboardingTestTimeout                                     = 120 * time.Second
-	appOnboardingTestExecute           appOnboardingTestExecutor = defaultAppOnboardingTestExecute
-	appOnboardingTestAfterCommit                                 = func() {}
-	appOnboardingProviderAfterTestWait                           = func() {}
+	appOnboardingTestNow                                               = time.Now
+	appOnboardingTestRandom                                            = defaultAppOnboardingTestRandom
+	appOnboardingTestTimeout                                           = 120 * time.Second
+	appOnboardingTestExecute                 appOnboardingTestExecutor = defaultAppOnboardingTestExecute
+	appOnboardingTestAfterCommit                                       = func() {}
+	appOnboardingProviderAfterTestWait                                 = func() {}
+	appOnboardingCompleteNow                                           = time.Now
+	appOnboardingCompleteConstantTimeCompare                           = subtle.ConstantTimeCompare
 )
 
 const appOnboardingReceiptCompensationTimeout = 5 * time.Second
@@ -119,6 +123,17 @@ type appOnboardingTestChatResponse struct {
 	TestToken  string `json:"test_token"`
 	ExpiresAt  string `json:"expires_at"`
 	Revision   int64  `json:"revision"`
+}
+
+type appOnboardingCompleteRequest struct {
+	Revision  int64  `json:"revision"`
+	TestToken string `json:"test_token"`
+}
+
+type appOnboardingCompleteResponse struct {
+	Completed         bool   `json:"completed"`
+	OnboardingVersion int64  `json:"onboarding_version"`
+	ComboID           string `json:"combo_id"`
 }
 
 // appOnboardingStatusResponse is deliberately a projection rather than an alias of the Store
@@ -512,6 +527,149 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 		ModelID: state.ModelID, TestToken: token,
 		ExpiresAt: policy.ExpiresAt.Format(time.RFC3339Nano), Revision: updated.Revision,
 	})
+}
+
+type appOnboardingCompleteSnapshot struct {
+	staged      store.OnboardingStagingAccount
+	nonceHash   string
+	comboID     string
+	fingerprint string
+}
+
+// handleOnboardingComplete is the explicit human confirmation boundary. Test Chat only issues a
+// one-time proof; it never activates routing on its own. The transition lease closes Test Chat
+// admission while an already-running test is canceled and reaped, then Store performs the only
+// validation-and-activation transaction.
+func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
+	var request appOnboardingCompleteRequest
+	if !a.decodeOnboardingBody(w, r, &request) {
+		return
+	}
+	if !a.requireOnboardingRevision(w, request.Revision) {
+		return
+	}
+
+	onboardingMutationMu.Lock()
+	if r.Context().Err() != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
+		return
+	}
+	now := appOnboardingCompleteNow().UTC()
+	if _, ok := a.preflightOnboardingComplete(w, request.Revision, request.TestToken, now); !ok {
+		onboardingMutationMu.Unlock()
+		return
+	}
+	transition, ok := acquireAppOnboardingProviderTransitionLease()
+	if !ok {
+		onboardingMutationMu.Unlock()
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_COMMIT_FAILED",
+			"Không thể khoá cấu hình để hoàn tất thiết lập; hãy thử lại", nil)
+		return
+	}
+	defer transition.release()
+	onboardingMutationMu.Unlock()
+
+	if !transition.cancelAndWait(r.Context()) {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
+		return
+	}
+	onboardingMutationMu.Lock()
+	defer onboardingMutationMu.Unlock()
+	if r.Context().Err() != nil {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
+		return
+	}
+	now = appOnboardingCompleteNow().UTC()
+	snapshot, ok := a.preflightOnboardingComplete(w, request.Revision, request.TestToken, now)
+	if !ok {
+		return
+	}
+	updated, err := a.st.CompleteOnboarding(r.Context(), store.CompleteOnboardingInput{
+		Revision:           request.Revision,
+		TestNonceHash:      snapshot.nonceHash,
+		PersonaFingerprint: snapshot.fingerprint,
+		StagingConfigDir:   snapshot.staged.ConfigDir,
+		Now:                now,
+	})
+	if err != nil {
+		a.writeOnboardingCompleteError(w, err)
+		return
+	}
+	if updated.Phase != store.OnboardingPhaseCompleted ||
+		updated.CompletedVersion != store.CurrentOnboardingVersion || updated.Revision != request.Revision+1 {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, appOnboardingCompleteResponse{
+		Completed:         true,
+		OnboardingVersion: store.CurrentOnboardingVersion,
+		ComboID:           snapshot.comboID,
+	})
+}
+
+func (a *api) preflightOnboardingComplete(
+	w http.ResponseWriter,
+	expectedRevision int64,
+	testToken string,
+	now time.Time,
+) (appOnboardingCompleteSnapshot, bool) {
+	state, ok := a.onboardingMutationState(w, expectedRevision)
+	if !ok {
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	if state.Phase != store.OnboardingPhaseTest || state.TestNonceHash == "" ||
+		state.TestExpiresAt == "" ||
+		(state.CompletedVersion >= store.CurrentOnboardingVersion && !state.RestartInProgress) {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingTestRequired)
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	decodedToken, err := base64.RawURLEncoding.DecodeString(testToken)
+	if err != nil || len(testToken) != 43 || len(decodedToken) != sha256.Size ||
+		base64.RawURLEncoding.EncodeToString(decodedToken) != testToken {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingTestRequired)
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	computedHash := sha256.Sum256([]byte(testToken))
+	storedHash, err := hex.DecodeString(state.TestNonceHash)
+	if err != nil || len(storedHash) != sha256.Size ||
+		appOnboardingCompleteConstantTimeCompare(storedHash, computedHash[:]) != 1 {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingTestRequired)
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, state.TestExpiresAt)
+	if err != nil || expiresAt.Location() != time.UTC {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingConfigurationChanged)
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	if !expiresAt.After(now) {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingTestExpired)
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	staged, _, displayName, err := a.preflightOnboardingTestChat(state)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrOnboardingInvalidPhase):
+			a.writeOnboardingCompleteError(w, store.ErrOnboardingTestRequired)
+		case errors.Is(err, store.ErrOnboardingInvalidStagingOwnership),
+			errors.Is(err, store.ErrOnboardingModelUnavailable),
+			errors.Is(err, store.ErrOnboardingPersonaMismatch):
+			a.writeOnboardingCompleteError(w, store.ErrOnboardingConfigurationChanged)
+		default:
+			a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
+		}
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	if strings.TrimSpace(displayName) == "" || state.PersonaFingerprint == "" {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingConfigurationChanged)
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	return appOnboardingCompleteSnapshot{
+		staged:      staged,
+		nonceHash:   hex.EncodeToString(computedHash[:]),
+		comboID:     state.StagedComboID,
+		fingerprint: state.PersonaFingerprint,
+	}, true
 }
 
 func beginAppOnboardingTest() bool {
@@ -1159,6 +1317,29 @@ func (a *api) writeOnboardingStoreError(w http.ResponseWriter, err error) {
 			"Tên hoặc văn phong của bot đã thay đổi; hãy xác nhận lại trước khi kiểm tra", nil)
 	default:
 		a.writeOnboardingStateUnavailable(w, err)
+	}
+}
+
+func (a *api) writeOnboardingCompleteError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrOnboardingConflict):
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT",
+			"Trạng thái thiết lập đã thay đổi; hãy tải lại rồi thử tiếp", nil)
+	case errors.Is(err, store.ErrOnboardingTestRequired):
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_TEST_REQUIRED",
+			"Cần hoàn tất Test Chat và xác nhận bằng biên nhận mới nhất", nil)
+	case errors.Is(err, store.ErrOnboardingTestExpired):
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_TEST_EXPIRED",
+			"Biên nhận Test Chat đã hết hạn; hãy kiểm tra lại", nil)
+	case errors.Is(err, store.ErrOnboardingConfigurationChanged):
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_CONFIGURATION_CHANGED",
+			"Cấu hình thiết lập đã thay đổi; hãy kiểm tra lại trước khi hoàn tất", nil)
+	default:
+		if a.logger != nil {
+			a.logger.Error("onboarding complete: atomic commit failed", "err", err)
+		}
+		a.writeLLMErr(w, http.StatusInternalServerError, "ONBOARDING_COMMIT_FAILED",
+			"Không thể hoàn tất thiết lập an toàn; cấu hình cũ vẫn được giữ nguyên", nil)
 	}
 }
 

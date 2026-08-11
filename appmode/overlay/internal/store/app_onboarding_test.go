@@ -3,9 +3,12 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1789,4 +1792,415 @@ func seedOnboardingTestReceiptForTest(t *testing.T, st *Store, revision int64) {
 		AccountID: "staged-account", ModelID: "gpt-5.6-terra", StagedComboID: "staged-combo",
 		PersonaFingerprint: "persona-fingerprint", Revision: revision,
 	})
+}
+
+const onboardingCompletionComboIDForTest = "5f9967c7-93cf-4ac8-9da8-f6a7c1af8801"
+
+func TestCompleteOnboardingActivatesVerifiedReceiptAtomically(t *testing.T) {
+	st := openAppStoreForTest(t)
+	now := seedCompleteOnboardingForTest(t, st, false, 51)
+	beforeRevision := onboardingRouteRevisionForTest(t, st)
+
+	got, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+		Revision: 51, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account",
+		Now: now,
+	})
+	if err != nil {
+		t.Fatalf("CompleteOnboarding() = %v", err)
+	}
+	if got.Phase != OnboardingPhaseCompleted || got.CompletedVersion != CurrentOnboardingVersion ||
+		got.RestartInProgress || got.Revision != 52 || got.ProviderKind != "codex" ||
+		got.ProviderID != "codex" || got.AccountID != "staged-account" ||
+		got.ModelID != "gpt-5.6-terra" || got.StagedComboID != "" ||
+		got.PersonaFingerprint != "" || got.TestNonceHash != "" || got.TestExpiresAt != "" {
+		t.Fatalf("completed state = %+v", got)
+	}
+
+	providers, err := st.LLMProviders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerEnabled := map[string]bool{}
+	for _, provider := range providers {
+		providerEnabled[provider.ID] = provider.Enabled
+	}
+	if !providerEnabled["codex"] || !providerEnabled["other-provider"] {
+		t.Fatalf("provider enablement = %#v; selected and unrelated providers must be preserved/enabled", providerEnabled)
+	}
+	accounts, err := st.LLMAccounts("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountEnabled := map[string]bool{}
+	for _, account := range accounts {
+		accountEnabled[account.ID] = account.Enabled
+	}
+	if !accountEnabled["staged-account"] || accountEnabled["old-live"] || accountEnabled["old-disabled"] || len(accountEnabled) != 3 {
+		t.Fatalf("same-provider accounts = %#v", accountEnabled)
+	}
+	otherAccounts, err := st.LLMAccounts("other-provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(otherAccounts) != 1 || otherAccounts[0].ID != "other-live" || !otherAccounts[0].Enabled {
+		t.Fatalf("other-provider accounts changed: %+v", otherAccounts)
+	}
+	combos, err := st.LLMCombos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combos) != 1 || combos[0].ID != onboardingCompletionComboIDForTest ||
+		combos[0].Name != "Mặc định · Codex" || combos[0].Type != "fallback" ||
+		!combos[0].Active || combos[0].Revision != 1 || len(combos[0].Members) != 1 {
+		t.Fatalf("completed combos = %+v", combos)
+	}
+	wantMember := LLMRouteEntry{Position: 0, ProviderID: "codex", ModelID: "gpt-5.6-terra", Enabled: true}
+	if combos[0].Members[0] != wantMember {
+		t.Fatalf("completed member = %+v; want %+v", combos[0].Members[0], wantMember)
+	}
+	route, err := st.LLMRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.ComboID != onboardingCompletionComboIDForTest || route.Type != "fallback" ||
+		route.Revision != 1 || len(route.Entries) != 1 || route.Entries[0] != wantMember {
+		t.Fatalf("completed route = %+v", route)
+	}
+	if projection := onboardingLegacyRouteForTest(t, st); projection != "0:codex:gpt-5.6-terra:1" {
+		t.Fatalf("legacy route projection = %q", projection)
+	}
+	if revision := onboardingRouteRevisionForTest(t, st); revision != beforeRevision+1 {
+		t.Fatalf("legacy route revision = %d; want %d", revision, beforeRevision+1)
+	}
+
+	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+		Revision: 51, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+	}); !errors.Is(err, ErrOnboardingConflict) {
+		t.Fatalf("one-time retry error = %v; want ErrOnboardingConflict", err)
+	}
+}
+
+func TestCompleteOnboardingRestartReplacesLiveRouteOnlyAtCommit(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "complete.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	now := seedCompleteOnboardingForTest(t, st, true, 61)
+	before := completeOnboardingDigestForTest(t, st)
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+
+	oldFailpoint := onboardingCompleteFailpoint
+	onboardingCompleteFailpoint = func(stage string) error {
+		if stage != onboardingCompleteStageCommit {
+			return nil
+		}
+		if during := completeOnboardingDigestFromDBForTest(t, raw); during != before {
+			t.Fatalf("uncommitted replacement became visible:\nbefore=%s\nduring=%s", before, during)
+		}
+		return nil
+	}
+	t.Cleanup(func() { onboardingCompleteFailpoint = oldFailpoint })
+
+	got, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+		Revision: 61, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CompletedVersion != CurrentOnboardingVersion || got.RestartInProgress || got.Revision != 62 {
+		t.Fatalf("restart completion state = %+v", got)
+	}
+	if after := completeOnboardingDigestForTest(t, st); after == before {
+		t.Fatal("restart completion did not replace the live projection")
+	}
+}
+
+func TestCompleteOnboardingRollsBackEveryStatementGroup(t *testing.T) {
+	stages := []string{
+		onboardingCompleteStageAccounts,
+		onboardingCompleteStageMemberDelete,
+		onboardingCompleteStageLegacyRouteDelete,
+		onboardingCompleteStageComboDelete,
+		onboardingCompleteStageComboInsert,
+		onboardingCompleteStageMemberInsert,
+		onboardingCompleteStageRouteSync,
+		onboardingCompleteStageStateUpdate,
+		onboardingCompleteStageCommit,
+	}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			now := seedCompleteOnboardingForTest(t, st, false, 71)
+			before := completeOnboardingDigestForTest(t, st)
+			oldFailpoint := onboardingCompleteFailpoint
+			onboardingCompleteFailpoint = func(current string) error {
+				if current == stage {
+					return errors.New("injected completion failure")
+				}
+				return nil
+			}
+			t.Cleanup(func() { onboardingCompleteFailpoint = oldFailpoint })
+
+			_, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
+				Revision: 71, TestNonceHash: completeOnboardingHashForTest(),
+				PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+			})
+			if !errors.Is(err, ErrOnboardingCommitFailed) {
+				t.Fatalf("stage %q error = %v; want ErrOnboardingCommitFailed", stage, err)
+			}
+			if after := completeOnboardingDigestForTest(t, st); after != before {
+				t.Fatalf("stage %q escaped rollback:\nbefore=%s\nafter=%s", stage, before, after)
+			}
+		})
+	}
+}
+
+func TestCompleteOnboardingRejectsInvalidReceiptAndConfigurationWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Store, *OnboardingState, *CompleteOnboardingInput)
+		want   error
+	}{
+		{name: "stale revision", want: ErrOnboardingConflict, mutate: func(_ *Store, _ *OnboardingState, input *CompleteOnboardingInput) { input.Revision-- }},
+		{name: "wrong phase", want: ErrOnboardingTestRequired, mutate: func(_ *Store, state *OnboardingState, _ *CompleteOnboardingInput) {
+			state.Phase = OnboardingPhasePersona
+		}},
+		{name: "missing receipt", want: ErrOnboardingTestRequired, mutate: func(_ *Store, state *OnboardingState, _ *CompleteOnboardingInput) { state.TestNonceHash = "" }},
+		{name: "wrong receipt", want: ErrOnboardingTestRequired, mutate: func(_ *Store, _ *OnboardingState, input *CompleteOnboardingInput) {
+			input.TestNonceHash = strings.Repeat("cd", sha256.Size)
+		}},
+		{name: "expired receipt", want: ErrOnboardingTestExpired, mutate: func(_ *Store, state *OnboardingState, input *CompleteOnboardingInput) {
+			state.TestExpiresAt = input.Now.Format(time.RFC3339Nano)
+		}},
+		{name: "persona changed", want: ErrOnboardingConfigurationChanged, mutate: func(_ *Store, _ *OnboardingState, input *CompleteOnboardingInput) {
+			input.PersonaFingerprint = "changed"
+		}},
+		{name: "provider missing", want: ErrOnboardingConfigurationChanged, mutate: func(st *Store, _ *OnboardingState, _ *CompleteOnboardingInput) {
+			_, _ = st.db.Exec(`DELETE FROM llm_providers WHERE id = 'codex'`)
+		}},
+		{name: "provider kind drift", want: ErrOnboardingConfigurationChanged, mutate: func(st *Store, _ *OnboardingState, _ *CompleteOnboardingInput) {
+			_, _ = st.db.Exec(`UPDATE llm_providers SET kind = 'openai' WHERE id = 'codex'`)
+		}},
+		{name: "account enabled drift", want: ErrOnboardingConfigurationChanged, mutate: func(st *Store, _ *OnboardingState, _ *CompleteOnboardingInput) {
+			_, _ = st.db.Exec(`UPDATE llm_accounts SET enabled = 1 WHERE id = 'staged-account'`)
+		}},
+		{name: "account provider drift", want: ErrOnboardingConfigurationChanged, mutate: func(st *Store, _ *OnboardingState, _ *CompleteOnboardingInput) {
+			_, _ = st.db.Exec(`UPDATE llm_accounts SET provider_id = 'other-provider' WHERE id = 'staged-account'`)
+		}},
+		{name: "config drift", want: ErrOnboardingConfigurationChanged, mutate: func(st *Store, _ *OnboardingState, _ *CompleteOnboardingInput) {
+			_, _ = st.db.Exec(`UPDATE llm_accounts SET config_dir = 'D:/changed' WHERE id = 'staged-account'`)
+		}},
+		{name: "model unavailable", want: ErrOnboardingConfigurationChanged, mutate: func(st *Store, _ *OnboardingState, _ *CompleteOnboardingInput) {
+			_, _ = st.db.Exec(`UPDATE llm_models SET available = 0 WHERE provider_id = 'codex'`)
+		}},
+		{name: "model name invalid", want: ErrOnboardingConfigurationChanged, mutate: func(st *Store, _ *OnboardingState, _ *CompleteOnboardingInput) {
+			_, _ = st.db.Exec(`UPDATE llm_models SET name = '' WHERE provider_id = 'codex'`)
+		}},
+		{name: "combo id invalid", want: ErrOnboardingConfigurationChanged, mutate: func(_ *Store, state *OnboardingState, _ *CompleteOnboardingInput) { state.StagedComboID = "not-a-uuid" }},
+		{name: "already completed", want: ErrOnboardingTestRequired, mutate: func(_ *Store, state *OnboardingState, _ *CompleteOnboardingInput) {
+			state.Phase = OnboardingPhaseCompleted
+			state.CompletedVersion = CurrentOnboardingVersion
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			now := seedCompleteOnboardingForTest(t, st, false, 81)
+			state := mustOnboardingStateForTest(t, st)
+			input := CompleteOnboardingInput{
+				Revision: 81, TestNonceHash: completeOnboardingHashForTest(),
+				PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+			}
+			tt.mutate(st, &state, &input)
+			setOnboardingStateForTest(t, st, state)
+			before := completeOnboardingDigestForTest(t, st)
+			if _, err := st.CompleteOnboarding(context.Background(), input); !errors.Is(err, tt.want) {
+				t.Fatalf("CompleteOnboarding() error = %v; want %v", err, tt.want)
+			}
+			if after := completeOnboardingDigestForTest(t, st); after != before {
+				t.Fatalf("rejected completion mutated data:\nbefore=%s\nafter=%s", before, after)
+			}
+		})
+	}
+}
+
+func TestCompleteOnboardingAllowsExactlyOneConcurrentWinner(t *testing.T) {
+	st := openAppStoreForTest(t)
+	now := seedCompleteOnboardingForTest(t, st, false, 91)
+	input := CompleteOnboardingInput{
+		Revision: 91, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := st.CompleteOnboarding(context.Background(), input)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	successes, conflicts := 0, 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrOnboardingConflict):
+			conflicts++
+		default:
+			t.Fatalf("concurrent completion error = %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("concurrent outcomes success=%d conflict=%d", successes, conflicts)
+	}
+}
+
+func seedCompleteOnboardingForTest(t *testing.T, st *Store, restart bool, revision int64) time.Time {
+	t.Helper()
+	if err := st.EnsureOnboardingProviderForKind("codex"); err != nil {
+		t.Fatal(err)
+	}
+	insertOnboardingAccountForTest(t, st, "staged-account", "codex", false, "D:/onboarding/staged-account")
+	insertOnboardingAccountForTest(t, st, "old-live", "codex", true, "D:/live/old")
+	insertOnboardingAccountForTest(t, st, "old-disabled", "codex", false, "D:/old/disabled")
+	insertOnboardingProviderForTest(t, st, "other-provider", "openai")
+	insertOnboardingAccountForTest(t, st, "other-live", "other-provider", true, "D:/other/live")
+	if err := st.AddLLMModel(LLMModel{
+		ProviderID: "codex", ModelID: "gpt-5.6-terra", Name: "Terra",
+		Source: LLMModelManual, Available: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddLLMModel(LLMModel{
+		ProviderID: "other-provider", ModelID: "old-model", Name: "Old",
+		Source: LLMModelManual, Available: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	combo, err := st.CreateLLMCombo("Old live", "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReplaceLLMComboMembers(combo.ID, combo.Revision, "fallback", []LLMRouteEntry{{
+		ProviderID: "other-provider", ModelID: "old-model", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetActiveLLMCombo(combo.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`INSERT INTO llm_route_entries(position, provider_id, model_id, enabled)
+VALUES (0, 'other-provider', 'old-model', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE app_meta SET value = '41' WHERE key = 'llm_route_revision'`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 11, 12, 0, 0, 123, time.UTC)
+	completedVersion := int64(0)
+	if restart {
+		completedVersion = CurrentOnboardingVersion
+	}
+	setOnboardingStateForTest(t, st, OnboardingState{
+		CompletedVersion: completedVersion, Phase: OnboardingPhaseTest,
+		ProviderKind: "codex", ProviderID: "codex", AccountID: "staged-account",
+		ModelID: "gpt-5.6-terra", StagedComboID: onboardingCompletionComboIDForTest,
+		PersonaFingerprint: "persona-fingerprint", TestNonceHash: completeOnboardingHashForTest(),
+		TestExpiresAt:     now.Add(time.Minute).Format(time.RFC3339Nano),
+		RestartInProgress: restart, Revision: revision,
+	})
+	return now
+}
+
+func completeOnboardingHashForTest() string {
+	digest := sha256.Sum256([]byte("verified-test-token"))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func onboardingRouteRevisionForTest(t *testing.T, st *Store) int64 {
+	t.Helper()
+	var value int64
+	if err := st.db.QueryRow(`SELECT CAST(value AS INTEGER) FROM app_meta WHERE key = 'llm_route_revision'`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func onboardingLegacyRouteForTest(t *testing.T, st *Store) string {
+	t.Helper()
+	var value string
+	if err := st.db.QueryRow(`SELECT COALESCE(group_concat(position || ':' || provider_id || ':' || model_id || ':' || enabled, ','), '')
+FROM llm_route_entries`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func completeOnboardingDigestForTest(t *testing.T, st *Store) string {
+	t.Helper()
+	return completeOnboardingDigestFromDBForTest(t, st.db)
+}
+
+func completeOnboardingDigestFromDBForTest(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	queries := []string{
+		`SELECT completed_version, phase, provider_kind, provider_id, account_id, model_id, staged_combo_id, persona_fingerprint, test_nonce_hash, test_expires_at, restart_in_progress, revision, updated_at FROM app_onboarding_state ORDER BY id`,
+		`SELECT id, name, kind, enabled, system_provider, hex(credential_cipher), last_check_status, last_error, last_checked_at FROM llm_providers ORDER BY id`,
+		`SELECT id, provider_id, label, email, config_dir, enabled, added_at FROM llm_accounts ORDER BY id`,
+		`SELECT provider_id, model_id, name, source, available FROM llm_models ORDER BY provider_id, model_id`,
+		`SELECT id, name, type, active, revision FROM llm_combos ORDER BY id`,
+		`SELECT combo_id, position, provider_id, model_id, enabled FROM llm_combo_members ORDER BY combo_id, position`,
+		`SELECT position, provider_id, model_id, enabled FROM llm_route_entries ORDER BY position`,
+		`SELECT key, value FROM app_meta WHERE key = 'llm_route_revision'`,
+	}
+	var digest strings.Builder
+	for _, query := range queries {
+		rows, err := db.Query(query)
+		if err != nil {
+			t.Fatalf("digest query %q: %v", query, err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&digest, "%s|", query)
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			fmt.Fprintf(&digest, "%#v;", values)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return digest.String()
 }
