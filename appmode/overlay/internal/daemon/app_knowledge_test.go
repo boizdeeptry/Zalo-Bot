@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -11,9 +12,46 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agentdc/internal/config"
+	"agentdc/internal/store"
 )
+
+func TestRunIngestCancelsHangingNPMDiscovery(t *testing.T) {
+	fixture := newHangingNPMDiscovery(t)
+	previous := ingest
+	ingest = &ingestState{running: true}
+	t.Cleanup(func() { ingest = previous })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	a := newAppKnowledgeTestAPI(t)
+	a.st = st
+	dir := t.TempDir()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.runIngest(ctx, func() {}, dir)
+	}()
+	fixture.waitStarted(t)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		fixture.release()
+		<-done
+		t.Fatal("runIngest did not cancel while npm discovery was hanging")
+	}
+	if got := ingest.snapshot()["err"]; got != "đã huỷ" {
+		t.Fatalf("ingest error = %q; want cancellation message", got)
+	}
+}
 
 func newAppKnowledgeTestAPI(t *testing.T) *api {
 	t.Helper()

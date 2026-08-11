@@ -12,7 +12,7 @@
 
 **Spec:** `.planning/specs/2026-08-06-provider-routing-design.md`
 
-**Research:** skipped — no research artifact exists; the approved spec and a direct survey of the local codebase and official Provider APIs were used.
+**Research:** `.planning/research/9router-RESEARCH.md`; the approved spec, this artifact, a direct survey of the local codebase, and official Provider APIs were used.
 
 ---
 
@@ -22,8 +22,8 @@
 
 - Create `appmode/overlay/internal/store/app_llm.go`: Provider, model, route, revision, and telemetry persistence APIs.
 - Create `appmode/overlay/internal/store/app_llm_test.go`: public store behavior, transaction, conflict, delete guard, and snapshot tests.
-- Modify `appmode/overlay/internal/store/app_schema.go`: schema version 2 and the four LLM tables plus indexes.
-- Modify `appmode/overlay/internal/store/app_schema_test.go`: idempotent migration and system Provider seed assertions.
+- Modify `appmode/overlay/internal/store/app_schema.go`: schema version 3 and the four LLM tables plus indexes; version 2 remains reserved for Zalo CLI sessions.
+- Modify `appmode/overlay/internal/store/app_schema_test.go`: idempotent, monotonic schema-version and system Provider seed assertions.
 - Create `appmode/overlay/internal/daemon/app_secret.go`: package-level secret protector interface and redaction helpers.
 - Create `appmode/overlay/internal/daemon/app_secret_windows.go`: current-user DPAPI encryption and decryption.
 - Create `appmode/overlay/internal/daemon/app_secret_other.go`: fail-closed implementation for non-Windows builds.
@@ -37,13 +37,15 @@
 - Create `appmode/overlay/internal/daemon/app_llm_router.go`: immutable snapshot routing, timeouts, Claude Code delegation, and telemetry emission.
 - Create `appmode/overlay/internal/daemon/app_llm_router_test.go`: fallback, stop, cancellation, attachment bypass, and telemetry behavior.
 - Create `appmode/overlay/internal/daemon/app_llm_api.go`: authenticated Provider, model, route, connection-test, discovery, and status handlers.
+- Create `appmode/overlay/internal/daemon/app_llm_api_shared.go`: shared strict decoding, Provider lookup, credential loading, and sanitized API error helpers.
 - Create `appmode/overlay/internal/daemon/app_llm_api_test.go`: HTTP behavior, secret masking, validation, and conflict tests.
 - Modify `appmode/overlay/internal/daemon/app_routes.go`: register and cookie-authorize the `/llm` routes and bootstrap the legacy model once.
 
 ### Staging seam and Portal
 
-- Modify `scripts/BuildApp.psm1`: apply one guarded `duty.go` seam that wraps the existing `zaloRunner` per turn.
-- Modify `tests/build-app.Tests.ps1`: prove the new seam is inserted exactly once and the source repository is untouched.
+- Modify `appmode/overlay/internal/daemon/app_zalo_session_hook.go`: compose Provider selection at the existing `appAnswerZalo`/`appRunZalo` session boundary; add no new `duty.go` seam.
+- Modify `appmode/overlay/internal/daemon/app_zalo_session_hook_test.go`: prove stateless API success and session-aware Claude attachment/fallback behavior through the existing seams.
+- Modify `tests/build-app.Tests.ps1`: keep proving the two existing session seams are inserted exactly once and the source repository is untouched.
 - Modify `appmode/overlay/internal/daemon/app_foundation_test.go`: route registration and mutation-header coverage.
 - Modify `appmode/overlay/internal/daemon/app_shell_test.go`: embedded Provider page asset coverage.
 - Create `appmode/overlay/internal/webui/static/pages/providers.js`: Provider list, sheet editor, credential mutations, connection test, discovery, and manual models.
@@ -99,17 +101,19 @@
 
   Cover: the seeded `claude-code` system Provider; model upsert and replacement; route revision `1`; successful compare-and-swap to revision `2`; stale revision returning `ErrLLMRouteConflict`; disabled/missing Provider or model rejection; Claude Code required as the enabled final entry; referenced Provider deletion returning `ErrLLMProviderInUse`; and mutation of a returned slice not affecting the next snapshot. Record an `LLMAttempt` and query status, then inspect the schema with `PRAGMA table_info(llm_attempts)` to prove no prompt, request, response, or message column exists.
 
+  Extend the schema migration test from the Zalo-session baseline: version `2` advances to Provider version `3`, repeated migration remains `3`, a pre-existing numeric version greater than `3` is preserved exactly, and malformed version metadata returns an error without being overwritten.
+
 - [ ] **Step 2: Run the staged build and confirm the tests fail for the right reason**
 
   Run:
 
   ```powershell
-  pwsh -NoProfile -File .\build-app.ps1 -Repo $env:ZALOBOT_REPO -PersonaSource $env:ZALOBOT_PERSONA -Out (Join-Path $env:TEMP ('provider-store-red-' + [guid]::NewGuid().ToString('N')))
+  pwsh -NoProfile -File .\build-app.ps1 -Repo 'C:\Users\manva\OneDrive\Máy tính\agentdc' -PersonaSource 'D:\TuvanZalo\brain\reference\persona' -Out (Join-Path $env:TEMP ('provider-store-red-' + [guid]::NewGuid().ToString('N')))
   ```
 
   Expected: FAIL during `go test` because `LLMProvider`, `LLMRouteSnapshot`, and the new `Store` methods do not exist.
 
-- [ ] **Step 3: Implement schema version 2 and store methods**
+- [ ] **Step 3: Implement schema version 3 and store methods**
 
   Add `llm_providers`, `llm_models`, `llm_route_entries`, and `llm_attempts`. Use foreign keys, unique `(provider_id, model_id)`, unique route `position`, an index on attempt start time, and `CHECK` constraints for booleans. Seed only the protected Provider metadata in migration:
 
@@ -117,8 +121,11 @@
   INSERT OR IGNORE INTO llm_providers(id, name, kind, enabled, system_provider)
   VALUES ('claude-code', 'Claude Code', 'claude_code', 1, 1);
   INSERT OR IGNORE INTO app_meta(key, value) VALUES ('llm_route_revision', '1');
-  UPDATE app_meta SET value = '2' WHERE key = 'schema_version';
+  -- Run only after strict Go parsing proves the current numeric version is below 3.
+  UPDATE app_meta SET value = '3' WHERE key = 'schema_version';
   ```
+
+  Reserve schema version `2` for the Zalo CLI-session migration already present on this branch. Advance to `3` inside the same transaction only when the strictly parsed, non-negative numeric value is lower; preserve higher versions and return an error for malformed metadata instead of coercing or overwriting it.
 
   Implement `LLMProviders`, `CreateLLMProvider`, `UpdateLLMProvider`, `DeleteLLMProvider`, `SetLLMCredentialCipher`, `ClearLLMCredential`, `ReplaceLLMModels`, `AddLLMModel`, `DeleteLLMModel`, `LLMRoute`, `ReplaceLLMRoute`, `BootstrapClaudeRoute`, `RecordLLMAttempt`, and `LLMStatus`. `ReplaceLLMRoute` must validate and replace entries inside one SQL transaction, update the revision with `WHERE value = expected`, and roll back on every validation or conflict error. Cap attempts to the newest 500 rows after insert.
 
@@ -318,63 +325,70 @@
 ### Task 5: Integrate routing into the staged daemon without restart
 
 **Files:**
-- Modify: `scripts/BuildApp.psm1` (inside `Apply-AppSeams`)
-- Modify: `tests/build-app.Tests.ps1` (seam fixture section)
+- Modify: `appmode/overlay/internal/daemon/app_zalo_session_hook.go`
+- Modify: `appmode/overlay/internal/daemon/app_zalo_session_hook_test.go`
 - Modify: `appmode/overlay/internal/daemon/app_llm_router.go`
 - Modify: `appmode/overlay/internal/daemon/app_llm_router_test.go`
 - Modify: `appmode/overlay/internal/daemon/app_routes.go`
 
-**Public behavior to verify:** The existing Zalo answer pipeline uses the newest saved route on the next message, keeps the old snapshot for an in-flight message, migrates `data/model.txt` to Claude Code once, and requires no daemon restart.
+**Public behavior to verify:** The existing Zalo answer pipeline uses the newest saved route on the next message, keeps the old snapshot for an in-flight message, leaves API turns stateless, and delegates attachment or API fallback into Claude through the existing per-thread resumable-session path without a daemon restart.
 
-- [ ] **Step 1: Write failing seam and runtime tests**
+- [ ] **Step 1: Write failing runtime-boundary tests**
 
-  Extend the PowerShell fixture to require exactly one staged replacement of:
+  Keep the two already-shipped `duty.go` seams (`appAnswerZalo` and `appRunZalo`) unchanged; do not add a Provider-specific answer seam. Add tests proving:
 
-  ```go
-  a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)
-  ```
-
-  with:
-
-  ```go
-  a.answerZalo(ctx, deps.cfg, a.appZaloRunner(deps.cfg, deps.run, len(files) > 0), threadID, question, step, reply, files...)
-  ```
-
-  Assert the source `duty.go` remains byte-identical and applying seams twice fails. In Go tests, save route A, create a runner, block its first adapter call, save route B, and prove the blocked turn completes on A while a new runner uses B. Bootstrap a temporary `data/model.txt` containing `sonnet`, assert the system route ends with `claude-code/sonnet`, run bootstrap again after a route edit, and prove the edit is not overwritten.
+  - an API success receives one complete safe prompt as a stateless request, does not invoke `appZaloStructuredRunner`, and does not advance/create Claude session state;
+  - an attachment skips every API adapter and delegates once to the injected `appZaloStructuredRunner`;
+  - an eligible API failure delegates once to that same structured runner, preserving its recovery metadata and safe error classification;
+  - a saved route/model or prompt-fingerprint change causes the existing session selector to rotate before the next Claude turn, while an in-flight turn keeps its immutable route snapshot; and
+  - bootstrapping `data/model.txt` containing `sonnet` creates a final `claude-code/sonnet` route once, then preserves later route edits.
 
 - [ ] **Step 2: Run and confirm RED**
 
-  Run:
+  Build a real stage and run the focused runtime tests inside it (replace the test names below with the exact names added in Step 1):
 
   ```powershell
-  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
+  Import-Module .\scripts\BuildApp.psm1 -Force
+  $stageRoot = Join-Path $env:TEMP ('provider-session-red-' + [guid]::NewGuid().ToString('N'))
+  $stage = New-AppStage -Repo 'C:\Users\manva\OneDrive\Máy tính\agentdc' `
+    -Overlay .\appmode\overlay -StageRoot $stageRoot
+  Apply-AppSeams -Stage $stage
+  Push-Location $stage
+  try {
+    go test -count=1 -run '^(TestAppProviderAPIStateless|TestAppProviderClaudeUsesExistingSessionBoundary)$' `
+      -v ./internal/daemon
+    if ($LASTEXITCODE -ne 0) { throw "focused Provider session tests failed: $LASTEXITCODE" }
+  } finally { Pop-Location }
   ```
 
-  Expected: FAIL because the duty seam and `appZaloRunner` do not exist.
+  Expected: FAIL because the routing bridge at the existing session hook does not exist.
 
-- [ ] **Step 3: Implement the guarded runtime seam**
+- [ ] **Step 3: Integrate at the existing session-aware boundary**
 
-  Extend `Apply-AppSeams` to read and write `internal/daemon/duty.go` with `Replace-ExactlyOnce` and `Assert-SignatureAbsent`. Implement `appZaloRunner` so each invocation constructs a fresh routed runner and creates a same-package `execZaloRunner` with a copied `zaloConfig.Model` for the selected Claude model; retain the injected base runner when its model already matches so upstream fake-runner tests remain valid. Call `BootstrapClaudeRoute` from `registerAppRoutes`, reading the legacy model through the same validation used by `/kb/model`; default to the current `zaloConfig` model when the file is absent. Keep `data/model.txt` untouched for rollback.
+  Load and deep-copy the route once per Zalo turn inside the existing `appAnswerZalo`/`appRunZalo` integration. API adapters consume the fully constructed prompt as a one-shot stateless request; API success must not create or advance a Claude mapping. When an attachment selects Claude immediately, or when the API chain falls back to Claude, delegate to the injected `appZaloStructuredRunner` rather than calling its legacy `Run` method. Preserve the existing per-thread gate, cursor, recovery and completion semantics.
+
+  Feed the selected Claude model and the effective route/prompt revision into the existing session model/fingerprint inputs so a change marks the mapping for rotation before the next Claude call. Do not patch `duty.go` again and do not change `Apply-AppSeams`; the already-shipped answer and runner seams remain the sole integration points. Call `BootstrapClaudeRoute` from `registerAppRoutes`, reading the legacy model through the same validation used by `/kb/model`; default to the current `zaloConfig` model when the file is absent. Keep `data/model.txt` untouched for rollback.
 
 - [ ] **Step 4: Run focused and full verification**
 
-  Run the build-script fixture command from Step 2, then the staged-build command with output prefix `provider-runtime-green-`.
+  Run the Pester command, then the staged-build command with output prefix `provider-runtime-green-`.
 
-  Expected: both PASS; the source repository status is unchanged and the existing Zalo tests remain green.
+  Expected: both PASS; the source repository status is unchanged, API-only turns leave Claude session state untouched, and attachment/fallback Claude turns create or resume the correct per-thread UUID.
 
 - [ ] **Step 5: Refactor and commit**
 
-  Keep the new seam adjacent to the existing answer call and avoid modifying upstream source directly.
+  Keep routing snapshot selection separate from the session hook, preserve the existing two staged seams, and avoid modifying upstream source directly.
 
   ```powershell
-  git add scripts/BuildApp.psm1 tests/build-app.Tests.ps1 appmode/overlay/internal/daemon/app_llm_router.go appmode/overlay/internal/daemon/app_llm_router_test.go appmode/overlay/internal/daemon/app_routes.go
-  git commit -m "feat: activate provider routes per Zalo turn"
+  git add appmode/overlay/internal/daemon/app_zalo_session_hook.go appmode/overlay/internal/daemon/app_zalo_session_hook_test.go appmode/overlay/internal/daemon/app_llm_router.go appmode/overlay/internal/daemon/app_llm_router_test.go appmode/overlay/internal/daemon/app_routes.go
+  git commit -m "feat: route providers through Zalo session boundary"
   ```
 
 ### Task 6: Expose secure Provider administration APIs
 
 **Files:**
 - Create: `appmode/overlay/internal/daemon/app_llm_api.go`
+- Create: `appmode/overlay/internal/daemon/app_llm_api_shared.go`
 - Create: `appmode/overlay/internal/daemon/app_llm_api_test.go`
 - Modify: `appmode/overlay/internal/daemon/app_routes.go`
 - Modify: `appmode/overlay/internal/daemon/app_foundation_test.go`
@@ -578,7 +592,8 @@
   Run:
 
   ```powershell
-  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
+  $pester = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru
+  if ($pester.FailedCount -ne 0) { throw "Pester failed: $($pester.FailedCount)" }
   ```
 
   Expected: FAIL until the package gate includes the Provider canary scan and the cross-layer fallback fixture reports the expected status.
@@ -593,10 +608,11 @@
 
   ```powershell
   npm --prefix appmode test
-  pwsh -NoProfile -File .\tests\build-app.Tests.ps1
+  $pester = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru
+  if ($pester.FailedCount -ne 0) { throw "Pester failed: $($pester.FailedCount)" }
   $out = Join-Path $env:TEMP ('provider-final-' + [guid]::NewGuid().ToString('N'))
-  pwsh -NoProfile -File .\build-app.ps1 -Repo $env:ZALOBOT_REPO -PersonaSource $env:ZALOBOT_PERSONA -Out $out
-  git -C $env:ZALOBOT_REPO status --short
+  pwsh -NoProfile -File .\build-app.ps1 -Repo 'C:\Users\manva\OneDrive\Máy tính\agentdc' -PersonaSource 'D:\TuvanZalo\brain\reference\persona' -Out $out
+  git -C 'C:\Users\manva\OneDrive\Máy tính\agentdc' status --short
   git status --short
   ```
 

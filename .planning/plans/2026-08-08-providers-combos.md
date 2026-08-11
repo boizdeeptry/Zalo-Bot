@@ -58,40 +58,40 @@
   Add to `store/app_schema_test.go`:
   ```go
   func TestMigrateAppSeedsDefaultCombo(t *testing.T) {
-  	db := openMigratedAppDB(t) // existing helper used by TestMigrateAppIsIdempotent
-  	var id, name, typ string
-  	var active int
-  	if err := db.QueryRow(
-  		`SELECT id, name, type, active FROM llm_combos WHERE active = 1`).Scan(&id, &name, &typ, &active); err != nil {
-  		t.Fatalf("read active combo: %v", err)
-  	}
-  	if id != "default" || typ != "fallback" || active != 1 {
-  		t.Errorf("active combo = (%q,%q,%q,%d); want (default,Mặc định,fallback,1)", id, name, typ, active)
-  	}
-  	var version string
-  	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key='schema_version'`).Scan(&version); err != nil {
-  		t.Fatalf("read schema_version: %v", err)
-  	}
-  	if version != "4" {
-  		t.Errorf("schema_version = %q; want 4", version)
-  	}
+      db := openMigratedAppDB(t) // existing helper used by TestMigrateAppIsIdempotent
+      var id, name, typ string
+      var active int
+      if err := db.QueryRow(
+          `SELECT id, name, type, active FROM llm_combos WHERE active = 1`).Scan(&id, &name, &typ, &active); err != nil {
+          t.Fatalf("read active combo: %v", err)
+      }
+      if id != "default" || typ != "fallback" || active != 1 {
+          t.Errorf("active combo = (%q,%q,%q,%d); want (default,Mặc định,fallback,1)", id, name, typ, active)
+      }
+      var version string
+      if err := db.QueryRow(`SELECT value FROM app_meta WHERE key='schema_version'`).Scan(&version); err != nil {
+          t.Fatalf("read schema_version: %v", err)
+      }
+      if version != "4" {
+          t.Errorf("schema_version = %q; want 4", version)
+      }
   }
 
   func TestMigrateAppKeepsEditedCombo(t *testing.T) {
-  	db := openMigratedAppDB(t)
-  	if _, err := db.Exec(`UPDATE llm_combos SET name='Của tôi' WHERE id='default'`); err != nil {
-  		t.Fatal(err)
-  	}
-  	if err := migrateApp(db); err != nil { // re-run: INSERT OR IGNORE must not clobber
-  		t.Fatalf("re-migrate: %v", err)
-  	}
-  	var name string
-  	if err := db.QueryRow(`SELECT name FROM llm_combos WHERE id='default'`).Scan(&name); err != nil {
-  		t.Fatal(err)
-  	}
-  	if name != "Của tôi" {
-  		t.Errorf("combo name after re-migration = %q; want unchanged 'Của tôi'", name)
-  	}
+      db := openMigratedAppDB(t)
+      if _, err := db.Exec(`UPDATE llm_combos SET name='Của tôi' WHERE id='default'`); err != nil {
+          t.Fatal(err)
+      }
+      if err := migrateApp(db); err != nil { // re-run: INSERT OR IGNORE must not clobber
+          t.Fatalf("re-migrate: %v", err)
+      }
+      var name string
+      if err := db.QueryRow(`SELECT name FROM llm_combos WHERE id='default'`).Scan(&name); err != nil {
+          t.Fatal(err)
+      }
+      if name != "Của tôi" {
+          t.Errorf("combo name after re-migration = %q; want unchanged 'Của tôi'", name)
+      }
   }
   ```
   (If `openMigratedAppDB` isn't the exact helper name, mirror the setup in `TestMigrateAppIsIdempotent` at `app_schema_test.go:8`.)
@@ -161,57 +161,57 @@
   package store
 
   import (
-  	"errors"
-  	"testing"
+      "errors"
+      "testing"
   )
 
   func TestCreateComboIsInactiveByDefault(t *testing.T) {
-  	st := newMigratedStore(t) // mirror existing store test setup (see app_llm_test.go)
-  	c, err := st.CreateLLMCombo("Xoay vòng", "round_robin")
-  	if err != nil {
-  		t.Fatalf("CreateLLMCombo = %v", err)
-  	}
-  	if c.Active {
-  		t.Error("new combo is active; want inactive (default stays active)")
-  	}
-  	combos, err := st.LLMCombos()
-  	if err != nil || len(combos) != 2 {
-  		t.Fatalf("LLMCombos() = %d combos, %v; want 2", len(combos), err)
-  	}
+      st := newMigratedStore(t) // mirror existing store test setup (see app_llm_test.go)
+      c, err := st.CreateLLMCombo("Xoay vòng", "round_robin")
+      if err != nil {
+          t.Fatalf("CreateLLMCombo = %v", err)
+      }
+      if c.Active {
+          t.Error("new combo is active; want inactive (default stays active)")
+      }
+      combos, err := st.LLMCombos()
+      if err != nil || len(combos) != 2 {
+          t.Fatalf("LLMCombos() = %d combos, %v; want 2", len(combos), err)
+      }
   }
 
   func TestSetActiveComboFlipsExactlyOne(t *testing.T) {
-  	st := newMigratedStore(t)
-  	c, _ := st.CreateLLMCombo("Xoay vòng", "round_robin")
-  	if err := st.SetActiveLLMCombo(c.ID); err != nil {
-  		t.Fatalf("SetActiveLLMCombo = %v", err)
-  	}
-  	combos, _ := st.LLMCombos()
-  	active := 0
-  	for _, x := range combos {
-  		if x.Active {
-  			active++
-  		}
-  	}
-  	if active != 1 {
-  		t.Errorf("active combos = %d; want exactly 1", active)
-  	}
+      st := newMigratedStore(t)
+      c, _ := st.CreateLLMCombo("Xoay vòng", "round_robin")
+      if err := st.SetActiveLLMCombo(c.ID); err != nil {
+          t.Fatalf("SetActiveLLMCombo = %v", err)
+      }
+      combos, _ := st.LLMCombos()
+      active := 0
+      for _, x := range combos {
+          if x.Active {
+              active++
+          }
+      }
+      if active != 1 {
+          t.Errorf("active combos = %d; want exactly 1", active)
+      }
   }
 
   func TestDeleteComboRefusesActiveAndLast(t *testing.T) {
-  	st := newMigratedStore(t)
-  	if err := st.DeleteLLMCombo("default"); !errors.Is(err, ErrLLMComboProtected) {
-  		t.Fatalf("delete active = %v; want ErrLLMComboProtected", err)
-  	}
-  	c, _ := st.CreateLLMCombo("Xoay vòng", "round_robin")
-  	// c is inactive, deletable
-  	if err := st.DeleteLLMCombo(c.ID); err != nil {
-  		t.Fatalf("delete inactive = %v; want nil", err)
-  	}
-  	// now only default remains and it is active+last → protected
-  	if err := st.DeleteLLMCombo("default"); !errors.Is(err, ErrLLMComboProtected) {
-  		t.Fatalf("delete last = %v; want ErrLLMComboProtected", err)
-  	}
+      st := newMigratedStore(t)
+      if err := st.DeleteLLMCombo("default"); !errors.Is(err, ErrLLMComboProtected) {
+          t.Fatalf("delete active = %v; want ErrLLMComboProtected", err)
+      }
+      c, _ := st.CreateLLMCombo("Xoay vòng", "round_robin")
+      // c is inactive, deletable
+      if err := st.DeleteLLMCombo(c.ID); err != nil {
+          t.Fatalf("delete inactive = %v; want nil", err)
+      }
+      // now only default remains and it is active+last → protected
+      if err := st.DeleteLLMCombo("default"); !errors.Is(err, ErrLLMComboProtected) {
+          t.Fatalf("delete last = %v; want ErrLLMComboProtected", err)
+      }
   }
   ```
   (Use whatever migrated-store constructor the existing store tests use; if it's inline, factor a local `newMigratedStore(t)` helper in this file.)
@@ -223,11 +223,11 @@
   package store
 
   import (
-  	"database/sql"
-  	"errors"
-  	"fmt"
+      "database/sql"
+      "errors"
+      "fmt"
 
-  	"github.com/google/uuid"
+      "github.com/google/uuid"
   )
 
   // ErrLLMComboProtected chặn xoá combo đang active hoặc combo cuối cùng: bot luôn cần đúng
@@ -239,112 +239,112 @@
   var ErrLLMComboConflict = errors.New("llm combo revision conflict")
 
   type LLMCombo struct {
-  	ID, Name, Type string
-  	Active         bool
-  	Revision       int64
-  	Members        []LLMRouteEntry
+      ID, Name, Type string
+      Active         bool
+      Revision       int64
+      Members        []LLMRouteEntry
   }
 
   func (s *Store) LLMCombos() ([]LLMCombo, error) {
-  	rows, err := s.db.Query(`SELECT id, name, type, active, revision FROM llm_combos ORDER BY name`)
-  	if err != nil {
-  		return nil, fmt.Errorf("list llm combos: %w", err)
-  	}
-  	defer rows.Close()
-  	var combos []LLMCombo
-  	for rows.Next() {
-  		var c LLMCombo
-  		var active int
-  		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &active, &c.Revision); err != nil {
-  			return nil, err
-  		}
-  		c.Active = active == 1
-  		combos = append(combos, c)
-  	}
-  	if err := rows.Err(); err != nil {
-  		return nil, err
-  	}
-  	for i := range combos {
-  		members, err := s.comboMembers(combos[i].ID)
-  		if err != nil {
-  			return nil, err
-  		}
-  		combos[i].Members = members
-  	}
-  	return combos, nil
+      rows, err := s.db.Query(`SELECT id, name, type, active, revision FROM llm_combos ORDER BY name`)
+      if err != nil {
+          return nil, fmt.Errorf("list llm combos: %w", err)
+      }
+      defer rows.Close()
+      var combos []LLMCombo
+      for rows.Next() {
+          var c LLMCombo
+          var active int
+          if err := rows.Scan(&c.ID, &c.Name, &c.Type, &active, &c.Revision); err != nil {
+              return nil, err
+          }
+          c.Active = active == 1
+          combos = append(combos, c)
+      }
+      if err := rows.Err(); err != nil {
+          return nil, err
+      }
+      for i := range combos {
+          members, err := s.comboMembers(combos[i].ID)
+          if err != nil {
+              return nil, err
+          }
+          combos[i].Members = members
+      }
+      return combos, nil
   }
 
   // comboMembers đọc members của một combo theo thứ tự position.
   func (s *Store) comboMembers(comboID string) ([]LLMRouteEntry, error) {
-  	rows, err := s.db.Query(
-  		`SELECT position, provider_id, model_id, enabled FROM llm_combo_members
-  		 WHERE combo_id = ? ORDER BY position`, comboID)
-  	if err != nil {
-  		return nil, fmt.Errorf("read combo members %s: %w", comboID, err)
-  	}
-  	defer rows.Close()
-  	entries := make([]LLMRouteEntry, 0)
-  	for rows.Next() {
-  		var e LLMRouteEntry
-  		var enabled int
-  		if err := rows.Scan(&e.Position, &e.ProviderID, &e.ModelID, &enabled); err != nil {
-  			return nil, err
-  		}
-  		e.Enabled = enabled == 1
-  		entries = append(entries, e)
-  	}
-  	return entries, rows.Err()
+      rows, err := s.db.Query(
+          `SELECT position, provider_id, model_id, enabled FROM llm_combo_members
+           WHERE combo_id = ? ORDER BY position`, comboID)
+      if err != nil {
+          return nil, fmt.Errorf("read combo members %s: %w", comboID, err)
+      }
+      defer rows.Close()
+      entries := make([]LLMRouteEntry, 0)
+      for rows.Next() {
+          var e LLMRouteEntry
+          var enabled int
+          if err := rows.Scan(&e.Position, &e.ProviderID, &e.ModelID, &enabled); err != nil {
+              return nil, err
+          }
+          e.Enabled = enabled == 1
+          entries = append(entries, e)
+      }
+      return entries, rows.Err()
   }
 
   func (s *Store) CreateLLMCombo(name, typ string) (LLMCombo, error) {
-  	if typ != "fallback" && typ != "round_robin" {
-  		return LLMCombo{}, fmt.Errorf("create combo: type lạ %q", typ)
-  	}
-  	id := uuid.NewString()
-  	if _, err := s.db.Exec(
-  		`INSERT INTO llm_combos(id, name, type, active, revision) VALUES(?,?,?,0,1)`,
-  		id, name, typ); err != nil {
-  		return LLMCombo{}, fmt.Errorf("create combo: %w", err)
-  	}
-  	return LLMCombo{ID: id, Name: name, Type: typ, Active: false, Revision: 1, Members: []LLMRouteEntry{}}, nil
+      if typ != "fallback" && typ != "round_robin" {
+          return LLMCombo{}, fmt.Errorf("create combo: type lạ %q", typ)
+      }
+      id := uuid.NewString()
+      if _, err := s.db.Exec(
+          `INSERT INTO llm_combos(id, name, type, active, revision) VALUES(?,?,?,0,1)`,
+          id, name, typ); err != nil {
+          return LLMCombo{}, fmt.Errorf("create combo: %w", err)
+      }
+      return LLMCombo{ID: id, Name: name, Type: typ, Active: false, Revision: 1, Members: []LLMRouteEntry{}}, nil
   }
 
   // SetActiveLLMCombo bật đúng một combo trong một transaction: tắt tất cả rồi bật cái được chọn.
   func (s *Store) SetActiveLLMCombo(id string) error {
-  	return s.inLLMTx("set active combo", func(tx *sql.Tx) error {
-  		var exists int
-  		if err := tx.QueryRow(`SELECT COUNT(*) FROM llm_combos WHERE id = ?`, id).Scan(&exists); err != nil {
-  			return err
-  		}
-  		if exists == 0 {
-  			return fmt.Errorf("set active combo: không có combo %s", id)
-  		}
-  		if _, err := tx.Exec(`UPDATE llm_combos SET active = 0`); err != nil {
-  			return err
-  		}
-  		_, err := tx.Exec(`UPDATE llm_combos SET active = 1 WHERE id = ?`, id)
-  		return err
-  	})
+      return s.inLLMTx("set active combo", func(tx *sql.Tx) error {
+          var exists int
+          if err := tx.QueryRow(`SELECT COUNT(*) FROM llm_combos WHERE id = ?`, id).Scan(&exists); err != nil {
+              return err
+          }
+          if exists == 0 {
+              return fmt.Errorf("set active combo: không có combo %s", id)
+          }
+          if _, err := tx.Exec(`UPDATE llm_combos SET active = 0`); err != nil {
+              return err
+          }
+          _, err := tx.Exec(`UPDATE llm_combos SET active = 1 WHERE id = ?`, id)
+          return err
+      })
   }
 
   func (s *Store) DeleteLLMCombo(id string) error {
-  	return s.inLLMTx("delete combo", func(tx *sql.Tx) error {
-  		var active, total int
-  		if err := tx.QueryRow(`SELECT active FROM llm_combos WHERE id = ?`, id).Scan(&active); err != nil {
-  			if errors.Is(err, sql.ErrNoRows) {
-  				return fmt.Errorf("delete combo: không có combo %s", id)
-  			}
-  			return err
-  		}
-  		if err := tx.QueryRow(`SELECT COUNT(*) FROM llm_combos`).Scan(&total); err != nil {
-  			return err
-  		}
-  		if active == 1 || total <= 1 {
-  			return ErrLLMComboProtected
-  		}
-  		_, err := tx.Exec(`DELETE FROM llm_combos WHERE id = ?`, id) // members cascade
-  		return err
-  	})
+      return s.inLLMTx("delete combo", func(tx *sql.Tx) error {
+          var active, total int
+          if err := tx.QueryRow(`SELECT active FROM llm_combos WHERE id = ?`, id).Scan(&active); err != nil {
+              if errors.Is(err, sql.ErrNoRows) {
+                  return fmt.Errorf("delete combo: không có combo %s", id)
+              }
+              return err
+          }
+          if err := tx.QueryRow(`SELECT COUNT(*) FROM llm_combos`).Scan(&total); err != nil {
+              return err
+          }
+          if active == 1 || total <= 1 {
+              return ErrLLMComboProtected
+          }
+          _, err := tx.Exec(`DELETE FROM llm_combos WHERE id = ?`, id) // members cascade
+          return err
+      })
   }
   ```
 
@@ -372,35 +372,35 @@
 - [ ] **Step 1: Write failing tests**
   ```go
   func TestReplaceComboMembersIsCAS(t *testing.T) {
-  	st := newMigratedStore(t)
-  	seedProviderAndModel(t, st, "openai-1", "gpt-5-mini") // mirror existing seed helpers
-  	entries := []LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}
-  	saved, err := st.ReplaceLLMComboMembers("default", 1, "round_robin", entries)
-  	if err != nil {
-  		t.Fatalf("ReplaceLLMComboMembers(rev 1) = %v", err)
-  	}
-  	if saved.Revision != 2 || saved.Type != "round_robin" || len(saved.Members) != 1 {
-  		t.Fatalf("saved = rev %d type %q members %d; want rev 2 round_robin 1", saved.Revision, saved.Type, len(saved.Members))
-  	}
-  	if _, err := st.ReplaceLLMComboMembers("default", 1, "fallback", entries); !errors.Is(err, ErrLLMComboConflict) {
-  		t.Fatalf("stale rev = %v; want ErrLLMComboConflict", err)
-  	}
+      st := newMigratedStore(t)
+      seedProviderAndModel(t, st, "openai-1", "gpt-5-mini") // mirror existing seed helpers
+      entries := []LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}
+      saved, err := st.ReplaceLLMComboMembers("default", 1, "round_robin", entries)
+      if err != nil {
+          t.Fatalf("ReplaceLLMComboMembers(rev 1) = %v", err)
+      }
+      if saved.Revision != 2 || saved.Type != "round_robin" || len(saved.Members) != 1 {
+          t.Fatalf("saved = rev %d type %q members %d; want rev 2 round_robin 1", saved.Revision, saved.Type, len(saved.Members))
+      }
+      if _, err := st.ReplaceLLMComboMembers("default", 1, "fallback", entries); !errors.Is(err, ErrLLMComboConflict) {
+          t.Fatalf("stale rev = %v; want ErrLLMComboConflict", err)
+      }
   }
 
   func TestLLMRouteResolvesActiveCombo(t *testing.T) {
-  	st := newMigratedStore(t)
-  	seedProviderAndModel(t, st, "openai-1", "gpt-5-mini")
-  	if _, err := st.ReplaceLLMComboMembers("default", 1, "round_robin",
-  		[]LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}); err != nil {
-  		t.Fatal(err)
-  	}
-  	snap, err := st.LLMRoute()
-  	if err != nil {
-  		t.Fatalf("LLMRoute() = %v", err)
-  	}
-  	if snap.Type != "round_robin" || snap.ComboID != "default" || len(snap.Entries) != 1 {
-  		t.Errorf("snapshot = type %q combo %q entries %d; want round_robin/default/1", snap.Type, snap.ComboID, len(snap.Entries))
-  	}
+      st := newMigratedStore(t)
+      seedProviderAndModel(t, st, "openai-1", "gpt-5-mini")
+      if _, err := st.ReplaceLLMComboMembers("default", 1, "round_robin",
+          []LLMRouteEntry{{ProviderID: "openai-1", ModelID: "gpt-5-mini", Enabled: true}}); err != nil {
+          t.Fatal(err)
+      }
+      snap, err := st.LLMRoute()
+      if err != nil {
+          t.Fatalf("LLMRoute() = %v", err)
+      }
+      if snap.Type != "round_robin" || snap.ComboID != "default" || len(snap.Entries) != 1 {
+          t.Errorf("snapshot = type %q combo %q entries %d; want round_robin/default/1", snap.Type, snap.ComboID, len(snap.Entries))
+      }
   }
   ```
   Also update the existing route tests in `app_llm_test.go`: `ReplaceLLMRoute` now targets the active combo, and the empty-start snapshot gains `Type: "fallback"`, `ComboID: "default"`. Fix those assertions (they already assert `Revision`/`Entries`; add the two fields where the test constructs an expected snapshot).
@@ -412,41 +412,41 @@
   In `store/app_llm.go`, extend the struct:
   ```go
   type LLMRouteSnapshot struct {
-  	Revision int64
-  	Type     string // active combo type: "fallback" | "round_robin"
-  	ComboID  string // active combo id (router keys the RR cursor on it)
-  	Entries  []LLMRouteEntry
+      Revision int64
+      Type     string // active combo type: "fallback" | "round_robin"
+      ComboID  string // active combo id (router keys the RR cursor on it)
+      Entries  []LLMRouteEntry
   }
   ```
   Replace `LLMRoute()` body to read the active combo:
   ```go
   func (s *Store) LLMRoute() (LLMRouteSnapshot, error) {
-  	id, typ, revision, err := s.activeCombo()
-  	if err != nil {
-  		return LLMRouteSnapshot{}, err
-  	}
-  	entries, err := s.comboMembers(id)
-  	if err != nil {
-  		return LLMRouteSnapshot{}, err
-  	}
-  	return LLMRouteSnapshot{Revision: revision, Type: typ, ComboID: id, Entries: entries}, nil
+      id, typ, revision, err := s.activeCombo()
+      if err != nil {
+          return LLMRouteSnapshot{}, err
+      }
+      entries, err := s.comboMembers(id)
+      if err != nil {
+          return LLMRouteSnapshot{}, err
+      }
+      return LLMRouteSnapshot{Revision: revision, Type: typ, ComboID: id, Entries: entries}, nil
   }
   ```
   Repoint `ReplaceLLMRoute` at the active combo (keeps its callers/tests working):
   ```go
   // ReplaceLLMRoute ghi đè members của combo ĐANG ACTIVE (alias giữ hợp đồng cũ cho router/UI/tests).
   func (s *Store) ReplaceLLMRoute(expectedRevision int64, entries []LLMRouteEntry) (LLMRouteSnapshot, error) {
-  	id, typ, _, err := s.activeCombo()
-  	if err != nil {
-  		return LLMRouteSnapshot{}, err
-  	}
-  	if _, err := s.ReplaceLLMComboMembers(id, expectedRevision, typ, entries); err != nil {
-  		if errors.Is(err, ErrLLMComboConflict) {
-  			return LLMRouteSnapshot{}, ErrLLMRouteConflict // preserve the sentinel UI checks for
-  		}
-  		return LLMRouteSnapshot{}, err
-  	}
-  	return s.LLMRoute()
+      id, typ, _, err := s.activeCombo()
+      if err != nil {
+          return LLMRouteSnapshot{}, err
+      }
+      if _, err := s.ReplaceLLMComboMembers(id, expectedRevision, typ, entries); err != nil {
+          if errors.Is(err, ErrLLMComboConflict) {
+              return LLMRouteSnapshot{}, ErrLLMRouteConflict // preserve the sentinel UI checks for
+          }
+          return LLMRouteSnapshot{}, err
+      }
+      return s.LLMRoute()
   }
   ```
 
@@ -455,58 +455,58 @@
   // activeCombo trả (id, type, revision) của combo đang active. Luôn có đúng một (seed default,
   // SetActive giữ bất biến), nên không tìm thấy là database hỏng — trả lỗi, KHÔNG bịa mặc định.
   func (s *Store) activeCombo() (id, typ string, revision int64, err error) {
-  	err = s.db.QueryRow(
-  		`SELECT id, type, revision FROM llm_combos WHERE active = 1 LIMIT 1`).Scan(&id, &typ, &revision)
-  	if errors.Is(err, sql.ErrNoRows) {
-  		return "", "", 0, fmt.Errorf("active combo: không có combo nào đang active")
-  	}
-  	return id, typ, revision, err
+      err = s.db.QueryRow(
+          `SELECT id, type, revision FROM llm_combos WHERE active = 1 LIMIT 1`).Scan(&id, &typ, &revision)
+      if errors.Is(err, sql.ErrNoRows) {
+          return "", "", 0, fmt.Errorf("active combo: không có combo nào đang active")
+      }
+      return id, typ, revision, err
   }
 
   // ReplaceLLMComboMembers ghi đè members + type của một combo nếu revision người gọi cầm vẫn mới
   // nhất. Hợp lệ hoá qua validateLLMRoute (dùng lại: mắt xích cuối bật + provider/model tồn tại).
   func (s *Store) ReplaceLLMComboMembers(comboID string, expectedRevision int64, typ string, entries []LLMRouteEntry) (LLMCombo, error) {
-  	if typ != "fallback" && typ != "round_robin" {
-  		return LLMCombo{}, fmt.Errorf("replace combo members: type lạ %q", typ)
-  	}
-  	next := expectedRevision + 1
-  	err := s.inLLMTx("replace combo members", func(tx *sql.Tx) error {
-  		res, err := tx.Exec(
-  			`UPDATE llm_combos SET revision = ?, type = ? WHERE id = ? AND revision = ?`,
-  			next, typ, comboID, expectedRevision)
-  		if err != nil {
-  			return err
-  		}
-  		changed, err := res.RowsAffected()
-  		if err != nil {
-  			return err
-  		}
-  		if changed != 1 {
-  			return ErrLLMComboConflict // wrong revision OR unknown combo
-  		}
-  		if err := validateLLMRoute(tx, entries); err != nil {
-  			return err
-  		}
-  		if _, err := tx.Exec(`DELETE FROM llm_combo_members WHERE combo_id = ?`, comboID); err != nil {
-  			return err
-  		}
-  		for i, e := range entries {
-  			if _, err := tx.Exec(
-  				`INSERT INTO llm_combo_members(combo_id, position, provider_id, model_id, enabled) VALUES(?,?,?,?,?)`,
-  				comboID, i, e.ProviderID, e.ModelID, boolInt(e.Enabled)); err != nil {
-  				return err
-  			}
-  		}
-  		return nil
-  	})
-  	if err != nil {
-  		return LLMCombo{}, err
-  	}
-  	members, err := s.comboMembers(comboID)
-  	if err != nil {
-  		return LLMCombo{}, err
-  	}
-  	return LLMCombo{ID: comboID, Type: typ, Revision: next, Members: members}, nil
+      if typ != "fallback" && typ != "round_robin" {
+          return LLMCombo{}, fmt.Errorf("replace combo members: type lạ %q", typ)
+      }
+      next := expectedRevision + 1
+      err := s.inLLMTx("replace combo members", func(tx *sql.Tx) error {
+          res, err := tx.Exec(
+              `UPDATE llm_combos SET revision = ?, type = ? WHERE id = ? AND revision = ?`,
+              next, typ, comboID, expectedRevision)
+          if err != nil {
+              return err
+          }
+          changed, err := res.RowsAffected()
+          if err != nil {
+              return err
+          }
+          if changed != 1 {
+              return ErrLLMComboConflict // wrong revision OR unknown combo
+          }
+          if err := validateLLMRoute(tx, entries); err != nil {
+              return err
+          }
+          if _, err := tx.Exec(`DELETE FROM llm_combo_members WHERE combo_id = ?`, comboID); err != nil {
+              return err
+          }
+          for i, e := range entries {
+              if _, err := tx.Exec(
+                  `INSERT INTO llm_combo_members(combo_id, position, provider_id, model_id, enabled) VALUES(?,?,?,?,?)`,
+                  comboID, i, e.ProviderID, e.ModelID, boolInt(e.Enabled)); err != nil {
+                  return err
+              }
+          }
+          return nil
+      })
+      if err != nil {
+          return LLMCombo{}, err
+      }
+      members, err := s.comboMembers(comboID)
+      if err != nil {
+          return LLMCombo{}, err
+      }
+      return LLMCombo{ID: comboID, Type: typ, Revision: next, Members: members}, nil
   }
   ```
 
@@ -533,42 +533,42 @@
 - [ ] **Step 1: Write failing tests**
   ```go
   func TestRotate(t *testing.T) {
-  	in := []store.LLMRouteEntry{{ProviderID: "a"}, {ProviderID: "b"}, {ProviderID: "c"}}
-  	got := rotate(in, 1)
-  	if got[0].ProviderID != "b" || got[1].ProviderID != "c" || got[2].ProviderID != "a" {
-  		t.Errorf("rotate(abc,1) = %v; want b,c,a", providerIDs(got))
-  	}
-  	if len(rotate(nil, 3)) != 0 {
-  		t.Error("rotate(nil) must be empty")
-  	}
-  	if got := rotate(in, 0); got[0].ProviderID != "a" {
-  		t.Error("rotate(_,0) must be identity order")
-  	}
+      in := []store.LLMRouteEntry{{ProviderID: "a"}, {ProviderID: "b"}, {ProviderID: "c"}}
+      got := rotate(in, 1)
+      if got[0].ProviderID != "b" || got[1].ProviderID != "c" || got[2].ProviderID != "a" {
+          t.Errorf("rotate(abc,1) = %v; want b,c,a", providerIDs(got))
+      }
+      if len(rotate(nil, 3)) != 0 {
+          t.Error("rotate(nil) must be empty")
+      }
+      if got := rotate(in, 0); got[0].ProviderID != "a" {
+          t.Error("rotate(_,0) must be identity order")
+      }
   }
 
   func TestComboRRAdvancesAndIsolatesByCombo(t *testing.T) {
-  	rr := newComboRR()
-  	if a, b, c := rr.next("x", 3), rr.next("x", 3), rr.next("x", 3); a != 0 || b != 1 || c != 2 {
-  		t.Errorf("combo x offsets = %d,%d,%d; want 0,1,2", a, b, c)
-  	}
-  	if d := rr.next("x", 3); d != 0 {
-  		t.Errorf("combo x wrap = %d; want 0", d)
-  	}
-  	if y := rr.next("y", 2); y != 0 {
-  		t.Errorf("combo y first = %d; want 0 (isolated cursor)", y)
-  	}
-  	if n := rr.next("z", 0); n != 0 {
-  		t.Errorf("n==0 → %d; want 0", n)
-  	}
+      rr := newComboRR()
+      if a, b, c := rr.next("x", 3), rr.next("x", 3), rr.next("x", 3); a != 0 || b != 1 || c != 2 {
+          t.Errorf("combo x offsets = %d,%d,%d; want 0,1,2", a, b, c)
+      }
+      if d := rr.next("x", 3); d != 0 {
+          t.Errorf("combo x wrap = %d; want 0", d)
+      }
+      if y := rr.next("y", 2); y != 0 {
+          t.Errorf("combo y first = %d; want 0 (isolated cursor)", y)
+      }
+      if n := rr.next("z", 0); n != 0 {
+          t.Errorf("n==0 → %d; want 0", n)
+      }
   }
 
   func TestRunRoundRobinStartsRotatedThenFallsThrough(t *testing.T) {
-  	// Two members; RR turn 2 should try member[1] first, then member[0].
-  	// Build a runner with a fake a.run/adapters seam (mirror app_llm_router_test.go helpers):
-  	// member[1] fails with a fallback-eligible error, member[0] succeeds → assert order via
-  	// the recorded attempts (provider ids in call order).
-  	// ... use the existing test harness pattern; assert first attempted provider == member[1]
-  	//     on the 2nd turn (offset 1), and that member[0] answered.
+      // Two members; RR turn 2 should try member[1] first, then member[0].
+      // Build a runner with a fake a.run/adapters seam (mirror app_llm_router_test.go helpers):
+      // member[1] fails with a fallback-eligible error, member[0] succeeds → assert order via
+      // the recorded attempts (provider ids in call order).
+      // ... use the existing test harness pattern; assert first attempted provider == member[1]
+      //     on the 2nd turn (offset 1), and that member[0] answered.
   }
   ```
   (`providerIDs` is a tiny test helper; the `TestRunRoundRobin…` body follows the existing fake-adapter harness in `app_llm_router_test.go` — reuse its runner builder and the recorded-attempt inspection.)
@@ -580,37 +580,37 @@
   // rotate trả một lát cắt bắt đầu ở offset k rồi vòng về đầu: entries[k:] + entries[:k]. Thuần,
   // không sửa đầu vào (Run đã Clone snapshot.Entries). k phải trong [0,len).
   func rotate(entries []store.LLMRouteEntry, k int) []store.LLMRouteEntry {
-  	n := len(entries)
-  	if n == 0 || k%n == 0 {
-  		return entries
-  	}
-  	k %= n
-  	out := make([]store.LLMRouteEntry, 0, n)
-  	out = append(out, entries[k:]...)
-  	out = append(out, entries[:k]...)
-  	return out
+      n := len(entries)
+      if n == 0 || k%n == 0 {
+          return entries
+      }
+      k %= n
+      out := make([]store.LLMRouteEntry, 0, n)
+      out = append(out, entries[k:]...)
+      out = append(out, entries[:k]...)
+      return out
   }
 
   // comboRR là con trỏ round-robin in-memory theo combo id — đối xứng accountSel (app_llm_accounts.go):
   // `api` khai ở base repo không thêm field được, và runner dựng mới mỗi lượt nên cursor không ở đó
   // được. Guard mutex; restart reset (vô hại: cùng lắm lệch một lượt phân bổ).
   type comboRRCursor struct {
-  	mu     sync.Mutex
-  	cursor map[string]int
+      mu     sync.Mutex
+      cursor map[string]int
   }
 
   func newComboRR() *comboRRCursor { return &comboRRCursor{cursor: map[string]int{}} }
 
   // next trả offset hiện tại cho combo rồi tăng con trỏ (mod n). n<=0 → 0.
   func (c *comboRRCursor) next(comboID string, n int) int {
-  	if n <= 0 {
-  		return 0
-  	}
-  	c.mu.Lock()
-  	defer c.mu.Unlock()
-  	k := c.cursor[comboID] % n
-  	c.cursor[comboID] = (k + 1) % n
-  	return k
+      if n <= 0 {
+          return 0
+      }
+      c.mu.Lock()
+      defer c.mu.Unlock()
+      k := c.cursor[comboID] % n
+      c.cursor[comboID] = (k + 1) % n
+      return k
   }
 
   var comboRR = newComboRR()
@@ -618,7 +618,7 @@
   In `Run`, right after `entries := slices.Clone(snapshot.Entries)` and the empty check, before the attachment branch:
   ```go
   if snapshot.Type == "round_robin" {
-  	entries = rotate(entries, comboRR.next(snapshot.ComboID, len(entries)))
+      entries = rotate(entries, comboRR.next(snapshot.ComboID, len(entries)))
   }
   ```
   (Add `"sync"` to imports if not present.) Nothing else in `Run` changes — the loop, claude terminal path, budgets, telemetry all consume `entries`.
@@ -657,12 +657,12 @@
 - [ ] **Step 3: Implement** `daemon/app_llm_combos_http.go` — handlers calling the store methods, JSON via `a.writeJSON`, errors via `a.writeLLMErr`/`a.writeLLMInternal` (same helpers connect uses). Map `ErrLLMComboProtected` → 409 `COMBO_PROTECTED`; `ErrLLMComboConflict` → 409 `COMBO_REVISION_CONFLICT`. Decode bodies with `a.decodeLLMBody`. Combo body shape:
   ```go
   type comboBody struct {
-  	ID       string          `json:"id"`
-  	Name     string          `json:"name"`
-  	Type     string          `json:"type"`
-  	Active   bool            `json:"active"`
-  	Revision int64           `json:"revision"`
-  	Entries  []routeEntryDTO `json:"entries"` // reuse the existing route entry DTO (provider_id, model_id, enabled) — NO position/config_dir
+      ID       string          `json:"id"`
+      Name     string          `json:"name"`
+      Type     string          `json:"type"`
+      Active   bool            `json:"active"`
+      Revision int64           `json:"revision"`
+      Entries  []routeEntryDTO `json:"entries"` // reuse the existing route entry DTO (provider_id, model_id, enabled) — NO position/config_dir
   }
   ```
   In `app_routes.go`, add to `appPortalRoutePatterns` and `registerAppRoutes` (auth-wrapped, exactly like the connect routes added for #2):

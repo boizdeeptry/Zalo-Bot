@@ -1,0 +1,92 @@
+{
+  "version": "memory-v2-canary-transcript/v1",
+  "status": "PASS",
+  "generatedUtc": "2026-08-10T07:59:56.9560625Z",
+  "port": 8785,
+  "events": [
+    {
+      "utc": "2026-08-10T07:59:53.9086650Z",
+      "name": "source",
+      "status": "PASS",
+      "detail": "immutable quick_check/schema/baseline"
+    },
+    {
+      "utc": "2026-08-10T07:59:54.1245046Z",
+      "name": "copy-and-scrub",
+      "status": "PASS",
+      "detail": "byte-identical DB; controls and credentials absent"
+    },
+    {
+      "utc": "2026-08-10T07:59:54.1493139Z",
+      "name": "isolation-before-start",
+      "status": "PASS",
+      "detail": "no transport env, credential, PID, lock, or copied token"
+    },
+    {
+      "utc": "2026-08-10T07:59:55.3420872Z",
+      "name": "migration-start",
+      "status": "PASS",
+      "detail": "exact process path; loopback listener; status/memory HTTP 200"
+    },
+    {
+      "utc": "2026-08-10T07:59:55.8112954Z",
+      "name": "migration-stop",
+      "status": "PASS",
+      "detail": "clean stop; schema 4 to 4; stable fields preserved"
+    },
+    {
+      "utc": "2026-08-10T07:59:55.9470688Z",
+      "name": "fake-fixtures",
+      "status": "PASS",
+      "detail": "opaque local-only fixtures seeded while stopped"
+    },
+    {
+      "utc": "2026-08-10T07:59:56.1738963Z",
+      "name": "J1",
+      "status": "PASS",
+      "detail": "common/member isolation and selected-member sync state"
+    },
+    {
+      "utc": "2026-08-10T07:59:56.1928504Z",
+      "name": "J2",
+      "status": "PASS",
+      "detail": "replacement approved and subject revision advanced once"
+    },
+    {
+      "utc": "2026-08-10T07:59:56.2057835Z",
+      "name": "J3",
+      "status": "PASS",
+      "detail": "sensitive pending rejected without active revision change"
+    },
+    {
+      "utc": "2026-08-10T07:59:56.2260444Z",
+      "name": "J4",
+      "status": "PASS",
+      "detail": "expired Memory restored then pinned; revision advanced twice"
+    },
+    {
+      "utc": "2026-08-10T07:59:56.2349875Z",
+      "name": "J5",
+      "status": "PASS",
+      "detail": "private lineage deleted through API; message retention checked after stop"
+    },
+    {
+      "utc": "2026-08-10T07:59:56.2443730Z",
+      "name": "J6",
+      "status": "PASS",
+      "detail": "two unchanged same-subject reads kept revisions and sync state stable"
+    },
+    {
+      "utc": "2026-08-10T07:59:56.6559662Z",
+      "name": "canary-stop",
+      "status": "PASS",
+      "detail": "exact candidate process exited; listener absent"
+    },
+    {
+      "utc": "2026-08-10T07:59:56.9560012Z",
+      "name": "final-evidence",
+      "status": "PASS",
+      "detail": "immutable final schema/quick_check and source baseline stable"
+    }
+  ]
+}

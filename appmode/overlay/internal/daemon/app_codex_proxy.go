@@ -21,7 +21,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"agentdc/internal/store"
@@ -296,11 +298,108 @@ func writeCodexTokens(configDir string, tok codexTokens, lastRefresh string) err
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return fmt.Errorf("ghi auth.json.tmp: %w", err)
+	return writeCodexAuthAtomic(path, out)
+}
+
+// writeCodexAuthAtomic writes through a unique sibling file so independent
+// writers never share auth.json.tmp. Syncing the file before rename makes its
+// contents durable; POSIX additionally needs the containing directory synced
+// for the rename itself to survive a crash.
+func writeCodexAuthAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("tạo auth.json temp: %w", err)
 	}
-	return os.Rename(tmp, path)
+	tmpPath := tmp.Name()
+	removeTemp := true
+	defer func() {
+		_ = tmp.Close()
+		if removeTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return fmt.Errorf("đặt quyền auth.json temp: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("ghi auth.json temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync auth.json temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("đóng auth.json temp: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("thay auth.json: %w", err)
+	}
+	removeTemp = false
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("mở thư mục auth.json để sync: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync thư mục auth.json: %w", err)
+	}
+	return nil
+}
+
+// codexRefreshGates serializes the rare 401 recovery for each CODEX_HOME. The
+// account set is bounded and stable for a daemon lifetime, so retaining one
+// small mutex per normalized configDir avoids a more error-prone refcount map.
+var codexRefreshGates sync.Map
+
+func codexRefreshGate(configDir string) *sync.Mutex {
+	key := filepath.Clean(configDir)
+	if absolute, err := filepath.Abs(key); err == nil {
+		key = absolute
+	}
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	gate, _ := codexRefreshGates.LoadOrStore(key, &sync.Mutex{})
+	return gate.(*sync.Mutex)
+}
+
+// refreshCodexTokensAfter401 re-reads auth.json while holding the account gate.
+// A concurrent request that already persisted a replacement access token wins;
+// later waiters reuse it instead of rotating the same refresh token twice.
+func refreshCodexTokensAfter401(
+	ctx context.Context,
+	client *http.Client,
+	configDir string,
+	stale codexTokens,
+) (codexTokens, error) {
+	gate := codexRefreshGate(configDir)
+	gate.Lock()
+	defer gate.Unlock()
+
+	current, err := readCodexTokens(configDir)
+	if err != nil {
+		return codexTokens{}, err
+	}
+	if current.AccessToken != stale.AccessToken {
+		return current, nil
+	}
+	refreshed, err := refreshCodexToken(ctx, client, current.RefreshToken)
+	if err != nil {
+		return codexTokens{}, err
+	}
+	if refreshed.RefreshToken == "" {
+		refreshed.RefreshToken = current.RefreshToken
+	}
+	refreshed.AccountID = current.AccountID
+	if err := writeCodexTokens(
+		configDir, refreshed, time.Now().UTC().Format(time.RFC3339),
+	); err != nil {
+		return codexTokens{}, fmt.Errorf("lưu token mới: %w", err)
+	}
+	return refreshed, nil
 }
 
 // codexProxyGenerate là một lượt hỏi HOÀN CHỈNH qua proxy: đọc token của account → gọi responses →
@@ -313,15 +412,10 @@ func codexProxyGenerate(ctx context.Context, client *http.Client, configDir, mod
 	}
 	text, status, err := codexDoResponses(ctx, client, tok, model, prompt)
 	if status == http.StatusUnauthorized {
-		newTok, rerr := refreshCodexToken(ctx, client, tok.RefreshToken)
+		newTok, rerr := refreshCodexTokensAfter401(ctx, client, configDir, tok)
 		if rerr != nil {
 			return "", status, fmt.Errorf("refresh token: %w", rerr)
 		}
-		if newTok.RefreshToken == "" {
-			newTok.RefreshToken = tok.RefreshToken // refresh không trả cái mới → giữ cái cũ
-		}
-		newTok.AccountID = tok.AccountID
-		_ = writeCodexTokens(configDir, newTok, time.Now().UTC().Format(time.RFC3339)) // best-effort: lỗi ghi không chặn lượt
 		text, status, err = codexDoResponses(ctx, client, newTok, model, prompt)
 	}
 	if err != nil {

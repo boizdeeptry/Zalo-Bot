@@ -228,9 +228,11 @@ $phase = 'lắp thư mục gói'
 if (Test-Path -LiteralPath $Out) {
   if ($KeepData) {
     Write-Host '      -KeepData: giu data\ (CHI de thu, khong de ban)' -ForegroundColor Yellow
-    Clear-AppOutput -Out $Out -KeepData
+    Clear-AppOutput -Out $Out -ProtectedRoot @($Repo, $PersonaSource, $PSScriptRoot) `
+      -ExpectedOutIdentity $paths.OutIdentity -KeepData
   } else {
-    Clear-AppOutput -Out $Out
+    Clear-AppOutput -Out $Out -ProtectedRoot @($Repo, $PersonaSource, $PSScriptRoot) `
+      -ExpectedOutIdentity $paths.OutIdentity
   }
 }
 # Bo cuc goc: CHI nhung gi nguoi mua can nhin.
@@ -283,8 +285,9 @@ Invoke-AppCommand -Label 'npm prune' -FilePath $npmExe `
 # cai Node. npm.cmd dung `%~dp0` (tro node.exe + node_modules\npm cung thu muc no)
 # nen chi can dat ca ba canh nhau trong app\node la thanh mot ban node+npm doc lap,
 # di chuyen duoc. run.bat chen app\node len dau PATH, va tro npm_config_prefix vao
-# data\cli, nen npm cai duoc offline vao mot thu muc ghi duoc va `npm root -g` tra
-# dung noi do -- daemon tim thay codex.js theo cung duong.
+# data\cli, nen runtime tu chua du va `npm root -g` tra dung noi daemon tim codex.js.
+# Rieng thao tac Connect/cai Codex hoac Claude van can ket noi online toi npm registry;
+# viec dong goi npm khong bien mot lan cai package moi thanh thao tac offline.
 $node = (Get-Command node).Source
 $nodeSrcDir = Split-Path -Parent $node
 $nodeOut = Join-Path $Out 'app\node'

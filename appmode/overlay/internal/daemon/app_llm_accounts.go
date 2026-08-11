@@ -59,6 +59,25 @@ func (s *accountSelector) pick(kind string, accounts []store.LLMAccount) (store.
 	return soonest, true
 }
 
+// appSelectClaudeAccountForSession keeps an enabled account already bound to a
+// conversation. Only an absent/disabled account enters the process-wide
+// round-robin selector, allowing independent threads to distribute without
+// moving one Claude transcript between config directories.
+func appSelectClaudeAccountForSession(
+	sel *accountSelector,
+	accounts []store.LLMAccount,
+	current *store.ZaloCLISession,
+) (store.LLMAccount, bool) {
+	if current != nil && current.ClaudeAccountID != "" {
+		for _, account := range accounts {
+			if account.Enabled && account.ID == current.ClaudeAccountID {
+				return account, true
+			}
+		}
+	}
+	return sel.pick("claude-code", accounts)
+}
+
 // penalize đặt cooldown cho một account vừa dính rate-limit.
 func (s *accountSelector) penalize(accountID string) {
 	s.mu.Lock()

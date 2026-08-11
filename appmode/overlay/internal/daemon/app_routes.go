@@ -1,8 +1,6 @@
 package daemon
 
-import (
-	"net/http"
-)
+import "net/http"
 
 var appPortalRoutePatterns = []string{
 	"GET /agent",
@@ -43,6 +41,18 @@ var appPortalRoutePatterns = []string{
 	"POST /llm/combos/{id}/activate",
 	"DELETE /llm/combos/{id}",
 	"GET /llm/status",
+	"GET /memory",
+	"GET /memory/threads/{tid}",
+	"POST /memory/threads/{tid}",
+	"PUT /memory/threads/{tid}/{id}",
+	"DELETE /memory/threads/{tid}/{id}",
+	"POST /memory/threads/{tid}/{id}/approve",
+	"POST /memory/threads/{tid}/{id}/reject",
+	"POST /memory/threads/{tid}/{id}/restore",
+	"GET /memory/lessons",
+	"POST /memory/lessons",
+	"PUT /memory/lessons/{id}",
+	"DELETE /memory/lessons/{id}",
 }
 
 func init() {
@@ -76,6 +86,7 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /llm/providers/{id}/models", a.auth(a.handleLLMModelAdd))
 	mux.Handle("DELETE /llm/providers/{id}/models", a.auth(a.handleLLMModelDelete))
 	mux.Handle("DELETE /llm/providers/{id}/accounts/{accountId}", a.auth(a.handleLLMAccountDelete))
+
 	// connectMgr is refreshed on every registerAppRoutes call (not lazily nil-guarded) so it always
 	// reflects the api that registered the routes. Production registers once; tests each get their
 	// own valid manager and never inherit a prior test's closed store / nil logger.
@@ -95,4 +106,16 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /llm/combos/{id}/activate", a.auth(a.handleLLMComboActivate))
 	mux.Handle("DELETE /llm/combos/{id}", a.auth(a.handleLLMComboDelete))
 	mux.Handle("GET /llm/status", a.auth(a.handleLLMStatus))
+	mux.Handle("GET /memory", a.auth(a.handleMemoryOverview))
+	mux.Handle("GET /memory/threads/{tid}", a.auth(a.handleMemoryThreadGet))
+	mux.Handle("POST /memory/threads/{tid}", a.auth(a.handleMemoryThreadPost))
+	mux.Handle("PUT /memory/threads/{tid}/{id}", a.auth(a.handleMemoryThreadPut))
+	mux.Handle("DELETE /memory/threads/{tid}/{id}", a.auth(a.handleMemoryThreadDelete))
+	mux.Handle("POST /memory/threads/{tid}/{id}/approve", a.auth(a.handleMemoryThreadApprove))
+	mux.Handle("POST /memory/threads/{tid}/{id}/reject", a.auth(a.handleMemoryThreadReject))
+	mux.Handle("POST /memory/threads/{tid}/{id}/restore", a.auth(a.handleMemoryThreadRestore))
+	mux.Handle("GET /memory/lessons", a.auth(a.handleMemoryLessonsGet))
+	mux.Handle("POST /memory/lessons", a.auth(a.handleMemoryLessonPost))
+	mux.Handle("PUT /memory/lessons/{id}", a.auth(a.handleMemoryLessonPut))
+	mux.Handle("DELETE /memory/lessons/{id}", a.auth(a.handleMemoryLessonDelete))
 }

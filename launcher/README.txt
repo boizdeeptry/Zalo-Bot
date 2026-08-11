@@ -14,35 +14,40 @@ Go bo = xoa thu muc.
 
   Nhan doi   "Start.vbs"
 
-Sau khoang 4 giay trinh duyet tu mo trang Zalo. Bam Ket noi, quet ma QR bang
-dien thoai. Xong.
+Sau khoang 4 giay, Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.
+Day la trang quan ly, khong phai trang Zalo. Lan chay dau chua co Provider,
+Combo hay route; hay lam phan THIET LAP BOT ben duoi truoc khi ket noi Zalo.
 
   Dung lai:  nhan doi "Stop.bat"
 
 Khong co cua so nao hien ra khi chay -- do la co y. Muon xem no co song khong
-thi mo http://127.0.0.1:8770/zalo
+thi mo http://127.0.0.1:8770/
 
 
 ────────────────────────────────────────────────────────────────────────────────
- MOT LAN DUY NHAT: DANG NHAP CLAUDE
+ THIET LAP BOT TRUOC KHI KET NOI ZALO
 ────────────────────────────────────────────────────────────────────────────────
 
-Day la buoc DUY NHAT khong the bo, va phai noi ro vi sao.
+Lam theo DUNG thu tu nay trong Portal:
 
-Bo nao viet cau tra loi khong nam trong thu muc nay. No la Claude Code, va no
-chay bang tai khoan CUA BAN. Phan mem nay khong the di kem tai khoan cua nguoi
-ban: chi phi moi cau tra loi tinh vao tai khoan do, va ban lai quyen truy cap
-la trai dieu khoan cua Anthropic.
+  1. Mo trang Providers. Bam Connect cho Claude Code hoac Codex.
 
-  1. Cai Claude Code:   https://claude.com/claude-code
-  2. Mo Command Prompt, go:   claude
-  3. Dang nhap theo huong dan (mot lan, no nho)
+     Nut Connect tu dong cai Claude duoc quan ly neu can; khong can cai Claude
+     global thu cong. Lam tiep cac buoc dang nhap ma Portal hien ra.
 
-Kiem xem xong chua: go  claude --version  ra so phien ban la duoc.
+     Provider API dung endpoint/API key hien chua co trong Portal (Sap co).
+     Khong nhap endpoint, key hay model API o man hinh khac.
 
-KHONG lam buoc nay thi: phan mem van chay, portal van mo, van quet QR duoc, van
-nhan duoc tin cua khach -- nhung bot KHONG tra loi cau nao. Trang Runtime se in
-"khong thay claude tren PATH".
+     Lenh claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
+
+  2. Mo trang Combos. Chon model, tao hoac sua Combo, them Provider/model can
+     dung, sau do kich hoat Combo de tao route dang hoat dong.
+
+  3. Mo trang Zalo. Bam Ket noi, roi quet ma QR bang dien thoai.
+
+Khong co Provider da ket noi va route dang hoat dong, bot co y im lang. Portal
+va Zalo van co the mo, nhung bot se khong tu y roi ve Claude global hay mot
+Provider khac. Day la hanh vi an toan cua ban V6, khong phai loi.
 
 
 ────────────────────────────────────────────────────────────────────────────────
@@ -76,11 +81,22 @@ HAI TANG, va phan biet duoc chung la quan trong:
   wiki\   la thu da BIEN SOAN thanh trang ngan, mot chu de mot trang. Bot tra
           loi tot nhat tu tang nay.
 
-CACH DI TU raw\ SANG wiki\ -- va day la cho Claude Code lam ho:
+CACH DI TU raw\ SANG wiki\:
+
+UU TIEN dung luong da dong goi: mo trang Knowledge trong Portal, upload tep va
+chay ingest. Portal se dung runtime duoc quan ly; khong can lenh Claude global
+de nap tri thuc hoac de bot tra loi Zalo.
+
+Cach Command Prompt duoi day la TUY CHON va tach rieng. No chi chay neu ban da
+co san lenh  claude  global tren PATH:
 
   1. Bo tep nguon vao  brain\raw\
   2. Mo Command Prompt, go:   cd /d "duong-dan-app\brain"   roi   claude
   3. Noi: "doc raw\ va viet trang wiki cho nhung nguon moi"
+
+Claude do Portal quan ly khong duoc them lau dai vao PATH cua shell nguoi dung.
+Vi vay, bam Connect thanh cong khong co nghia lenh  claude  se xuat hien trong
+Command Prompt. Khong cai Claude global cung khong anh huong onboarding cua bot.
 
 CLAUDE.md trong thu muc do la ban chi dan san co cho viec nay: no noi ro dat ten
 trang the nao, moi trang gom gi, cap nhat index.md va log.md ra sao. Khong phai

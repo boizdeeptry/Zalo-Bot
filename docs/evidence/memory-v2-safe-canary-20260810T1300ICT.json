@@ -1,0 +1,54 @@
+{
+  "version": "memory-v2-canary/v1",
+  "status": "PASS",
+  "generatedUtc": "2026-08-10T05:57:34.3234859Z",
+  "port": 8784,
+  "candidate": {
+    "path": "D:\\TuvanZalo\\_artifacts\\memory-v2\\app\\agentdc.exe",
+    "sha256": "940211E40306C29C0DCA1D234C1F884FD06E53D6655D2C1574A7ED64524AAC45"
+  },
+  "source": {
+    "dbPath": "D:\\TuvanZalo\\_backups\\memory-v2-20260810-113825\\data\\agentdc.db",
+    "dbSha256": "68DCE8FCCF2491BE5D1CD7B4C8859ED241F21D5E03F5FDC894856CC4DFD01933",
+    "schema": 3,
+    "quickCheck": "ok"
+  },
+  "copy": {
+    "homePath": "C:\\Users\\manva\\AppData\\Local\\Temp\\agentdc-memory-v2-safe-canary-20260810T1300ICT",
+    "dbSha256Before": "68DCE8FCCF2491BE5D1CD7B4C8859ED241F21D5E03F5FDC894856CC4DFD01933",
+    "schemaBefore": 3,
+    "quickCheckBefore": "ok",
+    "schemaMigrated": 4,
+    "quickCheckMigrated": "ok",
+    "dbSha256Final": "EB03D28385845416BCA3654692F83A0862276098A882D4FB6AC1E65BB9A3B504",
+    "schemaFinal": 4,
+    "quickCheckFinal": "ok"
+  },
+  "journeys": {
+    "J1": true,
+    "J2": true,
+    "J3": true,
+    "J4": true,
+    "J5": true,
+    "J6": true
+  },
+  "isolation": {
+    "outsideLiveRoot": true,
+    "credentialsAbsent": true,
+    "transportEnvironmentCleared": true,
+    "runtimeControlsRemoved": true,
+    "portInitiallyFree": true,
+    "candidatePathExact": true
+  },
+  "stopped": {
+    "processExited": true,
+    "listenerAbsent": true
+  },
+  "evidence": {
+    "transcriptPath": "D:\\TuvanZalo\\_build\\.worktrees\\portal-m1\\docs\\evidence\\memory-v2-safe-canary-20260810T1300ICT.transcript.json",
+    "transcriptSha256": "E0935E82D0685A2253EE332A6DF9F7FEE334850B7128FD3AB5CA62B2E99F45D4",
+    "sourceBaselineSha256": "80D0055D482E5D16F9E70853E241CDC0DF7BBE90FF009DCAE03BF4771EE4D612",
+    "migrationComparisonSha256": "FB43ABA57CFFF01C0A0E6CD6A4CBAEF6427DADCD981C0500743E1BCC73480CC4",
+    "finalDbSha256": "EB03D28385845416BCA3654692F83A0862276098A882D4FB6AC1E65BB9A3B504"
+  }
+}

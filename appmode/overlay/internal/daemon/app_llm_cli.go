@@ -211,7 +211,7 @@ func probeGeminiAuth(credPath string) authState {
 // probeClaudeAuth chạy `claude auth status --json` (exe native dưới npm root) rồi đọc trường loggedIn.
 // Rẻ, chỉ đọc, KHÔNG sinh nội dung. Không dò được (chưa cài / spawn lỗi) → unknown, KHÔNG suy ra loggedOut.
 func probeClaudeAuth(ctx context.Context, d cliDescriptor, logger *slog.Logger) authState {
-	program, prefixArgs, err := resolveCLIProgram(d)
+	program, prefixArgs, err := resolveCLIProgramContext(ctx, d)
 	if err != nil {
 		return authUnknown // chưa cài → không biết trạng thái đăng nhập
 	}
@@ -272,9 +272,19 @@ type cliExit struct {
 func (e *cliExit) Error() string { return e.err.Error() }
 func (e *cliExit) Unwrap() error { return e.err }
 
+// managedCLIProcessLifetime owns the platform-specific lifetime boundary around
+// a CLI process. A Windows Job Object contains detached descendants; supported
+// Unix systems contain only descendants that remain in the dedicated process
+// group; remaining platforms use an explicit direct-process fallback.
+type managedCLIProcessLifetime interface {
+	terminate() error
+	close() error
+}
+
 // runCLIProcess chạy một CLI đã dựng sẵn, ghi prompt vào stdin nếu có, đọc stdout, và khi ctx bị
-// huỷ thì giết CẢ CÂY bằng killPidTree (taskkill /T) — KHÔNG dựa exec.CommandContext, vì nó chỉ
-// giết con trực tiếp, để lại node→cli→[con] mồ côi (bug Task 5, headless.go nêu đúng hazard).
+// huỷ thì dọn phạm vi tiến trình mà managedCLIProcessLifetime của nền tảng sở hữu. Trên Windows,
+// tiến trình được start suspended, assign vào Job Object rồi mới resume nên cả detached descendant
+// cũng bị giữ. Trên Unix, process group chỉ giữ descendant không tự setsid/setpgid để thoát nhóm.
 //
 // childPID: nếu != nil PHẢI được đọc (buffered cap>=1, hoặc đọc ở goroutine khác) — send này CHẶN
 // tới khi pid được nhận, cố ý để pid vào sổ orphan-reap trước khi chờ tiến trình.
@@ -286,22 +296,29 @@ func runCLIProcess(ctx context.Context, cmd *exec.Cmd, stdin []byte, childPID ch
 	} else {
 		cmd.Stdin = bytes.NewReader(nil) // codex exec đọc stdin mặc định → cấp rỗng, không để treo
 	}
-	if err := cmd.Start(); err != nil {
+	process, err := startManagedCLIProcess(cmd, logger)
+	if err != nil {
 		return nil, err
 	}
 	if childPID != nil {
 		childPID <- cmd.Process.Pid
 	}
-	// Goroutine thoát khi cmd.Wait trả về; sau killPidTree (taskkill /F ép thoát cây, giết cả node
-	// con trực tiếp) Wait trả về ngay nên <-done không kẹt.
+	// Goroutine thoát khi cmd.Wait trả về. terminate/close dọn lifetime boundary theo nền tảng;
+	// close là idempotent vì cả nhánh cancel lẫn nhánh hoàn tất đều gọi nó.
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
 	case <-ctx.Done():
-		_ = killPidTree(cmd.Process.Pid, "llm-cli", logger) // taskkill /T — giết cả cây
+		if err := process.terminate(); err != nil && logger != nil {
+			logger.Warn("llm-cli: terminate process lifetime", "pid", cmd.Process.Pid, "err", err)
+		}
 		<-done
+		_ = process.close()
 		return nil, ctx.Err()
 	case err := <-done:
+		if closeErr := process.close(); closeErr != nil && logger != nil {
+			logger.Warn("llm-cli: close process lifetime", "pid", cmd.Process.Pid, "err", closeErr)
+		}
 		if err != nil {
 			return out.Bytes(), &cliExit{err: err, stderr: errBuf.String()}
 		}
@@ -387,14 +404,17 @@ func (a *cliAdapter) spawn(ctx context.Context, argv []string, stdin []byte) ([]
 		out, err := a.run(ctx, argv, stdin)
 		return out, penalize, err
 	}
-	program, prefixArgs, err := resolveCLIProgram(a.d)
+	program, prefixArgs, err := resolveCLIProgramContext(ctx, a.d)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, penalize, err
+		}
 		// Chưa cài → credential (cần cài + đăng nhập), loại DỪNG chuỗi: thử tiếp một CLI chưa cài
 		// chỉ tốn thời gian của khách.
 		return nil, penalize, newLLMError(classifyCLIError("", true), nil, "%s: CLI chưa cài", a.d.kind)
 	}
-	// exec.Command chứ không CommandContext: runCLIProcess tự xử lý huỷ ctx bằng killPidTree
-	// (giết cả cây node→cli→cháu), còn CommandContext chỉ giết con trực tiếp và để cháu mồ côi.
+	// exec.Command chứ không CommandContext: runCLIProcess tự quản lý lifetime boundary của nền
+	// tảng (Windows Job hoặc Unix process group); CommandContext chỉ giết tiến trình trực tiếp.
 	cmd := exec.Command(program, append(prefixArgs, argv...)...)
 	if env != nil {
 		cmd.Env = env
@@ -586,8 +606,29 @@ func parseGeminiAnswer(out []byte) string {
 // Định vị thật được Task 8 ghim (spawn thật + capture output); ở đây đủ để đường sản xuất dựng
 // được lệnh. Test KHÔNG đi qua đây — a.run seam chặn trước.
 func resolveCLIProgram(d cliDescriptor) (program string, prefixArgs []string, err error) {
+	return resolveCLIProgramWithRoot(d, npmGlobalRoot)
+}
+
+// resolveCLIProgramContext is the request-scoped resolver. Only npm discovery
+// can block; the remaining LookPath/stat operations are local and bounded.
+func resolveCLIProgramContext(
+	ctx context.Context,
+	d cliDescriptor,
+) (program string, prefixArgs []string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	return resolveCLIProgramWithRoot(d, func() (string, error) {
+		return npmGlobalRootContext(ctx)
+	})
+}
+
+func resolveCLIProgramWithRoot(
+	d cliDescriptor,
+	rootFn func() (string, error),
+) (program string, prefixArgs []string, err error) {
 	if d.npmBin != "" {
-		root, err := npmGlobalRoot()
+		root, err := rootFn()
 		if err != nil {
 			return "", nil, err
 		}
@@ -601,7 +642,7 @@ func resolveCLIProgram(d cliDescriptor) (program string, prefixArgs []string, er
 	if err != nil {
 		return "", nil, err
 	}
-	root, err := npmGlobalRoot()
+	root, err := rootFn()
 	if err != nil {
 		return "", nil, err
 	}
@@ -612,19 +653,60 @@ func resolveCLIProgram(d cliDescriptor) (program string, prefixArgs []string, er
 	return node, []string{binJS}, nil
 }
 
-// npmGlobalRoot đọc npm global root, nơi gói cài -g nằm.
-//
-// Cache MỘT lần cả đời daemon (OnceValues): root không đổi lúc chạy, còn `npm root -g` là một
-// spawn KHÔNG có ctx nên ngân sách 25s mỗi Provider của router không huỷ được nó — không cache thì
-// một npm cold-start chậm chạy trên MỌI lượt codex/gemini. Cache lại giới hạn cái treo đó về lần
-// resolve đầu tiên.
-var npmGlobalRoot = sync.OnceValues(func() (string, error) {
-	out, err := exec.Command("npm", "root", "-g").Output()
-	if err != nil {
+// npmGlobalRoot reads npm's global package root with a bounded background
+// context. Keep this zero-argument seam for management paths and existing tests;
+// request paths call npmGlobalRootContext with their own cancellation.
+var npmGlobalRoot = func() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return npmGlobalRootContext(ctx)
+}
+
+type npmRootSuccessCache struct {
+	mu   sync.RWMutex
+	root string
+}
+
+var npmRootCache npmRootSuccessCache
+
+// npmGlobalRootContext caches only a successful discovery. It deliberately
+// does not singleflight an in-progress command: a subprocess that ignores or is
+// slow to observe cancellation must not make later callers wait behind it.
+func npmGlobalRootContext(ctx context.Context) (string, error) {
+	npmRootCache.mu.RLock()
+	root := npmRootCache.root
+	npmRootCache.mu.RUnlock()
+	if root != "" {
+		return root, nil
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
-})
+	discoveryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// npm is a shim that spawns node. Reuse the established CLI lifetime boundary
+	// so cancellation reaches the platform-managed descendants, not only the shim.
+	cmd := exec.Command("npm", "root", "-g")
+	out, err := runCLIProcess(discoveryCtx, cmd, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		if ctxErr := discoveryCtx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", err
+	}
+	root = strings.TrimSpace(string(out))
+	if root == "" {
+		return "", errors.New("npm root -g trả đường dẫn rỗng")
+	}
+	npmRootCache.mu.Lock()
+	if npmRootCache.root == "" {
+		npmRootCache.root = root
+	} else {
+		root = npmRootCache.root
+	}
+	npmRootCache.mu.Unlock()
+	return root, nil
+}
 
 // geminiCredPath là đường dò credential của Gemini CLI.
 //

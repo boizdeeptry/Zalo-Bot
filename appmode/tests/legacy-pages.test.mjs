@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import { createKnowledgePage } from "../overlay/internal/webui/static/pages/knowledge.js";
 import { createAgentsPage } from "../overlay/internal/webui/static/pages/agents.js";
@@ -33,6 +34,15 @@ function installKeyDispatcher(doc) {
   };
   return { listenerCount: () => listeners.size };
 }
+
+test("legacy Memory sheet CSS stays scoped and collapses on mobile", async () => {
+  const css = await readFile(new URL("../overlay/internal/webui/static/portal.css", import.meta.url), "utf8");
+  assert.match(css, /\.memory-page \.memory-metrics\s*\{/);
+  assert.match(css, /\.memory-page \.memory-split\s*\{/);
+  assert.match(css, /\[data-memory-overlay\] \.sheet\s*\{/);
+  assert.match(css, /@media \(max-width: 760px\)[\s\S]*\.memory-page \.memory-split/);
+  assert.doesNotMatch(css, /^\s*\.(?:memory-metrics|memory-split|memory-entry|memory-dialog-field)\s*\{/m);
+});
 
 test("Knowledge renders the legacy page contract", async (t) => {
   const dom = installDOM();

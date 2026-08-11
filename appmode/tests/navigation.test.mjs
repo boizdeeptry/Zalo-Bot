@@ -41,7 +41,7 @@ test("navigation exposes the legacy menu contract", () => {
           id: "memory",
           icon: "🗃",
           label: "Memory",
-          todo: "Ghi chú bot tự viết cho từng hội thoại, và bài học rút từ lần người trực sửa câu. Hiện xem trong trang Zalo.",
+          todo: undefined,
           href: undefined,
         },
       ],
@@ -105,4 +105,16 @@ test("navigation exposes the legacy menu contract", () => {
       ],
     },
   ]);
+});
+
+test("navigation exposes Providers, Combos, and the real Memory page", () => {
+  const items = NAVIGATION.flatMap(({ items }) => items);
+  const providers = items.find(({ id }) => id === "providers");
+  const combos = items.find(({ id }) => id === "combos");
+  const memory = items.find(({ id }) => id === "memory");
+
+  assert.equal(providers?.label, "Providers");
+  assert.equal(combos?.label, "Combos");
+  assert.equal(memory?.label, "Memory");
+  assert.equal(memory.todo, undefined);
 });

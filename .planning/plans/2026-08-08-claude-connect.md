@@ -48,13 +48,13 @@
 - [ ] **Step 1: failing tests.** In `app_schema_test.go` add:
   ```go
   func TestMigrateAppUnifiesClaudeKind(t *testing.T) {
-  	db := openMigratedAppDB(t) // same helper the other migrate tests use
-  	// simulate a pre-existing underscore row (upgrade path)
-  	if _, err := db.Exec(`UPDATE llm_providers SET kind='claude_code' WHERE id='claude-code'`); err != nil { t.Fatal(err) }
-  	if err := migrateApp(db); err != nil { t.Fatalf("re-migrate: %v", err) }
-  	var kind string
-  	if err := db.QueryRow(`SELECT kind FROM llm_providers WHERE id='claude-code'`).Scan(&kind); err != nil { t.Fatal(err) }
-  	if kind != "claude-code" { t.Errorf("claude kind = %q; want claude-code", kind) }
+      db := openMigratedAppDB(t) // same helper the other migrate tests use
+      // simulate a pre-existing underscore row (upgrade path)
+      if _, err := db.Exec(`UPDATE llm_providers SET kind='claude_code' WHERE id='claude-code'`); err != nil { t.Fatal(err) }
+      if err := migrateApp(db); err != nil { t.Fatalf("re-migrate: %v", err) }
+      var kind string
+      if err := db.QueryRow(`SELECT kind FROM llm_providers WHERE id='claude-code'`).Scan(&kind); err != nil { t.Fatal(err) }
+      if kind != "claude-code" { t.Errorf("claude kind = %q; want claude-code", kind) }
   }
   ```
   And add an `envVarFor` test in `app_llm_accounts_test.go` (or wherever `envVarFor` is tested): `envVarFor("claude-code")` → `("CLAUDE_CONFIG_DIR", true)`; `envVarFor("claude_code")` → `("", false)`.
@@ -84,13 +84,13 @@
 - [ ] **Step 1: failing tests.**
   ```go
   func TestScanClaudeLoginURL(t *testing.T) {
-  	sample := "Opening browser to sign in…\n" +
-  		"If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz\n" +
-  		"Paste code here if prompted > "
-  	url := scanClaudeLoginURL(strings.NewReader(sample))
-  	if url != "https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz" {
-  		t.Errorf("scanClaudeLoginURL = %q", url)
-  	}
+      sample := "Opening browser to sign in…\n" +
+          "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz\n" +
+          "Paste code here if prompted > "
+      url := scanClaudeLoginURL(strings.NewReader(sample))
+      if url != "https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz" {
+          t.Errorf("scanClaudeLoginURL = %q", url)
+      }
   }
   ```
   Plus a state-machine test with a fake runner whose `login` returns a URL + a `wait()` that returns nil (exit 0), asserting the job reaches `connected` and `CreateLLMAccount` is called with the fake email label, and `connectState` carries **no** `config_dir` (canary).
@@ -142,9 +142,9 @@
   - In `execZaloRunner.Run`, after `cmd.Env = prof.Env(os.Environ())` (duty.go:1728), add:
     ```go
     if e.cfg.ConfigDir != "" {
-    	// Per-account Claude login (Zalo multi-account). Appended AFTER prof.Env so it wins;
-    	// empty = default config, behavior unchanged.
-    	cmd.Env = append(cmd.Env, "CLAUDE_CONFIG_DIR="+e.cfg.ConfigDir)
+        // Per-account Claude login (Zalo multi-account). Appended AFTER prof.Env so it wins;
+        // empty = default config, behavior unchanged.
+        cmd.Env = append(cmd.Env, "CLAUDE_CONFIG_DIR="+e.cfg.ConfigDir)
     }
     ```
 - [ ] **Step 4: run — PASS**; run the base package `go -C …\AgentDC test ./internal/daemon`.
@@ -164,22 +164,22 @@
 - [ ] **Step 3: implement** — rewrite `appClaudeRunner`:
   ```go
   func (a *api) appClaudeRunner(zc zaloConfig, base zaloRunner, model string) zaloRunner {
-  	// Multi-account: pick a claude-code account (round-robin+cooldown). 0 accounts → default
-  	// config + preserve the base test-injection seam.
-  	if accounts, err := a.st.LLMAccounts(claudeCodeProviderID); err == nil && len(accounts) > 0 {
-  		if acc, ok := accountSel.pick("claude-code", accounts); ok {
-  			zc.ConfigDir = acc.ConfigDir
-  			if model != "" && model != zc.Model {
-  				zc.Model = model
-  			}
-  			return execZaloRunner{cfg: zc, logger: a.logger}
-  		}
-  	}
-  	if model == "" || model == zc.Model {
-  		return base
-  	}
-  	zc.Model = model
-  	return execZaloRunner{cfg: zc, logger: a.logger}
+      // Multi-account: pick a claude-code account (round-robin+cooldown). 0 accounts → default
+      // config + preserve the base test-injection seam.
+      if accounts, err := a.st.LLMAccounts(claudeCodeProviderID); err == nil && len(accounts) > 0 {
+          if acc, ok := accountSel.pick("claude-code", accounts); ok {
+              zc.ConfigDir = acc.ConfigDir
+              if model != "" && model != zc.Model {
+                  zc.Model = model
+              }
+              return execZaloRunner{cfg: zc, logger: a.logger}
+          }
+      }
+      if model == "" || model == zc.Model {
+          return base
+      }
+      zc.Model = model
+      return execZaloRunner{cfg: zc, logger: a.logger}
   }
   ```
   (`claudeCodeProviderID = "claude-code"` already exists; `accountSel`/`store.LLMAccounts` already exist.)
