@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createOnboardingPage, createOnboardingService } from "../overlay/internal/webui/static/pages/onboarding.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
+import { onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
 const flush = () => new Promise((resolve) => setImmediate(resolve)); const microtask = () => Promise.resolve();
 function deferred() {
   let resolve; let reject;
@@ -16,10 +17,7 @@ function providerCard(root, kind) {
   return find(root, (node) => hasClass(node, "onboarding-provider-card") && node.dataset.providerKind === kind);
 }
 function providerStatus(overrides = {}) {
-  return {
-    required: true, phase: "provider", provider_kind: "", suggested_provider_kind: "",
-    provider_id: "", account_id: "", model_id: "", revision: 1, ...overrides,
-  };
+  return onboardingStatus("provider", { revision: 1, ...overrides });
 }
 function connectStatus(overrides = {}) {
   return providerStatus({
@@ -556,7 +554,7 @@ test("Setup Retry renders an authoritative non-Setup phase without stale POST", 
   const cases = [
     ["persona", personaStatus({ revision: 9 }), "onboarding-persona-stage", "Trợ lý của bạn là ai"],
     ["test", { ...personaStatus({ revision: 9 }), phase: "test" }, "onboarding-test-stage", "Thử trò chuyện với Bé Mi"],
-    ["completed", providerStatus({ required: false, phase: "completed", revision: 9 }), "onboarding-done-stage", "Bé Mi đã sẵn sàng!"],
+    ["completed", providerStatus({ phase: "completed", revision: 9 }), "onboarding-done-stage", "Bé Mi đã sẵn sàng!"],
     ["provider", providerStatus({ revision: 9 }), "onboarding-provider-stage", "Chọn nhà cung cấp"],
     ["connect", connectStatus({ revision: 9 }), "onboarding-connect-stage", "Kết nối Codex"],
   ];

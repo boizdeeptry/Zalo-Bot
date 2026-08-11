@@ -6,27 +6,19 @@ import {
   createOnboardingService,
 } from "../overlay/internal/webui/static/pages/onboarding.js";
 import {
+  normalizeSetupResult,
   normalizeStatus,
   normalizeTestResponse,
 } from "../overlay/internal/webui/static/pages/onboarding-contract.js";
 import { find, installDOM, text } from "./helpers/dom-harness.mjs";
+import { onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const button = (root, label) => find(root, (node) => node.tagName === "BUTTON"
   && text(node).includes(label));
 
 function status(overrides = {}) {
-  return {
-    required: true,
-    phase: "test",
-    provider_kind: "codex",
-    suggested_provider_kind: "",
-    provider_id: "codex",
-    account_id: "account-1",
-    model_id: "gpt-5.6-terra",
-    revision: 7,
-    ...overrides,
-  };
+  return onboardingStatus("test", overrides);
 }
 
 function response(overrides = {}) {
@@ -119,27 +111,72 @@ test("Test Chat gives the persona-specific request error a distinct recovery pat
   assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
 });
 
-test("status requires exact required/phase pairing", () => {
-  for (const phase of ["provider", "connect", "setup", "persona", "test"]) {
-    const missingRequired = status({ phase });
-    delete missingRequired.required;
-    assert.equal(normalizeStatus(status({ phase, required: false })), null, phase);
-    assert.equal(normalizeStatus(status({ phase, required: "true" })), null, phase);
-    assert.equal(normalizeStatus(missingRequired), null, phase);
+test("status validates and retains exact version, required, and restart markers", () => {
+  const fresh = normalizeStatus(status({ current_version: 2, completed_version: 1 }));
+  assert.deepEqual({
+    required: fresh?.required,
+    current_version: fresh?.current_version,
+    completed_version: fresh?.completed_version,
+    restart_in_progress: fresh?.restart_in_progress,
+  }, { required: true, current_version: 2, completed_version: 1, restart_in_progress: false });
+  const restarted = normalizeStatus(status({
+    phase: "provider", current_version: 2, completed_version: 2, restart_in_progress: true,
+  }));
+  assert.equal(restarted?.phase, "provider");
+  assert.equal(normalizeStatus(status({ phase: "completed", current_version: 2 }))?.required, false);
+
+  const malformed = [
+    { current_version: 0 }, { current_version: -1 }, { current_version: 1.5 },
+    { current_version: "1" }, { completed_version: -1 }, { completed_version: 2 },
+    { completed_version: 0.5 }, { completed_version: "0" }, { restart_in_progress: "false" },
+    { required: false },
+    { phase: "completed", required: true },
+    { phase: "completed", restart_in_progress: true },
+    { phase: "test", completed_version: 1, restart_in_progress: false },
+    { phase: "test", completed_version: 0, restart_in_progress: true },
+  ];
+  for (const overrides of malformed) assert.equal(normalizeStatus(status(overrides)), null, JSON.stringify(overrides));
+  for (const field of ["required", "current_version", "completed_version", "restart_in_progress"]) {
+    const missing = status();
+    delete missing[field];
+    assert.equal(normalizeStatus(missing), null, `missing ${field}`);
   }
-  assert.equal(normalizeStatus(status({ phase: "completed", required: true })), null);
-  assert.equal(normalizeStatus(status({ phase: "completed", required: "false" })), null);
-  assert.equal(normalizeStatus(status({ phase: "completed", required: false }))?.phase, "completed");
-  assert.equal(normalizeStatus(status({
-    phase: "provider", required: true, restart_in_progress: true,
-  }))?.phase, "provider");
 });
 
-test("contradictory completed status fails closed initially and after refresh", async (t) => {
+test("Setup-to-Persona retains lifecycle markers", () => {
+  const lifecycle = normalizeStatus(status({ phase: "setup", revision: 3 }));
+  const setupResponse = {
+    revision: 4,
+    provider_kind: "codex",
+    provider_id: "codex",
+    account_id: "account-1",
+    model_id: "gpt-5.6-terra",
+    staged_combo_id: "combo-staged",
+    combo_name: "Codex mặc định",
+  };
+  const expected = {
+    accountID: "account-1", revision: 3, providerKind: "codex", providerID: "codex", lifecycle,
+  };
+  const result = normalizeSetupResult(setupResponse, expected);
+  assert.deepEqual({
+    current_version: result?.current_version,
+    completed_version: result?.completed_version,
+    restart_in_progress: result?.restart_in_progress,
+  }, { current_version: 1, completed_version: 0, restart_in_progress: false });
+  const malformedLifecycle = { ...lifecycle };
+  delete malformedLifecycle.current_version;
+  assert.equal(normalizeSetupResult(setupResponse, {
+    ...expected, lifecycle: malformedLifecycle,
+  }), null);
+});
+
+test("missing and contradictory lifecycle markers fail closed initially and after refresh", async (t) => {
   await t.test("initial", async (subtest) => {
     let handoffs = 0;
+    const missingCurrentVersion = status({ phase: "completed" });
+    delete missingCurrentVersion.current_version;
     const { host } = mount(subtest, {
-      initialStatus: status({ phase: "completed", required: true }),
+      initialStatus: missingCurrentVersion,
       onComplete: () => { handoffs++; },
     });
     await flush();
@@ -157,7 +194,10 @@ test("contradictory completed status fails closed initially and after refresh", 
       service: service({
         testChat: () => Promise.resolve(response()),
         complete: () => Promise.reject(conflict),
-        status: () => Promise.resolve(status({ phase: "completed", required: true, revision: 9 })),
+        status: () => Promise.resolve(status({
+          phase: "completed", current_version: 1, completed_version: 2,
+          required: false, revision: 9,
+        })),
       }),
       onComplete: () => { handoffs++; },
     });

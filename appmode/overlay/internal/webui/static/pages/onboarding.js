@@ -6,7 +6,7 @@ import {
   normalizeAgentResponse, normalizeCompleteResponse, normalizeConnectedSetup,
   normalizeProviderSelection, normalizeSetupResult, normalizeStatus, normalizeTestMessage,
   normalizeTestResponse, positiveRevision, safeServerFieldCount, semanticString, successorRevision,
-  terminalIdentity, testResponseError, validDisplayName, validateConnectController,
+  terminalIdentity, testChatRecovery, testResponseError, validDisplayName, validateConnectController,
   validateOnboardingPageService,
 } from "./onboarding-contract.js";
 import { createDoneStage, createPersonaStage, createTestStage } from "./onboarding-late-view.js";
@@ -16,15 +16,9 @@ import {
 } from "./onboarding-early-view.js";
 export { createOnboardingService };
 export function createOnboardingPage({
-  initialStatus,
-  service = createOnboardingService(),
-  connectService = createProviderService(),
-  connectFactory = createProviderConnect,
-  onComplete = () => {},
-  setupSuccessDelayMs = 0,
-  setTimeoutFn = setTimeout,
-  clearTimeoutFn = clearTimeout,
-  nowFn = Date.now,
+  initialStatus, service = createOnboardingService(), connectService = createProviderService(),
+  connectFactory = createProviderConnect, onComplete = () => {}, setupSuccessDelayMs = 0,
+  setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, nowFn = Date.now,
   connectOptions = {},
 } = {}) {
   validateOnboardingPageService(service);
@@ -313,12 +307,7 @@ export function createOnboardingPage({
       try {
         const response = await service.setup(accountID, revision, controller.signal);
         if (!owns(run)) return false;
-        const nextState = normalizeSetupResult(response, {
-          accountID,
-          revision,
-          providerKind,
-          providerID,
-        });
+        const nextState = normalizeSetupResult(response, { accountID, revision, providerKind, providerID, lifecycle: snapshot });
         if (!nextState) {
           setupInFlight = null;
           renderSetup("error", SAFE_SETUP_ERROR);
@@ -604,6 +593,10 @@ export function createOnboardingPage({
       if (!owns(run) || requestController.signal.aborted) return false;
       testBusy = false;
       clearReceipt();
+      const recovery = testChatRecovery(error?.code);
+      if (recovery === "refresh") return refreshStatus();
+      if (recovery === "provider") return refreshStatus({ fallbackToProvider: true });
+      if (recovery === "persona") { agentName = ""; return renderPersona(); }
       testError = error?.code === "ONBOARDING_PERSONA_NOT_APPLIED" ? "Bot đã phản hồi nhưng chưa áp dụng đúng Persona." : "Chưa thể trò chuyện thử. Vui lòng thử lại.";
       renderTest();
       return false;
@@ -644,7 +637,8 @@ export function createOnboardingPage({
       }
       clearReceipt();
       completeBusy = false;
-      state = { ...expected, required: false, phase: "completed" };
+      state = { ...expected, required: false, completed_version: expected.current_version,
+        restart_in_progress: false, phase: "completed" };
       renderDone();
       return true;
     } catch (error) {
@@ -720,11 +714,16 @@ export function createOnboardingPage({
       default: renderSafeError();
     }
   }
-  async function refreshStatus() {
+  function renderProviderRecovery(snapshot) {
+    state = { ...snapshot, phase: "provider" };
+    selectedProvider = SUPPORTED_PROVIDERS.has(state.provider_kind) ? state.provider_kind : "";
+    renderWelcome("Cấu hình kết nối không còn hợp lệ. Vui lòng chọn lại nhà cung cấp.");
+    return false;
+  }
+  async function refreshStatus({ fallbackToProvider = false } = {}) {
     clearReceipt();
-    agentName = "";
-    testBusy = false;
-    completeBusy = false;
+    agentName = ""; testBusy = false; completeBusy = false;
+    const fallbackState = state;
     const { run, controller } = beginOperation();
     renderLoading();
     try {
@@ -732,18 +731,19 @@ export function createOnboardingPage({
       if (!owns(run)) return false;
       const nextState = normalizeStatus(response);
       if (!nextState) {
+        if (fallbackToProvider) return renderProviderRecovery(fallbackState);
         state = null;
         renderSafeError();
         return false;
       }
       state = nextState;
-      selectedProvider = nextState.phase === "provider"
-        ? nextState.provider_kind || nextState.suggested_provider_kind
-        : "";
+      if (fallbackToProvider && nextState.phase === "test") return renderProviderRecovery(nextState);
+      selectedProvider = nextState.phase === "provider" ? nextState.provider_kind || nextState.suggested_provider_kind : "";
       renderCurrent();
       return true;
     } catch (error) {
       if (!owns(run) || error?.name === "AbortError") return false;
+      if (fallbackToProvider) return renderProviderRecovery(fallbackState);
       renderSafeError();
       return false;
     } finally {

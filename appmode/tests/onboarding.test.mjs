@@ -6,6 +6,7 @@ import {
   createOnboardingService,
 } from "../overlay/internal/webui/static/pages/onboarding.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
+import { onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -27,17 +28,7 @@ const byClass = (root, name) => find(root, (node) => hasClass(node, name));
 const futureExpiry = () => new Date(Date.now() + 600_000).toISOString();
 
 function testStatus(overrides = {}) {
-  return {
-    required: true,
-    phase: "test",
-    provider_kind: "codex",
-    suggested_provider_kind: "",
-    provider_id: "codex",
-    account_id: "account-1",
-    model_id: "gpt-5.6-terra",
-    revision: 7,
-    ...overrides,
-  };
+  return onboardingStatus("test", overrides);
 }
 
 function personaStatus(overrides = {}) {
@@ -714,7 +705,7 @@ test("Test resume has no receipt and completed resume requires an authoritative 
   await t.test("completed resume", async (subtest) => {
     let loads = 0;
     const { host } = mountPage(subtest, {
-      initialStatus: testStatus({ required: false, phase: "completed", revision: 9 }),
+      initialStatus: testStatus({ phase: "completed", revision: 9 }),
       service: baseService({
         loadAgent: () => {
           loads++;

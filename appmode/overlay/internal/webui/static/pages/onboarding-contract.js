@@ -97,7 +97,16 @@ export function normalizeSetupResponse(response, { accountID, revision, provider
 export function normalizeStatus(snapshot) {
   if (!isRecord(snapshot) || !SUPPORTED_PHASES.has(snapshot.phase)) return null;
   const completed = snapshot.phase === "completed";
-  if (snapshot.required !== !completed) return null;
+  const currentVersion = Number.isSafeInteger(snapshot.current_version) && snapshot.current_version > 0
+    ? snapshot.current_version : 0;
+  const completedVersion = Number.isSafeInteger(snapshot.completed_version)
+    && snapshot.completed_version >= 0 ? snapshot.completed_version : -1;
+  const restartInProgress = snapshot.restart_in_progress;
+  if (!currentVersion || completedVersion < 0 || completedVersion > currentVersion
+    || typeof restartInProgress !== "boolean" || typeof snapshot.required !== "boolean"
+    || snapshot.required !== (completedVersion < currentVersion || restartInProgress)
+    || snapshot.required !== !completed
+    || (restartInProgress && completedVersion !== currentVersion)) return null;
   const revision = positiveRevision(snapshot.revision);
   const providerKindValue = optionalSemanticString(snapshot, "provider_kind");
   const suggestionValue = optionalSemanticString(snapshot, "suggested_provider_kind");
@@ -115,6 +124,9 @@ export function normalizeStatus(snapshot) {
   if (["persona", "test"].includes(snapshot.phase) && !modelID) return null;
   return {
     required: snapshot.required,
+    current_version: currentVersion,
+    completed_version: completedVersion,
+    restart_in_progress: restartInProgress,
     phase: snapshot.phase,
     provider_kind: providerKind,
     suggested_provider_kind: suggestedProviderKind,
@@ -149,8 +161,17 @@ export function normalizeSetupResult(result, expected) {
     revision: expected.revision,
     providerKind: expected.providerKind,
   });
-  if (!normalized || normalized.provider_id !== expected.providerID) return null;
-  return { required: true, suggested_provider_kind: "", ...normalized };
+  const lifecycle = normalizeStatus(expected.lifecycle);
+  if (!normalized || normalized.provider_id !== expected.providerID
+    || lifecycle?.phase !== "setup" || lifecycle.required !== true) return null;
+  return {
+    required: true,
+    current_version: lifecycle.current_version,
+    completed_version: lifecycle.completed_version,
+    restart_in_progress: lifecycle.restart_in_progress,
+    suggested_provider_kind: "",
+    ...normalized,
+  };
 }
 
 export function normalizeAgentResponse(response) {
@@ -252,6 +273,15 @@ export function testResponseError(response, displayName, now) {
   return Number.isFinite(expiry) && expiry <= now
     ? "Kết quả thử đã hết hạn. Vui lòng thử lại."
     : "Chưa thể xác minh kết quả trò chuyện. Vui lòng thử lại.";
+}
+
+export function testChatRecovery(code) {
+  if (["ONBOARDING_REVISION_CONFLICT", "ONBOARDING_PHASE_INVALID", "ONBOARDING_TEST_BUSY"].includes(code)) {
+    return "refresh";
+  }
+  if (code === "ONBOARDING_PERSONA_CHANGED") return "persona";
+  if (["ONBOARDING_STAGING_INVALID", "ONBOARDING_NO_MODEL"].includes(code)) return "provider";
+  return "local";
 }
 
 export function safeServerFieldCount(error) {
