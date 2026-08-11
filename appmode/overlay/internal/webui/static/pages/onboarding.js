@@ -20,6 +20,8 @@ const SAFE_SETUP_ERROR = "Chưa thể chuẩn bị cấu hình. Vui lòng thử 
 const isRecord = (value) => Boolean(value)
   && typeof value === "object" && !Array.isArray(value);
 const positiveRevision = (value) => Number.isSafeInteger(value) && value > 0 ? value : 0;
+const successorRevision = (value) => positiveRevision(value)
+  && value < Number.MAX_SAFE_INTEGER ? value + 1 : 0;
 
 function semanticString(value, { allowEmpty = false } = {}) {
   if (typeof value !== "string"
@@ -35,7 +37,6 @@ function optionalSemanticString(record, field) {
   if (!Object.hasOwn(record, field)) return "";
   return semanticString(record[field], { allowEmpty: true });
 }
-
 function projectStatus(value) {
   if (!isRecord(value)) return value;
   const projected = {};
@@ -44,37 +45,47 @@ function projectStatus(value) {
   }
   return projected;
 }
-
-function projectSetup(value) {
-  const response = isRecord(value) ? value : {};
-  return {
-    phase: "persona",
-    revision: response.revision,
-    provider_kind: response.provider_kind,
-    provider_id: response.provider_id,
-    account_id: response.account_id,
-    model_id: response.model_id,
-  };
-}
 function requireProviderKind(kind) {
   if (!SUPPORTED_PROVIDERS.has(kind)) {
     throw new RangeError("Onboarding provider kind is not supported");
   }
   return kind;
 }
-
 function requireRevision(revision) {
   const valid = positiveRevision(revision);
   if (!valid) throw new RangeError("Onboarding revision must be a positive safe integer");
   return valid;
 }
-
 function requireAccountID(accountId) {
   const valid = semanticString(accountId);
   if (!valid) throw new TypeError("Onboarding account id is invalid");
   return valid;
 }
-
+function requireSuccessor(revision) {
+  const successor = successorRevision(revision);
+  if (!successor) throw new RangeError("Onboarding revision has no safe successor");
+  return successor;
+}
+function normalizeSetupResponse(response, { accountID, revision, providerKind = "" }) {
+  if (!isRecord(response)) return null;
+  const kind = semanticString(response.provider_kind);
+  const providerID = semanticString(response.provider_id);
+  const returnedAccountID = semanticString(response.account_id);
+  const modelID = semanticString(response.model_id);
+  const stagedComboID = semanticString(response.staged_combo_id);
+  const comboName = semanticString(response.combo_name);
+  if (response.revision !== successorRevision(revision)
+    || (Object.hasOwn(response, "phase") && response.phase !== "persona")
+    || !SUPPORTED_PROVIDERS.has(kind)
+    || (providerKind && kind !== providerKind)
+    || providerID !== kind || returnedAccountID !== accountID
+    || !modelID || !stagedComboID || !comboName) return null;
+  return {
+    phase: "persona", revision: response.revision, provider_kind: kind,
+    provider_id: providerID, account_id: returnedAccountID, model_id: modelID,
+    staged_combo_id: stagedComboID, combo_name: comboName,
+  };
+}
 export function createOnboardingService({ requestJSON = sharedRequestJSON } = {}) {
   if (typeof requestJSON !== "function") {
     throw new TypeError("Onboarding service requires a requestJSON function");
@@ -84,26 +95,34 @@ export function createOnboardingService({ requestJSON = sharedRequestJSON } = {}
       return Promise.resolve(requestJSON("/onboarding/status", { signal })).then(projectStatus);
     },
     selectProvider(kind, revision, signal) {
-      const providerKind = requireProviderKind(kind);
-      const currentRevision = requireRevision(revision);
+      const providerKind = requireProviderKind(kind), currentRevision = requireRevision(revision);
+      requireSuccessor(currentRevision);
       return Promise.resolve(requestJSON("/onboarding/provider", {
-        method: "PUT",
-        body: { kind: providerKind, revision: currentRevision },
-        signal,
-      })).then(projectStatus);
+        method: "PUT", body: { kind: providerKind, revision: currentRevision }, signal,
+      })).then((response) => {
+        const normalized = normalizeProviderSelection(response, { providerKind, revision: currentRevision });
+        if (!normalized) throw new TypeError("Invalid onboarding provider response");
+        return normalized;
+      });
     },
     setup(accountId, revision, signal) {
       const exactAccountID = requireAccountID(accountId);
       const currentRevision = requireRevision(revision);
+      requireSuccessor(currentRevision);
       return Promise.resolve(requestJSON("/onboarding/setup", {
         method: "POST",
         body: { account_id: exactAccountID, revision: currentRevision },
         signal,
-      })).then(projectSetup);
+      })).then((response) => {
+        const normalized = normalizeSetupResponse(response, {
+          accountID: exactAccountID, revision: currentRevision,
+        });
+        if (!normalized) throw new TypeError("Invalid onboarding setup response");
+        return normalized;
+      });
     },
   });
 }
-
 function normalizeStatus(snapshot) {
   if (!isRecord(snapshot)
     || snapshot.required !== true
@@ -124,7 +143,6 @@ function normalizeStatus(snapshot) {
     || modelID === null) {
     return null;
   }
-
   const providerKind = SUPPORTED_PROVIDERS.has(providerKindValue) ? providerKindValue : "";
   const suggestedProviderKind = SUPPORTED_PROVIDERS.has(suggestionValue) ? suggestionValue : "";
   if (snapshot.phase !== "provider" && snapshot.phase !== "completed"
@@ -136,7 +154,6 @@ function normalizeStatus(snapshot) {
     return null;
   }
   if (snapshot.phase === "persona" && !modelID) return null;
-
   return {
     required: true,
     phase: snapshot.phase,
@@ -148,40 +165,37 @@ function normalizeStatus(snapshot) {
     revision,
   };
 }
-
-function normalizeSetupResult(result, expected) {
-  const projected = projectSetup(result);
-  const revision = positiveRevision(projected.revision);
-  const providerKind = semanticString(projected.provider_kind);
-  const providerID = semanticString(projected.provider_id);
-  const accountID = semanticString(projected.account_id);
-  const modelID = semanticString(projected.model_id);
-  if (!revision
-    || providerKind !== expected.providerKind
-    || providerID !== expected.providerID
-    || accountID !== expected.accountID
-    || !modelID) {
-    return null;
-  }
-  return {
-    required: true,
-    phase: "persona",
-    provider_kind: providerKind,
-    suggested_provider_kind: "",
-    provider_id: providerID,
-    account_id: accountID,
-    model_id: modelID,
-    revision,
-  };
+function normalizeProviderSelection(snapshot, { providerKind, revision }) {
+  const normalized = normalizeStatus(snapshot);
+  if (!normalized || normalized.phase !== "connect"
+    || normalized.provider_kind !== providerKind
+    || normalized.revision !== successorRevision(revision)
+    || normalized.provider_id || normalized.account_id || normalized.model_id) return null;
+  return normalized;
 }
-
+function normalizeConnectedSetup(snapshot, { providerKind, accountID, revision }) {
+  const normalized = normalizeStatus(snapshot);
+  if (!normalized || normalized.phase !== "setup"
+    || normalized.provider_kind !== providerKind || normalized.provider_id !== providerKind
+    || normalized.account_id !== accountID || normalized.model_id
+    || normalized.revision !== successorRevision(revision)) return null;
+  return normalized;
+}
+function normalizeSetupResult(result, expected) {
+  const normalized = normalizeSetupResponse(result, {
+    accountID: expected.accountID,
+    revision: expected.revision,
+    providerKind: expected.providerKind,
+  });
+  if (!normalized || normalized.provider_id !== expected.providerID) return null;
+  return { required: true, suggested_provider_kind: "", ...normalized };
+}
 const providerName = (kind) => kind === "claude-code" ? "Claude Code" : "Codex";
 function currentStepIndex(phase) {
   if (phase === "persona") return 1;
   if (phase === "test" || phase === "completed") return 2;
   return 0;
 }
-
 function validatePageService(service) {
   for (const method of ["status", "selectProvider", "setup"]) {
     if (typeof service?.[method] !== "function") {
@@ -189,7 +203,6 @@ function validatePageService(service) {
     }
   }
 }
-
 function validateConnectController(controller) {
   for (const method of ["mount", "start", "cancel", "dispose"]) {
     if (typeof controller?.[method] !== "function") {
@@ -197,7 +210,6 @@ function validateConnectController(controller) {
     }
   }
 }
-
 export function createOnboardingPage({
   initialStatus,
   service = createOnboardingService(),
@@ -214,7 +226,6 @@ export function createOnboardingPage({
     throw new TypeError("Onboarding page requires a connect factory");
   }
   if (typeof onComplete !== "function") throw new TypeError("onComplete must be a function");
-
   let state = normalizeStatus(initialStatus);
   let selectedProvider = state?.phase === "provider"
     ? state.provider_kind || state.suggested_provider_kind
@@ -231,49 +242,41 @@ export function createOnboardingPage({
   let connectTerminalPromise = null;
   let setupInFlight = null;
   const listeners = new Set();
-
   function listen(node, type, listener) {
     node.addEventListener(type, listener);
     listeners.add({ node, type, listener });
     return node;
   }
-
   function clearListeners() {
     for (const binding of listeners) {
       binding.node.removeEventListener(binding.type, binding.listener);
     }
     listeners.clear();
   }
-
   function clearPersonaTimer() {
     if (personaTimer === null) return;
     clearTimeoutFn(personaTimer);
     personaTimer = null;
   }
-
   function abortActive() {
     activeController?.abort();
     activeController = null;
   }
-
   function invalidate() {
     generation++;
     abortActive();
     clearPersonaTimer();
     return generation;
   }
-
   function beginOperation() {
     const run = invalidate();
     const controller = new AbortController();
     activeController = controller;
     return { run, controller };
   }
-
   function owns(run) {
     return !disposed && root && generation === run;
   }
-
   function releaseOperation(run, controller) {
     if (generation === run && activeController === controller) activeController = null;
   }
@@ -432,6 +435,11 @@ export function createOnboardingPage({
 
   async function selectProvider() {
     if (!state || !selectedProvider || !SUPPORTED_PROVIDERS.has(selectedProvider)) return false;
+    if (!successorRevision(state.revision)) {
+      renderSafeError();
+      return false;
+    }
+    const requested = { providerKind: selectedProvider, revision: state.revision };
     const { run, controller } = beginOperation();
     try {
       const response = await service.selectProvider(
@@ -440,7 +448,7 @@ export function createOnboardingPage({
         controller.signal,
       );
       if (!owns(run)) return false;
-      const nextState = normalizeStatus(response);
+      const nextState = normalizeProviderSelection(response, requested);
       if (!nextState) {
         renderSafeError();
         return false;
@@ -467,40 +475,26 @@ export function createOnboardingPage({
     return { kind, providerID, accountID };
   }
 
-  function exactSetupSnapshot(snapshot, terminal) {
-    return snapshot.phase === "setup"
-      && snapshot.provider_kind === terminal.kind
-      && snapshot.provider_id === terminal.providerID
-      && snapshot.account_id === terminal.accountID;
-  }
-
-  async function reconcileConnected(stageRun, terminal) {
+  async function reconcileConnected(stageRun, connectRevision, terminal) {
     if (!owns(stageRun)) return false;
+    if (!successorRevision(connectRevision)) {
+      renderSafeError();
+      return false;
+    }
     const { run, controller } = beginOperation();
     try {
       const response = await service.status(controller.signal);
       if (!owns(run)) return false;
-      const nextState = normalizeStatus(response);
+      const nextState = normalizeConnectedSetup(response, {
+        providerKind: terminal.kind,
+        accountID: terminal.accountID,
+        revision: connectRevision,
+      });
       if (!nextState) {
         renderSafeError();
         return false;
       }
-      const exactIdentity = nextState.provider_kind === terminal.kind
-        && nextState.provider_id === terminal.providerID
-        && nextState.account_id === terminal.accountID;
-      if (!exactIdentity) {
-        renderSafeError();
-        return false;
-      }
       state = nextState;
-      if (nextState.phase === "persona") {
-        renderCurrent();
-        return true;
-      }
-      if (!exactSetupSnapshot(nextState, terminal)) {
-        renderSafeError();
-        return false;
-      }
       return startSetup(nextState);
     } catch (error) {
       if (!owns(run) || error?.name === "AbortError") return false;
@@ -511,7 +505,7 @@ export function createOnboardingPage({
     }
   }
 
-  function handleConnected(stageRun, expectedKind, terminal) {
+  function handleConnected(stageRun, expectedKind, connectRevision, terminal) {
     if (connectTerminalPromise) return connectTerminalPromise;
     if (!owns(stageRun)) return Promise.resolve(false);
     const identity = terminalIdentity(terminal, expectedKind);
@@ -519,7 +513,7 @@ export function createOnboardingPage({
       renderSafeError();
       return Promise.resolve(false);
     }
-    connectTerminalPromise = reconcileConnected(stageRun, identity);
+    connectTerminalPromise = reconcileConnected(stageRun, connectRevision, identity);
     return connectTerminalPromise;
   }
 
@@ -586,7 +580,7 @@ export function createOnboardingPage({
         ...connectOptions,
         kind,
         service: connectService,
-        onConnected: (terminal) => handleConnected(stageRun, kind, terminal),
+        onConnected: (terminal) => handleConnected(stageRun, kind, state.revision, terminal),
         onBack: () => goBackFromConnect(stageRun),
       });
       validateConnectController(instance);
@@ -624,7 +618,7 @@ export function createOnboardingPage({
           attributes: { role: "alert" },
           text: message || SAFE_SETUP_ERROR,
         }) : null,
-        error ? retryButton(() => startSetup(state)) : null,
+        error ? retryButton(refreshStatus) : null,
       ),
     );
   }
@@ -639,6 +633,10 @@ export function createOnboardingPage({
       renderSafeError();
       return Promise.resolve(false);
     }
+    if (!successorRevision(revision)) {
+      renderSafeError();
+      return Promise.resolve(false);
+    }
     const key = `${accountID}\u0000${revision}`;
     if (setupInFlight?.key === key) return setupInFlight.promise;
     const { run, controller } = beginOperation();
@@ -649,6 +647,7 @@ export function createOnboardingPage({
         if (!owns(run)) return false;
         const nextState = normalizeSetupResult(response, {
           accountID,
+          revision,
           providerKind,
           providerID,
         });
