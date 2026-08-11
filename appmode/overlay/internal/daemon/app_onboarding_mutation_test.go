@@ -393,6 +393,7 @@ func TestAppOnboardingProviderAuthoritativelyCancelsAndWaitsForMatchingConnect(t
 	env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
 	ctx, cancel := context.WithCancel(context.Background())
 	job := newManualConnectJob("codex", cancel)
+	job.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
 	cleaned := make(chan struct{})
 	connectMgr = &connectManager{job: job, jobKind: "codex"}
 	go func() {
@@ -421,6 +422,7 @@ func TestAppLLMConnectStartWaitsForOnboardingCleanupTransition(t *testing.T) {
 
 	oldCtx, cancelOld := context.WithCancel(context.Background())
 	oldJob := newManualConnectJob("codex", cancelOld)
+	oldJob.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
 	newStarted := make(chan struct{})
 	connectMgr = &connectManager{
 		runner:        &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut},
@@ -645,8 +647,9 @@ func TestConnectOnboardingRouteStagesDisabledAccountAndAdvancesState(t *testing.
 	state := env.state(t)
 	createCalls := 0
 	connectMgr = &connectManager{
-		runner: &fakeRunner{installed: true, auth: authLoggedIn},
-		ensure: env.a.st.EnsureProviderForKind,
+		runner:           &fakeRunner{installed: true, auth: authLoggedIn},
+		ensure:           env.a.st.EnsureProviderForKind,
+		ensureOnboarding: env.a.st.EnsureOnboardingProviderForKind,
 		ensureModels: func(kind string) error {
 			return env.a.st.ReplaceLLMModels(kind, store.LLMModelDiscovered, cliProviderModels(env.a.st, kind, kind))
 		},
@@ -678,6 +681,20 @@ func TestConnectOnboardingRouteStagesDisabledAccountAndAdvancesState(t *testing.
 	if len(accounts) != 1 || accounts[0].ID != terminal.AccountID || accounts[0].Enabled {
 		t.Fatalf("onboarding accounts=%+v", accounts)
 	}
+	providers, err := env.a.st.LLMProviders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var connectedProvider *store.LLMProvider
+	for i := range providers {
+		if providers[i].ID == terminal.ProviderID {
+			connectedProvider = &providers[i]
+			break
+		}
+	}
+	if connectedProvider == nil || connectedProvider.Enabled {
+		t.Fatalf("onboarding Providers=%+v; want connected Provider disabled", providers)
+	}
 	onboarding := env.state(t)
 	if onboarding.AccountID != terminal.AccountID || onboarding.ProviderID != terminal.ProviderID ||
 		onboarding.Phase != store.OnboardingPhaseSetup || onboarding.Revision != state.Revision+1 {
@@ -706,16 +723,17 @@ func TestConnectOnboardingStateChangeDuringLoginFailsClosed(t *testing.T) {
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(runner.release) }) })
 	connectMgr = &connectManager{
-		runner:         runner,
-		ensure:         env.a.st.EnsureProviderForKind,
-		ensureModels:   func(string) error { return nil },
-		createAccount:  env.a.st.CreateLLMAccount,
-		bindOnboarding: env.a.st.BindOnboardingAccount,
-		dataDir:        env.dataDir,
-		newID:          func() string { return "stale-account" },
-		logger:         env.a.logger,
-		loginTimeout:   500 * time.Millisecond,
-		pollInterval:   5 * time.Millisecond,
+		runner:           runner,
+		ensure:           env.a.st.EnsureProviderForKind,
+		ensureOnboarding: env.a.st.EnsureOnboardingProviderForKind,
+		ensureModels:     func(string) error { return nil },
+		createAccount:    env.a.st.CreateLLMAccount,
+		bindOnboarding:   env.a.st.BindOnboardingAccount,
+		dataDir:          env.dataDir,
+		newID:            func() string { return "stale-account" },
+		logger:           env.a.logger,
+		loginTimeout:     500 * time.Millisecond,
+		pollInterval:     5 * time.Millisecond,
 	}
 	rr := env.serve(http.MethodPost, "/llm/providers/codex/connect",
 		fmt.Sprintf(`{"onboarding_revision":%d}`, state.Revision))
@@ -762,11 +780,53 @@ func TestAppOnboardingProviderDoesNotCancelUnrelatedConnect(t *testing.T) {
 	}
 }
 
+func TestAppOnboardingProviderDoesNotCancelSameKindNormalConnect(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	job := newManualConnectJob("codex", cancel)
+	connectMgr = &connectManager{job: job, jobKind: "codex"}
+	t.Cleanup(func() { cancel(); close(job.done) })
+
+	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
+		t.Fatal("onboarding mutation canceled a normal same-kind Connect")
+	}
+}
+
+func TestAppOnboardingProviderRejectsMismatchedConnectContextWithoutCancel(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 4,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	job := newManualConnectJob("codex", cancel)
+	job.onboarding = &connectOnboardingContext{Revision: 3, Kind: "codex"}
+	connectMgr = &connectManager{job: job, jobKind: "codex"}
+	t.Cleanup(func() { cancel(); close(job.done) })
+	before := env.state(t)
+
+	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":4,"kind":"claude-code"}`)
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT")
+	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
+		t.Fatal("mismatched onboarding Connect was canceled")
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("mismatched context changed state: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestAppOnboardingCanceledConnectCannotCompleteLate(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
 	ctx, cancel := context.WithCancel(context.Background())
 	job := newManualConnectJob("codex", cancel)
+	job.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
 	lateAdvanced := make(chan bool, 1)
 	connectMgr = &connectManager{job: job, jobKind: "codex"}
 	go func() {
@@ -800,6 +860,7 @@ func TestAppOnboardingConnectCleanupTimeoutAndRequestCancelPreserveState(t *test
 			env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
 			jobCtx, cancelJob := context.WithCancel(context.Background())
 			job := newManualConnectJob("codex", cancelJob)
+			job.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
 			connectMgr = &connectManager{job: job, jobKind: "codex"}
 			originalWait := appOnboardingConnectCancelWait
 			appOnboardingConnectCancelWait = 40 * time.Millisecond
@@ -834,6 +895,7 @@ func TestAppOnboardingProviderRechecksRevisionAfterConnectCleanup(t *testing.T) 
 	env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
 	ctx, cancel := context.WithCancel(context.Background())
 	job := newManualConnectJob("codex", cancel)
+	job.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
 	connectMgr = &connectManager{job: job, jobKind: "codex"}
 	go func() {
 		<-ctx.Done()

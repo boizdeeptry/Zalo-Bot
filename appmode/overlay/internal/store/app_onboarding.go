@@ -53,6 +53,44 @@ func IsOnboardingProviderKind(kind string) bool {
 	return kind == "codex" || kind == "claude-code"
 }
 
+// EnsureOnboardingProviderForKind creates the exact subscription Provider needed by onboarding
+// as disabled staging. An existing exact Provider is accepted without changing its enabled state.
+func (s *Store) EnsureOnboardingProviderForKind(kind string) error {
+	if !IsOnboardingProviderKind(kind) {
+		return fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
+	}
+	name := subscriptionDisplayName[kind]
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin onboarding Provider ensure: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var existingKind string
+	err = tx.QueryRow(`SELECT kind FROM llm_providers WHERE id = ?`, kind).Scan(&existingKind)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
+VALUES (?, ?, ?, 0)`, kind, name, kind); err != nil {
+			return fmt.Errorf("insert disabled onboarding Provider %q: %w", kind, err)
+		}
+	case err != nil:
+		return fmt.Errorf("read onboarding Provider %q: %w", kind, err)
+	case existingKind != kind:
+		return fmt.Errorf(
+			"%w: Provider %q has kind %q instead of %q",
+			ErrOnboardingInvalidStagingOwnership,
+			kind,
+			existingKind,
+			kind,
+		)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit onboarding Provider ensure: %w", err)
+	}
+	return nil
+}
+
 // OnboardingState returns the required singleton state. A missing row is an
 // explicit error so callers cannot mistake a damaged database for completion.
 func (s *Store) OnboardingState() (OnboardingState, error) {

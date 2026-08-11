@@ -142,6 +142,47 @@ VALUES ('codex', 'Codex', 'codex', 0)`); err != nil {
 	}
 }
 
+func TestEnsureOnboardingProviderForKindCreatesDisabledAndPreservesExistingState(t *testing.T) {
+	t.Run("fresh provider is disabled", func(t *testing.T) {
+		st := openAppStoreForTest(t)
+		if err := st.EnsureOnboardingProviderForKind("codex"); err != nil {
+			t.Fatalf("EnsureOnboardingProviderForKind() = %v", err)
+		}
+		var kind string
+		var enabled int
+		if err := st.db.QueryRow(
+			`SELECT kind, enabled FROM llm_providers WHERE id = 'codex'`,
+		).Scan(&kind, &enabled); err != nil {
+			t.Fatal(err)
+		}
+		if kind != "codex" || enabled != 0 {
+			t.Fatalf("Provider kind=%q enabled=%d; want codex/0", kind, enabled)
+		}
+	})
+
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing_enabled_%t_is_unchanged", enabled), func(t *testing.T) {
+			st := openAppStoreForTest(t)
+			if _, err := st.db.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
+VALUES ('codex', 'Existing', 'codex', ?)`, boolInt(enabled)); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.EnsureOnboardingProviderForKind("codex"); err != nil {
+				t.Fatalf("EnsureOnboardingProviderForKind() = %v", err)
+			}
+			var got int
+			if err := st.db.QueryRow(
+				`SELECT enabled FROM llm_providers WHERE id = 'codex'`,
+			).Scan(&got); err != nil {
+				t.Fatal(err)
+			}
+			if got != boolInt(enabled) {
+				t.Fatalf("existing Provider enabled=%d; want %d", got, boolInt(enabled))
+			}
+		})
+	}
+}
+
 func TestBindOnboardingAccountRejectsInvalidStateAndRollsBack(t *testing.T) {
 	tests := []struct {
 		name            string

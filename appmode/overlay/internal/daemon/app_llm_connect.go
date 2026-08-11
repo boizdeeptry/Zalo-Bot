@@ -78,11 +78,15 @@ type connectRunner interface {
 // (migration seeded claude_code → claude-code).
 var subscriptionKinds = map[string]bool{"codex": true, "claude-code": true}
 
-var errConnectBusy = errors.New("connect: đang có phiên kết nối khác")
+var (
+	errConnectBusy           = errors.New("connect: đang có phiên kết nối khác")
+	errConnectCleanupPending = errors.New("connect: cleanup is still pending")
+)
 
 const (
-	connectLoginTimeout = 5 * time.Minute
-	connectPollInterval = 2 * time.Second
+	connectLoginTimeout         = 5 * time.Minute
+	connectPollInterval         = 2 * time.Second
+	connectCleanupFailedMessage = "không dọn được dữ liệu kết nối; hãy thử lại"
 )
 
 type connectPollTicker struct {
@@ -98,15 +102,16 @@ func startConnectPollTicker(interval time.Duration) connectPollTicker {
 // connectJob holds one in-flight connect attempt. configDir/accountID/label are internal (not
 // in connectState). All state access goes through guarded helpers/snapshot under the mutex.
 type connectJob struct {
-	mu         sync.Mutex
-	state      connectState
-	accountID  string
-	configDir  string
-	label      string
-	onboarding *connectOnboardingContext
-	cancel     context.CancelFunc
-	done       chan struct{}
-	claimed    bool // success owns persistence; protected by mu and never exposed to the Portal
+	mu             sync.Mutex
+	state          connectState
+	accountID      string
+	configDir      string
+	label          string
+	onboarding     *connectOnboardingContext
+	cancel         context.CancelFunc
+	done           chan struct{}
+	claimed        bool // success owns persistence; protected by mu and never exposed to the Portal
+	cleanupPending bool
 }
 
 func (j *connectJob) snapshot() connectState { j.mu.Lock(); defer j.mu.Unlock(); return j.state }
@@ -183,24 +188,48 @@ func (j *connectJob) failIfActive(userMsg string) bool {
 	return true
 }
 
+func (j *connectJob) markCleanupFailed() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.cleanupPending = true
+	j.state.Phase = phaseError
+	j.state.Error = connectCleanupFailedMessage
+	j.state.ProviderID = ""
+	j.state.AccountID = ""
+}
+
+func (j *connectJob) cleanupIsPending() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cleanupPending
+}
+
+func (j *connectJob) markCleanupComplete() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.cleanupPending = false
+}
+
 // connectManager runs ONE connect job at a time. Dependencies are injected (not the store) so
 // the state machine tests without a DB: ensure creates the provider row, createAccount records
 // the account, dataDir anchors the per-account config dir, newID mints the account id.
 type connectManager struct {
-	mu             sync.Mutex
-	runner         connectRunner
-	ensure         func(kind string) error
-	ensureModels   func(kind string) error
-	createAccount  func(store.LLMAccount) error
-	bindOnboarding func(expectedRevision int64, kind string, account store.LLMAccount) (store.OnboardingState, error)
-	dataDir        string
-	newID          func() string
-	logger         *slog.Logger
-	job            *connectJob
-	jobKind        string
-	loginTimeout   time.Duration // 0 → connectLoginTimeout (5m default); test seam
-	pollInterval   time.Duration // 0 → connectPollInterval (2s default); test seam
-	newPollTicker  func(time.Duration) connectPollTicker
+	mu               sync.Mutex
+	runner           connectRunner
+	ensure           func(kind string) error
+	ensureOnboarding func(kind string) error
+	ensureModels     func(kind string) error
+	createAccount    func(store.LLMAccount) error
+	bindOnboarding   func(expectedRevision int64, kind string, account store.LLMAccount) (store.OnboardingState, error)
+	dataDir          string
+	newID            func() string
+	logger           *slog.Logger
+	job              *connectJob
+	jobKind          string
+	loginTimeout     time.Duration // 0 → connectLoginTimeout (5m default); test seam
+	pollInterval     time.Duration // 0 → connectPollInterval (2s default); test seam
+	newPollTicker    func(time.Duration) connectPollTicker
+	cleanupConfigDir func(path string) error
 }
 
 func (m *connectManager) start(
@@ -231,6 +260,13 @@ func (m *connectManager) start(
 			}
 			m.mu.Unlock()
 			return connectState{}, errConnectBusy
+		}
+		if m.job.cleanupIsPending() {
+			if err := m.cleanupJobConfig(m.job, m.jobKind); err != nil {
+				cur = m.job.snapshot()
+				m.mu.Unlock()
+				return cur, err
+			}
 		}
 	}
 	id := m.newID()
@@ -282,9 +318,36 @@ func (m *connectManager) cancel(kind string) bool {
 
 func (m *connectManager) fail(job *connectJob, kind, userMsg string, cause error) {
 	if m.logger != nil {
-		m.logger.Error("connect failed", "kind", kind, "phase", job.snapshot().Phase, "err", cause)
+		m.logger.Error(
+			"connect failed",
+			"kind", kind,
+			"phase", job.snapshot().Phase,
+			"errorType", fmt.Sprintf("%T", cause),
+		)
 	}
 	job.failIfActive(userMsg)
+}
+
+// cleanupJobConfig performs one bounded cleanup attempt. A failed attempt remains owned by the
+// completed job, and start/provider-mutation retries it before admitting any replacement work.
+func (m *connectManager) cleanupJobConfig(job *connectJob, kind string) error {
+	remove := m.cleanupConfigDir
+	if remove == nil {
+		remove = os.RemoveAll
+	}
+	if err := remove(job.configDir); err != nil {
+		job.markCleanupFailed()
+		if m.logger != nil {
+			m.logger.Error(
+				"connect cleanup failed",
+				"kind", kind,
+				"errorType", fmt.Sprintf("%T", err),
+			)
+		}
+		return errConnectCleanupPending
+	}
+	job.markCleanupComplete()
+	return nil
 }
 
 func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) {
@@ -293,18 +356,14 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	// remaining process, pipe, or filesystem cleanup.
 	defer close(job.done)
 	// start() created job.configDir before OAuth ran. Only the success path (connected=true) writes
-	// auth.json into it and records an account row; every terminal non-success (detect/install/login
-	// fail, timeout, cancel) leaves it empty and unreferenced. Remove it on non-success so failed
-	// attempts don't orphan empty dirs. Deferred FIRST so it runs LAST (after job.cancel below), giving
-	// the login process its ctx-cancel kill before we drop its dir. Best-effort: a failed remove logs.
+	// auth.json into it and records an account row. Deferred FIRST so cleanup runs after process
+	// cancellation/join. Failed removal remains owned by this job and is retried before replacement.
 	connected := false
 	defer func() {
 		if connected {
 			return
 		}
-		if err := os.RemoveAll(job.configDir); err != nil && m.logger != nil {
-			m.logger.Warn("connect: remove orphan config dir", "kind", kind, "dir", job.configDir, "err", err)
-		}
+		_ = m.cleanupJobConfig(job, kind)
 	}()
 	var loginWaitDone <-chan error
 	defer func() {
@@ -425,9 +484,24 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 			if !job.claimSuccess() {
 				return
 			}
-			if err := m.ensure(kind); err != nil {
-				m.fail(job, kind, "không lưu được kết nối", err)
-				return
+			if job.onboarding == nil {
+				if m.ensure == nil {
+					m.fail(job, kind, "không lưu được kết nối", errors.New("normal Provider ensure is unavailable"))
+					return
+				}
+				if err := m.ensure(kind); err != nil {
+					m.fail(job, kind, "không lưu được kết nối", err)
+					return
+				}
+			} else {
+				if m.ensureOnboarding == nil {
+					m.fail(job, kind, "không lưu được kết nối", errors.New("onboarding Provider ensure is unavailable"))
+					return
+				}
+				if err := m.ensureOnboarding(kind); err != nil {
+					m.fail(job, kind, "không lưu được kết nối", err)
+					return
+				}
 			}
 			if m.ensureModels != nil {
 				if err := m.ensureModels(kind); err != nil {
@@ -496,8 +570,9 @@ var connectMgr *connectManager
 
 func (a *api) newConnectManager() *connectManager {
 	return &connectManager{
-		runner: newDefaultConnectRunner(a.logger),
-		ensure: a.st.EnsureProviderForKind,
+		runner:           newDefaultConnectRunner(a.logger),
+		ensure:           a.st.EnsureProviderForKind,
+		ensureOnboarding: a.st.EnsureOnboardingProviderForKind,
 		ensureModels: func(k string) error {
 			models := cliProviderModels(a.st, k, k)
 			return a.st.ReplaceLLMModels(k, store.LLMModelDiscovered, models)
@@ -1002,6 +1077,11 @@ func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 		// the other is mid-connect returns errConnectBusy (a second POST of the SAME kind returns
 		// the current state instead; unsupported kinds are rejected 400 above).
 		a.writeLLMErr(w, http.StatusConflict, "CONNECT_BUSY", "đang có phiên kết nối khác", nil)
+		return
+	}
+	if errors.Is(err, errConnectCleanupPending) {
+		a.writeLLMErr(w, http.StatusInternalServerError, "CONNECT_CLEANUP_FAILED",
+			connectCleanupFailedMessage, nil)
 		return
 	}
 	if err != nil {

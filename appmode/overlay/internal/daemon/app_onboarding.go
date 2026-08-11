@@ -286,9 +286,9 @@ func preflightOnboardingRestart(state store.OnboardingState) error {
 	return nil
 }
 
-// cancelOnboardingConnect cancels only the live job owned by the state's selected kind. Waiting
-// for done is essential: connectJob closes it only after child/process/config cleanup. Returning
-// before that point would race the following directory ownership check and Store transition.
+// cancelOnboardingConnect cancels only the live job owned by the exact selected kind/revision.
+// Normal Connect and other onboarding contexts are unrelated. Waiting for done is essential:
+// connectJob closes it only after child/process/config cleanup.
 func (a *api) cancelOnboardingConnect(w http.ResponseWriter, ctx context.Context, state store.OnboardingState) bool {
 	if state.ProviderKind == "" || connectMgr == nil {
 		return true
@@ -296,18 +296,40 @@ func (a *api) cancelOnboardingConnect(w http.ResponseWriter, ctx context.Context
 	manager := connectMgr
 	manager.mu.Lock()
 	job := manager.job
-	matching := job != nil && manager.jobKind == state.ProviderKind
-	if matching {
-		select {
-		case <-job.done:
-			matching = false
-		default:
-		}
-	}
-	manager.mu.Unlock()
-	if !matching {
+	if job == nil || manager.jobKind != state.ProviderKind {
+		manager.mu.Unlock()
 		return true
 	}
+	expected := &connectOnboardingContext{Revision: state.Revision, Kind: state.ProviderKind}
+	finished := false
+	select {
+	case <-job.done:
+		finished = true
+	default:
+	}
+	if finished && !job.cleanupIsPending() {
+		manager.mu.Unlock()
+		return true
+	}
+	if job.onboarding == nil {
+		manager.mu.Unlock()
+		return true
+	}
+	if !equalConnectOnboardingContext(job.onboarding, expected) {
+		manager.mu.Unlock()
+		a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
+		return false
+	}
+	if finished {
+		err := manager.cleanupJobConfig(job, state.ProviderKind)
+		manager.mu.Unlock()
+		if err != nil {
+			a.writeOnboardingCleanupFailed(w, err)
+			return false
+		}
+		return true
+	}
+	manager.mu.Unlock()
 	if ctx.Err() != nil {
 		a.writeOnboardingCleanupFailed(w, ctx.Err())
 		return false

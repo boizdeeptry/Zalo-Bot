@@ -188,7 +188,7 @@ func (f *fakeRunner) accountLabel(_, _ string) string        { return f.acctLabe
 func newTestManager(t *testing.T, r connectRunner, ensure func(string) error, create func(store.LLMAccount) error) *connectManager {
 	t.Helper()
 	return &connectManager{
-		runner: r, ensure: ensure, createAccount: create,
+		runner: r, ensure: ensure, ensureOnboarding: ensure, createAccount: create,
 		dataDir: t.TempDir(), newID: func() string { return "acc1" },
 		logger:       slog.New(slog.DiscardHandler),
 		loginTimeout: 200 * time.Millisecond,
@@ -339,6 +339,101 @@ func TestConnectOnboardingPersistenceFailuresLeaveNoIDsOrConfigDirectory(t *test
 			if _, err := os.Stat(filepath.Join(m.dataDir, "accounts", "codex", "acc1")); !os.IsNotExist(err) {
 				t.Fatalf("failed persistence left config dir: %v", err)
 			}
+		})
+	}
+}
+
+func TestConnectOnboardingFailureCleanupRetriesWithoutLeakingPaths(t *testing.T) {
+	tests := []struct {
+		name     string
+		modelErr error
+		bindErr  error
+		wantBind int
+	}{
+		{name: "model", modelErr: errors.New("MODEL_SECRET D:/private/model-cache"), wantBind: 0},
+		{name: "bind", bindErr: errors.New("BIND_SECRET D:/private/account"), wantBind: 1},
+		{name: "bind CAS", bindErr: store.ErrOnboardingConflict, wantBind: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &fakeRunner{installed: true, auth: authLoggedIn}
+			var logs strings.Builder
+			idCalls := 0
+			bindCalls := 0
+			cleanupCalls := 0
+			cleanupFails := true
+			m := newTestManager(t, r, func(string) error { return nil }, func(store.LLMAccount) error {
+				t.Error("onboarding failure called normal createAccount")
+				return nil
+			})
+			m.logger = slog.New(slog.NewTextHandler(&logs, nil))
+			m.ensureOnboarding = func(string) error { return nil }
+			m.ensureModels = func(string) error { return tt.modelErr }
+			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+				bindCalls++
+				return store.OnboardingState{}, tt.bindErr
+			}
+			m.newID = func() string {
+				idCalls++
+				return fmt.Sprintf("cleanup-account-%d", idCalls)
+			}
+			m.cleanupConfigDir = func(path string) error {
+				cleanupCalls++
+				if cleanupFails {
+					return errors.New("REMOVE_SECRET " + path)
+				}
+				return os.RemoveAll(path)
+			}
+			ctx := &connectOnboardingContext{Revision: 6, Kind: "codex"}
+			if _, err := m.start("codex", "cleanup", ctx); err != nil {
+				t.Fatal(err)
+			}
+			waitConnectJobDone(t, m)
+			st, _ := m.status("codex")
+			if st.Phase != phaseError || st.Error != connectCleanupFailedMessage ||
+				st.ProviderID != "" || st.AccountID != "" {
+				t.Fatalf("cleanup-failed terminal=%+v", st)
+			}
+			if bindCalls != tt.wantBind || cleanupCalls != 1 || idCalls != 1 {
+				t.Fatalf("bind=%d cleanup=%d ids=%d", bindCalls, cleanupCalls, idCalls)
+			}
+			firstDir := filepath.Join(m.dataDir, "accounts", "codex", "cleanup-account-1")
+			if _, err := os.Stat(firstDir); err != nil {
+				t.Fatalf("failed removal released directory ownership: %v", err)
+			}
+			serialized, err := json.Marshal(st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{firstDir, "D:/private", "MODEL_SECRET", "BIND_SECRET", "REMOVE_SECRET"} {
+				if strings.Contains(string(serialized), forbidden) || strings.Contains(logs.String(), forbidden) {
+					t.Fatalf("cleanup failure leaked %q: state=%s logs=%s", forbidden, serialized, logs.String())
+				}
+			}
+
+			if _, err := m.start("codex", "blocked retry", ctx); !errors.Is(err, errConnectCleanupPending) {
+				t.Fatalf("start while cleanup still fails = %v; want errConnectCleanupPending", err)
+			}
+			if cleanupCalls != 2 || idCalls != 1 {
+				t.Fatalf("blocked retry cleanup=%d ids=%d; want 2/1", cleanupCalls, idCalls)
+			}
+
+			cleanupFails = false
+			r.auth = authLoggedOut
+			if _, err := m.start("codex", "successful cleanup retry", ctx); err != nil {
+				t.Fatalf("start after cleanup became possible = %v", err)
+			}
+			if cleanupCalls != 3 || idCalls != 2 {
+				t.Fatalf("successful retry cleanup=%d ids=%d; want 3/2", cleanupCalls, idCalls)
+			}
+			if _, err := os.Stat(firstDir); !os.IsNotExist(err) {
+				t.Fatalf("successful retry left old owned directory: %v", err)
+			}
+			waitPhase(t, m, "codex", phasePolling)
+			if !m.cancel("codex") {
+				t.Fatal("cancel cleanup retry job returned false")
+			}
+			waitConnectJobDone(t, m)
 		})
 	}
 }
@@ -1575,6 +1670,41 @@ func TestConnectEndpoints(t *testing.T) {
 	a.handleLLMConnectCancel(rec4, req4)
 	if rec4.Code != http.StatusOK {
 		t.Errorf("DELETE connect = %d; want 200", rec4.Code)
+	}
+}
+
+func TestConnectCleanupPendingEndpointDoesNotLeakPathOrRemoveError(t *testing.T) {
+	a := newAppRouteAPI(t)
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	a.logger = logger
+	done := make(chan struct{})
+	close(done)
+	const privatePath = `D:\private\credentials\auth`
+	job := &connectJob{
+		state:     connectState{Kind: "codex", Phase: phaseError, Error: connectCleanupFailedMessage},
+		configDir: privatePath, done: done, cleanupPending: true,
+	}
+	connectMgr = &connectManager{
+		job: job, jobKind: "codex", logger: logger,
+		cleanupConfigDir: func(string) error { return errors.New("REMOVE_SECRET " + privatePath) },
+	}
+	t.Cleanup(func() { connectMgr = nil })
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/llm/providers/codex/connect", nil)
+	req.SetPathValue("kind", "codex")
+	a.handleLLMConnectStart(rec, req)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "CONNECT_CLEANUP_FAILED") {
+		t.Fatalf("cleanup-pending response status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, forbidden := range []string{privatePath, "REMOVE_SECRET"} {
+		if strings.Contains(rec.Body.String(), forbidden) || strings.Contains(logs.String(), forbidden) {
+			t.Fatalf("cleanup endpoint leaked %q: body=%s logs=%s", forbidden, rec.Body.String(), logs.String())
+		}
+	}
+	if !job.cleanupIsPending() {
+		t.Fatal("failed endpoint retry released cleanup ownership")
 	}
 }
 
