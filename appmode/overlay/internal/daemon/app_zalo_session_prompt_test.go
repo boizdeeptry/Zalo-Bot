@@ -34,6 +34,36 @@ func TestAppZaloBootstrapPromptKeepsExistingContract(t *testing.T) {
 	}
 }
 
+func TestAppZaloDisplayNameIdentityPromptIsExactAndTrimmed(t *testing.T) {
+	const want = "Tên hiển thị bắt buộc của bạn: Bé Mi. Khi tự giới thiệu, phải dùng đúng tên này.\n"
+	if got := appAgentIdentityPrompt("  Bé Mi\r\n"); got != want {
+		t.Fatalf("appAgentIdentityPrompt() = %q; want %q", got, want)
+	}
+	if got := appAgentIdentityPrompt(" \r\n\t "); got != "" {
+		t.Fatalf("empty normalized display name emitted %q", got)
+	}
+}
+
+func TestAppZaloDisplayNameBootstrapPrecedesPersonaExactlyOnce(t *testing.T) {
+	personaPath := filepath.Join(t.TempDir(), "persona.md")
+	if err := os.WriteFile(personaPath, []byte("DISPLAY-NAME-PERSONA-MARKER"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt := buildAppZaloIdentityBootstrapPrompt(
+		zaloConfig{PersonaPath: personaPath}, "Bé Mi", "question", nil, nil,
+	)
+	identity := appAgentIdentityPrompt("Bé Mi")
+	identityAt := strings.Index(prompt, identity)
+	personaAt := strings.Index(prompt, "DISPLAY-NAME-PERSONA-MARKER")
+	if identityAt < 0 || personaAt < 0 || identityAt >= personaAt {
+		t.Fatalf("identity/persona order is wrong: identity=%d persona=%d", identityAt, personaAt)
+	}
+	if got := strings.Count(prompt, identity); got != 1 {
+		t.Fatalf("identity appears %d times; want exactly once", got)
+	}
+}
+
 func TestAppZaloMemoryContractAppearsOnceInBootstrapAndDeltaPrompts(t *testing.T) {
 	prompts := map[string]string{
 		"bootstrap": buildAppZaloBootstrapPrompt(zaloConfig{}, "cau hoi bootstrap", nil, nil),
@@ -647,7 +677,10 @@ func TestAppZaloPromptFingerprintTracksPromptMeaning(t *testing.T) {
 	if baseline == "" || baseline != appZaloPromptFingerprint(base, threadID) {
 		t.Fatalf("fingerprint khong on dinh: %q", baseline)
 	}
-	want := appZaloTestFingerprint("zalo-session-prompt/v1", base, "persona-v1", "roster-v1", "overlay-v1")
+	want := appZaloTestFingerprint(
+		"zalo-session-prompt/v1", "zalo-agent-display-name/v1", base, "",
+		"persona-v1", "roster-v1", "overlay-v1",
+	)
 	if baseline != want {
 		t.Fatalf("fingerprint = %q; muon SHA-256 cua cac field co version va do dai %q", baseline, want)
 	}
@@ -702,6 +735,24 @@ func TestAppZaloPromptFingerprintTracksPromptMeaning(t *testing.T) {
 		Model: base.Model, PromptFingerprint: baseline,
 	}, base.Model, ownerFingerprint) {
 		t.Error("session khong xoay khi OwnerUID trong authorization contract thay doi")
+	}
+}
+
+func TestAppZaloPromptFingerprintTracksNormalizedDisplayName(t *testing.T) {
+	base := zaloConfig{Model: "sonnet", CiteMode: "soft"}
+	withoutName := appZaloPromptFingerprint(base, "thread")
+	withName := appZaloPromptFingerprint(base, "thread", "Bé Mi")
+	if withName == withoutName {
+		t.Fatal("fingerprint did not change when only structured display name changed")
+	}
+	if got := appZaloPromptFingerprint(base, "thread", " \r\nBé Mi\t "); got != withName {
+		t.Fatalf("trimmed display name fingerprint = %q; want %q", got, withName)
+	}
+	want := appZaloTestFingerprint(
+		"zalo-session-prompt/v1", "zalo-agent-display-name/v1", base, "Bé Mi", "", "", "",
+	)
+	if withName != want {
+		t.Fatalf("display-name fingerprint = %q; want framed/versioned digest %q", withName, want)
 	}
 }
 
@@ -774,10 +825,16 @@ func appZaloRewritePromptFixture(t *testing.T, path, body string) {
 	}
 }
 
-func appZaloTestFingerprint(version string, zc zaloConfig, persona, roster, overlay string) string {
+func appZaloTestFingerprint(
+	version, displayNameVersion string,
+	zc zaloConfig,
+	displayName, persona, roster, overlay string,
+) string {
 	h := sha256.New()
 	appZaloTestWriteFingerprintField(h, "contract_version", version)
 	appZaloTestWriteFingerprintField(h, "memory_contract_version", appZaloMemoryContractVersion)
+	appZaloTestWriteFingerprintField(h, "display_name_version", displayNameVersion)
+	appZaloTestWriteFingerprintField(h, "display_name", displayName)
 	appZaloTestWriteFingerprintField(h, "model", zc.Model)
 	appZaloTestWriteFingerprintField(h, "cite_mode", zc.CiteMode)
 	appZaloTestWriteFingerprintField(h, "owner_uid", zc.OwnerUID)

@@ -22,6 +22,7 @@ const (
 	// prompt envelope instead of allowing it to grow with transcript history.
 	appZaloMaxDeltaHistoryBytes  = (16 << 10) - len(appZaloMemoryContract) - 2
 	appZaloPromptContractVersion = "zalo-session-prompt/v1"
+	appZaloDisplayNameVersion    = "zalo-agent-display-name/v1"
 
 	appZaloConversationTag        = "untrusted_conversation_jsonl"
 	appZaloFilesTag               = "untrusted_customer_files_jsonl"
@@ -84,10 +85,20 @@ type appZaloFileRecord struct {
 
 // appZaloPromptFingerprint identifies the stable inputs whose meaning is held
 // in a Claude transcript. A changed value requires a fresh bootstrap session.
-func appZaloPromptFingerprint(zc zaloConfig, threadID string) string {
+func appZaloPromptFingerprint(zc zaloConfig, threadID string, displayNames ...string) string {
+	displayName := ""
+	if len(displayNames) > 0 {
+		displayName = appZaloNormalizeAgentDisplayName(displayNames[0])
+	}
+	return appZaloPromptFingerprintNormalized(zc, threadID, displayName)
+}
+
+func appZaloPromptFingerprintNormalized(zc zaloConfig, threadID, displayName string) string {
 	h := sha256.New()
 	appZaloWriteFingerprintField(h, "contract_version", appZaloPromptContractVersion)
 	appZaloWriteFingerprintField(h, "memory_contract_version", appZaloMemoryContractVersion)
+	appZaloWriteFingerprintField(h, "display_name_version", appZaloDisplayNameVersion)
+	appZaloWriteFingerprintField(h, "display_name", displayName)
 	appZaloWriteFingerprintField(h, "model", zc.Model)
 	appZaloWriteFingerprintField(h, "cite_mode", zc.CiteMode)
 	appZaloWriteFingerprintField(h, "owner_uid", zc.OwnerUID)
@@ -110,9 +121,61 @@ func buildAppZaloBootstrapPrompt(
 	found []passage,
 	files ...ipc.ZaloAttachment,
 ) string {
+	return buildAppZaloIdentityBootstrapPrompt(zc, "", question, history, found, files...)
+}
+
+func buildAppZaloIdentityBootstrapPrompt(
+	zc zaloConfig,
+	displayName string,
+	question string,
+	history []ipc.ZaloMessage,
+	found []passage,
+	files ...ipc.ZaloAttachment,
+) string {
 	return appZaloAppendMemoryContract(
-		buildConsultPrompt(zc, question, history, found, files...),
+		buildAppZaloIdentityConsultPrompt(zc, displayName, question, history, found, files...),
 	)
+}
+
+func buildAppZaloIdentityConsultPrompt(
+	zc zaloConfig,
+	displayName string,
+	question string,
+	history []ipc.ZaloMessage,
+	found []passage,
+	files ...ipc.ZaloAttachment,
+) string {
+	return buildAppZaloNormalizedIdentityConsultPrompt(
+		zc, appZaloNormalizeAgentDisplayName(displayName), question, history, found, files...,
+	)
+}
+
+func buildAppZaloNormalizedIdentityConsultPrompt(
+	zc zaloConfig,
+	displayName string,
+	question string,
+	history []ipc.ZaloMessage,
+	found []passage,
+	files ...ipc.ZaloAttachment,
+) string {
+	return appAgentIdentityPromptNormalized(displayName) +
+		buildConsultPrompt(zc, question, history, found, files...)
+}
+
+func appAgentIdentityPrompt(displayName string) string {
+	return appAgentIdentityPromptNormalized(appZaloNormalizeAgentDisplayName(displayName))
+}
+
+func appAgentIdentityPromptNormalized(displayName string) string {
+	if displayName == "" {
+		return ""
+	}
+	return "Tên hiển thị bắt buộc của bạn: " + displayName +
+		". Khi tự giới thiệu, phải dùng đúng tên này.\n"
+}
+
+func appZaloNormalizeAgentDisplayName(displayName string) string {
+	return strings.TrimSpace(displayName)
 }
 
 func appZaloAppendMemoryContract(prompt string) string {
