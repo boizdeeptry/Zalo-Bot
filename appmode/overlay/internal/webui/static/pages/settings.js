@@ -9,10 +9,6 @@ import {
 } from "./onboarding-contract.js";
 
 const SAFE_SETTINGS_ERROR = "Không thể đọc trạng thái thiết lập an toàn. Vui lòng thử lại.";
-const CONFLICT_CODES = new Set([
-  "ONBOARDING_REVISION_CONFLICT",
-  "ONBOARDING_PHASE_INVALID",
-]);
 
 function isCompletedStatus(status) {
   return status?.phase === "completed"
@@ -87,8 +83,8 @@ export function createSettingsController({
   let host = null;
   let root = null;
   let status = null;
-  let activeController = null;
-  let generation = 0;
+  let statusController = null;
+  let statusGeneration = 0;
   let disposed = false;
   let restartBusy = false;
   let handoffDone = false;
@@ -112,19 +108,19 @@ export function createSettingsController({
     root.replaceChildren(...children);
   }
 
-  function beginOperation() {
-    generation += 1;
-    activeController?.abort();
-    activeController = new AbortController();
-    return { controller: activeController, run: generation };
+  function beginStatusOperation() {
+    statusGeneration += 1;
+    statusController?.abort();
+    statusController = new AbortController();
+    return { controller: statusController, run: statusGeneration };
   }
 
   function owns(run) {
-    return !disposed && root && run === generation;
+    return !disposed && root && run === statusGeneration;
   }
 
   function release(run, controller) {
-    if (run === generation && activeController === controller) activeController = null;
+    if (run === statusGeneration && statusController === controller) statusController = null;
   }
 
   function renderLoading() {
@@ -203,25 +199,26 @@ export function createSettingsController({
     );
   }
 
-  function handoffRestarted(restarted) {
-    if (disposed || handoffDone) return false;
+  function notifyRestartOwner(...args) {
+    if (handoffDone) return false;
     handoffDone = true;
     restartBusy = false;
-    onRestarted(restarted);
+    try {
+      Promise.resolve(onRestarted(...args)).catch(() => {});
+    } catch {
+      // The restart settlement is still consumed exactly once.
+    }
     return true;
   }
 
   async function retryStatus() {
     if (disposed || !root) return false;
-    const priorRevision = isCompletedStatus(status) ? status.revision : 0;
-    const { controller, run } = beginOperation();
+    const { controller, run } = beginStatusOperation();
     restartBusy = false;
     renderLoading();
     try {
       const response = await service.status(controller.signal);
       if (!owns(run)) return false;
-      const restarted = normalizeRestartStatus(response, priorRevision);
-      if (restarted) return handoffRestarted(restarted);
       const normalized = normalizeStatus(projectStatus(response));
       if (!isCompletedStatus(normalized)) {
         status = null;
@@ -244,27 +241,18 @@ export function createSettingsController({
   async function confirmRestart() {
     if (disposed || restartBusy || handoffDone || !isCompletedStatus(status)) return false;
     const expected = status;
-    const { controller, run } = beginOperation();
+    statusGeneration += 1;
+    statusController?.abort();
+    statusController = null;
+    const controller = new AbortController();
     restartBusy = true;
     renderConfirmation();
     try {
       const response = await service.restart(expected.revision, controller.signal);
-      if (!owns(run)) return false;
       const restarted = normalizeRestartStatus(response, expected.revision);
-      if (!restarted) {
-        restartBusy = false;
-        renderError();
-        return false;
-      }
-      return handoffRestarted(restarted);
-    } catch (error) {
-      if (!owns(run) || controller.signal.aborted || error?.name === "AbortError") return false;
-      restartBusy = false;
-      if (CONFLICT_CODES.has(error?.code) || error?.status === 409) return retryStatus();
-      renderError();
-      return false;
-    } finally {
-      release(run, controller);
+      return restarted ? notifyRestartOwner(restarted) : notifyRestartOwner();
+    } catch {
+      return notifyRestartOwner();
     }
   }
 
@@ -284,9 +272,9 @@ export function createSettingsController({
   function dispose() {
     if (disposed) return;
     disposed = true;
-    generation += 1;
-    activeController?.abort();
-    activeController = null;
+    statusGeneration += 1;
+    statusController?.abort();
+    statusController = null;
     clearListeners();
     root?.remove();
     root = null;

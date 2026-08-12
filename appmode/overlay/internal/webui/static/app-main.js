@@ -248,6 +248,7 @@ export function startApp({
   let activeDispose = () => {};
   let activeKind = "";
   let retryBinding = null;
+  let restartReconciliation = null;
 
   function clearRetryBinding() {
     if (!retryBinding) return;
@@ -269,20 +270,68 @@ export function startApp({
     if (!bodyHadGateClass) documentRef.body.classList.remove(GATE_CLASS);
   }
 
-  function replaceActive(kind, mount) {
-    const disposePrevious = activeDispose;
+  function isCurrent(run) {
+    return !disposed && run === generation;
+  }
+
+  function showFailure() {
+    hideShell();
+    renderRetry();
+    return false;
+  }
+
+  function disposeActive() {
+    try {
+      activeDispose();
+    } catch {
+      return false;
+    }
     activeDispose = () => {};
     activeKind = "";
+    return true;
+  }
+
+  function discardActive() {
     try {
-      disposePrevious();
+      activeDispose();
     } catch {
-      // Ownership is already cleared; a broken child disposer cannot revive that child.
+      // Application disposal is best-effort; no successor will be mounted.
     }
-    if (!mount) return null;
-    const mounted = mount();
+    activeDispose = () => {};
+    activeKind = "";
+  }
+
+  function disposeLateMount(mounted) {
+    try {
+      activeDisposer(mounted)();
+    } catch {
+      // A stale child cannot block the current owner.
+    }
+  }
+
+  function adoptActive(kind, mounted, run) {
+    if (!isCurrent(run)) {
+      disposeLateMount(mounted);
+      return false;
+    }
     activeDispose = activeDisposer(mounted);
     activeKind = kind;
-    return mounted;
+    return true;
+  }
+
+  function mountActive(kind, mount, run) {
+    let mounted;
+    try {
+      mounted = mount();
+    } catch {
+      return showFailure();
+    }
+    if (mounted && typeof mounted.then === "function") {
+      return Promise.resolve(mounted)
+        .then((resolved) => adoptActive(kind, resolved, run))
+        .catch(() => (isCurrent(run) ? showFailure() : false));
+    }
+    return adoptActive(kind, mounted, run);
   }
 
   function renderLoading() {
@@ -304,19 +353,18 @@ export function startApp({
   function beginGate() {
     activeController?.abort();
     activeController = null;
-    replaceActive("", null);
+    if (!disposeActive()) return showFailure();
     hideShell();
     renderLoading();
+    return true;
   }
 
   function failClosed() {
-    replaceActive("", null);
-    hideShell();
-    renderRetry();
-    return false;
+    if (!disposeActive()) return showFailure();
+    return showFailure();
   }
 
-  function mountWizard(status) {
+  function mountWizard(status, run) {
     hideShell();
     let handoffStarted = false;
     const onComplete = ({ destination } = {}) => {
@@ -326,44 +374,94 @@ export function startApp({
       handoffStarted = true;
       return loadAuthoritative(destination);
     };
-    replaceActive("wizard", () => mountOnboarding({
+    return mountActive("wizard", () => mountOnboarding({
       container: content,
       initialStatus: status,
       onComplete,
-    }));
-    return true;
+    }), run);
   }
 
-  function mountValidatedPortal(destination) {
+  function mountValidatedPortal(destination, run) {
     if (destination && Object.hasOwn(DESTINATION_HASHES, destination)) {
       windowRef.location.hash = DESTINATION_HASHES[destination];
     }
-    showShell();
     clearRetryBinding();
-    replaceActive("portal", () => mountPortal({
+    const mounted = mountActive("portal", () => mountPortal({
       document: documentRef,
       window: windowRef,
       onRestartOnboarding,
-    }));
-    return true;
+    }), run);
+    if (mounted && typeof mounted.then === "function") {
+      return mounted.then((ok) => {
+        if (ok && isCurrent(run)) showShell();
+        return ok;
+      });
+    }
+    if (mounted) showShell();
+    return mounted;
+  }
+
+  function transitionToStatus(status, destination, run) {
+    if (!isCurrent(run)) return false;
+    if (!disposeActive()) return showFailure();
+    if (status.required === false) return mountValidatedPortal(destination, run);
+    return mountWizard(status, run);
+  }
+
+  function reconcileRestart() {
+    if (restartReconciliation) return restartReconciliation;
+    if (disposed || activeKind !== "portal") return false;
+    const run = ++generation;
+    activeController?.abort();
+    const controller = new AbortController();
+    activeController = controller;
+    let statusRequest;
+    try {
+      statusRequest = loadStatus(controller.signal);
+    } catch (error) {
+      statusRequest = Promise.reject(error);
+    }
+    const reconciliation = Promise.resolve(statusRequest)
+      .then((response) => {
+        if (!isCurrent(run) || controller.signal.aborted) return false;
+        const status = normalizeStatus(projectStatus(response));
+        if (!status) return failClosed();
+        if (status.required === false) {
+          showShell();
+          clearRetryBinding();
+          return false;
+        }
+        return transitionToStatus(status, "", run);
+      })
+      .catch((error) => {
+        if (!isCurrent(run) || controller.signal.aborted || error?.name === "AbortError") {
+          return false;
+        }
+        return failClosed();
+      })
+      .finally(() => {
+        if (run === generation && activeController === controller) activeController = null;
+        if (restartReconciliation === reconciliation) restartReconciliation = null;
+      });
+    restartReconciliation = reconciliation;
+    return reconciliation;
   }
 
   function onRestartOnboarding(response) {
     if (disposed || activeKind !== "portal") return false;
+    if (arguments.length === 0) return reconcileRestart();
     const status = normalizedHostRestart(response);
     if (!status) return false;
-    generation += 1;
+    const run = ++generation;
     activeController?.abort();
     activeController = null;
-    replaceActive("", null);
-    hideShell();
-    return mountWizard(status);
+    return transitionToStatus(status, "", run);
   }
 
   function loadAuthoritative(destination = "") {
     if (disposed) return Promise.resolve(false);
     const run = ++generation;
-    beginGate();
+    if (!beginGate()) return Promise.resolve(false);
     const controller = new AbortController();
     activeController = controller;
     let statusRequest;
@@ -377,17 +475,15 @@ export function startApp({
         if (disposed || run !== generation || controller.signal.aborted) return false;
         const status = normalizeStatus(projectStatus(response));
         if (!status) {
-          renderRetry();
-          return false;
+          return showFailure();
         }
-        if (status.required === false) return mountValidatedPortal(destination);
-        return mountWizard(status);
+        return transitionToStatus(status, destination, run);
       })
       .catch((error) => {
         if (disposed || run !== generation || controller.signal.aborted || error?.name === "AbortError") {
           return false;
         }
-        return failClosed();
+        return showFailure();
       })
       .finally(() => {
         if (run === generation && activeController === controller) activeController = null;
@@ -408,7 +504,7 @@ export function startApp({
     activeController = null;
     clearRetryBinding();
     windowRef.removeEventListener("beforeunload", onBeforeUnload);
-    replaceActive("", null);
+    discardActive();
   }
 
   hideShell();

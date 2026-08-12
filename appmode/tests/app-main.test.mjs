@@ -73,6 +73,12 @@ function controllerHarness({ loadPage, pageContext, routeHost } = {}) {
   };
 }
 
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function retryButton(root) {
+  return find(root, (node) => node.tagName === "BUTTON" && text(node) === "Thử lại");
+}
+
 const completedStatus = (overrides = {}) => onboardingStatus("completed", overrides);
 const requiredStatus = (overrides = {}) => onboardingStatus("provider", overrides);
 const restartingStatus = (overrides = {}) => onboardingStatus("provider", {
@@ -83,7 +89,14 @@ const restartingStatus = (overrides = {}) => onboardingStatus("provider", {
   ...overrides,
 });
 
-function appHarness(t, { loadStatus, hash = "#agents" } = {}) {
+function appHarness(t, {
+  loadStatus,
+  hash = "#agents",
+  portalFactory,
+  wizardFactory,
+  portalDispose,
+  wizardDispose,
+} = {}) {
   const dom = installDOM();
   t.after(dom.restore);
   const toggle = document.createElement("button");
@@ -125,29 +138,37 @@ function appHarness(t, { loadStatus, hash = "#agents" } = {}) {
   const wizards = [];
   const startPortal = (context) => {
     events.push("mount:portal");
-    const portal = {
-      context,
-      disposeCalls: 0,
-      dispose() {
-        this.disposeCalls++;
-        events.push("dispose:portal");
-      },
+    const build = () => {
+      const portal = {
+        context,
+        disposeCalls: 0,
+        dispose() {
+          this.disposeCalls++;
+          events.push("dispose:portal");
+          return portalDispose?.(this);
+        },
+      };
+      portals.push(portal);
+      return portal;
     };
-    portals.push(portal);
-    return portal;
+    return portalFactory ? portalFactory(context, build) : build();
   };
   const mountOnboarding = (context) => {
     events.push("mount:wizard");
-    const wizard = {
-      context,
-      disposeCalls: 0,
-      dispose() {
-        this.disposeCalls++;
-        events.push("dispose:wizard");
-      },
+    const build = () => {
+      const wizard = {
+        context,
+        disposeCalls: 0,
+        dispose() {
+          this.disposeCalls++;
+          events.push("dispose:wizard");
+          return wizardDispose?.(this);
+        },
+      };
+      wizards.push(wizard);
+      return wizard;
     };
-    wizards.push(wizard);
-    return wizard;
+    return wizardFactory ? wizardFactory(context, build) : build();
   };
   const app = appMain.startApp({
     document,
@@ -335,6 +356,153 @@ test("validated Settings restart disposes Portal before mounting the wizard", as
   assert.equal(harness.rail.hidden, true);
   assert.equal(restart(restartingStatus({ provider_id: "codex", revision: 13 })), false);
   assert.equal(harness.wizards.length, 1);
+});
+
+test("an uncertain committed restart is reconciled once by the application owner", async (t) => {
+  await t.test("server committed the restart", async (subtest) => {
+    const gate = deferred();
+    let loads = 0;
+    const harness = appHarness(subtest, {
+      loadStatus: async () => ++loads === 1 ? completedStatus() : gate.promise,
+    });
+    await harness.app.ready;
+
+    const reconcile = harness.portals[0].context.onRestartOnboarding;
+    const first = reconcile();
+    const duplicate = reconcile();
+    assert.equal(loads, 2);
+    assert.equal(harness.portals[0].disposeCalls, 0,
+      "Portal stays owned until the authoritative status proves a restart");
+    gate.resolve(restartingStatus({ revision: 12 }));
+    assert.equal(await first, true);
+    assert.equal(await duplicate, true);
+    assert.deepEqual(harness.events, ["mount:portal", "dispose:portal", "mount:wizard"]);
+  });
+
+  await t.test("server did not commit the restart", async (subtest) => {
+    let loads = 0;
+    const harness = appHarness(subtest, {
+      loadStatus: async () => { loads++; return completedStatus({ revision: loads + 10 }); },
+    });
+    await harness.app.ready;
+
+    assert.equal(await harness.portals[0].context.onRestartOnboarding(), false);
+    assert.equal(loads, 2);
+    assert.deepEqual(harness.events, ["mount:portal"]);
+    assert.equal(harness.portals[0].disposeCalls, 0);
+    assert.equal(harness.rail.hidden, false);
+  });
+});
+
+test("a throwing Portal disposer blocks restart until Retry confirms cleanup", async (t) => {
+  let cleanupCalls = 0;
+  let loads = 0;
+  const harness = appHarness(t, {
+    loadStatus: async () => ++loads === 1 ? completedStatus() : restartingStatus(),
+    portalDispose() {
+      cleanupCalls++;
+      if (cleanupCalls === 1) throw new Error("SECRET cleanup detail");
+    },
+  });
+  await harness.app.ready;
+
+  const result = harness.portals[0].context.onRestartOnboarding(restartingStatus());
+  assert.equal(await Promise.resolve(result), false);
+  assert.equal(harness.wizards.length, 0);
+  assert.equal(harness.rail.hidden, true);
+  assert.ok(retryButton(harness.main));
+  retryButton(harness.main).click();
+  await flush();
+
+  assert.equal(loads, 2);
+  assert.equal(cleanupCalls, 2);
+  assert.equal(harness.wizards.length, 1);
+  assert.deepEqual(harness.events, [
+    "mount:portal", "dispose:portal", "dispose:portal", "mount:wizard",
+  ]);
+});
+
+test("a throwing wizard disposer blocks completion until Retry confirms cleanup", async (t) => {
+  let cleanupCalls = 0;
+  let loads = 0;
+  const harness = appHarness(t, {
+    loadStatus: async () => ++loads === 1 ? requiredStatus() : completedStatus(),
+    wizardDispose() {
+      cleanupCalls++;
+      if (cleanupCalls === 1) throw new Error("SECRET cleanup detail");
+    },
+  });
+  await harness.app.ready;
+
+  assert.equal(await harness.wizards[0].context.onComplete({ destination: "portal" }), false);
+  assert.equal(loads, 1, "authoritative GET waits until cleanup is confirmed");
+  assert.equal(harness.portals.length, 0);
+  assert.ok(retryButton(harness.main));
+  retryButton(harness.main).click();
+  await flush();
+
+  assert.equal(loads, 2);
+  assert.equal(cleanupCalls, 2);
+  assert.equal(harness.portals.length, 1);
+});
+
+test("mount failures fail closed and Retry authoritatively mounts one successor", async (t) => {
+  await t.test("asynchronous Portal mount rejection", async (subtest) => {
+    const rejection = deferred();
+    rejection.promise.catch(() => {});
+    let attempts = 0;
+    const harness = appHarness(subtest, {
+      loadStatus: async () => completedStatus(),
+      portalFactory(_context, build) {
+        attempts++;
+        return attempts === 1 ? rejection.promise : build();
+      },
+    });
+    rejection.reject(new Error("SECRET portal mount detail"));
+    assert.equal(await harness.app.ready, false);
+    assert.equal(harness.portals.length, 0);
+    assert.ok(retryButton(harness.main));
+    retryButton(harness.main).click();
+    await flush();
+    assert.equal(attempts, 2);
+    assert.equal(harness.portals.length, 1);
+  });
+
+  await t.test("synchronous wizard mount throw", async (subtest) => {
+    let attempts = 0;
+    const harness = appHarness(subtest, {
+      loadStatus: async () => requiredStatus(),
+      wizardFactory(_context, build) {
+        attempts++;
+        if (attempts === 1) throw new Error("SECRET wizard mount detail");
+        return build();
+      },
+    });
+    assert.equal(await harness.app.ready, false);
+    assert.equal(harness.wizards.length, 0);
+    assert.ok(retryButton(harness.main));
+    retryButton(harness.main).click();
+    await flush();
+    assert.equal(attempts, 2);
+    assert.equal(harness.wizards.length, 1);
+  });
+});
+
+test("a mount resolving after application disposal is immediately cleaned up", async (t) => {
+  const mountGate = deferred();
+  const harness = appHarness(t, {
+    loadStatus: async () => requiredStatus(),
+    wizardFactory: (_context, build) => mountGate.promise.then(build),
+  });
+  await flush();
+  assert.deepEqual(harness.events, ["mount:wizard"]);
+  harness.app.dispose();
+  mountGate.resolve();
+
+  assert.equal(await harness.app.ready, false);
+  assert.equal(harness.wizards.length, 1);
+  assert.equal(harness.wizards[0].disposeCalls, 1);
+  assert.deepEqual(harness.events, ["mount:wizard", "dispose:wizard"]);
 });
 
 test("a stale route resolving after a newer route never mounts or focuses", async () => {

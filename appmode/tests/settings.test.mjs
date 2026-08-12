@@ -173,74 +173,44 @@ test("only a validated completed status offers restart; malformed loads fail clo
   assert.ok(button(host, "Thiết lập lại trợ lý"));
 });
 
-test("transport errors stay safe and revision conflicts refresh authoritative status", async (t) => {
-  let loads = 0;
-  let restarts = 0;
-  const { host } = mountController(t, {
-    status: async () => completedStatus({ revision: 11 + loads++ }),
-    restart: async () => {
-      restarts++;
-      if (restarts === 1) {
-        throw Object.assign(new Error("SECRET conflict detail"), {
-          code: "ONBOARDING_REVISION_CONFLICT",
-          status: 409,
-        });
-      }
-      throw new Error("SECRET transport detail");
-    },
-  });
-  await flush();
-  button(host, "Thiết lập lại trợ lý").click();
-  button(host, "Xác nhận thiết lập lại").click();
-  await flush();
-  assert.equal(loads, 2);
-  assert.ok(button(host, "Thiết lập lại trợ lý"));
-  button(host, "Thiết lập lại trợ lý").click();
-  button(host, "Xác nhận thiết lập lại").click();
-  await flush();
-  assert.doesNotMatch(text(host), /SECRET/u);
-  assert.ok(button(host, "Thử lại"));
-});
-
-test("a conflict refresh hands off only an authoritative restart successor", async (t) => {
+test("a rejected restart reports uncertainty to the application owner without a local GET", async (t) => {
   let loads = 0;
   const handoffs = [];
   const { host } = mountController(t, {
-    status: async () => ++loads === 1 ? completedStatus() : restartStatus(),
+    status: async () => { loads++; return completedStatus(); },
     restart: async () => {
-      throw Object.assign(new Error("stale revision"), {
+      throw Object.assign(new Error("SECRET conflict detail"), {
         code: "ONBOARDING_REVISION_CONFLICT",
         status: 409,
       });
     },
-  }, (status) => handoffs.push(status));
+  }, (...args) => handoffs.push(args));
   await flush();
   button(host, "Thiết lập lại trợ lý").click();
   button(host, "Xác nhận thiết lập lại").click();
   await flush();
 
-  assert.equal(loads, 2);
-  assert.deepEqual(handoffs, [restartStatus()]);
+  assert.equal(loads, 1, "only the application owner may reconcile the uncertain POST");
+  assert.deepEqual(handoffs, [[]]);
+  assert.doesNotMatch(text(host), /SECRET/u);
 });
 
-test("retry supersedes stale loads and dispose aborts every late mutation", async (t) => {
+test("retry supersedes stale loads and dispose aborts the owned status GET", async (t) => {
   const stale = deferred();
   const fresh = deferred();
-  const mutation = deferred();
+  const pending = deferred();
   const signals = [];
   let loads = 0;
-  let callbacks = 0;
   const { controller, host } = mountController(t, {
     status(signal) {
       signals.push(signal);
       loads++;
-      return loads === 1 ? stale.promise : fresh.promise;
+      if (loads === 1) return stale.promise;
+      if (loads === 2) return fresh.promise;
+      return pending.promise;
     },
-    restart(_revision, signal) {
-      signals.push(signal);
-      return mutation.promise;
-    },
-  }, () => { callbacks++; });
+    restart: async () => restartStatus(),
+  });
 
   const retry = controller.retry();
   assert.equal(signals[0].aborted, true);
@@ -250,14 +220,62 @@ test("retry supersedes stale loads and dispose aborts every late mutation", asyn
   await flush();
   assert.ok(button(host, "Thiết lập lại trợ lý"));
 
+  const abandoned = controller.retry();
+  controller.dispose();
+  controller.dispose();
+  assert.equal(signals.at(-1).aborted, true);
+  pending.resolve(completedStatus());
+  assert.equal(await abandoned, false);
+  assert.equal(text(host), "");
+});
+
+test("a committed restart success survives route disposal and hands off exactly once", async (t) => {
+  const mutation = deferred();
+  const signals = [];
+  const handoffs = [];
+  const { controller, host } = mountController(t, {
+    status: async () => completedStatus(),
+    restart(_revision, signal) {
+      signals.push(signal);
+      return mutation.promise;
+    },
+  }, (...args) => handoffs.push(args));
+  await flush();
+
   button(host, "Thiết lập lại trợ lý").click();
   button(host, "Xác nhận thiết lập lại").click();
   controller.dispose();
   controller.dispose();
-  assert.equal(signals.at(-1).aborted, true);
-  mutation.resolve(restartStatus({ revision: 13 }));
+  assert.equal(signals[0].aborted, false,
+    "disposing the Settings view must not cancel an already dispatched POST");
+  mutation.resolve(restartStatus());
   await flush();
-  assert.equal(callbacks, 0);
+
+  assert.deepEqual(handoffs, [[restartStatus()]]);
+  assert.equal(text(host), "");
+});
+
+test("a committed restart rejection survives disposal and reports uncertainty once", async (t) => {
+  const mutation = deferred();
+  const signals = [];
+  const handoffs = [];
+  const { controller, host } = mountController(t, {
+    status: async () => completedStatus(),
+    restart(_revision, signal) {
+      signals.push(signal);
+      return mutation.promise;
+    },
+  }, (...args) => handoffs.push(args));
+  await flush();
+
+  button(host, "Thiết lập lại trợ lý").click();
+  button(host, "Xác nhận thiết lập lại").click();
+  controller.dispose();
+  mutation.reject(new Error("SECRET transport detail"));
+  await flush();
+
+  assert.equal(signals[0].aborted, false);
+  assert.deepEqual(handoffs, [[]]);
   assert.equal(text(host), "");
 });
 
