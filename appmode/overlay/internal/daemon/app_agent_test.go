@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"agentdc/internal/store"
 )
 
 func newAppAgentTestAPI(persona, roster string) *api {
@@ -24,6 +27,18 @@ func newAppAgentTestAPI(persona, roster string) *api {
 			KBRoots:     []string{`D:\\knowledge`},
 		}},
 	}
+}
+
+func newAppAgentStoreTestAPI(t *testing.T, persona, roster string) *api {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "portal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	a := newAppAgentTestAPI(persona, roster)
+	a.st = st
+	return a
 }
 
 func appAgentRequest(t *testing.T, a *api, method, target string, body any) *httptest.ResponseRecorder {
@@ -101,6 +116,232 @@ func TestAppAgentReportsSortedPlaceholdersAndFillsThem(t *testing.T) {
 	}
 	if string(backup) != original {
 		t.Fatalf("original backup changed: got %q", backup)
+	}
+}
+
+func TestAppAgentDetectsBroadMustachePlaceholders(t *testing.T) {
+	dir := t.TempDir()
+	persona := filepath.Join(dir, "persona.md")
+	if err := os.WriteFile(persona, []byte("{{lower}} {{Tên bot}} {{with space}} {{has-dash}}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newAppAgentTestAPI(persona, filepath.Join(dir, "roster.md"))
+
+	rr := appAgentRequest(t, a, http.MethodGet, "/agent", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /agent status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	got := decodeAppRouteJSON[struct {
+		Ready        bool          `json:"ready"`
+		Placeholders []placeholder `json:"placeholders"`
+	}](t, rr.Body.Bytes())
+	if got.Ready || len(got.Placeholders) != 4 {
+		t.Fatalf("broad placeholder state = %+v", got)
+	}
+	want := []string{"Tên bot", "has-dash", "lower", "with space"}
+	for i, key := range want {
+		if got.Placeholders[i].Key != key {
+			t.Fatalf("placeholder[%d] = %q; want %q", i, got.Placeholders[i].Key, key)
+		}
+	}
+}
+
+func TestAppAgentUnclosedMustacheIsNotReady(t *testing.T) {
+	dir := t.TempDir()
+	persona := filepath.Join(dir, "persona.md")
+	if err := os.WriteFile(persona, []byte("Tên bot: {{TEN_BOT"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newAppAgentTestAPI(persona, filepath.Join(dir, "roster.md"))
+
+	rr := appAgentRequest(t, a, http.MethodGet, "/agent", nil)
+	got := decodeAppRouteJSON[struct {
+		Ready           bool   `json:"ready"`
+		ValidationError string `json:"validation_error"`
+	}](t, rr.Body.Bytes())
+	if got.Ready || got.ValidationError == "" {
+		t.Fatalf("unclosed mustache response = %+v", got)
+	}
+}
+
+func TestAppAgentReadyRequiresValidStoredDisplayName(t *testing.T) {
+	tests := []struct {
+		name        string
+		displayName string
+		wantReady   bool
+	}{
+		{name: "missing name", wantReady: false},
+		{name: "valid name", displayName: "An Nhiên", wantReady: true},
+		{name: "newline name", displayName: "An\nNhiên", wantReady: false},
+		{name: "delimiter name", displayName: "An {{Nhiên", wantReady: false},
+		{name: "overlong name", displayName: strings.Repeat("ệ", 61), wantReady: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			persona := filepath.Join(dir, "persona.md")
+			if err := os.WriteFile(persona, []byte("Persona hoàn chỉnh.\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+			if tt.displayName != "" {
+				if err := a.st.SetAgentDisplayName(tt.displayName); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			rr := appAgentRequest(t, a, http.MethodGet, "/agent", nil)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("GET /agent status = %d body=%s", rr.Code, rr.Body.String())
+			}
+			got := decodeAppRouteJSON[struct {
+				Ready           bool   `json:"ready"`
+				ValidationError string `json:"validation_error"`
+			}](t, rr.Body.Bytes())
+			if got.Ready != tt.wantReady {
+				t.Fatalf("ready = %t; want %t; response=%s", got.Ready, tt.wantReady, rr.Body.String())
+			}
+			if !tt.wantReady && got.ValidationError == "" {
+				t.Fatalf("invalid display name has no validation_error: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestAppAgentMultilineMustacheIsMalformedNotPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	persona := filepath.Join(dir, "persona.md")
+	if err := os.WriteFile(persona, []byte("Tên {{foo\nbar}}.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+	if err := a.st.SetAgentDisplayName("An Nhiên"); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := appAgentRequest(t, a, http.MethodGet, "/agent", nil)
+	got := decodeAppRouteJSON[struct {
+		Ready           bool          `json:"ready"`
+		Placeholders    []placeholder `json:"placeholders"`
+		ValidationError string        `json:"validation_error"`
+	}](t, rr.Body.Bytes())
+	if got.Ready || len(got.Placeholders) != 0 || got.ValidationError == "" {
+		t.Fatalf("multiline mustache response = %+v", got)
+	}
+}
+
+func TestAppAgentRejectsInvalidValuesWithoutWrites(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: "  "},
+		{name: "newline", value: "An\nNhiên"},
+		{name: "opening delimiter", value: "An {{ Nhiên"},
+		{name: "closing delimiter", value: "An }} Nhiên"},
+		{name: "over 60 Unicode code points", value: strings.Repeat("ệ", 61)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			persona := filepath.Join(dir, "persona.md")
+			original := []byte("Tên bot: {{TEN_BOT}}\n")
+			if err := os.WriteFile(persona, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+
+			rr := appAgentRequest(t, a, http.MethodPut, "/agent", map[string]any{
+				"values": map[string]string{"TEN_BOT": tt.value},
+			})
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s; want 400", rr.Code, rr.Body.String())
+			}
+			if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+				t.Fatalf("invalid value changed persona to %q (%v)", got, err)
+			}
+			if _, err := os.Stat(persona + ".goc"); !os.IsNotExist(err) {
+				t.Fatalf("invalid value created backup: %v", err)
+			}
+			if name, err := a.st.AgentDisplayName(); err != nil || name != "" {
+				t.Fatalf("invalid value changed display name to %q (%v)", name, err)
+			}
+		})
+	}
+}
+
+func TestAppAgentTENBOTIsAuthoritativeDisplayName(t *testing.T) {
+	dir := t.TempDir()
+	persona := filepath.Join(dir, "persona.md")
+	if err := os.WriteFile(persona, []byte("Tên bot: {{TEN_BOT}}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+
+	rr := appAgentRequest(t, a, http.MethodPut, "/agent", map[string]any{
+		"values": map[string]string{"TEN_BOT": "  An Nhiên  "},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT /agent status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if name, err := a.st.AgentDisplayName(); err != nil || name != "An Nhiên" {
+		t.Fatalf("AgentDisplayName() = %q, %v", name, err)
+	}
+	get := appAgentRequest(t, a, http.MethodGet, "/agent", nil)
+	state := decodeAppRouteJSON[struct {
+		DisplayName string `json:"display_name"`
+	}](t, get.Body.Bytes())
+	if state.DisplayName != "An Nhiên" {
+		t.Fatalf("GET /agent display_name = %q", state.DisplayName)
+	}
+}
+
+func TestAppAgentRejectsConflictingDisplayName(t *testing.T) {
+	dir := t.TempDir()
+	persona := filepath.Join(dir, "persona.md")
+	original := []byte("Tên bot: {{TEN_BOT}}\n")
+	if err := os.WriteFile(persona, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+
+	rr := appAgentRequest(t, a, http.MethodPut, "/agent", map[string]any{
+		"values":       map[string]string{"TEN_BOT": "An Nhiên"},
+		"display_name": "Tên khác",
+	})
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d body=%s; want 422", rr.Code, rr.Body.String())
+	}
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("conflict changed persona to %q (%v)", got, err)
+	}
+}
+
+func TestAppAgentRejectsInvalidDisplayNamesWithoutWrites(t *testing.T) {
+	tests := []string{"", "An\nNhiên", "An {{ Nhiên", "An }} Nhiên", strings.Repeat("ệ", 61)}
+	for _, displayName := range tests {
+		t.Run(fmt.Sprintf("%q", displayName), func(t *testing.T) {
+			dir := t.TempDir()
+			persona := filepath.Join(dir, "persona.md")
+			original := []byte("Chưa có tên bot trong mẫu\n")
+			if err := os.WriteFile(persona, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+
+			rr := appAgentRequest(t, a, http.MethodPut, "/agent", map[string]any{
+				"values":              map[string]string{},
+				"display_name":        displayName,
+				"require_complete":    true,
+				"onboarding_revision": 1,
+			})
+			if rr.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d body=%s; want 422", rr.Code, rr.Body.String())
+			}
+			if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+				t.Fatalf("invalid display name changed persona to %q (%v)", got, err)
+			}
+		})
 	}
 }
 
@@ -201,7 +442,10 @@ func TestAppPersonaWritesUTF8WithoutBOMAndRefreshesReadiness(t *testing.T) {
 	if err := os.WriteFile(persona, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a := newAppAgentTestAPI(persona, filepath.Join(dir, "roster.md"))
+	a := newAppAgentStoreTestAPI(t, persona, filepath.Join(dir, "roster.md"))
+	if err := a.st.SetAgentDisplayName("An Nhiên"); err != nil {
+		t.Fatal(err)
+	}
 
 	req := httptest.NewRequest(http.MethodPut, "/agent/persona/persona", bytes.NewBufferString(
 		`{"text":"Tên bot: An Nhiên\r\nGiọng nói: thân thiện — rõ ràng\r\n"}`,

@@ -99,7 +99,7 @@ test("navigation exposes the legacy menu contract", () => {
           id: "settings",
           icon: "⚙",
           label: "Settings",
-          todo: "Cửa sổ gom tin, tên bot, thư mục tri thức. Hiện đặt trong trang Zalo và trong Chay.bat.",
+          todo: undefined,
           href: undefined,
         },
       ],
@@ -107,14 +107,17 @@ test("navigation exposes the legacy menu contract", () => {
   ]);
 });
 
-test("navigation exposes Providers, Combos, and the real Memory page", () => {
+test("navigation exposes Providers, Combos, Memory, and Settings as real pages", () => {
   const items = NAVIGATION.flatMap(({ items }) => items);
   const providers = items.find(({ id }) => id === "providers");
   const combos = items.find(({ id }) => id === "combos");
   const memory = items.find(({ id }) => id === "memory");
+  const settings = items.find(({ id }) => id === "settings");
 
   assert.equal(providers?.label, "Providers");
   assert.equal(combos?.label, "Combos");
   assert.equal(memory?.label, "Memory");
   assert.equal(memory.todo, undefined);
+  assert.equal(settings?.label, "Settings");
+  assert.equal(settings.todo, undefined);
 });

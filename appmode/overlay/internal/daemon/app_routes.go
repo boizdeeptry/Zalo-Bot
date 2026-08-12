@@ -3,6 +3,12 @@ package daemon
 import "net/http"
 
 var appPortalRoutePatterns = []string{
+	"GET /onboarding/status",
+	"PUT /onboarding/provider",
+	"POST /onboarding/setup",
+	"POST /onboarding/test-chat",
+	"POST /onboarding/complete",
+	"POST /onboarding/restart",
 	"GET /agent",
 	"PUT /agent",
 	"GET /agent/persona/{name}",
@@ -62,6 +68,12 @@ func init() {
 }
 
 func (a *api) registerAppRoutes(mux *http.ServeMux) {
+	mux.Handle("GET /onboarding/status", a.auth(a.handleOnboardingStatus))
+	mux.Handle("PUT /onboarding/provider", a.auth(a.handleOnboardingProvider))
+	mux.Handle("POST /onboarding/setup", a.auth(a.handleOnboardingSetup))
+	mux.Handle("POST /onboarding/test-chat", a.auth(a.handleOnboardingTestChat))
+	mux.Handle("POST /onboarding/complete", a.auth(a.handleOnboardingComplete))
+	mux.Handle("POST /onboarding/restart", a.auth(a.handleOnboardingRestart))
 	mux.Handle("GET /agent", a.auth(a.handleAgentGet))
 	mux.Handle("PUT /agent", a.auth(a.handleAgentPut))
 	mux.Handle("GET /agent/persona/{name}", a.auth(a.handlePersonaGet))

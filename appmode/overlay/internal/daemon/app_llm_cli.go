@@ -19,20 +19,21 @@ import (
 // cliDescriptor là DỮ LIỆU cho một vendor CLI, không phải code. Adapter thân duy nhất đọc nó.
 // Học từ 9Router: provider là descriptor, không phải một nhánh switch.
 type cliDescriptor struct {
-	kind           string // kind của họ provider local_cli. claude-code dùng gạch nối, thống nhất với hàng seeded (migration đã hợp nhất kind cũ claude_code → claude-code).
-	display        string
-	npmPackage     string   // gói cài; rỗng nếu là native exe
-	binJS          string   // đường dẫn tương đối tới entry .js trong node_modules; rỗng nếu native
-	npmBin         string   // đường tương đối tới exe native dưới npm root (A-native); rỗng nếu chạy qua node+binJS
-	subArgs        []string // lệnh con không tương tác: {"exec"} codex, nil cho -p
-	promptViaStdin bool     // true: prompt qua stdin; false: positional arg
-	promptFlag     string   // cờ đứng trước prompt trong argv: "-p" gemini; rỗng = positional (codex)
-	modelFlag      string
-	readOnlyArgs   []string   // cờ giới hạn chỉ-đọc — BẮT BUỘC có
-	bannedArgs     []string   // cờ bỏ sandbox — test chặn adapter dựng chúng
-	authMethod     string     // "claude-json" | "codex-exit" | "gemini-file"
-	modelSeeds     []cliModel // Discover tĩnh
-	claudeBudget   bool       // Task 11 đọc khi claude-code chạy qua cliAdapter; hiện Run ép ngân sách dài theo providerID. true = dùng ctx gốc, không đặt dưới 25s (chỉ claude-code)
+	kind            string // kind của họ provider local_cli. claude-code dùng gạch nối, thống nhất với hàng seeded (migration đã hợp nhất kind cũ claude_code → claude-code).
+	display         string
+	npmPackage      string   // gói cài; rỗng nếu là native exe
+	binJS           string   // đường dẫn tương đối tới entry .js trong node_modules; rỗng nếu native
+	npmBin          string   // đường tương đối tới exe native dưới npm root (A-native); rỗng nếu chạy qua node+binJS
+	subArgs         []string // lệnh con không tương tác: {"exec"} codex, nil cho -p
+	promptViaStdin  bool     // true: prompt qua stdin; false: positional arg
+	promptFlag      string   // cờ đứng trước prompt trong argv: "-p" gemini; rỗng = positional (codex)
+	modelFlag       string
+	readOnlyArgs    []string   // cờ giới hạn chỉ-đọc — BẮT BUỘC có
+	bannedArgs      []string   // cờ bỏ sandbox — test chặn adapter dựng chúng
+	authMethod      string     // "claude-json" | "codex-exit" | "gemini-file"
+	modelSeeds      []cliModel // Discover tĩnh
+	onboardingModel string     // model ưu tiên rõ ràng cho Auto-combo; rỗng nếu kind không hỗ trợ onboarding
+	claudeBudget    bool       // Task 11 đọc khi claude-code chạy qua cliAdapter; hiện Run ép ngân sách dài theo providerID. true = dùng ctx gốc, không đặt dưới 25s (chỉ claude-code)
 }
 
 type cliModel struct{ id, name string }
@@ -60,8 +61,9 @@ var cliDescriptors = map[string]cliDescriptor{
 			"-c", "features.plugins=false",
 			"-c", "features.skill_search=false",
 		},
-		bannedArgs: []string{"--dangerously-bypass-approvals-and-sandbox", "workspace-write", "danger-full-access"},
-		authMethod: "codex-exit",
+		bannedArgs:      []string{"--dangerously-bypass-approvals-and-sandbox", "workspace-write", "danger-full-access"},
+		authMethod:      "codex-exit",
+		onboardingModel: "gpt-5.6-terra",
 		// modelSeeds ghim theo /models THẬT (~/.codex/models_cache.json, fetch từ API 2026-08-07). Bỏ
 		// codex-auto-review (model duyệt nội bộ, không phải model chat). gpt-5.4 CŨ đã không còn tồn tại.
 		modelSeeds: []cliModel{
@@ -88,6 +90,7 @@ var cliDescriptors = map[string]cliDescriptor{
 		readOnlyArgs: []string{"--allowed-tools", "Read", "Grep", "Glob", "WebFetch"},
 		bannedArgs:   []string{"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "bypassPermissions", "--permission-mode"},
 		authMethod:   "claude-json", claudeBudget: true,
+		onboardingModel: "sonnet",
 		// Cùng TẬP với modelChoices (app_knowledge.go): mỗi seed đi vào combo picker rồi thành tham
 		// số --model của một tiến trình claude thật, nên hai danh sách phải khớp — kể cả haiku (model
 		// Zalo mặc định) để combo dựng được trên nó. Bí danh, không id đầy đủ (xem modelChoices).

@@ -286,6 +286,387 @@ func TestAppRunZaloLeavesStatelessRunnerUnchanged(t *testing.T) {
 	}
 }
 
+func TestAppZaloStatelessDisplayNameReachesDirectAndFallbackPrompts(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "stateless-name", "fallback-name")
+	if err := st.SetAgentDisplayName("  Bé Mi  "); err != nil {
+		t.Fatal(err)
+	}
+	identity := appAgentIdentityPrompt("Bé Mi")
+
+	direct := &fakeZaloRunner{out: `{"answers":["ok"]}`}
+	if _, err := a.appRunZalo(
+		t.Context(), direct, zc, "stateless-name", "question", "msg-1",
+		nil, nil, nil, func(string) {},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(direct.gotPrompt, identity); got != 1 {
+		t.Fatalf("direct stateless prompt identity count = %d; want 1", got)
+	}
+
+	fallback := &appZaloStatelessHookRunner{}
+	if _, err := a.appRunZalo(
+		t.Context(), fallback, zc, "fallback-name", "question", "msg-1",
+		nil, nil, nil, func(string) {},
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs := fallback.snapshot()
+	if len(inputs) != 1 || strings.Count(inputs[0].StatelessPrompt, identity) != 1 {
+		t.Fatalf("fallback inputs = %+v; want one full prompt with structured identity", inputs)
+	}
+}
+
+func TestAppZaloStructuredDisplayNameBootstrapThenResumeUsesDeltaOnly(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "display-name-resume")
+	if err := st.SetAgentDisplayName(" Bé Mi "); err != nil {
+		t.Fatal(err)
+	}
+	personaPath := filepath.Join(t.TempDir(), "persona.md")
+	if err := os.WriteFile(personaPath, []byte("DISPLAY-NAME-RESUME-PERSONA"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	zc.PersonaPath = personaPath
+	run := &appZaloHookRunner{results: []appZaloRunResult{
+		{Answer: `{"answers":["first"]}`},
+		{Answer: `{"answers":["second"]}`},
+	}}
+	deps := &zaloDeps{cfg: zc, run: run}
+	for index, msgID := range []string{"msg-1", "msg-2"} {
+		question := fmt.Sprintf("question-%d", index+1)
+		if err := appZaloAddMessage(st, "display-name-resume", ipc.ZaloIn, "khách", question, msgID); err != nil {
+			t.Fatal(err)
+		}
+		if err := appZaloTestAnswer(
+			a, deps, "display-name-resume", question, appZaloReply(msgID), nil,
+		); err != nil {
+			t.Fatalf("turn %d: %v", index+1, err)
+		}
+	}
+
+	inputs, legacy := run.snapshot()
+	if len(inputs) != 2 || legacy != 0 {
+		t.Fatalf("calls = %d structured, %d legacy; want 2, 0", len(inputs), legacy)
+	}
+	identity := appAgentIdentityPrompt("Bé Mi")
+	if inputs[0].Resume || strings.Count(inputs[0].Prompt, identity) != 1 ||
+		strings.Count(inputs[0].Prompt, "DISPLAY-NAME-RESUME-PERSONA") != 1 {
+		t.Fatalf("first turn is not one identity+persona bootstrap: %+v", inputs[0])
+	}
+	if !inputs[1].Resume || strings.Contains(inputs[1].Prompt, identity) ||
+		strings.Contains(inputs[1].Prompt, "DISPLAY-NAME-RESUME-PERSONA") {
+		t.Fatalf("resumed prompt resent stable identity/persona: %+v", inputs[1])
+	}
+	if inputs[0].SessionID != inputs[1].SessionID {
+		t.Fatalf("unchanged display name rotated session from %q to %q", inputs[0].SessionID, inputs[1].SessionID)
+	}
+}
+
+func TestAppZaloDisplayNameOnlyChangeRotatesToFreshBootstrap(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "display-name-rotate")
+	personaPath := filepath.Join(t.TempDir(), "persona.md")
+	if err := os.WriteFile(personaPath, []byte("DISPLAY-NAME-ROTATE-PERSONA"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	zc.PersonaPath = personaPath
+	run := &appZaloHookRunner{results: []appZaloRunResult{
+		{Answer: `{"answers":["first"]}`},
+		{Answer: `{"answers":["second"]}`},
+	}}
+	deps := &zaloDeps{cfg: zc, run: run}
+
+	if err := st.SetAgentDisplayName("Bé Mi"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloAddMessage(st, "display-name-rotate", ipc.ZaloIn, "khách", "first", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloTestAnswer(a, deps, "display-name-rotate", "first", appZaloReply("msg-1"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetAgentDisplayName("An Nhiên"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloAddMessage(st, "display-name-rotate", ipc.ZaloIn, "khách", "second", "msg-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloTestAnswer(a, deps, "display-name-rotate", "second", appZaloReply("msg-2"), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	inputs, _ := run.snapshot()
+	if len(inputs) != 2 {
+		t.Fatalf("structured calls = %d; want 2", len(inputs))
+	}
+	if inputs[1].Resume || inputs[1].SessionID == inputs[0].SessionID {
+		t.Fatalf("display-name-only change did not select fresh session: first=%+v second=%+v", inputs[0], inputs[1])
+	}
+	newIdentity := appAgentIdentityPrompt("An Nhiên")
+	if strings.Count(inputs[1].Prompt, newIdentity) != 1 ||
+		strings.Count(inputs[1].Prompt, "DISPLAY-NAME-ROTATE-PERSONA") != 1 {
+		t.Fatalf("rotated turn is not a full new-name bootstrap: %+v", inputs[1])
+	}
+}
+
+func TestAppZaloDisplayNameMetadataReadOncePerCapturedTurn(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "display-name-read-once")
+	if err := appZaloAddMessage(st, "display-name-read-once", ipc.ZaloIn, "khách", "question", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	original := appZaloReadAgentDisplayName
+	t.Cleanup(func() { appZaloReadAgentDisplayName = original })
+	reads := 0
+	appZaloReadAgentDisplayName = func(*store.Store) (string, error) {
+		reads++
+		return "  Bé Mi\r\n", nil
+	}
+
+	run := &appZaloHookRunner{results: []appZaloRunResult{{Answer: `{"answers":["ok"]}`}}}
+	if err := appZaloTestAnswer(
+		a, &zaloDeps{cfg: zc, run: run}, "display-name-read-once", "question",
+		appZaloReply("msg-1"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	identityFound := len(inputs) == 1 && strings.Contains(inputs[0].Prompt, appAgentIdentityPrompt("Bé Mi"))
+	if reads != 1 || !identityFound {
+		t.Fatalf("metadata reads = %d, structured calls = %d, identity found = %v; want 1, 1, true",
+			reads, len(inputs), identityFound)
+	}
+}
+
+func TestAppZaloDisplayNameMetadataReadOnceForUnstructuredFallback(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "display-name-unstructured-read-once")
+	if err := appZaloAddMessage(
+		st, "display-name-unstructured-read-once", ipc.ZaloIn, "khách", "question", "msg-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	original := appZaloReadAgentDisplayName
+	t.Cleanup(func() { appZaloReadAgentDisplayName = original })
+	reads := 0
+	appZaloReadAgentDisplayName = func(*store.Store) (string, error) {
+		reads++
+		return "  Bé Mi  ", nil
+	}
+	run := &fakeZaloRunner{out: `{"answers":["ok"]}`}
+
+	if err := appZaloTestAnswer(
+		a, &zaloDeps{cfg: zc, run: run}, "display-name-unstructured-read-once",
+		"question", appZaloReply("msg-1"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 1 || run.calls != 1 ||
+		strings.Count(run.gotPrompt, appAgentIdentityPrompt("Bé Mi")) != 1 {
+		t.Fatalf("metadata reads = %d, runner calls = %d, identity count = %d; want 1, 1, 1",
+			reads, run.calls, strings.Count(run.gotPrompt, appAgentIdentityPrompt("Bé Mi")))
+	}
+}
+
+func TestAppZaloDisplayNameMetadataReadFailureIsSafeAndClosed(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "display-name-read-failure")
+	if err := appZaloAddMessage(st, "display-name-read-failure", ipc.ZaloIn, "khách", "PRIVATE-PROMPT-CANARY", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	a.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	original := appZaloReadAgentDisplayName
+	t.Cleanup(func() { appZaloReadAgentDisplayName = original })
+	reads := 0
+	appZaloReadAgentDisplayName = func(*store.Store) (string, error) {
+		reads++
+		return "", errors.New("PRIVATE-NAME-CANARY")
+	}
+	run := &appZaloHookRunner{}
+
+	err := appZaloTestAnswer(
+		a, &zaloDeps{cfg: zc, run: run}, "display-name-read-failure",
+		"PRIVATE-PROMPT-CANARY", appZaloReply("msg-1"), nil,
+	)
+	if err == nil || err.Error() != appZaloErrorAgentDisplayNameRead || reads != 1 {
+		t.Fatalf("answer error = %v, metadata reads = %d; want safe failure and one read", err, reads)
+	}
+	inputs, legacy := run.snapshot()
+	if len(inputs) != 0 || legacy != 0 {
+		t.Fatalf("runner was invoked after metadata read failure: %d structured, %d legacy", len(inputs), legacy)
+	}
+	for _, canary := range []string{"PRIVATE-NAME-CANARY", "PRIVATE-PROMPT-CANARY"} {
+		if strings.Contains(err.Error(), canary) || strings.Contains(logs.String(), canary) {
+			t.Fatalf("private content %q leaked through error/log", canary)
+		}
+	}
+}
+
+func TestAppZaloDisplayNameCorruptPersistedMetadataFailsClosed(t *testing.T) {
+	tests := []struct {
+		name            string
+		value           string
+		existingSession bool
+	}{
+		{name: "newline", value: "Bé\nMi"},
+		{name: "nul", value: "Bé\x00Mi", existingSession: true},
+		{name: "tab", value: "Bé\tMi", existingSession: true},
+		{name: "escape", value: "Bé\x1bMi", existingSession: true},
+		{name: "Unicode line separator", value: "Bé\u2028Mi", existingSession: true},
+		{name: "Unicode format control", value: "Bé\u202eMi", existingSession: true},
+		{name: "invalid UTF-8", value: string([]byte{'B', 'e', 0xff, 'M', 'i'}), existingSession: true},
+		{name: "opening delimiter", value: "Bé {{Mi", existingSession: true},
+		{name: "closing delimiter", value: "Bé }}Mi", existingSession: true},
+		{name: "over 60 runes", value: strings.Repeat("ộ", 61), existingSession: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "corrupt-display-name.db")
+			st, err := store.Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			if err := st.UpsertZaloThread("thread", "thread"); err != nil {
+				t.Fatal(err)
+			}
+			if err := appZaloAddMessage(st, "thread", ipc.ZaloIn, "khách", "PRIVATE-PROMPT-CANARY", "msg-1"); err != nil {
+				t.Fatal(err)
+			}
+			zc := appZaloHookConfig(t)
+			var originalSession store.ZaloCLISession
+			if tc.existingSession {
+				originalSession = appZaloCreateHookSession(t, st, zc, "thread", appZaloTestSessionID)
+			}
+			rawDB, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=busy_timeout(5000)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rawDB.Exec(`INSERT INTO app_meta(key, value) VALUES ('agent_display_name', ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, tc.value); err != nil {
+				_ = rawDB.Close()
+				t.Fatal(err)
+			}
+			if err := rawDB.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			a := appZaloAPIWithStore(config.Config{}, st)
+			var logs strings.Builder
+			a.logger = slog.New(slog.NewTextHandler(&logs, nil))
+			run := &appZaloHookRunner{}
+			err = appZaloTestAnswer(
+				a, &zaloDeps{cfg: zc, run: run}, "thread",
+				"PRIVATE-PROMPT-CANARY", appZaloReply("msg-1"), nil,
+			)
+			if err == nil || err.Error() != appZaloErrorAgentDisplayNameRead {
+				t.Fatalf("answer error = %v; want safe display-name sentinel", err)
+			}
+			inputs, legacy := run.snapshot()
+			if len(inputs) != 0 || legacy != 0 {
+				t.Fatalf("provider invoked for corrupt display name: %d structured, %d legacy", len(inputs), legacy)
+			}
+			gotSession, sessionErr := st.ZaloCLISession("thread")
+			if tc.existingSession {
+				if sessionErr != nil || gotSession != originalSession {
+					t.Fatalf("corrupt display name updated session side effect: got %+v, %v; want %+v",
+						gotSession, sessionErr, originalSession)
+				}
+			} else if !errors.Is(sessionErr, store.ErrNotFound) {
+				t.Fatalf("corrupt display name created session side effect: %v", sessionErr)
+			}
+			for _, private := range []string{tc.value, "PRIVATE-PROMPT-CANARY"} {
+				if private != "" && (strings.Contains(err.Error(), private) || strings.Contains(logs.String(), private)) {
+					t.Fatalf("private corrupt metadata or prompt leaked through error/log")
+				}
+			}
+		})
+	}
+}
+
+func TestAppZaloDisplayNameBlankPersistedMetadataKeepsLegacyPrompt(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "blank-display-name")
+	if err := st.SetAgentDisplayName(" \r\n\t "); err != nil {
+		t.Fatal(err)
+	}
+	run := &appZaloHookRunner{results: []appZaloRunResult{{Answer: `{"answers":["ok"]}`}}}
+	if err := appZaloAddMessage(st, "blank-display-name", ipc.ZaloIn, "khách", "question", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloTestAnswer(
+		a, &zaloDeps{cfg: zc, run: run}, "blank-display-name", "question",
+		appZaloReply("msg-1"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 1 || strings.Contains(inputs[0].Prompt, "Tên hiển thị bắt buộc") {
+		t.Fatalf("blank legacy display name did not preserve identity-free prompt")
+	}
+}
+
+func TestAppZaloDisplayNameSnapshotIsImmutableAcrossMetadataMutation(t *testing.T) {
+	a, st, zc := appZaloHookFixture(t, "display-name-snapshot")
+	if err := st.SetAgentDisplayName("Bé Mi"); err != nil {
+		t.Fatal(err)
+	}
+	run := &appZaloHookRunner{
+		results: []appZaloRunResult{
+			{Answer: `{"answers":["first"]}`},
+			{Answer: `{"answers":["second"]}`},
+		},
+		afterSnapshot: func(call int, _ bool) {
+			if call == 0 {
+				if err := st.SetAgentDisplayName("An Nhiên"); err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+	}
+	deps := &zaloDeps{cfg: zc, run: run}
+	if err := appZaloAddMessage(st, "display-name-snapshot", ipc.ZaloIn, "khách", "first", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloTestAnswer(
+		a, deps, "display-name-snapshot", "first", appZaloReply("msg-1"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	firstSession, err := st.ZaloCLISession("display-name-snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSession.PromptFingerprint != appZaloPromptFingerprint(zc, "display-name-snapshot", "Bé Mi") {
+		t.Fatalf("current turn fingerprint did not retain captured old name")
+	}
+
+	if err := appZaloAddMessage(st, "display-name-snapshot", ipc.ZaloIn, "khách", "second", "msg-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appZaloTestAnswer(
+		a, deps, "display-name-snapshot", "second", appZaloReply("msg-2"), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := run.snapshot()
+	if len(inputs) != 2 {
+		t.Fatalf("structured calls = %d; want 2", len(inputs))
+	}
+	oldIdentity := appAgentIdentityPrompt("Bé Mi")
+	newIdentity := appAgentIdentityPrompt("An Nhiên")
+	if strings.Count(inputs[0].Prompt, oldIdentity) != 1 || strings.Contains(inputs[0].Prompt, newIdentity) {
+		t.Fatalf("current turn prompt did not retain captured old name")
+	}
+	if inputs[1].Resume || inputs[1].SessionID == inputs[0].SessionID ||
+		strings.Count(inputs[1].Prompt, newIdentity) != 1 || strings.Contains(inputs[1].Prompt, oldIdentity) {
+		t.Fatalf("next turn did not rotate to a new-name bootstrap")
+	}
+	secondSession, err := st.ZaloCLISession("display-name-snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondSession.PromptFingerprint != appZaloPromptFingerprint(zc, "display-name-snapshot", "An Nhiên") {
+		t.Fatalf("next turn fingerprint did not use new captured name")
+	}
+}
+
 func TestAppZaloVirginSessionStaysFreshAfterStatelessSuccess(t *testing.T) {
 	a, st, zc := appZaloHookFixture(t, "virgin")
 	run := &appZaloStatelessHookRunner{}

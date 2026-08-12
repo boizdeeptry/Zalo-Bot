@@ -1,6 +1,13 @@
 import { requestJSON } from "../core/api.js";
 import { isProviderConnected } from "../core/providers-status.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
+import {
+  createProviderConnect,
+  INSTALL_CEILING,
+  phaseProgress,
+} from "../components/provider-connect.js";
+
+export { INSTALL_CEILING, phaseProgress };
 
 export const PROVIDER_CATALOG = [
   { kind: "claude-code", name: "Claude Code", group: "subscription", prefix: "cc", logoColor: "#c8613b" },
@@ -16,17 +23,6 @@ export const PROVIDER_CATALOG = [
 // --add-dir access — but that's a backend concern; here we only drive the login UI.)
 const CONNECTABLE_KINDS = new Set(["codex", "claude-code"]);
 const normalizeKind = (k) => String(k ?? "").replace(/_/g, "-");
-
-// phaseProgress maps a connect phase to its anchor %. Pure (phase in → number|null out) so the
-// mapping is unit-testable without a clock. installing returns its FLOOR (12): the live bar crawls
-// up from there toward INSTALL_CEILING but never reaches it (see tickConnect), so the % only hits
-// 100 once actually connected — honest, never a fake full bar. prompt/error/canceled → null: the
-// prompt has no bar, and terminal phases FREEZE at whatever % they reached (not a phase anchor).
-export const INSTALL_CEILING = 85;
-const PHASE_ANCHOR = { detecting: 8, installing: 12, awaiting_login: 90, polling: 90, connected: 100 };
-export function phaseProgress(phase) {
-  return PHASE_ANCHOR[phase] ?? null;
-}
 
 function providerPath(id, suffix = "") {
   const value = String(id ?? "").trim();
@@ -75,9 +71,15 @@ export function createProviderService(request = requestJSON) {
     ),
     // Connect flow addresses by KIND, not provider id: codex has no provider row yet the first
     // time someone connects it, so there is no id to key the path off of.
-    connectStart: (kind, label) => request(`/llm/providers/${encodeURIComponent(kind)}/connect`, {
-      method: "POST", body: { label },
-    }),
+    connectStart: (kind, label, onboardingRevision = 0) => {
+      const body = { label };
+      if (Number.isSafeInteger(onboardingRevision) && onboardingRevision > 0) {
+        body.onboarding_revision = onboardingRevision;
+      }
+      return request(`/llm/providers/${encodeURIComponent(kind)}/connect`, {
+        method: "POST", body,
+      });
+    },
     connectStatus: (kind) => request(`/llm/providers/${encodeURIComponent(kind)}/connect`),
     connectCancel: (kind) => request(`/llm/providers/${encodeURIComponent(kind)}/connect`, { method: "DELETE" }),
     removeAccount: (providerId, accountId) => request(
@@ -213,8 +215,7 @@ function renderConnections(entry, p, ui) {
   const add = ui.connectable
     ? element("button", {
         className: "pv-btn primary",
-        // Disabled while a connect flow for this entry is already open — a second click can't
-        // fire a second runConnect (belt, alongside the connectRun guard in runConnect itself).
+        // Disabled while this Provider's reusable Connect component is already open.
         attributes: { type: "button", disabled: ui.connecting, title: ui.connecting ? "Đang kết nối…" : undefined },
         text: addText,
         on: { click() { ui.onAdd(entry.kind); } },
@@ -282,11 +283,23 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       // view cầm trạng thái điều hướng: "gallery" hoặc kind của Provider đang xem chi tiết.
       // paint() là điểm vẽ DUY NHẤT đọc view này để quyết định vẽ gì vào root.
       let view = "gallery";
-      // Rời khỏi detail (mở kind khác, hoặc quay lại gallery) phải chấm dứt một luồng connect đang
-      // chạy — bump connectRun ở đây để vòng lặp poll của runConnect tự thấy mình lỗi thời ở lượt
-      // kiểm kế tiếp và dừng lại, không tiếp tục refresh() nền sau khi người dùng đã rời trang.
-      const openDetail = (kind) => { connectRun++; stopConnectTimer(); connect = null; view = kind; paint(); };
-      const backToGallery = () => { connectRun++; stopConnectTimer(); connect = null; view = "gallery"; paint(); };
+      let providerConnect = null;
+      let providerConnectKind = "";
+      let providerConnectSlot = null;
+      let providerConnectOpen = false;
+
+      function disposeProviderConnect() {
+        providerConnect?.dispose();
+        providerConnect = null;
+        providerConnectKind = "";
+        providerConnectSlot = null;
+        providerConnectOpen = false;
+      }
+
+      // Một detail sở hữu đúng một component Connect. Rời detail huỷ component để poll/timer/listener
+      // không sống qua điều hướng; paint lại cùng detail chỉ dùng lại controller hiện có.
+      const openDetail = (kind) => { disposeProviderConnect(); view = kind; paint(); };
+      const backToGallery = () => { disposeProviderConnect(); view = "gallery"; paint(); };
 
       const byKindFrom = (providers) => new Map(providers.map((p) => [normalizeKind(p.kind), p]));
       let lastProviders = [];
@@ -304,106 +317,13 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       // nên gõ vào ô search không làm mất focus hay dựng lại nút "Tải lại".
       const gallerySlot = element("div", {});
 
-      // connect cầm trạng thái luồng đăng nhập in-Portal cho MỘT kind tại một thời điểm — null khi
-      // panel đang đóng. connectSlot là node ổn định giống gallerySlot: paintConnect() chỉ thay nội
-      // dung của nó, không đụng root, nên không làm mất focus ô nhập tên tài khoản.
-      let connect = null; // { kind, phase, label, message?, loginUrl? }
-      // connectRun là token đơn điệu: MỖI lượt mở panel (startConnect) hoặc rời detail (openDetail/
-      // backToGallery) tăng nó lên một. runConnect chụp giá trị của mình vào myRun lúc bắt đầu; mọi
-      // điểm kiểm "đây còn phải là lượt của tôi không" so connectRun !== myRun thay vì so connect?.kind
-      // !== kind — kind không đổi khi bấm lại nút hay điều hướng, nên phép so sánh cũ không bắt được
-      // vòng lặp cũ vẫn đang chạy nền.
-      let connectRun = 0;
-      const ownsConnectRun = (kind, run) => (
-        !disposed && connectRun === run && connect?.kind === kind
-      );
-      const connectSlot = element("div", { className: "pv-connect" });
-      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const defaultLabel = (p) => `Tài khoản ${(p?.accounts?.length ?? 0) + 1}`;
 
-      // Progress-bar state for a live connect flow. connectPct is the displayed %, moved forward by
-      // real phase transitions (anchorTo) and, during installing, crawled toward INSTALL_CEILING by a
-      // single interval (connectTimer). connectStart anchors the elapsed timer. progress*Ref hold the
-      // live nodes so a crawl tick can nudge width/text WITHOUT rebuilding the whole panel — that
-      // keeps the CSS width transition smooth (a fresh node each tick wouldn't animate). Refs are
-      // reassigned on every paintConnect and nulled when no bar is shown.
-      let connectPct = 0;
-      let connectStart = 0;
-      let connectTimer = null;
-      let progressFillRef = null;
-      let progressBarRef = null;
-      let progressPctRef = null;
-      let progressElapsedRef = null;
-
-      // anchorTo jumps connectPct FORWARD to a phase's anchor on a real transition (never backward:
-      // anchors increase with the flow, and Math.max keeps a crawled installing % from snapping down).
-      const anchorTo = (phase) => {
-        const a = phaseProgress(phase);
-        if (a !== null) connectPct = Math.max(connectPct, a);
-      };
-      const elapsedText = () => `· ${Math.max(0, Math.floor((Date.now() - connectStart) / 1000))}s`;
-
-      function stopConnectTimer() {
-        if (connectTimer !== null) { clearInterval(connectTimer); connectTimer = null; }
-      }
-      function startConnectTimer() {
-        stopConnectTimer();
-        connectTimer = setInterval(tickConnect, crawlMs);
-        // unref so a stray interval never keeps Node's event loop (or a test run) alive — dispose
-        // clears it anyway, this is belt-and-suspenders. No-op in the browser (no unref on timers).
-        if (connectTimer && typeof connectTimer.unref === "function") connectTimer.unref();
-      }
-      // tickConnect runs every crawlMs: during installing it eases connectPct toward the ceiling
-      // (a fraction of the remaining gap, so it always moves but slows and never reaches 85). Then it
-      // nudges the live nodes directly. Other running phases hold at their anchor; only elapsed ticks.
-      function tickConnect() {
-        if (!connect) { stopConnectTimer(); return; }
-        if (connect.phase === "installing") {
-          connectPct = Math.min(INSTALL_CEILING - 0.1, connectPct + (INSTALL_CEILING - connectPct) * 0.08);
-        }
-        if (progressFillRef) {
-          const rounded = Math.round(connectPct);
-          progressFillRef.style.width = `${connectPct}%`;
-          if (progressBarRef) progressBarRef.setAttribute("aria-valuenow", String(rounded)); // keep SR in sync
-          if (progressPctRef) progressPctRef.textContent = `${rounded}%`;
-        }
-        if (progressElapsedRef) progressElapsedRef.textContent = elapsedText();
-      }
-
-      // renderProgress builds the bar + %/elapsed row and stashes refs for tickConnect. frozen=true
-      // (error/canceled) styles the bar muted-red and skips the CSS width transition — a dead flow
-      // must not keep animating. Not stored as refs when frozen: no tick will touch it.
-      function renderProgress(frozen) {
-        const fill = element("div", { className: "pv-progress-fill" });
-        fill.style.width = `${connectPct}%`;
-        const bar = element("div", {
-          className: `pv-progress${frozen ? " pv-progress--error" : ""}`,
-          attributes: {
-            role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100",
-            "aria-valuenow": String(Math.round(connectPct)),
-          },
-        }, fill);
-        const pct = element("span", { className: "pv-progress-pct", text: `${Math.round(connectPct)}%` });
-        const elapsed = element("span", { className: "pv-progress-elapsed", text: elapsedText() });
-        if (!frozen) { progressFillRef = fill; progressBarRef = bar; progressPctRef = pct; progressElapsedRef = elapsed; }
-        return element("div", { className: "pv-progress-wrap" }, bar,
-          element("div", { className: "pv-progress-row" }, pct, elapsed));
-      }
-
-      // startConnect mở panel ở chế độ "prompt" (nhập tên + bấm Bắt đầu). Đây là hàm mà nút
-      // "Thêm account" ở trang Accounts (việc sau) cũng sẽ gọi lại — nên export ra ngoài paint().
       function startConnect(kind) {
         const p = byKindFrom(lastProviders).get(normalizeKind(kind));
-        connectRun++; // invalidate any prior run before opening a fresh prompt
-        stopConnectTimer(); // kill any crawl still ticking from a prior flow
-        connect = { kind, phase: "prompt", label: defaultLabel(p) };
-        paint();
-        paintConnect();
-      }
-
-      function closeConnect() {
-        stopConnectTimer();
-        connect = null;
+        if (!providerConnect || providerConnectKind !== kind) return;
+        providerConnectOpen = true;
+        providerConnect.start({ label: defaultLabel(p) });
         paint();
       }
 
@@ -414,211 +334,31 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         await refresh();
       }
 
-      async function cancelConnect(kind) {
-        const myRun = connectRun;
-        try {
-          const canceled = await service.connectCancel(kind);
-          if (!ownsConnectRun(kind, myRun)) return;
-          if (canceled?.ok === true) {
-            // Cancellation owns the job only when the server confirms it. Invalidate the old poll
-            // before painting the terminal phase so an in-flight GET cannot overwrite the truth.
-            connectRun++;
-            stopConnectTimer();
-            connect = { ...connect, phase: "canceled" };
-            paintConnect();
-            return;
-          }
-
-          // Another success/persistence path owns the job. Reconcile immediately, then leave the
-          // original run token intact for non-terminal phases so its poll loop keeps following the
-          // authoritative job instead of claiming an optimistic cancellation.
-          const st = await service.connectStatus(kind);
-          if (!ownsConnectRun(kind, myRun)) return;
-          const prevPhase = connect.phase;
-          connect = {
-            ...connect,
-            phase: st.phase,
-            message: st.message,
-            loginUrl: st.loginUrl || connect.loginUrl,
-            code: st.code || connect.code,
-          };
-          if (st.phase !== prevPhase) anchorTo(st.phase);
-          paintConnect();
-          if (st.phase === "connected") {
-            connectRun++;
-            stopConnectTimer();
-            connect = null;
+      function ensureProviderConnect(entry) {
+        if (providerConnect && providerConnectKind === entry.kind) return;
+        disposeProviderConnect();
+        const slot = element("div", { className: "pv-connect" });
+        let component;
+        component = createProviderConnect({
+          kind: entry.kind,
+          service,
+          pollDelayMs: pollMs,
+          crawlDelayMs: crawlMs,
+          onConnected: async () => {
+            if (disposed || providerConnect !== component) return;
+            providerConnectOpen = false;
             await refresh();
-            return;
-          }
-          if (st.phase === "error" || st.phase === "canceled") {
-            connectRun++;
-            stopConnectTimer();
-            return;
-          }
-          if (connectTimer === null) startConnectTimer();
-        } catch (error) {
-          if (error?.name === "AbortError" || !ownsConnectRun(kind, myRun)) return;
-          // A failed DELETE (or its follow-up GET) says nothing about the backend job itself. Keep
-          // the last authoritative phase and run token so the normal status loop can still observe
-          // success; surface the uncertainty separately instead of freezing the flow as an error.
-          const detail = error?.message || "Không thể xác nhận yêu cầu huỷ kết nối.";
-          connect = { ...connect, cancelWarning: `${detail} Tiếp tục theo dõi kết nối.` };
-          paintConnect();
-        }
-      }
-
-      function phaseLabel(phase, message, kind) {
-        switch (phase) {
-          case "detecting": return "Đang kiểm tra…";
-          // Stable heading, not the raw npm line — the live npm output shows on its own .pv-connect-log
-          // line under the bar (see paintConnect), so the heading stays clean while the log streams.
-          case "installing": return "Đang cài đặt gói…";
-          // Claude has no device-auth code — just a browser URL to click. Codex needs the code typed in.
-          case "awaiting_login": return kind === "claude-code"
-            ? "Bấm link để đăng nhập Claude ở trình duyệt vừa mở, rồi chờ xác nhận…"
-            : "Mở trang đăng nhập, nhập mã bên dưới, rồi chờ xác nhận…";
-          case "polling": return "Đang xác nhận đăng nhập…";
-          case "connected": return "Đã kết nối.";
-          default: return message || "";
-        }
-      }
-
-      // paintConnect chỉ vẽ lại connectSlot — cùng nguyên tắc với paintGallery().
-      function paintConnect() {
-        // Drop stale progress refs before (maybe) re-creating them: any branch that doesn't render a
-        // live bar must leave tickConnect with nothing to poke.
-        progressFillRef = progressBarRef = progressPctRef = progressElapsedRef = null;
-        if (!connect) { connectSlot.replaceChildren(); return; }
-        if (connect.phase === "prompt") {
-          const input = element("input", { className: "pv-connect-label",
-            attributes: { type: "text", value: connect.label, "aria-label": "Tên tài khoản" } });
-          connectSlot.replaceChildren(element("div", { className: "pv-connect-prompt" },
-            input,
-            element("button", { className: "pv-btn primary", attributes: { type: "button" },
-              text: "Bắt đầu kết nối",
-              on: { click() { void runConnect(connect.kind, input.value); } } }),
-            element("button", { className: "pv-btn", attributes: { type: "button" },
-              text: "Huỷ", on: { click: closeConnect } }),
-          ));
-          return;
-        }
-        if (connect.phase === "error" || connect.phase === "canceled") {
-          // Claude Code installs via npm now (Tasks 4–5), but a connect can still fail before/during
-          // install (npm missing, network, bad login) and surface a generic error. Point the user at
-          // the download page on any claude-code connect error — install trouble is the likeliest
-          // early failure and the hint is harmless otherwise.
-          const installHint = connect.kind === "claude-code" && connect.phase === "error"
-            ? element("div", { className: "pv-connect-hint" },
-                element("span", { text: "Chưa cài Claude Code? Tải tại " }),
-                element("a", { attributes: { href: "https://claude.com/claude-code", target: "_blank", rel: "noopener" },
-                  text: "claude.com/claude-code" }))
-            : null;
-          // Frozen red bar above the message: shows how far the flow got before it died, and reads
-          // unmistakably as "stopped, not working" (muted-red, no animation). connectPct holds
-          // whatever the live bar reached (≥ the detecting anchor, since a flow always ran first).
-          connectSlot.replaceChildren(element("div", { className: "pv-connect-status" },
-            renderProgress(true),
-            element("div", { className: "pv-connect-message",
-              text: connect.message || (connect.phase === "canceled" ? "Đã huỷ kết nối." : "Kết nối thất bại.") }),
-            installHint,
-            element("button", { className: "pv-btn", attributes: { type: "button" },
-              text: "Đóng", on: { click: closeConnect } }),
-          ));
-          return;
-        }
-        // Đang chạy: detecting / installing / awaiting_login / polling. Chỉ dựng <a href> khi URL
-        // thật là https:// — một backend hỏng hay giả mạo trả về javascript:/data: không được phép
-        // trở thành một liên kết bấm được trong trang.
-        // Hiện link + mã bất cứ khi nào chúng có (awaiting_login VÀ polling): state machine set
-        // loginUrl/code NGAY lúc chuyển sang polling, nên nếu chỉ hiện ở awaiting_login thì người
-        // dùng không bao giờ kịp thấy mã cần nhập. Chúng tự biến mất ở connected/error/canceled
-        // (các phase đó có nhánh render riêng, không tới đây).
-        const loginLink = connect.loginUrl?.startsWith("https://")
-          ? element("a", { className: "pv-btn primary",
-              attributes: { href: connect.loginUrl, target: "_blank", rel: "noopener" },
-              text: "Mở trang đăng nhập" })
-          : null;
-        // device-auth: người dùng phải nhập mã một lần này vào trang đăng nhập. Hiện rõ + đọc được
-        // để copy; KHÔNG phải credential (mã hết hạn ~15 phút, chỉ dùng để ghép phiên login).
-        const codeBlock = connect.code
-          ? element("div", { className: "pv-connect-code" },
-              element("span", { className: "pv-connect-code-label", text: "Mã đăng nhập:" }),
-              element("code", { className: "pv-connect-code-value", text: connect.code }))
-          : null;
-        // Live npm output (streamed into connect.message during installing) shows on its own muted
-        // log line under the bar — the heading stays a stable phase label. Empty message → no line.
-        const logLine = connect.message
-          ? element("div", { className: "pv-connect-log", text: connect.message })
-          : null;
-        const cancelWarning = connect.cancelWarning
-          ? element("div", {
-              className: "pv-connect-log pv-connect-warning",
-              attributes: { role: "status" },
-              text: connect.cancelWarning,
-            })
-          : null;
-        connectSlot.replaceChildren(element("div", { className: "pv-connect-live" },
-          renderProgress(false),
-          cancelWarning,
-          logLine,
-          element("div", { className: "pv-connect-status" },
-            element("div", { className: "pv-connect-message", text: phaseLabel(connect.phase, connect.message, connect.kind) }),
-            loginLink,
-            codeBlock,
-            element("button", { className: "pv-btn", attributes: { type: "button" },
-              text: "Huỷ", on: { click() { void cancelConnect(connect.kind); } } }),
-          ),
-        ));
-      }
-
-      // runConnect lái luồng: POST bắt đầu, rồi GET lặp lại tới khi connected/error/canceled. Mỗi
-      // vòng kiểm connectRun !== myRun để tự dừng — KHÔNG connect?.kind !== kind: kind không đổi
-      // khi bấm lại nút hay điều hướng sang detail khác rồi quay lại cùng kind, nên phép so sánh
-      // theo kind bỏ lọt đúng ca gây lỗi (vòng lặp cũ chạy nền, đè trạng thái của lượt mới).
-      async function runConnect(kind, label) {
-        const myRun = ++connectRun;
-        // Fresh progress state for this flow: base at the detecting anchor, start the elapsed clock,
-        // and start the single crawl timer (cleared on every terminal/teardown path below).
-        connectPct = 0;
-        connectStart = Date.now();
-        connect = { kind, phase: "detecting", label };
-        anchorTo("detecting");
-        startConnectTimer();
-        paintConnect();
-        try {
-          await service.connectStart(kind, label);
-          for (;;) {
-            if (disposed || connectRun !== myRun) { stopConnectTimer(); return; }
-            const st = await service.connectStatus(kind);
-            if (disposed || connectRun !== myRun) { stopConnectTimer(); return; }
-            const prevPhase = connect.phase;
-            connect = { ...connect, phase: st.phase, message: st.message, loginUrl: st.loginUrl || connect.loginUrl, code: st.code || connect.code };
-            if (st.phase !== prevPhase) anchorTo(st.phase); // real transition → jump the bar forward
-            paintConnect();
-            if (st.phase === "connected") {
-              connectRun++; // terminal: invalidate pending cancel/reconciliation work for this run
-              stopConnectTimer();
-              connect = null;
-              await refresh();
-              return;
-            }
-            if (st.phase === "error" || st.phase === "canceled") {
-              connectRun++; // terminal state owns the final UI; late cancel work must be ignored
-              stopConnectTimer();
-              return;
-            }
-            await sleep(pollMs);
-          }
-        } catch (error) {
-          // Lượt cũ/lỗi muộn không được đè connect: {...null, phase:"error"} sinh ra một đối tượng
-          // thiếu kind là đúng thứ lỗi cần chặn.
-          if (disposed || connectRun !== myRun || error?.name === "AbortError") { stopConnectTimer(); return; }
-          connectRun++; // this run is terminal; invalidate pending cancel/reconciliation work
-          stopConnectTimer();
-          connect = { ...connect, phase: "error", message: error?.message || "Kết nối thất bại" };
-          paintConnect();
-        }
+          },
+          onBack: () => {
+            if (disposed || providerConnect !== component) return;
+            providerConnectOpen = false;
+            paint();
+          },
+        });
+        providerConnect = component;
+        providerConnectKind = entry.kind;
+        providerConnectSlot = slot;
+        component.mount(slot);
       }
 
       // headFor đóng bao service/refresh của mount() — group-head cần gọi testSaved() và refresh()
@@ -658,18 +398,19 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         if (view !== "gallery") {
           const entry = PROVIDER_CATALOG.find((e) => e.kind === view);
           if (entry) {
+            const connectable = entry.group === "subscription" && CONNECTABLE_KINDS.has(entry.kind);
+            if (connectable) ensureProviderConnect(entry);
             const connUI = {
-              connectable: entry.group === "subscription" && CONNECTABLE_KINDS.has(entry.kind),
-              connecting: connect?.kind === entry.kind,
-              connectSlot,
+              connectable,
+              connecting: providerConnectOpen && providerConnectKind === entry.kind,
+              connectSlot: providerConnectSlot,
               onAdd: startConnect,
               onRemoveAccount: removeAccount,
             };
             root.replaceChildren(header(), renderDetail(entry, byKindFrom(lastProviders), backToGallery, connUI));
-            // Slot node vẽ lại ở paint() mất nội dung cũ — refill nếu panel đang mở cho đúng kind này.
-            if (connect?.kind === entry.kind) paintConnect();
             return;
           }
+          disposeProviderConnect();
           view = "gallery";
         }
         paintGallery();
@@ -716,7 +457,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         dispose() {
           disposed = true;
           listRevision++;
-          stopConnectTimer(); // no interval may outlive the mounted page
+          disposeProviderConnect();
           controller.abort();
         },
       };

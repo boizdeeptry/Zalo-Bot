@@ -69,12 +69,7 @@ export const NAVIGATION = Object.freeze([
   Object.freeze({
     heading: "SYSTEM",
     items: freezeItems([
-      {
-        id: "settings",
-        icon: "⚙",
-        label: "Settings",
-        todo: "Cửa sổ gom tin, tên bot, thư mục tri thức. Hiện đặt trong trang Zalo và trong Chay.bat.",
-      },
+      { id: "settings", icon: "⚙", label: "Settings" },
     ]),
   }),
 ]);

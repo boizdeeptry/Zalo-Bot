@@ -108,6 +108,14 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 		a.writeErr(w, http.StatusBadRequest, "nội dung không phải UTF-8 hợp lệ")
 		return
 	}
+	if p == a.zalo.cfg.PersonaPath && a.st != nil {
+		onboardingMutationMu.Lock()
+		defer onboardingMutationMu.Unlock()
+		if err := a.resolveAgentPersonaRecovery(p); err != nil {
+			a.writeAgentRollbackFailed(w, err)
+			return
+		}
+	}
 
 	// Bản gốc, ghi MỘT lần. Cùng cơ chế với việc điền chỗ trống, và cùng lý do: ổ này không có
 	// git, nên .goc là đường lùi duy nhất.
@@ -129,17 +137,60 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 	// \r\n -> \n. Ô textarea của trình duyệt trả về \r\n theo chuẩn HTML, và một tệp lẫn hai kiểu
 	// xuống dòng làm mọi lần so sánh về sau nhiễu.
 	text := strings.ReplaceAll(req.Text, "\r\n", "\n")
-	if err := writeAppFileAtomic(p, []byte(text), 0o600); err != nil {
+	displayName := ""
+	recoveryToken := ""
+	if p == a.zalo.cfg.PersonaPath && a.st != nil {
+		displayName, err = a.st.AgentDisplayName()
+		if err != nil {
+			a.logger.Error("persona: đọc tên hiển thị trước khi lưu", "err", err)
+			a.writeErr(w, http.StatusInternalServerError, "không đọc được tên bot")
+			return
+		}
+		recoveryToken, err = a.prepareAgentPersonaRecovery(p, old, []byte(text))
+		if err != nil {
+			a.logger.Error("persona: chuẩn bị khôi phục", "err", err)
+			a.writeErr(w, http.StatusInternalServerError, "không chuẩn bị được bản khôi phục, chưa ghi gì")
+			return
+		}
+	}
+	writer := writeAppFileAtomic
+	if p == a.zalo.cfg.PersonaPath {
+		writer = writeAgentFileAtomic
+	}
+	if err := writer(p, []byte(text), 0o600); err != nil {
+		if recoveryToken != "" {
+			if cleanupErr := a.resolveAgentPersonaRecovery(p); cleanupErr != nil {
+				a.writeAgentRollbackFailed(w, cleanupErr)
+				return
+			}
+		}
 		a.logger.Error("persona: ghi tệp", "path", p, "err", err)
 		a.writeErr(w, http.StatusInternalServerError, "không ghi được tệp "+label)
 		return
 	}
-	holes := scanPlaceholders(text)
+	if p == a.zalo.cfg.PersonaPath && a.st != nil {
+		if _, err := a.st.UpdateAgentPersona(displayName, recoveryToken); err != nil {
+			a.rollbackAgentPersona(w, p, err)
+			return
+		}
+		if err := a.resolveAgentPersonaRecovery(p); err != nil {
+			a.writeAgentRollbackFailed(w, err)
+			return
+		}
+	}
+	analysis := analyzePersona(text)
+	validationError := analysis.ValidationError
+	if p == a.zalo.cfg.PersonaPath {
+		if _, err := normalizeAgentNameValue("tên hiển thị", displayName); validationError == "" && err != nil {
+			validationError = "tên hiển thị của bot không hợp lệ"
+		}
+	}
 	a.zlog.add(ipc.ZaloLogInfo, "", fmt.Sprintf("%s đã sửa (%d KB, %d chỗ trống còn lại)",
-		label, len(text)>>10, len(holes)))
+		label, len(text)>>10, len(analysis.Placeholders)))
 	// Trả về chỗ trống còn lại: người dùng có thể vừa dán vào một đoạn mang {{...}} mới, và trang
 	// phải biết để đổi bảng trạng thái.
 	a.writeJSON(w, http.StatusOK, map[string]any{
-		"bytes": len(text), "placeholders": holes, "ready": len(holes) == 0,
+		"bytes": len(text), "placeholders": analysis.Placeholders,
+		"ready": len(analysis.Placeholders) == 0 && validationError == "", "validation_error": validationError,
 	})
 }

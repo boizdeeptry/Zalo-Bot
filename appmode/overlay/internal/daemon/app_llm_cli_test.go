@@ -52,6 +52,24 @@ func TestCLIRegistryHasThreeVendors(t *testing.T) {
 	}
 }
 
+func TestOnboardingModelDescriptors(t *testing.T) {
+	tests := []struct {
+		kind string
+		want string
+	}{
+		{kind: "codex", want: "gpt-5.6-terra"},
+		{kind: "claude-code", want: "sonnet"},
+		{kind: "gemini-cli", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.kind, func(t *testing.T) {
+			if got := cliDescriptors[tt.kind].onboardingModel; got != tt.want {
+				t.Fatalf("cliDescriptors[%q].onboardingModel = %q; want %q", tt.kind, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestCLIArgvIsReadOnlyAndNeverBypassesSandbox chốt tính chất an ninh: tin nhắn khách chảy vào
 // req.Prompt là input không tin được, mà argv dựng ra không bao giờ được mang một cờ bỏ sandbox.
 func TestCLIArgvIsReadOnlyAndNeverBypassesSandbox(t *testing.T) {

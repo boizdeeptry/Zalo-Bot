@@ -1,15 +1,24 @@
 package daemon
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/exec"
 	"slices"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"agentdc/internal/agent"
 	"agentdc/internal/store"
 )
 
@@ -140,6 +149,244 @@ func newAppLLMRunner(cfg appLLMRunnerConfig) *appLLMRunner {
 		cfg.Logger = slog.Default()
 	}
 	return &appLLMRunner{cfg: cfg}
+}
+
+// appOnboardingNoopAttemptStore keeps Test Chat outside production telemetry.
+// The router still follows its normal attempt-recording semantics, but this
+// isolated sink deliberately commits nothing.
+type appOnboardingNoopAttemptStore struct{}
+
+func (appOnboardingNoopAttemptStore) RecordLLMAttempt(store.LLMAttempt) error { return nil }
+
+// newAppOnboardingTestRunner constructs a real router over a synthetic snapshot
+// containing exactly the disabled staging Account/model selected by onboarding.
+// It never reads the live route or live Account selector.
+func newAppOnboardingTestRunner(
+	ctx context.Context,
+	a *api,
+	state store.OnboardingState,
+	staged store.OnboardingStagingAccount,
+) (*appLLMRunner, error) {
+	if state.ProviderID == "" || state.ProviderID != state.ProviderKind ||
+		state.ProviderID != staged.ProviderID || state.ProviderKind != staged.ProviderKind ||
+		state.AccountID == "" || state.AccountID != staged.AccountID ||
+		state.ModelID == "" || state.StagedComboID == "" || staged.ConfigDir == "" {
+		return nil, store.ErrOnboardingInvalidStagingOwnership
+	}
+	logger := a.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	cfg := appLLMRunnerConfig{
+		Route: store.LLMRouteSnapshot{
+			Type:    "fallback",
+			ComboID: state.StagedComboID,
+			Entries: []store.LLMRouteEntry{{
+				Position: 0, ProviderID: state.ProviderID, ModelID: state.ModelID, Enabled: true,
+			}},
+		},
+		Store:          appOnboardingNoopAttemptStore{},
+		Adapters:       map[string]providerAdapter{},
+		Disabled:       map[string]bool{},
+		Credential:     func(string) ([]byte, error) { return nil, nil },
+		Claude:         func(string) zaloRunner { return silentZaloRunner{} },
+		HasAttachments: false,
+		Logger:         logger,
+	}
+
+	switch state.ProviderKind {
+	case "codex":
+		adapter, ok := newLLMAdapter(state.ProviderKind, state.ProviderID,
+			&http.Client{Timeout: defaultLLMProviderTimeout}, logger)
+		if !ok {
+			return nil, fmt.Errorf("onboarding test: staged Provider has no adapter")
+		}
+		switch pinned := adapter.(type) {
+		case *codexProxyAdapter:
+			pinned.pickConfigDir = makeOnboardingPinnedConfigDir(staged)
+		case *cliAdapter:
+			pinned.accountEnv = makeOnboardingPinnedAccountEnv(staged)
+		default:
+			return nil, fmt.Errorf("onboarding test: staged Codex adapter has unexpected type")
+		}
+		cfg.Adapters[state.ProviderID] = adapter
+	case "claude-code":
+		if a.zalo == nil {
+			return nil, fmt.Errorf("onboarding test: persona runtime is unavailable")
+		}
+		program, prefixArgs, err := resolveCLIProgramContext(ctx, cliDescriptors["claude-code"])
+		if err != nil {
+			return nil, fmt.Errorf("onboarding test: resolve staged Claude program: %w", err)
+		}
+		claude := appOnboardingPinnedClaudeRunner(
+			a.zalo.cfg, staged, state.ModelID, program, prefixArgs, logger,
+		)
+		cfg.Claude = func(string) zaloRunner { return claude }
+	default:
+		return nil, store.ErrOnboardingProviderUnsupported
+	}
+	return newAppLLMRunner(cfg), nil
+}
+
+type appOnboardingCLIProcess func(
+	context.Context,
+	*exec.Cmd,
+	[]byte,
+	chan<- int,
+	*slog.Logger,
+) ([]byte, error)
+
+var appOnboardingRunCLIProcess appOnboardingCLIProcess = runCLIProcess
+
+type appOnboardingClaudeRunner struct {
+	cfg    zaloConfig
+	logger *slog.Logger
+}
+
+// appOnboardingPinnedClaudeRunner receives the exact validated staging Account
+// directly. There is no round-robin or live-session selector on this path.
+// Unlike the legacy live runner, this stateless onboarding path delegates child
+// ownership to runCLIProcess so cancellation tears down the managed process tree.
+func appOnboardingPinnedClaudeRunner(
+	base zaloConfig,
+	staged store.OnboardingStagingAccount,
+	model string,
+	program string,
+	prefixArgs []string,
+	logger *slog.Logger,
+) zaloRunner {
+	isolated := zaloConfig{
+		KBRoots:           slices.Clone(base.KBRoots),
+		WorkDir:           base.WorkDir,
+		ThinkingTokens:    base.ThinkingTokens,
+		Model:             model,
+		ConfigDir:         staged.ConfigDir,
+		Program:           program,
+		ProgramPrefixArgs: slices.Clone(prefixArgs),
+	}
+	return &appOnboardingClaudeRunner{cfg: isolated, logger: logger}
+}
+
+func (r *appOnboardingClaudeRunner) Run(
+	ctx context.Context,
+	prompt string,
+	step func(string),
+) (string, error) {
+	profile := agent.ConsultReadOnly()
+	args, err := appOnboardingClaudeArgv(profile, r.cfg)
+	if err != nil {
+		return "", err
+	}
+	args = append(slices.Clone(r.cfg.ProgramPrefixArgs), args...)
+	for _, arg := range args {
+		if appOnboardingClaudeArgIsStateful(arg) {
+			return "", errors.New("staged Claude command contains session persistence")
+		}
+	}
+	cmd := exec.Command(r.cfg.Program, args...)
+	cmd.Dir = r.cfg.WorkDir
+	cmd.Env = profile.Env(os.Environ())
+	cmd.Env = appZaloSetEnv(cmd.Env, "CLAUDE_CONFIG_DIR", r.cfg.ConfigDir)
+	if r.cfg.ThinkingTokens > 0 {
+		cmd.Env = appZaloSetEnv(cmd.Env, "MAX_THINKING_TOKENS", fmt.Sprint(r.cfg.ThinkingTokens))
+	}
+
+	step("agent bắt đầu đọc knowledge base")
+	out, err := appOnboardingRunCLIProcess(ctx, cmd, []byte(prompt), nil, r.logger)
+	if err != nil {
+		return "", fmt.Errorf("run staged Claude: %w", err)
+	}
+
+	var answer string
+	var sawResult bool
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var event struct {
+			Type    string `json:"type"`
+			Result  string `json:"result"`
+			IsError bool   `json:"is_error"`
+		}
+		if err := json.Unmarshal(line, &event); err != nil || event.Type == "" {
+			return "", errors.New("staged Claude returned an invalid structured event")
+		}
+		progress, result, isResult := parseStreamLine(line)
+		if progress != "" {
+			step(progress)
+		}
+		if isResult {
+			if sawResult || event.IsError {
+				return "", errors.New("staged Claude returned an invalid result event")
+			}
+			answer, sawResult = sanitizeOnboardingClaudeResult(result)
+			if !sawResult {
+				return "", errors.New("staged Claude returned an empty or unsafe result")
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read staged Claude output: %w", err)
+	}
+	if !sawResult {
+		return "", errors.New("staged Claude returned no result event")
+	}
+	return answer, nil
+}
+
+func appOnboardingClaudeArgv(profile agent.Profile, cfg zaloConfig) ([]string, error) {
+	args := make([]string, 0, len(profile.HeadlessArgs)+2+len(cfg.KBRoots)*2)
+	for index := 0; index < len(profile.HeadlessArgs); index++ {
+		arg := profile.HeadlessArgs[index]
+		if arg == "--session-id" {
+			if index+1 >= len(profile.HeadlessArgs) || profile.HeadlessArgs[index+1] != "{SID}" {
+				return nil, errors.New("read-only Claude profile has an unsafe session-id shape")
+			}
+			index++
+			continue
+		}
+		if strings.Contains(arg, "{SID}") || appOnboardingClaudeArgIsStateful(arg) {
+			return nil, errors.New("read-only Claude profile contains session persistence")
+		}
+		args = append(args, arg)
+	}
+	args = append(args, "--no-session-persistence")
+	if cfg.Model != "" {
+		args = append(args, "--model", cfg.Model)
+	}
+	if len(cfg.KBRoots) == 0 {
+		return nil, errors.New("no knowledge-base roots configured")
+	}
+	for _, root := range cfg.KBRoots {
+		args = append(args, "--add-dir", root)
+	}
+	return args, nil
+}
+
+func appOnboardingClaudeArgIsStateful(arg string) bool {
+	name, _, _ := strings.Cut(arg, "=")
+	switch name {
+	case "--session-id", "--resume", "-r", "--continue", "-c", "--fork-session":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeOnboardingClaudeResult(result string) (string, bool) {
+	if !utf8.ValidString(result) {
+		return "", false
+	}
+	result = strings.TrimSpace(result)
+	if result == "" {
+		return "", false
+	}
+	for _, value := range result {
+		if unicode.IsControl(value) && value != '\n' && value != '\r' && value != '\t' {
+			return "", false
+		}
+	}
+	return result, true
 }
 
 // Run trả lời một lượt bằng snapshot đã chụp khi dựng runner.

@@ -263,7 +263,13 @@ test("subscription connect: click drives phases through to connected and refresh
     if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
     if (path === "/llm/providers/codex/connect" && !options.method) {
       const p = phases[Math.min(i++, phases.length - 1)];
-      return { kind: "codex", phase: p, loginUrl: p === "awaiting_login" ? "https://auth.example/x" : "" };
+      return {
+        kind: "codex",
+        phase: p,
+        loginUrl: p === "awaiting_login" ? "https://auth.example/x" : "",
+        providerId: p === "connected" ? "codex" : "",
+        accountId: p === "connected" ? "a1" : "",
+      };
     }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
@@ -285,7 +291,72 @@ test("subscription connect: click drives phases through to connected and refresh
 
   const post = calls.find((c) => c.path === "/llm/providers/codex/connect" && c.options.method === "POST");
   assert.ok(post && typeof post.options.body.label === "string" && post.options.body.label.length > 0, "POST connect carries a label");
-  assert.ok(listCalls >= 2, "connected triggers a provider-list refresh");
+  assert.equal(Object.hasOwn(post.options.body, "onboarding_revision"), false,
+    "ordinary Providers connect omits onboarding_revision entirely");
+  assert.equal(listCalls, 2, "one connected terminal refreshes the provider list exactly once");
+});
+
+test("a connected snapshot without terminal ids cannot refresh the Provider detail", async (t) => {
+  let listCalls = 0;
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) {
+      listCalls++;
+      return { providers: [], kinds: [] };
+    }
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") {
+      return { kind: "codex", phase: "detecting" };
+    }
+    if (path === "/llm/providers/codex/connect" && !options.method) {
+      return { kind: "codex", phase: "connected" };
+    }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
+  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && /Bắt đầu/.test(text(node))).click();
+  await flush();
+
+  assert.equal(listCalls, 1, "an incomplete terminal payload never invokes the refresh callback");
+  assert.match(text(main), /thiếu định danh Provider hoặc tài khoản/);
+  assert.notEqual(find(main, (node) => hasClass(node, "pv-progress"))?.getAttribute("aria-valuenow"), "100",
+    "an invalid connected snapshot never paints completed progress");
+});
+
+test("a contradictory connected identity cannot refresh the Provider detail", async (t) => {
+  let listCalls = 0;
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) {
+      listCalls++;
+      return { providers: [], kinds: [] };
+    }
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") {
+      return { kind: "codex", phase: "detecting" };
+    }
+    if (path === "/llm/providers/codex/connect" && !options.method) {
+      return {
+        kind: "claude-code",
+        phase: "connected",
+        providerId: "claude-code",
+        accountId: "foreign-account",
+      };
+    }
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
+  await flush();
+  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
+  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && /Bắt đầu/.test(text(node))).click();
+  for (let turn = 0; turn < 20; turn++) await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(listCalls, 1, "a foreign connected identity never invokes the account refresh callback");
+  assert.match(text(main), /phản hồi trạng thái kết nối không hợp lệ/i);
+  assert.notEqual(find(main, (node) => hasClass(node, "pv-progress"))?.getAttribute("aria-valuenow"), "100",
+    "a contradictory identity never paints completed progress");
 });
 
 // The backend sets loginUrl/code exactly as it flips awaiting_login -> polling, so the URL+code
@@ -431,105 +502,126 @@ test("cancel: an accepted DELETE renders canceled and stops the live flow", asyn
   assert.match(text(main), /Đã huỷ kết nối/, "a stale status result cannot overwrite accepted cancel");
 });
 
-test("cancel: a rejected ownership claim refreshes live status and keeps polling without claiming canceled", async (t) => {
+test("cancel: a rejected ownership claim warns, refreshes live status, and keeps polling", async (t) => {
   let deleteSeen = false;
+  let connectGets = 0;
   let statusGetsAfterDelete = 0;
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
-    if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") {
+      return { kind: "codex", phase: "detecting" };
+    }
     if (path === "/llm/providers/codex/connect" && options.method === "DELETE") {
       deleteSeen = true;
       return { ok: false };
     }
     if (path === "/llm/providers/codex/connect" && !options.method) {
+      connectGets++;
       if (deleteSeen) statusGetsAfterDelete++;
-      return { kind: "codex", phase: "polling", message: deleteSeen ? "Kết nối vẫn đang được hoàn tất." : "" };
+      return {
+        kind: "codex",
+        phase: "polling",
+        message: deleteSeen ? "Kết nối vẫn đang được hoàn tất." : "",
+      };
     }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   }, { pollMs: 0 });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
   await flush();
-  const detail = find(main, (n) => hasClass(n, "pv-detail"));
-  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
-  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
-  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && /Bắt đầu/.test(text(node))).click();
+  await waitFor(() => connectGets >= 1, "the first status snapshot");
 
-  find(main, (n) => n.tagName === "BUTTON" && /Huỷ/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Huỷ/.test(text(node))).click();
   await waitFor(() => statusGetsAfterDelete >= 1, "an authoritative status refresh after ok:false");
 
   assert.doesNotMatch(text(main), /Đã huỷ kết nối/, "ok:false never paints an optimistic canceled state");
   assert.match(text(main), /Kết nối vẫn đang được hoàn tất/, "the refreshed live phase remains visible");
+  assert.ok(find(main, (node) => hasClass(node, "pv-connect-warning")),
+    "uncertain cancellation is rendered as a non-terminal warning");
   const getsAfterRefresh = statusGetsAfterDelete;
-  await waitFor(() => statusGetsAfterDelete > getsAfterRefresh, "the original connect loop to continue polling");
+  await waitFor(() => statusGetsAfterDelete > getsAfterRefresh, "the reconciliation generation to continue polling");
 });
 
-test("cancel: a DELETE transport error stays non-terminal and polling continues", async (t) => {
+test("cancel: a DELETE transport error stays nonterminal and polling continues", async (t) => {
   let connectGets = 0;
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
-    if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
-    if (path === "/llm/providers/codex/connect" && !options.method) { connectGets++; return { kind: "codex", phase: "polling" }; }
-    if (path === "/llm/providers/codex/connect" && options.method === "DELETE") throw new Error("Không thể huỷ kết nối");
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") {
+      return { kind: "codex", phase: "detecting" };
+    }
+    if (path === "/llm/providers/codex/connect" && !options.method) {
+      connectGets++;
+      return { kind: "codex", phase: "polling" };
+    }
+    if (path === "/llm/providers/codex/connect" && options.method === "DELETE") {
+      throw new Error("Không thể huỷ kết nối");
+    }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   }, { pollMs: 0 });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
   await flush();
-  const detail = find(main, (n) => hasClass(n, "pv-detail"));
-  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
-  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
-  await flush();
+  find(main, (node) => node.tagName === "BUTTON" && /Bắt đầu/.test(text(node))).click();
+  await waitFor(() => connectGets >= 1, "the first status snapshot");
 
-  find(main, (n) => n.tagName === "BUTTON" && /Huỷ/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Huỷ/.test(text(node))).click();
   await waitFor(() => /Không thể huỷ kết nối/.test(text(main)), "the cancel-specific warning");
 
   assert.match(text(main), /Đang xác nhận đăng nhập/, "the authoritative polling phase remains visible");
   assert.match(text(main), /Tiếp tục theo dõi kết nối/, "the warning explains that status tracking continues");
-  assert.ok(find(main, (n) => hasClass(n, "pv-connect-warning")), "the feedback is rendered as a non-terminal warning");
+  assert.ok(find(main, (node) => hasClass(node, "pv-connect-warning")),
+    "the feedback is rendered as a non-terminal warning");
   const getsWithWarning = connectGets;
   await waitFor(() => connectGets > getsWithWarning, "status polling after the DELETE error");
 });
 
-test("cancel: a reconciliation GET transport error keeps the live phase and polling active", async (t) => {
+test("cancel: a reconciliation GET error keeps the live phase and polling active", async (t) => {
   let connectGets = 0;
   let failNextStatus = false;
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
-    if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") {
+      return { kind: "codex", phase: "detecting" };
+    }
     if (path === "/llm/providers/codex/connect" && options.method === "DELETE") return { ok: false };
     if (path === "/llm/providers/codex/connect" && !options.method) {
       connectGets++;
-      if (failNextStatus) { failNextStatus = false; throw new Error("Không đọc được trạng thái sau khi huỷ"); }
+      if (failNextStatus) {
+        failNextStatus = false;
+        throw new Error("Không đọc được trạng thái sau khi huỷ");
+      }
       return { kind: "codex", phase: "polling", message: "Đăng nhập vẫn đang chờ xác nhận." };
     }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   }, { pollMs: 0 });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
   await flush();
-  const detail = find(main, (n) => hasClass(n, "pv-detail"));
-  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
-  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Bắt đầu/.test(text(node))).click();
   await waitFor(() => connectGets >= 1, "the initial polling status");
 
   failNextStatus = true;
-  find(main, (n) => n.tagName === "BUTTON" && /Huỷ/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Huỷ/.test(text(node))).click();
   await waitFor(() => /Không đọc được trạng thái sau khi huỷ/.test(text(main)), "the reconciliation warning");
 
   assert.match(text(main), /Đang xác nhận đăng nhập/, "the last authoritative phase survives reconciliation failure");
-  assert.match(text(main), /Đăng nhập vẫn đang chờ xác nhận/, "the last authoritative backend message remains visible");
+  assert.match(text(main), /Đăng nhập vẫn đang chờ xác nhận/, "the last backend message remains visible");
   const getsWithWarning = connectGets;
   await waitFor(() => connectGets > getsWithWarning, "status polling after reconciliation failure");
 });
 
-test("cancel: a late DELETE rejection cannot obscure a connected result", async (t) => {
+test("cancel: stale old polls cannot refresh, while fresh reconciliation can", async (t) => {
   const deleteGate = deferred();
   const deleteStarted = deferred();
-  const connectedGate = deferred();
+  const staleConnected = deferred();
+  const reconciledConnected = deferred();
   let connectGets = 0;
   let listGets = 0;
   const { main } = mountPage(t, (path, options = {}) => {
@@ -537,39 +629,51 @@ test("cancel: a late DELETE rejection cannot obscure a connected result", async 
       listGets++;
       return { providers: listGets > 1 ? [CODEX_CONNECTED] : [], kinds: [] };
     }
-    if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
+    if (path === "/llm/providers/codex/connect" && options.method === "POST") {
+      return { kind: "codex", phase: "detecting" };
+    }
     if (path === "/llm/providers/codex/connect" && options.method === "DELETE") {
       deleteStarted.resolve();
       return deleteGate.promise;
     }
     if (path === "/llm/providers/codex/connect" && !options.method) {
       connectGets++;
-      if (connectGets === 1) return { kind: "codex", phase: "polling" };
-      return connectedGate.promise;
+      return connectGets === 1 ? staleConnected.promise : reconciledConnected.promise;
     }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   }, { pollMs: 0 });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
   await flush();
-  const detail = find(main, (n) => hasClass(n, "pv-detail"));
-  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
-  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
-  await waitFor(() => connectGets >= 2, "the terminal status request to be in flight");
+  find(main, (node) => node.tagName === "BUTTON" && /Bắt đầu/.test(text(node))).click();
+  await waitFor(() => connectGets === 1, "the old status request to be in flight");
 
-  find(main, (n) => n.tagName === "BUTTON" && /Huỷ/.test(text(n))).click();
+  find(main, (node) => node.tagName === "BUTTON" && /Huỷ/.test(text(node))).click();
   await deleteStarted.promise;
-  connectedGate.resolve({ kind: "codex", phase: "connected" });
-  await waitFor(() => listGets >= 2, "the connected provider refresh");
-  deleteGate.reject(new Error("Không thể huỷ kết nối muộn"));
+  staleConnected.resolve({
+    kind: "codex",
+    phase: "connected",
+    providerId: "codex",
+    accountId: "stale-account",
+  });
   await flush();
+  assert.equal(listGets, 1, "the invalidated old poll cannot invoke the refresh callback");
 
-  assert.match(text(main), /Tài khoản 1/, "the connected account remains visible after refresh");
-  assert.match(text(main), /\+ Thêm account/, "the connected provider detail remains active");
-  assert.doesNotMatch(text(main), /Không thể huỷ kết nối muộn/, "the stale cancel failure is ignored");
-  assert.equal(find(main, (n) => hasClass(n, "pv-connect-warning")), null,
-    "a stale cancel failure cannot add a warning to the terminal flow");
+  deleteGate.reject(new Error("Không thể huỷ kết nối muộn"));
+  await waitFor(() => connectGets === 2, "the fresh reconciliation status request");
+  reconciledConnected.resolve({
+    kind: "codex",
+    phase: "connected",
+    providerId: "codex",
+    accountId: "a1",
+  });
+  await waitFor(() => listGets === 2, "the reconciled connected provider refresh");
+
+  assert.match(text(main), /Tài khoản 1/, "the fresh authoritative generation refreshes the account");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(listGets, 2, "the reconciled connected callback fires exactly once");
 });
 
 // phaseProgress is the pure phase→% mapping the bar anchors to. Testing it directly avoids the

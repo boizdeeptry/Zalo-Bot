@@ -23,6 +23,10 @@ func TestAppPortalShellAssetsAreEmbedded(t *testing.T) {
 		"pages/route-editor.js",
 		"pages/providers.js",
 		"pages/roadmap.js",
+		"components/provider-connect.js",
+		"components/persona-fields.js",
+		"pages/onboarding.js",
+		"pages/settings.js",
 	} {
 		if _, err := fs.ReadFile(assetFS, name); err != nil {
 			t.Errorf("read Portal asset %q: %v", name, err)
@@ -62,6 +66,10 @@ func TestAppPackageServesManagementAssetsAndZalo(t *testing.T) {
 		"/assets/app.css",
 		"/assets/zalo.css",
 		"/assets/modal.css",
+		"/assets/components/provider-connect.js",
+		"/assets/components/persona-fields.js",
+		"/assets/pages/onboarding.js",
+		"/assets/pages/settings.js",
 		"/zalo",
 	} {
 		response := rawGet(t, ts, path)

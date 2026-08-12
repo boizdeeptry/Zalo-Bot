@@ -273,6 +273,18 @@ Copy-Item -LiteralPath (Join-Path $Tmp 'agentdc.exe') -Destination (Join-Path $O
 Copy-Item -LiteralPath (Join-Path $Tmp 'tuvan-zalo\dist') -Destination (Join-Path $Out 'app\transport') -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $Tmp 'tuvan-zalo\package.json') -Destination (Join-Path $Out 'app\transport') -Force
 Copy-Item -LiteralPath (Join-Path $Repo 'tuvan-zalo\node_modules') -Destination (Join-Path $Out 'app\transport') -Recurse -Force
+$portalAssetsOut = Join-Path $Out 'assets'
+foreach ($asset in @(
+    'components\provider-connect.js'
+    'components\persona-fields.js'
+    'pages\onboarding.js'
+    'pages\settings.js'
+  )) {
+  $assetSource = Join-Path (Join-Path $Tmp 'internal\webui\static') $asset
+  $assetDestination = Join-Path $portalAssetsOut $asset
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $assetDestination)) | Out-Null
+  Copy-Item -LiteralPath $assetSource -Destination $assetDestination -Force
+}
 # Tia dev deps TRONG GOI, khong trong repo: repo con can typescript de build.
 Invoke-AppCommand -Label 'npm prune' -FilePath $npmExe `
   -Arguments @('--prefix', (Join-Path $Out 'app\transport'), 'prune', '--omit=dev', '--silent') `

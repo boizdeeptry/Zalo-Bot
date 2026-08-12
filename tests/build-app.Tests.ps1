@@ -304,7 +304,7 @@ package daemon
     }
     $appSchema = [IO.File]::ReadAllText((Join-Path $stage 'internal\store\app_schema.go'))
     foreach ($signature in @(
-        'const appSchemaVersion int64 = 6',
+        'const appSchemaVersion int64 = 7',
         'llm_combos',
         'app_memory_subject_revisions'
       )) {
@@ -649,6 +649,12 @@ try {
   foreach ($relative in $required) {
     Write-TestFile (Join-Path $packageRoot $relative) "fixture`n"
   }
+  $requiredPortalAssets = @(
+    'assets\components\provider-connect.js'
+    'assets\components\persona-fields.js'
+    'assets\pages\onboarding.js'
+    'assets\pages\settings.js'
+  )
   $packageReadme = Join-Path $packageRoot 'README.txt'
   $validOnboarding = @'
 Nhan doi "Start.vbs". Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.
@@ -703,6 +709,12 @@ SET "NPM_CLI_JS=%~dp0\node_modules\npm\bin\npm-cli.js"
   )
   $validPackageBinary = 'fixture ' + ($requiredBinarySignatures -join ' ')
   Write-TestFile $packageBinary "$validPackageBinary`n"
+  foreach ($relative in $requiredPortalAssets) {
+    Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+      -Pattern ('package missing ' + [regex]::Escape($relative)) `
+      -Message "A package missing Portal asset '$relative' was accepted"
+    Write-TestFile (Join-Path $packageRoot $relative) "fixture module`n"
+  }
   Assert-AppPackage -Out $packageRoot | Out-Null
 
   $legacyOnlyOnboarding = @'
@@ -903,6 +915,41 @@ claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
       Relative = 'data\providers\credential.cache'
       Value = 'APP_TEST_PROVIDER_CREDENTIAL_CANARY_C17F46'
       Encoding = [Text.UnicodeEncoding]::new($false, $false)
+      AllowZalo = $false
+      Padding = 0
+    },
+    @{
+      Relative = 'data\onboarding\test-token.txt'
+      Value = 'ONBOARDING_TEST_TOKEN_CANARY_CLEAR_4F91'
+      Encoding = [Text.UTF8Encoding]::new($false)
+      AllowZalo = $false
+      Padding = 0
+    },
+    @{
+      Relative = 'data\onboarding\user-prompt.txt'
+      Value = 'ONBOARDING_USER_PROMPT_CANARY_CLEAR_8172'
+      Encoding = [Text.UnicodeEncoding]::new($false, $false)
+      AllowZalo = $false
+      Padding = 0
+    },
+    @{
+      Relative = 'data\onboarding\answer.txt'
+      Value = 'ONBOARDING_ANSWER_CANARY_CLEAR_BC43'
+      Encoding = [Text.UnicodeEncoding]::new($true, $false)
+      AllowZalo = $false
+      Padding = 0
+    },
+    @{
+      Relative = 'data\onboarding\credential.cache'
+      Value = 'ONBOARDING_CREDENTIAL_CANARY_CLEAR_D912'
+      Encoding = [Text.UTF8Encoding]::new($false)
+      AllowZalo = $false
+      Padding = 0
+    },
+    @{
+      Relative = 'data\accounts\claude-code\config-dir.txt'
+      Value = 'ACCOUNT_CONFIG_DIR_CANARY_CLEAR_A19E'
+      Encoding = [Text.UTF8Encoding]::new($false)
       AllowZalo = $false
       Padding = 0
     }

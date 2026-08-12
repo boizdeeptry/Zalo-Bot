@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -2343,5 +2344,294 @@ func TestChainFallsFromHTTPToCLI(t *testing.T) {
 	if status.LastErrorKind != string(llmErrorRateLimit) || status.LastErrorProviderID != "openai-1" {
 		t.Errorf("LLMStatus() lastError = %q/%q; want rate_limit/openai-1",
 			status.LastErrorKind, status.LastErrorProviderID)
+	}
+}
+
+func TestOnboardingPinnedAccountRouterUsesOnlyStagedCodexConfigAndModel(t *testing.T) {
+	state := store.OnboardingState{
+		Phase: store.OnboardingPhaseTest, ProviderKind: "codex", ProviderID: "codex",
+		AccountID: "staged", ModelID: "gpt-5.6-terra", StagedComboID: "staged-combo",
+		PersonaFingerprint: strings.Repeat("a", 64), Revision: 9,
+	}
+	staged := store.OnboardingStagingAccount{
+		AccountID: "staged", ProviderID: "codex", ProviderKind: "codex",
+		ConfigDir: `C:\accounts\staged`,
+	}
+	runner, err := newAppOnboardingTestRunner(
+		context.Background(),
+		&api{logger: slog.New(slog.DiscardHandler)},
+		state,
+		staged,
+	)
+	if err != nil {
+		t.Fatalf("newAppOnboardingTestRunner() = %v", err)
+	}
+	if runner.cfg.Route.Type != "fallback" || runner.cfg.Route.ComboID != "staged-combo" ||
+		len(runner.cfg.Route.Entries) != 1 {
+		t.Fatalf("isolated route = %+v", runner.cfg.Route)
+	}
+	entry := runner.cfg.Route.Entries[0]
+	if entry.Position != 0 || entry.ProviderID != "codex" ||
+		entry.ModelID != "gpt-5.6-terra" || !entry.Enabled {
+		t.Fatalf("isolated route entry = %+v", entry)
+	}
+	if len(runner.cfg.Adapters) != 1 || runner.cfg.Disabled["codex"] {
+		t.Fatalf("isolated adapters/disabled = %v/%v", runner.cfg.Adapters, runner.cfg.Disabled)
+	}
+	adapter, ok := runner.cfg.Adapters["codex"].(*codexProxyAdapter)
+	if !ok {
+		t.Fatalf("codex adapter = %T; want *codexProxyAdapter", runner.cfg.Adapters["codex"])
+	}
+	for i := 0; i < 3; i++ {
+		configDir, penalize, ok := adapter.pickConfigDir()
+		if !ok || configDir != staged.ConfigDir || penalize == nil {
+			t.Fatalf("pinned config %d = %q, penalize-nil=%t, ok=%t", i, configDir, penalize == nil, ok)
+		}
+		penalize(true)
+	}
+	if _, ok := runner.cfg.Store.(appOnboardingNoopAttemptStore); !ok {
+		t.Fatalf("attempt sink = %T; want onboarding no-op", runner.cfg.Store)
+	}
+}
+
+func TestOnboardingPinnedAccountClaudeRunnerReceivesExactAccount(t *testing.T) {
+	safeKB := t.TempDir()
+	safeWork := t.TempDir()
+	staged := store.OnboardingStagingAccount{
+		AccountID: "staged-claude", ProviderID: "claude-code", ProviderKind: "claude-code",
+		ConfigDir: `C:\accounts\staged-claude`,
+	}
+	base := zaloConfig{
+		KBRoots: []string{safeKB}, WorkDir: safeWork,
+		PersonaPath: `C:\live\persona.md`, RosterPath: `C:\live\roster.md`,
+		OverlayDir: `C:\live\overlays`, OwnerUID: "live-owner", CiteMode: "strict",
+		FilesDir: `C:\live\customer-files`, overlayFor: `C:\live\overlays\customer.md`,
+		Memory: []ipc.ZaloMemory{{}}, Lessons: []ipc.ZaloLesson{{}}, Timeout: 99 * time.Second,
+		ConfigDir: `C:\accounts\live-selected`, Model: "haiku",
+		Program: "live-claude.exe", ProgramPrefixArgs: []string{"live-prefix"},
+	}
+	got := appOnboardingPinnedClaudeRunner(
+		base,
+		staged,
+		"sonnet",
+		"staged-claude.exe",
+		[]string{"staged-prefix"},
+		slog.New(slog.DiscardHandler),
+	)
+	runner, ok := got.(*appOnboardingClaudeRunner)
+	if !ok {
+		t.Fatalf("pinned Claude runner = %T; want *appOnboardingClaudeRunner", got)
+	}
+	if runner.cfg.ConfigDir != staged.ConfigDir || runner.cfg.Model != "sonnet" ||
+		runner.cfg.Program != "staged-claude.exe" || !slices.Equal(runner.cfg.ProgramPrefixArgs, []string{"staged-prefix"}) {
+		t.Fatalf("pinned Claude config = %+v", runner.cfg)
+	}
+	if !slices.Equal(runner.cfg.KBRoots, []string{safeKB}) || runner.cfg.WorkDir != safeWork {
+		t.Fatalf("safe execution roots were not preserved: %+v", runner.cfg)
+	}
+	if runner.cfg.PersonaPath != "" || runner.cfg.RosterPath != "" || runner.cfg.OverlayDir != "" ||
+		runner.cfg.OwnerUID != "" || runner.cfg.CiteMode != "" || runner.cfg.FilesDir != "" ||
+		runner.cfg.overlayFor != "" || len(runner.cfg.Memory) != 0 || len(runner.cfg.Lessons) != 0 ||
+		runner.cfg.Timeout != 0 {
+		t.Fatalf("pinned Claude copied live/customer config: %+v", runner.cfg)
+	}
+}
+
+func TestOnboardingPinnedClaudeRunnerUsesManagedProcessAndCancelsIt(t *testing.T) {
+	staged := store.OnboardingStagingAccount{
+		AccountID: "staged-claude", ProviderID: "claude-code", ProviderKind: "claude-code",
+		ConfigDir: t.TempDir(),
+	}
+	base := zaloConfig{
+		KBRoots: []string{t.TempDir()}, WorkDir: t.TempDir(), ThinkingTokens: 1536,
+	}
+	got := appOnboardingPinnedClaudeRunner(
+		base,
+		staged,
+		"sonnet",
+		"staged-claude.exe",
+		[]string{"staged-prefix"},
+		slog.New(slog.DiscardHandler),
+	)
+	runner, ok := got.(*appOnboardingClaudeRunner)
+	if !ok {
+		t.Fatalf("pinned Claude runner = %T; want *appOnboardingClaudeRunner", got)
+	}
+
+	called := make(chan struct{})
+	canceled := make(chan error, 1)
+	oldRun := appOnboardingRunCLIProcess
+	appOnboardingRunCLIProcess = func(
+		ctx context.Context,
+		cmd *exec.Cmd,
+		stdin []byte,
+		childPID chan<- int,
+		_ *slog.Logger,
+	) ([]byte, error) {
+		if childPID != nil {
+			t.Errorf("childPID = non-nil; onboarding stateless runner must not leak ownership")
+		}
+		if cmd.Cancel != nil {
+			t.Errorf("cmd.Cancel is set; want exec.Command owned by runCLIProcess, not CommandContext")
+		}
+		if cmd.Path != "staged-claude.exe" {
+			t.Errorf("cmd.Path = %q; want staged executable", cmd.Path)
+		}
+		if len(cmd.Args) < 2 || cmd.Args[1] != "staged-prefix" {
+			t.Errorf("cmd.Args = %q; want staged prefix first", cmd.Args)
+		}
+		if slices.Contains(cmd.Args, "--session-id") {
+			t.Errorf("cmd.Args = %q; onboarding must not supply a transcript session UUID", cmd.Args)
+		}
+		if !slices.Contains(cmd.Args, "--no-session-persistence") {
+			t.Errorf("cmd.Args = %q; want --no-session-persistence", cmd.Args)
+		}
+		if string(stdin) != "prompt-for-managed-child" {
+			t.Errorf("stdin = %q; want exact prompt", stdin)
+		}
+		var values []string
+		for _, item := range cmd.Env {
+			if strings.HasPrefix(strings.ToUpper(item), "CLAUDE_CONFIG_DIR=") {
+				values = append(values, item[len("CLAUDE_CONFIG_DIR="):])
+			}
+		}
+		if !slices.Equal(values, []string{staged.ConfigDir}) {
+			t.Errorf("CLAUDE_CONFIG_DIR values = %v; want exactly [%q]", values, staged.ConfigDir)
+		}
+		close(called)
+		<-ctx.Done()
+		canceled <- ctx.Err()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { appOnboardingRunCLIProcess = oldRun })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.Run(ctx, "prompt-for-managed-child", func(string) {})
+		done <- err
+	}()
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("managed process seam was not invoked")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v; want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("managed process did not return after cancellation")
+	}
+	select {
+	case err := <-canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("managed process context error = %v; want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("managed process seam did not observe cancellation")
+	}
+}
+
+func TestOnboardingPinnedClaudeRunnerCreatesNoVendorSessionFiles(t *testing.T) {
+	stagedConfig := t.TempDir()
+	credential := filepath.Join(stagedConfig, "credential.json")
+	if err := os.WriteFile(credential, []byte("existing-auth"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := appOnboardingPinnedClaudeRunner(
+		zaloConfig{KBRoots: []string{t.TempDir()}, WorkDir: t.TempDir()},
+		store.OnboardingStagingAccount{
+			AccountID: "staged", ProviderID: "claude-code", ProviderKind: "claude-code",
+			ConfigDir: stagedConfig,
+		},
+		"sonnet", "claude.exe", nil, slog.New(slog.DiscardHandler),
+	).(*appOnboardingClaudeRunner)
+	oldRun := appOnboardingRunCLIProcess
+	appOnboardingRunCLIProcess = func(_ context.Context, cmd *exec.Cmd, _ []byte, _ chan<- int, _ *slog.Logger) ([]byte, error) {
+		persistDisabled := slices.Contains(cmd.Args, "--no-session-persistence")
+		hasSessionID := slices.Contains(cmd.Args, "--session-id")
+		if !persistDisabled || hasSessionID {
+			sessions := filepath.Join(stagedConfig, "sessions")
+			if err := os.MkdirAll(sessions, 0o700); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(filepath.Join(sessions, "transcript.jsonl"), []byte("persisted"), 0o600); err != nil {
+				return nil, err
+			}
+		}
+		return []byte(`{"type":"result","result":"Xin chào, tôi là Bé Mi."}` + "\n"), nil
+	}
+	t.Cleanup(func() { appOnboardingRunCLIProcess = oldRun })
+
+	answer, err := runner.Run(t.Context(), "prompt", func(string) {})
+	if err != nil || answer != "Xin chào, tôi là Bé Mi." {
+		t.Fatalf("Run() = %q, %v", answer, err)
+	}
+	var paths []string
+	if err := filepath.WalkDir(stagedConfig, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != stagedConfig {
+			paths = append(paths, filepath.Base(path))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(paths, []string{"credential.json"}) {
+		t.Fatalf("staged config files after stateless run = %v; want only existing credential", paths)
+	}
+}
+
+func TestOnboardingPinnedClaudeRunnerRequiresSanitizedStructuredResult(t *testing.T) {
+	tests := []struct {
+		name       string
+		output     string
+		wantAnswer string
+		wantErr    bool
+	}{
+		{name: "structured result", output: `{"type":"system","subtype":"init"}` + "\n" + `{"type":"result","result":"  Xin chào, tôi là Bé Mi.  "}` + "\n", wantAnswer: "Xin chào, tôi là Bé Mi."},
+		{name: "system and tool progress only", output: `{"type":"system","session_id":"CUSTOMER-SESSION"}` + "\n" + `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}` + "\n", wantErr: true},
+		{name: "malformed JSON", output: `{"type":"result","result":"RAW-CUSTOMER-SECRET"` + "\n", wantErr: true},
+		{name: "session metadata only", output: `{"type":"system","session_id":"CUSTOMER-SESSION-METADATA"}` + "\n", wantErr: true},
+		{name: "empty result", output: `{"type":"result","result":"  "}` + "\n", wantErr: true},
+		{name: "error result", output: `{"type":"result","result":"RAW-ERROR-RESULT","is_error":true}` + "\n", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := appOnboardingPinnedClaudeRunner(
+				zaloConfig{KBRoots: []string{t.TempDir()}, WorkDir: t.TempDir()},
+				store.OnboardingStagingAccount{
+					AccountID: "staged", ProviderID: "claude-code", ProviderKind: "claude-code",
+					ConfigDir: t.TempDir(),
+				},
+				"sonnet", "claude.exe", nil, slog.New(slog.DiscardHandler),
+			).(*appOnboardingClaudeRunner)
+			oldRun := appOnboardingRunCLIProcess
+			appOnboardingRunCLIProcess = func(context.Context, *exec.Cmd, []byte, chan<- int, *slog.Logger) ([]byte, error) {
+				return []byte(tt.output), nil
+			}
+			t.Cleanup(func() { appOnboardingRunCLIProcess = oldRun })
+
+			answer, err := runner.Run(t.Context(), "prompt", func(string) {})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Run() = %q, nil; want fail-closed parser error", answer)
+				}
+				for _, forbidden := range []string{"RAW-CUSTOMER-SECRET", "CUSTOMER-SESSION-METADATA", "RAW-ERROR-RESULT"} {
+					if strings.Contains(err.Error(), forbidden) || strings.Contains(answer, forbidden) {
+						t.Fatalf("parser leaked raw event data %q: answer=%q err=%v", forbidden, answer, err)
+					}
+				}
+				return
+			}
+			if err != nil || answer != tt.wantAnswer {
+				t.Fatalf("Run() = %q, %v; want %q, nil", answer, err, tt.wantAnswer)
+			}
+		})
 	}
 }

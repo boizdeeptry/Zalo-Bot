@@ -18,14 +18,34 @@ import (
 )
 
 const (
-	appZaloErrorStateUpdate = "session_state_update_failed"
-	appZaloErrorMemoryRead  = "memory_read_failed"
-	appZaloErrorMemoryApply = "memory_apply_failed"
+	appZaloErrorStateUpdate          = "session_state_update_failed"
+	appZaloErrorMemoryRead           = "memory_read_failed"
+	appZaloErrorMemoryApply          = "memory_apply_failed"
+	appZaloErrorAgentDisplayNameRead = "agent_display_name_read_failed"
 )
 
 var appZaloProcessThreadGate appZaloThreadGate
 
-var errAppZaloSessionStateUpdate = errors.New(appZaloErrorStateUpdate)
+var appZaloReadAgentDisplayName = func(st *store.Store) (string, error) {
+	return st.AgentDisplayName()
+}
+
+func appZaloReadValidatedAgentDisplayName(st *store.Store) (string, error) {
+	displayName, err := appZaloReadAgentDisplayName(st)
+	if err != nil {
+		return "", err
+	}
+	displayName, valid := appZaloNormalizeAndValidateAgentDisplayName(displayName)
+	if !valid {
+		return "", errAppZaloAgentDisplayNameRead
+	}
+	return displayName, nil
+}
+
+var (
+	errAppZaloSessionStateUpdate   = errors.New(appZaloErrorStateUpdate)
+	errAppZaloAgentDisplayNameRead = errors.New(appZaloErrorAgentDisplayNameRead)
+)
 
 type appZaloStructuredRunner interface {
 	appRunZaloSession(
@@ -109,14 +129,32 @@ type appZaloStructuredClaudeAwareRunner interface {
 	appWithZaloStructuredClaudeRequirement(bool) zaloRunner
 }
 
+// appZaloCapturedAgentIdentityRunner prevents the upstream consult seam from
+// re-reading metadata when it receives a runner backed by an immutable turn
+// snapshot. It deliberately does not expose the structured Claude seam.
+type appZaloCapturedAgentIdentityRunner interface {
+	appZaloCapturedAgentDisplayName() string
+}
+
+type appZaloCapturedIdentityRunner struct {
+	zaloRunner
+	agentDisplayName string
+}
+
+func (r *appZaloCapturedIdentityRunner) appZaloCapturedAgentDisplayName() string {
+	return r.agentDisplayName
+}
+
 type appZaloTurnSnapshot struct {
-	history        []ipc.ZaloMessage
-	directFiles    []ipc.ZaloAttachment
-	files          []ipc.ZaloAttachment
-	hasAttachments bool
-	highWater      int64
-	highWaterKnown bool
-	resumeDelta    appZaloResumeDeltaSnapshot
+	history             []ipc.ZaloMessage
+	directFiles         []ipc.ZaloAttachment
+	files               []ipc.ZaloAttachment
+	agentDisplayName    string
+	agentDisplayNameErr error
+	hasAttachments      bool
+	highWater           int64
+	highWaterKnown      bool
+	resumeDelta         appZaloResumeDeltaSnapshot
 }
 
 type appZaloResumeDeltaSnapshot struct {
@@ -149,6 +187,11 @@ type appZaloStructuredAnswerRunner struct {
 	highWaterKnown   bool
 	resumeDelta      appZaloResumeDeltaSnapshot
 	claudeBinding    appZaloClaudeBinding
+	agentDisplayName string
+}
+
+func (r *appZaloStructuredAnswerRunner) appZaloCapturedAgentDisplayName() string {
+	return r.agentDisplayName
 }
 
 func (r *appZaloStructuredAnswerRunner) Run(
@@ -182,6 +225,7 @@ func (r *appZaloStructuredAnswerRunner) Run(
 		r.highWaterKnown,
 		r.resumeDelta.clone(),
 		r.claudeBinding,
+		r.agentDisplayName,
 	)
 }
 
@@ -243,6 +287,9 @@ func (a *api) appAnswerZaloWithRunnerFactory(
 		return err
 	}
 	snapshot := a.appCaptureZaloTurnSnapshot(effectiveConfig, threadID, files)
+	if snapshot.agentDisplayNameErr != nil {
+		return snapshot.agentDisplayNameErr
+	}
 	if aware, ok := run.(appZaloAttachmentAwareRunner); ok {
 		run = aware.appWithZaloAttachments(snapshot.hasAttachments)
 	}
@@ -266,6 +313,11 @@ func (a *api) appAnswerZaloWithRunnerFactory(
 			highWaterKnown:   snapshot.highWaterKnown,
 			resumeDelta:      snapshot.resumeDelta,
 			claudeBinding:    binding,
+			agentDisplayName: snapshot.agentDisplayName,
+		}
+	} else {
+		run = &appZaloCapturedIdentityRunner{
+			zaloRunner: run, agentDisplayName: snapshot.agentDisplayName,
 		}
 	}
 	if err := a.answerZalo(ctx, deps.cfg, run, threadID, question, step, reply, files...); err != nil {
@@ -308,26 +360,40 @@ func (a *api) appCaptureZaloTurnSnapshot(
 	threadID string,
 	currentFiles []ipc.ZaloAttachment,
 ) appZaloTurnSnapshot {
+	directFiles := slices.Clone(currentFiles)
+	displayName, err := appZaloReadValidatedAgentDisplayName(a.st)
+	if err != nil {
+		a.logger.Warn("zalo session: could not read agent display name",
+			"thread", threadID, "code", appZaloErrorAgentDisplayNameRead,
+			"error_type", fmt.Sprintf("%T", err))
+		return appZaloTurnSnapshot{
+			directFiles: directFiles, files: slices.Clone(directFiles),
+			agentDisplayNameErr: errAppZaloAgentDisplayNameRead,
+			hasAttachments:      true,
+		}
+	}
 	history, err := a.st.ZaloMessages(threadID, zaloHistoryTurns)
 	if err != nil {
 		a.logger.Warn("llm route: không đọc được lịch sử, lượt này đi thẳng local CLI",
 			"thread", threadID, "err", err)
 		return appZaloTurnSnapshot{
-			directFiles: slices.Clone(currentFiles),
-			files:       slices.Clone(currentFiles), hasAttachments: true,
+			directFiles: directFiles, files: slices.Clone(directFiles),
+			agentDisplayName: displayName, hasAttachments: true,
 		}
 	}
 	history = appZaloCloneHistory(history)
-	directFiles := slices.Clone(currentFiles)
 	files := mergeZaloFiles(slices.Clone(directFiles), history)
 	highWater := appZaloHistoryCursor(history)
-	resumeDelta, deltaErr := a.appCaptureZaloResumeDelta(zc, threadID, highWater)
+	resumeDelta, deltaErr := a.appCaptureZaloResumeDelta(
+		zc, threadID, highWater, displayName,
+	)
 	if deltaErr != nil {
 		a.logger.Warn("zalo session: could not capture pending delta; cursor will stay conservative",
 			"thread", threadID, "err", deltaErr)
 	}
 	return appZaloTurnSnapshot{
 		history: history, directFiles: directFiles, files: files,
+		agentDisplayName: displayName,
 		hasAttachments: slices.ContainsFunc(files, func(at ipc.ZaloAttachment) bool {
 			return at.Path != ""
 		}) || appZaloDeltaHasAttachments(resumeDelta.delta) || !resumeDelta.known,
@@ -349,6 +415,7 @@ func (a *api) appCaptureZaloResumeDelta(
 	zc zaloConfig,
 	threadID string,
 	highWater int64,
+	agentDisplayName string,
 ) (appZaloResumeDeltaSnapshot, error) {
 	session, err := a.st.ZaloCLISession(threadID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -360,7 +427,8 @@ func (a *api) appCaptureZaloResumeDelta(
 	// A fresh or rotating session takes the bounded bootstrap path. Its full
 	// prompt intentionally remains the latest-10 history contract.
 	if session.TurnCount == 0 || appZaloShouldRotate(
-		session, zc.Model, appZaloPromptFingerprint(zc, threadID),
+		session, zc.Model,
+		appZaloPromptFingerprintNormalized(zc, threadID, agentDisplayName),
 	) {
 		return appZaloResumeDeltaSnapshot{known: true}, nil
 	}
@@ -468,18 +536,34 @@ func (a *api) appRunZalo(
 	files []ipc.ZaloAttachment,
 	step func(string),
 ) (string, error) {
+	agentDisplayName := ""
+	if captured, ok := run.(appZaloCapturedAgentIdentityRunner); ok {
+		agentDisplayName = captured.appZaloCapturedAgentDisplayName()
+	} else {
+		var err error
+		agentDisplayName, err = appZaloReadValidatedAgentDisplayName(a.st)
+		if err != nil {
+			a.logger.Warn("zalo session: could not read agent display name",
+				"thread", threadID, "code", appZaloErrorAgentDisplayNameRead,
+				"error_type", fmt.Sprintf("%T", err))
+			return "", errAppZaloAgentDisplayNameRead
+		}
+	}
 	var binding appZaloClaudeBinding
-	var err error
-	run, zc, binding, err = a.appResolveZaloSessionRoute(ctx, run, zc, threadID)
+	run, zc, binding, err := a.appResolveZaloSessionRoute(ctx, run, zc, threadID)
 	if err != nil {
 		return "", err
 	}
 	structured, ok := run.(appZaloStructuredRunner)
 	if !ok {
-		return run.Run(ctx, buildConsultPrompt(zc, question, history, found, files...), step)
+		return run.Run(ctx, buildAppZaloNormalizedIdentityConsultPrompt(
+			zc, agentDisplayName, question, history, found, files...,
+		), step)
 	}
 	highWater := appZaloHistoryCursor(history)
-	resumeDelta, err := a.appCaptureZaloResumeDelta(zc, threadID, highWater)
+	resumeDelta, err := a.appCaptureZaloResumeDelta(
+		zc, threadID, highWater, agentDisplayName,
+	)
 	if err != nil {
 		a.logger.Warn("zalo session: could not capture pending delta; cursor will stay conservative",
 			"thread", threadID, "err", err)
@@ -487,7 +571,7 @@ func (a *api) appRunZalo(
 	return a.appRunZaloStructured(
 		ctx, structured, zc, threadID, question, currentZaloMsgID,
 		history, found, files, slices.Clone(files), step, "", highWater, true, resumeDelta,
-		binding,
+		binding, agentDisplayName,
 	)
 }
 
@@ -505,10 +589,12 @@ func (a *api) appRunZaloStructured(
 	turnHighWaterKnown bool,
 	resumeDelta appZaloResumeDeltaSnapshot,
 	claudeBinding appZaloClaudeBinding,
+	agentDisplayName string,
 ) (string, error) {
 	selection, err := a.appSelectZaloSession(
 		zc, threadID, question, currentZaloMsgID, history, found, files, directFiles,
 		bootstrapOverride, turnHighWater, turnHighWaterKnown, resumeDelta, claudeBinding,
+		agentDisplayName,
 	)
 	if err != nil {
 		return "", err
@@ -617,9 +703,10 @@ func (a *api) appSelectZaloSession(
 	turnHighWaterKnown bool,
 	resumeDelta appZaloResumeDeltaSnapshot,
 	claudeBinding appZaloClaudeBinding,
+	agentDisplayName string,
 ) (appZaloSessionSelection, error) {
 	_ = bootstrapOverride
-	fingerprint := appZaloPromptFingerprint(zc, threadID)
+	fingerprint := appZaloPromptFingerprintNormalized(zc, threadID, agentDisplayName)
 	memorySubject := a.appResolveZaloMemorySubject(threadID, currentZaloMsgID)
 	snapshot := a.appLoadZaloMemorySnapshot(threadID, memorySubject.UID)
 	bootstrapConfig := zc
@@ -632,7 +719,9 @@ func (a *api) appSelectZaloSession(
 	if turnHighWaterKnown {
 		bootstrapCursor = turnHighWater
 	}
-	bootstrap := buildConsultPrompt(bootstrapConfig, question, history, found, files...)
+	bootstrap := buildAppZaloNormalizedIdentityConsultPrompt(
+		bootstrapConfig, agentDisplayName, question, history, found, files...,
+	)
 	if snapshot.memoryOK {
 		fullMemory := appZaloRenderMemoryRefresh(&appZaloMemoryRefresh{
 			Common: snapshot.common, Subject: snapshot.subject,
