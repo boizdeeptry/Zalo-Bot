@@ -100,6 +100,60 @@ function selectorsIn(region) {
     .flatMap((list) => list.split(",").map((part) => part.trim()).filter(Boolean));
 }
 
+function findMatchingBrace(css, open) {
+  let depth = 0;
+  for (let index = open; index < css.length; index += 1) {
+    const char = css[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function styleRulesIn(css) {
+  const text = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const rules = [];
+
+  function collect(block) {
+    let cursor = 0;
+    while (cursor < block.length) {
+      const open = block.indexOf("{", cursor);
+      if (open < 0) return;
+      const selector = block.slice(cursor, open).trim();
+      const close = findMatchingBrace(block, open);
+      if (close < 0) return;
+      const body = block.slice(open + 1, close);
+      if (selector.startsWith("@")) {
+        collect(body);
+      } else if (selector) {
+        rules.push({ selector, text: `${selector}{${body}}` });
+      }
+      cursor = close + 1;
+    }
+  }
+
+  collect(text);
+  return rules;
+}
+
+test("onboarding selectors are scoped away from legacy Portal pages", async () => {
+  const css = await readFile(new URL("portal.css", staticRoot), "utf8");
+  const selectors = styleRulesIn(css)
+    .filter((rule) => /onboarding|wizard/i.test(rule.text))
+    .flatMap((rule) => rule.selector.split(",").map((selector) => selector.trim()).filter(Boolean));
+
+  assert.ok(selectors.length > 0, "expected onboarding or wizard selectors in portal.css");
+  for (const selector of selectors) {
+    assert.ok(
+      selector.includes("[data-onboarding]") || selector.includes(".onboarding-shell"),
+      `onboarding selector "${selector}" must stay scoped to the wizard`,
+    );
+  }
+});
+
 // Mỗi khối marker phải giữ mọi luật trong tầm trang của nó. .provider-sheet là lớp cùng-sheet
 // duy nhất được phép ngoài .providers-page (detail dùng lại) — giữ nguyên allowance cũ, không nới.
 const SCOPED_REGIONS = [

@@ -973,14 +973,23 @@ function Assert-AppPackageSensitiveContentAbsent {
   # Test canaries stand in for prompt, response, stderr, and credential data.
   # Scan bytes rather than decoded text so binaries and the encodings below are
   # covered with a fixed 64 KiB working buffer.
-  $prefix = 'APP_TEST_'
+  $sensitiveMarkers = @(
+    'APP_TEST_',
+    'ONBOARDING_TEST_TOKEN_CANARY_CLEAR_4F91',
+    'ONBOARDING_USER_PROMPT_CANARY_CLEAR_8172',
+    'ONBOARDING_ANSWER_CANARY_CLEAR_BC43',
+    'ONBOARDING_CREDENTIAL_CANARY_CLEAR_D912',
+    'ACCOUNT_CONFIG_DIR_CANARY_CLEAR_A19E'
+  )
   $needles = [Collections.Generic.List[byte[]]]::new()
   foreach ($encoding in @(
       [Text.UTF8Encoding]::new($false),
       [Text.UnicodeEncoding]::new($false, $false),
       [Text.UnicodeEncoding]::new($true, $false)
     )) {
-    $needles.Add($encoding.GetBytes($prefix))
+    foreach ($marker in $sensitiveMarkers) {
+      $needles.Add($encoding.GetBytes($marker))
+    }
   }
   $needleArray = $needles.ToArray()
 
@@ -1262,6 +1271,10 @@ function Assert-AppPackage {
     'Stop.bat'
     'README.txt'
     'brain\wiki\index.md'
+    'assets\components\provider-connect.js'
+    'assets\components\persona-fields.js'
+    'assets\pages\onboarding.js'
+    'assets\pages\settings.js'
   )
   foreach ($relative in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $outPath $relative) -PathType Leaf)) {

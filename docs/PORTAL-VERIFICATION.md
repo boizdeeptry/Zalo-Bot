@@ -178,6 +178,39 @@ Navigation hiện tại trong `core/router.js` mang các nhãn **AI Agents**, **
 management asset và `/zalo` đang được phục vụ; không dùng lại nhãn hoặc asset của shell cũ làm tiêu
 chí smoke.
 
+## Onboarding wizard V1 — smoke thủ công bắt buộc
+
+Chạy các luồng dưới đây trên daemon/package cô lập, chỉ dùng tài khoản thử nghiệm và nội dung giả.
+Không chép prompt, câu trả lời, token đăng nhập, credential hay đường dẫn config thật vào evidence; chỉ
+ghi phase, HTTP status, schema/version, route/account id giả hoặc hash đã redact.
+
+| Luồng | Cách chạy | Kết quả mong đợi |
+|---|---|---|
+| Fresh DB qua Codex | Khởi động home rỗng, mở `/`, chọn **Codex**, bấm Connect, hoàn tất Setup, điền Persona, gửi Test Chat, rồi Complete. | Wizard hiện theo thiết kế Portal cũ, progress ba bước luôn thấy; `onboarding_version=1` được ghi đúng một lần sau Complete; trước Complete không có route/live Combo được bật; Test Chat dùng staging và không ghi Memory/session/live telemetry. |
+| Fresh DB qua Claude Code | Lặp lại trên home rỗng khác, chọn **Claude Code**, đăng nhập bằng Connect được quản lý, đi qua Persona/Test/Complete. | Account/config/model chỉ được stage trong onboarding; old Portal vẫn không cần Claude global; sau Complete route mới hoạt động và CTA “Vào Portal” đưa về Portal. |
+| Upgraded DB | Dùng bản sao DB đã có route/Combo/account pool live, khởi động binary mới rồi mở `/`. Không bấm Complete ngay. | Wizard yêu cầu onboarding V1 nhưng route/account pool cũ vẫn live cho Zalo/Portal cho đến Complete; Providers/Combos/Agent/Memory cũ vẫn mở và dữ liệu không đổi. |
+| Refresh tại Connect/Setup/Persona/Test | Ở từng phase, refresh trình duyệt hoặc mở lại `/`. | Wizard resume đúng phase đã persist; Connect không nhân đôi tiến trình; Setup không tạo account lặp; Persona giữ giá trị hợp lệ; Test không reuse receipt đã bị clear khi refresh. |
+| Daemon restart tại phase persist | Dừng/start daemon riêng ở các phase provider, connect/setup, persona, test và completed. | `/onboarding/status` trả phase/revision nhất quán; bootstrap fail-closed nếu status lỗi; completed không mount wizard nữa trừ khi Settings restart hợp lệ. |
+| Receipt lỗi/hết hạn và rollback Complete | Tạo Test Chat hợp lệ rồi thử Complete với token sai/hết hạn; sau đó ép lỗi khi Complete tạo Combo/route. | Complete trả lỗi an toàn, không bật route một phần, không để staging thành live, Test có thể chạy lại để lấy receipt mới; rollback giữ old route/account pool. |
+| Settings restart | Sau completed, vào Settings và bấm restart onboarding. Refresh giữa chừng và restart daemon. | Portal dispose trước khi wizard mount; phase quay về provider với `restart_in_progress=true`; old completed config vẫn live cho đến Complete mới; bootstrap fail-closed nếu restart response malformed. |
+| Hai CTA cuối | Sau Complete, bấm lần lượt **Vào Portal** và **Thêm kiến thức ngay** trên hai lần chạy riêng. | CTA bị khoá sau click để tránh double handoff; Portal CTA mở shell quản lý bình thường; Knowledge CTA đi đến trang Knowledge; Complete vẫn one-time và rollback-safe. |
+
+Các cổng tự động đi kèm luồng này:
+
+```powershell
+npm test --prefix appmode
+pwsh -NoProfile -File .\tests\run-overlay-go-tests.ps1 -Package all
+$env:ZALOBOT_REPO = 'C:\Users\manva\OneDrive\Máy tính\agentdc'
+$r = Invoke-Pester -Script .\tests\build-app.Tests.ps1 -PassThru; if ($r.FailedCount) { exit 1 }
+pwsh -NoProfile -File .\tests\memory-v2-deployment.Tests.ps1
+git diff --check
+```
+
+Trước khi ghi PASS cho package, xác nhận `assets\components\provider-connect.js`,
+`assets\components\persona-fields.js`, `assets\pages\onboarding.js` và
+`assets\pages\settings.js` nằm trong artifact; scanner phải từ chối canary token test onboarding,
+prompt người dùng, answer, credential và đường dẫn config account ở cả text lẫn binary/UTF-16.
+
 ## Checklist smoke Memory V2
 
 Sáu hành trình dưới đây là checklist cho lần triển khai Memory V2 sau khi candidate được duyệt. Phần tự động đã chạy được ghi riêng trong biên bản ngày 2026-08-10; phần cần lượt Zalo thật vẫn để mở. Chỉ dùng tài khoản/liên hệ thử nghiệm và dữ liệu giả, không dùng tên, số điện thoại, địa chỉ, tình trạng sức khoẻ, thông tin tài chính hoặc bí mật thật. Ảnh chụp và log phải che ID/token và không được chép nguyên prompt, câu trả lời hay nội dung khách hàng.
