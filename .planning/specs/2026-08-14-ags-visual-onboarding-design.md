@@ -1,7 +1,7 @@
 # AGS-Visual Onboarding Shell
 
 Date: 2026-08-14
-Status: awaiting spec approval
+Status: approved by user
 Supersedes the presentation portion of `2026-08-14-ags-like-onboarding-design.md`.
 
 ## Goal
