@@ -11,6 +11,26 @@ const button = (root, label) => find(root, (node) => node.tagName === "BUTTON" &
 const providerCard = (root, kind) => find(root, (node) => hasClass(node, "onboarding-provider-card")
   && node.dataset.providerKind === kind);
 
+function assertAGSFrame(host) {
+  const dashboards = findAll(host, (node) => hasClass(node, "onboarding-dashboard"));
+  const dialogs = findAll(host, (node) => node.getAttribute?.("role") === "dialog");
+  assert.equal(dashboards.length, 1);
+  assert.equal(dialogs.length, 1);
+  const [dashboard] = dashboards;
+  const [dialog] = dialogs;
+  assert.ok(hasClass(dialog, "onboarding-dialog"));
+  assert.equal(dashboard.getAttribute("aria-hidden"), "true");
+  const decorativeElements = findAll(dashboard, (node) => Boolean(node.tagName));
+  assert.ok(decorativeElements.every((node) => ["DIV", "SPAN"].includes(node.tagName)));
+  assert.equal(dialog.getAttribute("aria-modal"), "true");
+  assert.equal(dialog.getAttribute("aria-labelledby"), "onboarding-dialog-title");
+  assert.equal(document.activeElement, dialog);
+  const dismissers = findAll(dialog, (node) => node.tagName === "BUTTON"
+    && /đóng|bỏ qua|close|skip/iu.test(`${text(node)} ${node.getAttribute("aria-label") ?? ""}`));
+  assert.equal(dismissers.length, 0);
+  return { dashboard, dialog };
+}
+
 function providerStatus(overrides = {}) {
   return onboardingStatus("provider", { revision: 1, ...overrides });
 }
@@ -92,6 +112,7 @@ test("provider phase uses an AGS-like Agent Setup surface with separated selecti
     initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
     service: service({ selectProvider: () => { selects++; return Promise.resolve(connectStatus()); } }),
   });
+  const { dialog } = assertAGSFrame(host);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
   assert.match(text(host), /Agent Setup/u);
   assert.match(text(host), /Thiết lập Agent/u);
@@ -99,7 +120,15 @@ test("provider phase uses an AGS-like Agent Setup surface with separated selecti
   assert.match(text(host), /Chọn provider muốn dùng/u);
   assert.match(text(providerCard(host, "codex")), /Đã chọn/u);
   assert.match(text(providerCard(host, "claude-code")), /Chưa chọn/u);
-  assert.equal(findAll(host, (node) => hasClass(node, "onboarding-provider-card")).length, 2);
+  const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
+  assert.deepEqual(cards.map((card) => card.dataset.providerKind), ["claude-code", "codex"]);
+  assert.equal(findAll(host, (node) => hasClass(node, "onboarding-provider-mark")).length, 2);
+  const switches = findAll(host, (node) => hasClass(node, "onboarding-agent-switch"));
+  assert.equal(switches.length, 2);
+  assert.equal(switches.filter((node) => hasClass(node, "is-on")).length, 1);
+  dialog.dispatchEvent({ type: "keydown", key: "Escape" });
+  byClass(host, "onboarding-backdrop").click();
+  assert.equal(find(host, (node) => node.getAttribute?.("role") === "dialog"), dialog);
   providerCard(host, "claude-code").click();
   assert.equal(selects, 0, "clicking a row only changes local selection");
   assert.match(text(providerCard(host, "claude-code")), /Đã chọn/u);
@@ -112,11 +141,18 @@ test("connect phase keeps Provider Connect inside the same Agent Setup status su
     initialStatus: connectStatus({ revision: 6, provider_kind: "claude-code" }),
     connectFactory: connectFactory(instances),
   });
+  assertAGSFrame(host);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
   assert.match(text(host), /Agent Setup/u);
   assert.match(text(host), /Đang kết nối/u);
   assert.match(text(host), /Claude Code/u);
   assert.match(text(host), /Provider Connect/u);
+  const provider = byClass(host, "onboarding-connect-provider-row");
+  assert.ok(provider);
+  assert.equal(provider.tagName, "DIV");
+  assert.match(text(provider), /Claude Code/u);
+  assert.ok(byClass(provider, "onboarding-provider-mark"));
+  assert.ok(find(provider, (node) => hasClass(node, "onboarding-agent-switch") && hasClass(node, "is-on")));
   assert.ok(byClass(host, "onboarding-connect-slot"));
   assert.equal(instances.length, 1);
   assert.deepEqual(instances[0].starts, [{ label: "Onboarding", onboardingRevision: 6 }]);
@@ -137,6 +173,7 @@ test("setup phase looks like an inline AGS setup queue before Persona starts", a
   });
   await flush();
   assert.equal(setups, 1);
+  assertAGSFrame(host);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
   assert.match(text(host), /Agent Setup/u);
   assert.match(text(host), /Hàng đợi thiết lập/u);

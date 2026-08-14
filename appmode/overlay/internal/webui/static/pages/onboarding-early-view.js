@@ -27,18 +27,78 @@ function rail(phase) {
   );
 }
 
-export function renderOnboardingShell(root, phase, content) {
-  root.replaceChildren(element(
+function decorativeDashboard() {
+  return element(
     "div",
-    { className: "onboarding-shell" },
+    { className: "onboarding-dashboard", attributes: { "aria-hidden": "true" } },
+    element("div", { className: "onboarding-dashboard-topbar" },
+      element("span", { className: "onboarding-dashboard-menu", text: "☰" }),
+      element("span", { className: "onboarding-dashboard-product", text: "◇" }),
+      element("span", { className: "onboarding-dashboard-grid", text: "▦" }),
+      element("span", { className: "onboarding-dashboard-window", text: "▣" }),
+    ),
+    element("div", { className: "onboarding-dashboard-sidebar" },
+      element("div", { className: "onboarding-dashboard-brand" },
+        element("span", { text: "TUVANZALO" }),
+        element("span", { text: "Biến AI thành nhân sự thật" }),
+      ),
+      element("div", { className: "onboarding-dashboard-meter", text: "▰  LOCAL" }),
+      element("div", { className: "onboarding-dashboard-project", text: "▰  Chọn dự án  ›" }),
+      element("div", { className: "onboarding-dashboard-empty", text: "Chọn dự án để xem cuộc chat." }),
+      element("div", { className: "onboarding-dashboard-user", text: "◉  TuvanZalo Local ⌄" }),
+    ),
+    element("div", { className: "onboarding-dashboard-canvas" },
+      element("div", { className: "onboarding-dashboard-summary" },
+        element("span", { className: "onboarding-dashboard-kicker", text: "AGENT" }),
+        element("div", { className: "onboarding-dashboard-ready" },
+          element("span", { text: "2/2" }),
+          element("span", { text: "sẵn sàng" }),
+          element("span", { className: "onboarding-dashboard-bars", text: "▮▮" }),
+        ),
+        element("div", { className: "onboarding-dashboard-active" },
+          element("span", { text: "└ Đang dùng:" }),
+          element("span", { text: "Claude Code, Codex" }),
+        ),
+        element("div", { className: "onboarding-dashboard-manage", text: "✧  Quản lý Agents" }),
+      ),
+    ),
+  );
+}
+
+export function renderOnboardingShell(root, phase, content) {
+  const dialog = element(
+    "section",
+    {
+      className: "onboarding-dialog",
+      attributes: {
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-labelledby": "onboarding-dialog-title",
+        tabindex: "-1",
+      },
+    },
     element(
       "aside",
       { className: "onboarding-sidebar" },
-      element("div", { className: "onboarding-brand", text: "TuvanZalo" }),
+      element("div", { className: "onboarding-dialog-heading" },
+        element("span", {
+          className: "onboarding-brand",
+          attributes: { id: "onboarding-dialog-title" },
+          text: "Cài đặt Agent",
+        }),
+        element("span", { className: "onboarding-dialog-lock", attributes: { "aria-hidden": "true" }, text: "◆" }),
+      ),
       rail(phase),
     ),
     element("main", { className: "onboarding-main" }, content),
+  );
+  root.replaceChildren(element(
+    "div",
+    { className: "onboarding-shell" },
+    decorativeDashboard(),
+    element("div", { className: "onboarding-backdrop" }, dialog),
   ));
+  dialog.focus({ preventScroll: true });
 }
 
 function actionButton(label, primary = false) {
@@ -64,6 +124,28 @@ function providerStatusBadge(selected) {
   });
 }
 
+function providerMark(kind) {
+  return element("span", {
+    className: `onboarding-provider-mark onboarding-provider-mark--${kind}`,
+    attributes: { "aria-hidden": "true" },
+    text: kind === "claude-code" ? "✣" : "◎",
+  });
+}
+
+function providerSwitch(selected) {
+  return element("span", {
+    className: `onboarding-agent-switch${selected ? " is-on" : ""}`,
+    attributes: { "aria-hidden": "true" },
+  }, element("span", { className: "onboarding-agent-switch-knob" }));
+}
+
+function providerDetails(kind, label) {
+  return element("span", { className: "onboarding-agent-row-main" },
+    element("strong", { text: label }),
+    element("small", { text: kind === "claude-code" ? "Claude Desktop/CLI account" : "Codex local account" }),
+  );
+}
+
 function providerRow(kind, label, selected, listen, onSelect) {
   const card = element("button", {
     className: `onboarding-provider-card onboarding-agent-row${selected ? " is-selected" : ""}`,
@@ -72,11 +154,26 @@ function providerRow(kind, label, selected, listen, onSelect) {
       "data-provider-kind": kind,
       "aria-pressed": String(selected),
     },
-  }, element("span", { className: "onboarding-agent-row-main" },
-    element("strong", { text: label }),
-    element("small", { text: kind === "claude-code" ? "Claude Desktop/CLI account" : "Codex local account" }),
-  ), providerStatusBadge(selected));
+  }, providerMark(kind), providerDetails(kind, label), element(
+    "span",
+    { className: "onboarding-agent-row-tail" },
+    providerStatusBadge(selected),
+    providerSwitch(selected),
+  ));
   return listen(card, "click", () => onSelect(kind));
+}
+
+function connectedProviderRow(kind) {
+  return element(
+    "div",
+    { className: "onboarding-connect-provider-row onboarding-agent-row is-selected" },
+    providerMark(kind),
+    providerDetails(kind, providerName(kind)),
+    element("span", { className: "onboarding-agent-row-tail" },
+      element("span", { className: "onboarding-agent-badge is-selected", text: "Đã chọn" }),
+      providerSwitch(true),
+    ),
+  );
 }
 
 function setupStatusPanel({ title, status, detail, children = [] }) {
@@ -122,7 +219,7 @@ export function createWelcomeStage({
   onProceed,
   onRetry,
 }) {
-  const cards = [["codex", "Codex"], ["claude-code", "Claude Code"]]
+  const cards = [["claude-code", "Claude Code"], ["codex", "Codex"]]
     .map(([kind, label]) => providerRow(kind, label, selectedProvider === kind, listen, onSelect));
   const proceed = actionButton("Tiếp tục kết nối", true);
   proceed.disabled = !selectedProvider;
@@ -171,6 +268,7 @@ export function createConnectStage(kind, slot) {
       className: "onboarding-connect-intro",
       text: "Đang kết nối provider đã chọn. Provider Connect giữ nguyên thanh tiến trình và log để bạn nhìn được hệ thống đang làm gì.",
     }),
+    connectedProviderRow(kind),
     setupStatusPanel({
       title: "Trạng thái",
       status: "Đang kết nối",

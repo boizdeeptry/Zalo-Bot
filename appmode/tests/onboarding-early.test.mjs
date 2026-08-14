@@ -184,8 +184,8 @@ test("Welcome renders AGS-like provider setup, an exact three-step rail, and gua
   const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
   const continueButton = button(host, "Tiếp tục");
   assert.equal(cards.length, 2);
-  assert.match(text(cards[0]), /Codex.*Chưa chọn/u);
-  assert.match(text(cards[1]), /Claude Code.*Chưa chọn/u);
+  assert.match(text(cards[0]), /Claude Code.*Chưa chọn/u);
+  assert.match(text(cards[1]), /Codex.*Chưa chọn/u);
   assert.deepEqual(steps.map((step) => text(step)), [
     "Kết nối", "Cá nhân hoá", "Trò chuyện thử",
   ]);
@@ -581,6 +581,9 @@ test("Setup Retry renders an authoritative non-Setup phase without stale POST", 
       assert.equal(setups, 1);
       assert.ok(byClass(host, className));
       assert.equal(text(find(host, (node) => node.tagName === "H1")), heading);
+      const dialog = byClass(host, "onboarding-dialog");
+      assert.equal(dialog?.getAttribute("aria-modal"), "true");
+      assert.ok(byClass(host, "onboarding-dashboard"));
     });
   }
 });
