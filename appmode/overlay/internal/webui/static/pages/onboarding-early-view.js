@@ -5,7 +5,8 @@ const STEP_LABELS = Object.freeze(["Kết nối", "Cá nhân hoá", "Trò chuy�
 export const providerName = (kind) => kind === "claude-code" ? "Claude Code" : "Codex";
 
 export function focusProviderControl(node, kind) {
-  if (node?.dataset?.providerKind === kind) {
+  if (node?.classList?.contains("onboarding-provider-toggle")
+      && node.dataset.providerKind === kind) {
     node.focus({ preventScroll: true });
     return true;
   }
@@ -157,21 +158,44 @@ function providerDetails(kind, label) {
   );
 }
 
-function providerRow(kind, label, selected, listen, onSelect) {
-  const card = element("button", {
-    className: `onboarding-provider-card onboarding-agent-row${selected ? " is-selected" : ""}`,
+function providerRow(kind, label, selected, listen, onToggle, onInstall) {
+  const toggle = element("button", {
+    className: "onboarding-provider-toggle",
     attributes: {
       type: "button",
       "data-provider-kind": kind,
+      "aria-label": `${selected ? "Tắt" : "Bật"} ${label}`,
       "aria-pressed": String(selected),
     },
-  }, providerMark(kind), providerDetails(kind, label), element(
+  }, providerSwitch(selected));
+  const install = selected ? element("button", {
+    className: "onboarding-provider-install",
+    attributes: { type: "button" },
+    text: "Bấm để cài.",
+  }) : null;
+  const status = element(
+    "small",
+    { className: "onboarding-provider-install-state" },
+    element("span", { text: selected ? "Chưa cài. " : "Chưa dùng" }),
+    install,
+  );
+  listen(toggle, "click", () => onToggle(kind, toggle));
+  if (install) listen(install, "click", onInstall);
+  const card = element("div", {
+    className: `onboarding-provider-card onboarding-agent-row${selected ? " is-selected" : ""}`,
+    attributes: { "data-provider-kind": kind },
+  }, providerMark(kind), element(
+    "span",
+    { className: "onboarding-agent-row-main" },
+    element("strong", { text: label }),
+    status,
+  ), element(
     "span",
     { className: "onboarding-agent-row-tail" },
     providerStatusBadge(selected),
-    providerSwitch(selected),
+    toggle,
   ));
-  return listen(card, "click", () => onSelect(kind));
+  return { card, install, toggle };
 }
 
 function connectedProviderRow(kind) {
@@ -230,19 +254,89 @@ export function createWelcomeStage({
   onProceed,
   onRetry,
 }) {
-  const cards = [["claude-code", "Claude Code"], ["codex", "Codex"]]
-    .map(([kind, label]) => providerRow(kind, label, selectedProvider === kind, listen, onSelect));
-  const proceed = actionButton("Tiếp tục kết nối", true);
-  proceed.disabled = !selectedProvider;
-  let selecting = false;
-  listen(proceed, "click", () => {
-    if (selecting || !selectedProvider) return;
-    selecting = true;
-    proceed.disabled = true;
-    for (const card of cards) card.disabled = true;
+  let installing = false;
+  let confirmationNode = null;
+  let retry = null;
+  const confirmationHost = element("div");
+  const rowViews = [];
+  const providerControls = () => [
+    ...rowViews.flatMap(({ toggle, install }) => install ? [toggle, install] : [toggle]),
+    ...(retry ? [retry] : []),
+  ];
+  const disableProviderControls = (disabled) => {
+    for (const control of providerControls()) control.disabled = disabled;
+  };
+  const dismissConfirmation = (origin, restoreFocus = true) => {
+    confirmationNode = null;
+    confirmationHost.replaceChildren();
+    disableProviderControls(false);
+    if (restoreFocus) origin.focus({ preventScroll: true });
+  };
+  const showConfirmation = (replacementKind, origin) => {
+    if (confirmationNode || installing) return;
+    const cancel = actionButton("Huỷ");
+    const confirm = actionButton("Vẫn tắt", true);
+    confirmationNode = element(
+      "section",
+      {
+        className: "onboarding-provider-confirm",
+        attributes: {
+          role: "alertdialog",
+          "aria-labelledby": "onboarding-provider-confirm-title",
+          "aria-describedby": "onboarding-provider-confirm-description",
+        },
+      },
+      element("h2", {
+        attributes: { id: "onboarding-provider-confirm-title" },
+        text: "Xác nhận tắt provider",
+      }),
+      element("p", {
+        className: "onboarding-provider-confirm-description",
+        attributes: { id: "onboarding-provider-confirm-description" },
+        text: `Nếu tắt ${providerName(selectedProvider)} trước khi cài, lựa chọn này sẽ bị bỏ. Bạn vẫn muốn tắt chứ?`,
+      }),
+      element("div", { className: "onboarding-actions" }, cancel, confirm),
+    );
+    listen(cancel, "click", () => dismissConfirmation(origin));
+    listen(confirm, "click", () => {
+      dismissConfirmation(origin, false);
+      onSelect(replacementKind);
+    });
+    listen(confirmationNode, "keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      dismissConfirmation(origin);
+    });
+    confirmationHost.replaceChildren(confirmationNode);
+    disableProviderControls(true);
+    cancel.focus({ preventScroll: true });
+  };
+  const toggleProvider = (kind, origin) => {
+    if (installing || confirmationNode) return;
+    if (!selectedProvider) {
+      onSelect(kind);
+      return;
+    }
+    showConfirmation(kind === selectedProvider ? "" : kind, origin);
+  };
+  const installProvider = () => {
+    if (installing || confirmationNode || !selectedProvider) return;
+    installing = true;
+    disableProviderControls(true);
     onProceed();
-  });
-  const retry = message ? createRetryButton(listen, onRetry) : null;
+  };
+  for (const [kind, label] of [["claude-code", "Claude Code"], ["codex", "Codex"]]) {
+    rowViews.push(providerRow(
+      kind,
+      label,
+      selectedProvider === kind,
+      listen,
+      toggleProvider,
+      installProvider,
+    ));
+  }
+  const cards = rowViews.map(({ card }) => card);
+  retry = message ? createRetryButton(listen, onRetry) : null;
   return element(
     "section",
     { className: "onboarding-stage onboarding-provider-stage onboarding-agent-setup-stage" },
@@ -254,10 +348,11 @@ export function createWelcomeStage({
       title: "Trạng thái",
       status: selectedProvider ? "Đã có lựa chọn" : "Chưa chọn",
       detail: selectedProvider
-        ? `Đang chọn ${providerName(selectedProvider)}. Bấm Tiếp tục kết nối để bắt đầu xác minh.`
-        : "Chọn một provider bên dưới để bắt đầu kết nối.",
+        ? `Đang chọn ${providerName(selectedProvider)}. Có thể bắt đầu cài đặt ngay trong hàng bên dưới.`
+        : "Bật một provider bên dưới để chuẩn bị kết nối.",
     }),
     element("div", { className: "onboarding-provider-grid onboarding-agent-list" }, cards),
+    confirmationHost,
     element("p", {
       className: "onboarding-provider-warning",
       text: "Bạn cần đăng nhập. Cấu hình đang dùng chỉ thay đổi sau khi kết nối được xác minh, Chat thử đạt yêu cầu và bạn bấm Hoàn tất.",
@@ -265,7 +360,7 @@ export function createWelcomeStage({
     message ? element("p", {
       className: "onboarding-error", attributes: { role: "alert" }, text: message,
     }) : null,
-    element("div", { className: "onboarding-actions" }, retry, proceed),
+    retry ? element("div", { className: "onboarding-actions" }, retry) : null,
   );
 }
 

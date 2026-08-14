@@ -623,20 +623,15 @@
   border-top:1px solid var(--onboarding-divider); border-bottom:1px solid var(--onboarding-divider);
 }
 .onboarding-shell .onboarding-provider-card {
-  width:100%; min-height:66px; border:0; border-bottom:1px solid var(--onboarding-divider);
+  box-sizing:border-box; width:100%; display:flex; min-width:0; min-height:66px; align-items:center; gap:12px;
+  border:0; border-bottom:1px solid var(--onboarding-divider);
   border-radius:0; padding:10px 18px; color:var(--onboarding-text); background:transparent;
-  font:inherit; font-size:13px; font-weight:800; text-align:left; cursor:pointer;
+  font:inherit; font-size:13px; font-weight:800; text-align:left;
   transition:background .14s,box-shadow .14s,opacity .14s;
 }
 .onboarding-shell .onboarding-provider-card:last-child { border-bottom:0; }
-.onboarding-shell .onboarding-provider-card:hover:not(:disabled) {
-  background:rgba(255,255,255,.035);
-}
 .onboarding-shell .onboarding-provider-card.is-selected {
   box-shadow:inset 3px 0 0 var(--onboarding-cyan); background:rgba(84,217,244,.04);
-}
-.onboarding-shell .onboarding-provider-card:focus-visible {
-  outline:2px solid var(--onboarding-cyan); outline-offset:-3px;
 }
 .onboarding-shell .onboarding-agent-row {
   min-height:66px; display:flex; align-items:center; gap:12px;
@@ -659,6 +654,13 @@
 .onboarding-shell .onboarding-agent-row-main small,
 .onboarding-shell .onboarding-agent-status-detail {
   color:var(--onboarding-muted); font-size:10px; font-weight:500;
+}
+.onboarding-shell .onboarding-provider-install-state {
+  min-width:0; overflow-wrap:anywhere;
+}
+.onboarding-shell .onboarding-provider-install {
+  border:0; padding:0; color:var(--onboarding-cyan); background:transparent;
+  font:inherit; font-weight:800; text-decoration:underline; cursor:pointer;
 }
 .onboarding-shell .onboarding-agent-badge {
   flex:0 0 auto; border:0; padding:0; color:var(--onboarding-muted);
@@ -683,6 +685,28 @@
 .onboarding-shell .onboarding-agent-switch.is-on .onboarding-agent-switch-knob {
   transform:translateX(20px); background:var(--onboarding-lime);
 }
+.onboarding-shell .onboarding-provider-toggle {
+  display:inline-grid; flex:0 0 auto; place-items:center; border:0; padding:0;
+  border-radius:999px; color:inherit; background:transparent; cursor:pointer;
+}
+.onboarding-shell .onboarding-provider-toggle:disabled,
+.onboarding-shell .onboarding-provider-install:disabled { opacity:.45; cursor:default; }
+.onboarding-shell .onboarding-provider-toggle:focus-visible,
+.onboarding-shell .onboarding-provider-install:focus-visible,
+.onboarding-shell .onboarding-provider-confirm .onboarding-button:focus-visible {
+  outline:2px solid var(--onboarding-cyan); outline-offset:3px;
+}
+.onboarding-shell .onboarding-provider-confirm {
+  box-sizing:border-box; width:min(360px,100%); max-width:100%; margin:12px auto 0;
+  border:1px solid var(--onboarding-border); border-radius:9px; padding:12px; background:#151b30;
+}
+.onboarding-shell .onboarding-provider-confirm h2 {
+  margin:0 0 7px; color:var(--onboarding-text); font-size:13px;
+}
+.onboarding-shell .onboarding-provider-confirm-description {
+  margin:0; color:var(--onboarding-muted); font-size:11px;
+}
+.onboarding-shell .onboarding-provider-confirm .onboarding-actions { margin-top:11px; }
 .onboarding-shell .onboarding-connect-provider-row {
   margin:13px -18px 0; padding:10px 18px; border-top:1px solid var(--onboarding-divider);
   border-bottom:1px solid var(--onboarding-divider); background:rgba(84,217,244,.035);
@@ -821,11 +845,13 @@
   .onboarding-shell .onboarding-stage { padding:14px; }
   .onboarding-shell .onboarding-provider-grid { margin:12px -14px; }
   .onboarding-shell .onboarding-agent-row { min-height:62px; }
-  .onboarding-shell .onboarding-provider-card,
+  .onboarding-shell .onboarding-provider-card { min-width:0; padding:10px 12px; }
   .onboarding-shell .onboarding-connect-provider-row { padding:10px 12px; }
   .onboarding-shell .onboarding-connect-provider-row { margin:12px -14px 0; }
-  .onboarding-shell .onboarding-agent-row-tail { gap:6px; }
+  .onboarding-shell .onboarding-agent-row-main { min-width:0; overflow-wrap:anywhere; }
+  .onboarding-shell .onboarding-agent-row-tail { flex-shrink:0; gap:6px; }
   .onboarding-shell .onboarding-agent-badge { font-size:11px; }
+  .onboarding-shell .onboarding-provider-confirm { width:100%; }
   .onboarding-shell .onboarding-persona-form > div,
   .onboarding-shell .onboarding-chat-form,
   .onboarding-shell .pv-connect-prompt { grid-template-columns:1fr; }

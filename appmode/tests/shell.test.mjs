@@ -92,6 +92,12 @@ test("onboarding CSS shows only the modal over a full-screen grid", async () => 
   assert.match(css, /\.onboarding-shell \.onboarding-step-label\s*\{[^}]*font-size:\s*11px/s);
   assert.match(css, /\.onboarding-shell \.onboarding-agent-badge\s*\{[^}]*color:\s*var\(--onboarding-muted\)[^}]*font-size:\s*11px/s);
   assert.match(css, /\.onboarding-shell \.onboarding-agent-switch\s*\{[^}]*width:\s*46px[^}]*height:\s*26px/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-card\s*\{[^}]*display:\s*flex[^}]*min-width:\s*0/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-toggle\s*\{[^}]*display:\s*inline-grid[^}]*background:\s*transparent/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-install\s*\{[^}]*color:\s*var\(--onboarding-cyan\)[^}]*text-decoration:\s*underline/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-confirm\s*\{[^}]*width:\s*min\(360px,\s*100%\)[^}]*max-width:\s*100%/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-toggle:focus-visible,\s*\.onboarding-shell \.onboarding-provider-install:focus-visible,\s*\.onboarding-shell \.onboarding-provider-confirm \.onboarding-button:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--onboarding-cyan\)/s);
+  assert.match(css, /@media\s*\(max-width:\s*600px\)[\s\S]*\.onboarding-shell \.onboarding-provider-card\s*\{[^}]*min-width:\s*0[^}]*\}[\s\S]*\.onboarding-shell \.onboarding-provider-confirm\s*\{[^}]*width:\s*100%/s);
   assert.doesNotMatch(css, /@media\s*\(max-width:\s*900px\)[\s\S]*\.onboarding-shell \.onboarding-dashboard-sidebar/s);
 });
 
