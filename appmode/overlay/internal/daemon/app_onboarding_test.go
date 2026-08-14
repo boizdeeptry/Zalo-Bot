@@ -1116,6 +1116,10 @@ func seedAppOnboardingTestChat(
 		ModelID:   map[string]string{"codex": "gpt-5.6-terra", "claude-code": "sonnet"}[kind],
 		Available: true,
 	}})
+	// Task 6 migrates Test Chat and Complete to the ordered ready-stage model.
+	// Keep these pre-Task6 fixtures on their legacy singleton shape so Task 4
+	// does not silently change downstream production behavior.
+	env.replaceProviderStages(t)
 	const persona = "PERSONA-SECRET: nói ngắn gọn, chân thành."
 	configureAgentPersonaForOnboardingTest(t, env, persona)
 	if err := env.a.st.SetAgentDisplayName("Bé Mi"); err != nil {
@@ -2126,27 +2130,21 @@ VALUES (0, 'live-provider', 'model', 1)`); err != nil {
 	})
 	beforeLive := appOnboardingLiveRoutingBytes(t, env)
 
-	rr := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":7,"account_id":"staged-account"}`)
+	rr := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":7,"kind":"codex","account_id":"staged-account"}`)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	got := decodeOnboardingResponse[struct {
-		Revision      int64  `json:"revision"`
-		ProviderKind  string `json:"provider_kind"`
-		ProviderID    string `json:"provider_id"`
-		AccountID     string `json:"account_id"`
-		ModelID       string `json:"model_id"`
-		StagedComboID string `json:"staged_combo_id"`
-		ComboName     string `json:"combo_name"`
-	}](t, rr)
+	got := decodeOnboardingResponse[appOnboardingStatusWire](t, rr)
 	if got.Revision != 8 || got.ProviderKind != "codex" || got.ProviderID != "codex" ||
 		got.AccountID != "staged-account" || got.ModelID != "gpt-5.6-terra" ||
-		got.StagedComboID == "" || got.ComboName != "Mặc định · Codex" {
+		got.Phase != store.OnboardingPhasePersona || len(got.Providers) != 1 ||
+		got.Providers[0].Status != "ready" {
 		t.Fatalf("setup response = %+v", got)
 	}
 	state := env.state(t)
 	if state.Phase != store.OnboardingPhasePersona || state.Revision != 8 ||
-		state.ModelID != got.ModelID || state.StagedComboID != got.StagedComboID {
+		state.ProviderKind != "" || state.ProviderID != "" || state.AccountID != "" ||
+		state.ModelID != "" || state.StagedComboID == "" {
 		t.Fatalf("staged state = %+v; response = %+v", state, got)
 	}
 	if afterLive := appOnboardingLiveRoutingBytes(t, env); afterLive != beforeLive {
@@ -2158,12 +2156,12 @@ func TestAppOnboardingSetupUsesClaudePreferredModel(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	seedAppOnboardingSetup(t, env, "claude-code", "claude-account", false, 3, nil)
 
-	rr := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":3,"account_id":"claude-account"}`)
+	rr := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":3,"kind":"claude-code","account_id":"claude-account"}`)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	got := decodeOnboardingResponse[map[string]any](t, rr)
-	if got["model_id"] != "sonnet" || got["combo_name"] != "Mặc định · Claude" {
+	if got["model_id"] != "sonnet" || got["phase"] != store.OnboardingPhasePersona {
 		t.Fatalf("setup response = %#v", got)
 	}
 }
@@ -2176,7 +2174,7 @@ func TestAppOnboardingSetupFallsBackInDescriptorSeedOrder(t *testing.T) {
 		{ModelID: "gpt-5.6-luna", Available: true},
 	})
 
-	rr := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":5,"account_id":"fallback-account"}`)
+	rr := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":5,"kind":"codex","account_id":"fallback-account"}`)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
@@ -2195,7 +2193,7 @@ func TestAppOnboardingSetupNoAvailableModelFailsWithoutMutation(t *testing.T) {
 	before := env.state(t)
 	beforeLive := appOnboardingLiveRoutingBytes(t, env)
 
-	rr := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":4,"account_id":"no-model-account"}`)
+	rr := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":4,"kind":"codex","account_id":"no-model-account"}`)
 	requireOnboardingCode(t, rr, http.StatusUnprocessableEntity, "ONBOARDING_NO_MODEL")
 	if after := env.state(t); after != before {
 		t.Fatalf("no-model request changed state: before=%+v after=%+v", before, after)
@@ -2221,7 +2219,7 @@ func TestAppOnboardingSetupRejectsWrongOrEnabledAccount(t *testing.T) {
 			})
 			before := env.state(t)
 			rr := env.serve(http.MethodPost, "/onboarding/setup",
-				fmt.Sprintf(`{"revision":6,"account_id":%q}`, tt.requestAccount))
+				fmt.Sprintf(`{"revision":6,"kind":"codex","account_id":%q}`, tt.requestAccount))
 			requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_STAGING_INVALID")
 			if after := env.state(t); after != before {
 				t.Fatalf("rejected setup changed state: before=%+v after=%+v", before, after)
@@ -2234,8 +2232,8 @@ func TestAppOnboardingSetupRejectsStaleRevisionAndWrongPhase(t *testing.T) {
 	tests := []struct {
 		name, phase, body, code string
 	}{
-		{name: "stale", phase: store.OnboardingPhaseSetup, body: `{"revision":8,"account_id":"staged-account"}`, code: "ONBOARDING_REVISION_CONFLICT"},
-		{name: "wrong phase", phase: store.OnboardingPhaseConnect, body: `{"revision":9,"account_id":"staged-account"}`, code: "ONBOARDING_PHASE_INVALID"},
+		{name: "stale", phase: store.OnboardingPhaseSetup, body: `{"revision":8,"kind":"codex","account_id":"staged-account"}`, code: "ONBOARDING_REVISION_CONFLICT"},
+		{name: "wrong phase", phase: store.OnboardingPhaseConnect, body: `{"revision":9,"kind":"codex","account_id":"staged-account"}`, code: "ONBOARDING_PHASE_INVALID"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2245,6 +2243,10 @@ func TestAppOnboardingSetupRejectsStaleRevisionAndWrongPhase(t *testing.T) {
 			})
 			state := env.state(t)
 			state.Phase = tt.phase
+			if tt.phase == store.OnboardingPhaseConnect {
+				state.ProviderID = ""
+				state.AccountID = ""
+			}
 			env.setState(t, state)
 			before := env.state(t)
 			rr := env.serve(http.MethodPost, "/onboarding/setup", tt.body)
@@ -2261,7 +2263,7 @@ func TestAppOnboardingSetupLostResponseRetryIsIdempotent(t *testing.T) {
 	seedAppOnboardingSetup(t, env, "codex", "staged-account", false, 12, []store.LLMModel{
 		{ModelID: "gpt-5.6-terra", Available: true},
 	})
-	body := `{"revision":12,"account_id":"staged-account"}`
+	body := `{"revision":12,"kind":"codex","account_id":"staged-account"}`
 	first := env.serve(http.MethodPost, "/onboarding/setup", body)
 	if first.Code != http.StatusOK {
 		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
@@ -2275,7 +2277,7 @@ func TestAppOnboardingSetupLostResponseRetryIsIdempotent(t *testing.T) {
 		t.Fatalf("retry changed state: first=%+v retry=%+v", stateAfterFirst, stateAfterRetry)
 	}
 
-	mismatch := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":12,"account_id":"other-account"}`)
+	mismatch := env.serve(http.MethodPost, "/onboarding/setup", `{"revision":12,"kind":"codex","account_id":"other-account"}`)
 	requireOnboardingCode(t, mismatch, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT")
 	if stateAfterMismatch := env.state(t); stateAfterMismatch != stateAfterFirst {
 		t.Fatalf("mismatched retry changed state: first=%+v mismatch=%+v", stateAfterFirst, stateAfterMismatch)
@@ -2284,7 +2286,7 @@ func TestAppOnboardingSetupLostResponseRetryIsIdempotent(t *testing.T) {
 
 func TestAppOnboardingSetupStrictJSON(t *testing.T) {
 	tests := []string{
-		`{"revision":1,"account_id":"account","extra":true}`,
+		`{"revision":1,"kind":"codex","account_id":"account","extra":true}`,
 		`{"revision":1,`,
 	}
 	for _, body := range tests {
@@ -2312,11 +2314,23 @@ func seedAppOnboardingSetup(
 	if err := env.a.st.EnsureOnboardingProviderForKind(kind); err != nil {
 		t.Fatalf("EnsureOnboardingProviderForKind(%q) = %v", kind, err)
 	}
-	if err := env.a.st.CreateLLMAccount(store.LLMAccount{
+	env.replaceProviderStages(t, appOnboardingProviderWire{
+		Kind: kind, Status: "pending", Position: 0,
+	})
+	env.setState(t, store.OnboardingState{
+		Phase: store.OnboardingPhaseConnect, ProviderKind: kind, Revision: revision - 1,
+	})
+	account := store.LLMAccount{
 		ID: accountID, ProviderID: kind, Label: accountID,
-		ConfigDir: accountConfigDir(env.dataDir, kind, accountID), Enabled: accountEnabled,
-	}); err != nil {
-		t.Fatalf("CreateLLMAccount(%q) = %v", accountID, err)
+		ConfigDir: accountConfigDir(env.dataDir, kind, accountID), Enabled: false,
+	}
+	if _, err := env.a.st.BindOnboardingAccount(revision-1, kind, account); err != nil {
+		t.Fatalf("BindOnboardingAccount(%q) = %v", accountID, err)
+	}
+	if accountEnabled {
+		if _, err := env.db.Exec(`UPDATE llm_accounts SET enabled = 1 WHERE id = ?`, accountID); err != nil {
+			t.Fatalf("enable staged Account %q: %v", accountID, err)
+		}
 	}
 	if err := os.MkdirAll(accountConfigDir(env.dataDir, kind, accountID), 0o700); err != nil {
 		t.Fatalf("MkdirAll account config %q: %v", accountID, err)
@@ -2329,10 +2343,6 @@ func seedAppOnboardingSetup(
 			t.Fatalf("AddLLMModel(%q) = %v", model.ModelID, err)
 		}
 	}
-	env.setState(t, store.OnboardingState{
-		Phase: store.OnboardingPhaseSetup, ProviderKind: kind, ProviderID: kind,
-		AccountID: accountID, Revision: revision,
-	})
 }
 
 func appOnboardingLiveRoutingBytes(t *testing.T, env *onboardingRouteTestEnv) string {

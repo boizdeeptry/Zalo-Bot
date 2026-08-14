@@ -510,7 +510,9 @@ func TestConnectOnboardingHandlerValidatesContextBeforeStartingJob(t *testing.T)
 			kind: "codex", body: `{"onboarding_revision":1}`, status: http.StatusConflict, code: "ONBOARDING_REVISION_CONFLICT",
 		},
 		{
-			name: "wrong phase", state: store.OnboardingState{Phase: store.OnboardingPhaseSetup, ProviderKind: "codex", Revision: 2},
+			name: "wrong phase", state: store.OnboardingState{
+				Phase: store.OnboardingPhaseSetup, ProviderKind: "codex", ProviderID: "codex", AccountID: "account", Revision: 2,
+			},
 			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID",
 		},
 		{
@@ -521,7 +523,7 @@ func TestConnectOnboardingHandlerValidatesContextBeforeStartingJob(t *testing.T)
 			name: "dirty connect staging", state: store.OnboardingState{
 				Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", ProviderID: "old", Revision: 2,
 			},
-			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusConflict, code: "ONBOARDING_STAGING_INVALID",
+			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusInternalServerError, code: "ONBOARDING_STATE_UNAVAILABLE",
 		},
 		{
 			name: "correct context", state: store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 2},
@@ -533,6 +535,11 @@ func TestConnectOnboardingHandlerValidatesContextBeforeStartingJob(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			env := newOnboardingRouteTestEnv(t)
 			env.setState(t, tt.state)
+			if tt.state.Phase == store.OnboardingPhaseConnect || tt.state.Phase == store.OnboardingPhaseSetup {
+				env.replaceProviderStages(t, appOnboardingProviderWire{
+					Kind: "codex", Status: "pending", Position: 0,
+				})
+			}
 			starts := 0
 			connectMgr = &connectManager{
 				runner:        &fakeRunner{installed: true, auth: authLoggedOut},

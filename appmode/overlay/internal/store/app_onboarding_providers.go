@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,9 @@ import (
 
 var (
 	onboardingSnapshotAfterStateRead = func() {}
+	// Serial Store tests use this hook to prove that setup revalidates all
+	// staging ownership immediately before its compare-and-swap writes.
+	onboardingProviderSetupBeforeCAS = func(*sql.Tx) error { return nil }
 	// Test seam around the actual Commit call. Production delegates directly to
 	// sql.Tx.Commit; serial Store tests may replace and restore it.
 	onboardingProvidersCommit = func(tx *sql.Tx) error { return tx.Commit() }
@@ -27,6 +32,8 @@ const (
 	onboardingProviderMutationDomain         = "agentdc/onboarding-provider-mutation/v1"
 	onboardingProviderMutationReplace        = "replace-selection"
 	onboardingProviderMutationBegin          = "begin-provider"
+	onboardingProviderMutationBind           = "bind-account"
+	onboardingProviderMutationSetup          = "stage-setup"
 )
 
 type onboardingProviderMutationReceipt struct {
@@ -49,6 +56,12 @@ type OnboardingProviderStage struct {
 type OnboardingSnapshot struct {
 	State  OnboardingState
 	Stages []OnboardingProviderStage
+}
+
+type onboardingProviderAccountRecord struct {
+	Account      LLMAccount
+	ProviderKind string
+	AddedAt      string
 }
 
 // OnboardingSnapshot reads the singleton and its ordered Provider stages from
@@ -435,6 +448,214 @@ func inspectOnboardingProviderStages(
 	}, nil
 }
 
+func canonicalOnboardingProviderKind(kind string) (string, error) {
+	canonical, err := providercatalog.CanonicalSelectedKinds([]string{kind})
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrOnboardingProviderUnsupported, err)
+	}
+	return canonical[0], nil
+}
+
+func onboardingProviderDisplayName(kind string) (string, error) {
+	canonical, err := canonicalOnboardingProviderKind(kind)
+	if err != nil {
+		return "", err
+	}
+	for _, option := range providercatalog.Options() {
+		if option.Kind == canonical && option.Advertised {
+			return option.DisplayName, nil
+		}
+	}
+	return "", fmt.Errorf("%w: Provider catalog metadata is unavailable", ErrOnboardingConfigurationChanged)
+}
+
+func onboardingProviderAccountRecordInTx(
+	tx *sql.Tx,
+	accountID string,
+) (onboardingProviderAccountRecord, error) {
+	var record onboardingProviderAccountRecord
+	var enabled int64
+	err := tx.QueryRow(`SELECT
+a.id, a.provider_id, a.label, a.email, a.config_dir, a.enabled, a.added_at, p.kind
+FROM llm_accounts a
+JOIN llm_providers p ON p.id = a.provider_id
+WHERE a.id = ?`, accountID).Scan(
+		&record.Account.ID,
+		&record.Account.ProviderID,
+		&record.Account.Label,
+		&record.Account.Email,
+		&record.Account.ConfigDir,
+		&enabled,
+		&record.AddedAt,
+		&record.ProviderKind,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return onboardingProviderAccountRecord{}, fmt.Errorf(
+			"%w: onboarding Account does not exist with its Provider",
+			ErrOnboardingInvalidStagingOwnership,
+		)
+	}
+	if err != nil {
+		return onboardingProviderAccountRecord{}, fmt.Errorf("read onboarding Account: %w", err)
+	}
+	record.Account.Enabled = enabled != 0
+	if record.AddedAt != "" {
+		addedAt, err := parseTS(record.AddedAt)
+		if err != nil {
+			return onboardingProviderAccountRecord{}, fmt.Errorf(
+				"%w: onboarding Account timestamp is invalid",
+				ErrOnboardingConfigurationChanged,
+			)
+		}
+		record.Account.AddedAt = &addedAt
+	}
+	return record, nil
+}
+
+func onboardingProviderAccountOwnsSetup(
+	record onboardingProviderAccountRecord,
+	kind string,
+	accountID string,
+) bool {
+	return record.Account.ID == accountID && record.Account.ProviderID == kind &&
+		record.ProviderKind == kind && !record.Account.Enabled && record.Account.ConfigDir != ""
+}
+
+func onboardingProviderAccountMatchesRequest(
+	record onboardingProviderAccountRecord,
+	kind string,
+	account LLMAccount,
+) bool {
+	return onboardingProviderAccountOwnsSetup(record, kind, account.ID) &&
+		record.Account.ProviderID == account.ProviderID &&
+		record.Account.Label == account.Label && record.Account.Email == account.Email &&
+		record.Account.ConfigDir == account.ConfigDir && !account.Enabled &&
+		record.AddedAt == formatNullableTS(account.AddedAt)
+}
+
+func onboardingProviderModelIsAvailableInTx(
+	tx *sql.Tx,
+	providerID string,
+	modelID string,
+) (bool, error) {
+	var available int64
+	err := tx.QueryRow(`SELECT available FROM llm_models
+WHERE provider_id = ? AND model_id = ?`, providerID, modelID).Scan(&available)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read onboarding model: %w", err)
+	}
+	return available == 1, nil
+}
+
+func onboardingProviderBindPayload(
+	kind string,
+	account LLMAccount,
+	stages []OnboardingProviderStage,
+) []string {
+	return onboardingProviderBindPayloadFields(
+		kind,
+		account.ID,
+		account.ProviderID,
+		account.Label,
+		account.Email,
+		account.ConfigDir,
+		strconv.FormatBool(account.Enabled),
+		formatNullableTS(account.AddedAt),
+		stages,
+	)
+}
+
+func onboardingProviderBindRecordPayload(
+	kind string,
+	record onboardingProviderAccountRecord,
+	stages []OnboardingProviderStage,
+) []string {
+	return onboardingProviderBindPayloadFields(
+		kind,
+		record.Account.ID,
+		record.Account.ProviderID,
+		record.Account.Label,
+		record.Account.Email,
+		record.Account.ConfigDir,
+		strconv.FormatBool(record.Account.Enabled),
+		record.AddedAt,
+		stages,
+	)
+}
+
+func onboardingProviderBindPayloadFields(
+	kind string,
+	accountID string,
+	providerID string,
+	label string,
+	email string,
+	configDir string,
+	enabled string,
+	addedAt string,
+	stages []OnboardingProviderStage,
+) []string {
+	// Only the SHA-256 digest of this framed payload is persisted; account
+	// labels, email and config paths never are.
+	payload := make([]string, 0, 8+1+providercatalog.MaxSelectedKinds*6)
+	payload = append(payload, kind, accountID, providerID, label, email, configDir, enabled, addedAt)
+	return appendOnboardingProviderStagesToPayload(payload, stages)
+}
+
+func onboardingProviderSetupPayload(
+	kind string,
+	accountID string,
+	modelID string,
+	record onboardingProviderAccountRecord,
+	stages []OnboardingProviderStage,
+) []string {
+	payload := []string{
+		kind,
+		accountID,
+		modelID,
+		record.Account.ProviderID,
+		record.ProviderKind,
+		record.Account.Label,
+		record.Account.Email,
+		record.Account.ConfigDir,
+		strconv.FormatBool(record.Account.Enabled),
+		record.AddedAt,
+	}
+	return appendOnboardingProviderStagesToPayload(payload, stages)
+}
+
+func onboardingProviderStagesEqual(left, right []OnboardingProviderStage) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func appendOnboardingProviderStagesToPayload(
+	payload []string,
+	stages []OnboardingProviderStage,
+) []string {
+	payload = append(payload, strconv.Itoa(len(stages)))
+	for _, stage := range stages {
+		payload = append(payload,
+			stage.Kind,
+			stage.Status,
+			stage.ProviderID,
+			stage.AccountID,
+			stage.ModelID,
+			strconv.Itoa(stage.Position),
+		)
+	}
+	return payload
+}
+
 func providerStagesMatchCanonicalSelection(stages []OnboardingProviderStage, kinds []string) bool {
 	if len(stages) != len(kinds) {
 		return false
@@ -606,6 +827,72 @@ func beginOnboardingProviderLostResponseMatches(snapshot OnboardingSnapshot, kin
 	return selected && target.Status == onboardingProviderStagePending
 }
 
+func onboardingProviderBindLostResponseMatchesInTx(
+	tx *sql.Tx,
+	snapshot OnboardingSnapshot,
+	kind string,
+	account LLMAccount,
+) bool {
+	state := snapshot.State
+	if state.Phase != OnboardingPhaseSetup || state.ProviderKind != kind ||
+		state.ProviderID != kind || state.AccountID != account.ID || state.ModelID != "" ||
+		state.StagedComboID != "" || state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		return false
+	}
+	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	if err != nil || !stages.positionsCanonical {
+		return false
+	}
+	target, selected := stages.byKind[kind]
+	if !selected || target.Status != onboardingProviderStagePending {
+		return false
+	}
+	record, err := onboardingProviderAccountRecordInTx(tx, account.ID)
+	return err == nil && onboardingProviderAccountMatchesRequest(record, kind, account)
+}
+
+func onboardingProviderSetupLostResponseMatchesInTx(
+	tx *sql.Tx,
+	snapshot OnboardingSnapshot,
+	kind string,
+	accountID string,
+	modelID string,
+) bool {
+	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	if err != nil || !stages.positionsCanonical {
+		return false
+	}
+	target, selected := stages.byKind[kind]
+	if !selected || target.Status != onboardingProviderStageReady ||
+		target.ProviderID != kind || target.AccountID != accountID || target.ModelID != modelID {
+		return false
+	}
+	record, err := onboardingProviderAccountRecordInTx(tx, accountID)
+	if err != nil || !onboardingProviderAccountOwnsSetup(record, kind, accountID) {
+		return false
+	}
+	available, err := onboardingProviderModelIsAvailableInTx(tx, kind, modelID)
+	if err != nil || !available {
+		return false
+	}
+	allReady := selectedOnboardingProvidersAreAllReady(stages.byKind, stages.canonicalKinds)
+	state := snapshot.State
+	activeClean := state.ProviderKind == "" && state.ProviderID == "" &&
+		state.AccountID == "" && state.ModelID == "" &&
+		state.TestNonceHash == "" && state.TestExpiresAt == ""
+	if !activeClean {
+		return false
+	}
+	if allReady {
+		if state.Phase != OnboardingPhasePersona || state.PersonaFingerprint != "" {
+			return false
+		}
+		parsed, err := uuid.Parse(state.StagedComboID)
+		return err == nil && parsed.String() == state.StagedComboID
+	}
+	return state.Phase == OnboardingPhaseProvider && state.StagedComboID == ""
+}
+
 func writeOnboardingProviderMutationReceiptInTx(
 	tx *sql.Tx,
 	operation string,
@@ -717,7 +1004,9 @@ func onboardingProviderMutationPayloadSHA256(operation string, payload []string)
 
 func validOnboardingProviderMutationOperation(operation string) bool {
 	return operation == onboardingProviderMutationReplace ||
-		operation == onboardingProviderMutationBegin
+		operation == onboardingProviderMutationBegin ||
+		operation == onboardingProviderMutationBind ||
+		operation == onboardingProviderMutationSetup
 }
 
 func onboardingRevisionIsOneAhead(expectedRevision, currentRevision int64) bool {

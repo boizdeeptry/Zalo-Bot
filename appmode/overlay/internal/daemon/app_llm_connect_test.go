@@ -208,17 +208,17 @@ func TestConnectOnboardingSuccessStagesDisabledAccountAndPublishesIDsAfterBind(t
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseBind) }) })
 	bindCalls := 0
-	m.bindOnboarding = func(revision int64, kind string, account store.LLMAccount) (store.OnboardingState, error) {
+	m.bindOnboarding = func(revision int64, kind string, account store.LLMAccount) (store.OnboardingSnapshot, error) {
 		bindCalls++
 		if revision != 7 || kind != "codex" {
 			t.Errorf("bind context = revision:%d kind:%q", revision, kind)
 		}
 		bindEntered <- account
 		<-releaseBind
-		return store.OnboardingState{
+		return store.OnboardingSnapshot{State: store.OnboardingState{
 			Phase: store.OnboardingPhaseSetup, ProviderKind: kind,
 			ProviderID: kind, AccountID: account.ID, Revision: revision + 1,
-		}, nil
+		}}, nil
 	}
 
 	if _, err := m.start("codex", "Onboarding", &connectOnboardingContext{Revision: 7, Kind: "codex"}); err != nil {
@@ -252,9 +252,9 @@ func TestConnectNormalSuccessCreatesEnabledAccountWithoutOnboardingBind(t *testi
 		return nil
 	})
 	m.ensureModels = func(string) error { return nil }
-	m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+	m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingSnapshot, error) {
 		bindCalls++
-		return store.OnboardingState{}, nil
+		return store.OnboardingSnapshot{}, nil
 	}
 
 	if _, err := m.start("codex", "Normal"); err != nil {
@@ -320,9 +320,9 @@ func TestConnectOnboardingPersistenceFailuresLeaveNoIDsOrConfigDirectory(t *test
 				modelCalls++
 				return tt.modelsErr
 			}
-			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingSnapshot, error) {
 				bindCalls++
-				return store.OnboardingState{}, tt.bindErr
+				return store.OnboardingSnapshot{}, tt.bindErr
 			}
 			if _, err := m.start("codex", "Onboarding", &connectOnboardingContext{Revision: 3, Kind: "codex"}); err != nil {
 				t.Fatal(err)
@@ -369,9 +369,9 @@ func TestConnectOnboardingFailureCleanupRetriesWithoutLeakingPaths(t *testing.T)
 			m.logger = slog.New(slog.NewTextHandler(&logs, nil))
 			m.ensureOnboarding = func(string) error { return nil }
 			m.ensureModels = func(string) error { return tt.modelErr }
-			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingSnapshot, error) {
 				bindCalls++
-				return store.OnboardingState{}, tt.bindErr
+				return store.OnboardingSnapshot{}, tt.bindErr
 			}
 			m.newID = func() string {
 				idCalls++

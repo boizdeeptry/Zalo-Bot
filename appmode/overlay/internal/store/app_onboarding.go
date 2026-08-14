@@ -132,10 +132,15 @@ func IsOnboardingProviderKind(kind string) bool {
 // EnsureOnboardingProviderForKind creates the exact subscription Provider needed by onboarding
 // as disabled staging. An existing exact Provider is accepted without changing its enabled state.
 func (s *Store) EnsureOnboardingProviderForKind(kind string) error {
-	if !IsOnboardingProviderKind(kind) {
-		return fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
+	canonicalKind, err := canonicalOnboardingProviderKind(kind)
+	if err != nil {
+		return err
 	}
-	name := subscriptionDisplayName[kind]
+	kind = canonicalKind
+	name, err := onboardingProviderDisplayName(kind)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin onboarding Provider ensure: %w", err)
@@ -187,13 +192,15 @@ func (s *Store) BindOnboardingAccount(
 	expectedRevision int64,
 	kind string,
 	account LLMAccount,
-) (OnboardingState, error) {
-	if !IsOnboardingProviderKind(kind) {
-		return OnboardingState{}, fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
+) (OnboardingSnapshot, error) {
+	canonicalKind, err := canonicalOnboardingProviderKind(kind)
+	if err != nil {
+		return OnboardingSnapshot{}, err
 	}
+	kind = canonicalKind
 	if account.ID == "" || account.ProviderID == "" || account.ConfigDir == "" ||
 		account.ProviderID != kind || account.Enabled {
-		return OnboardingState{}, fmt.Errorf(
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: onboarding Account must be disabled and match provider kind %q",
 			ErrOnboardingInvalidStagingOwnership,
 			kind,
@@ -202,29 +209,71 @@ func (s *Store) BindOnboardingAccount(
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return OnboardingState{}, fmt.Errorf("begin onboarding Account bind: %w", err)
+		return OnboardingSnapshot{}, fmt.Errorf("begin onboarding Account bind: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	state, err := onboardingStateInTx(tx)
+	snapshot, err := onboardingSnapshotInTx(tx, nil)
 	if err != nil {
-		return OnboardingState{}, err
+		return OnboardingSnapshot{}, err
 	}
-	if state.Revision != expectedRevision {
-		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
+	if snapshot.State.Revision != expectedRevision {
+		if onboardingRevisionIsOneAhead(expectedRevision, snapshot.State.Revision) {
+			payload := onboardingProviderBindPayload(kind, account, snapshot.Stages)
+			provenanceMatches, err := onboardingProviderMutationReceiptMatchesInTx(
+				tx,
+				onboardingProviderMutationBind,
+				expectedRevision,
+				snapshot.State.Revision,
+				payload,
+			)
+			if err != nil {
+				return OnboardingSnapshot{}, err
+			}
+			if provenanceMatches && onboardingProviderBindLostResponseMatchesInTx(tx, snapshot, kind, account) {
+				return commitOnboardingProviderRead(tx, snapshot, "lost-response Account bind")
+			}
+		}
+		return OnboardingSnapshot{}, onboardingConflict(expectedRevision, snapshot.State.Revision)
 	}
+	state := snapshot.State
 	if state.Phase != OnboardingPhaseConnect {
-		return OnboardingState{}, fmt.Errorf(
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"bind onboarding Account from %q: %w",
 			state.Phase,
 			ErrOnboardingInvalidPhase,
 		)
 	}
 	if state.ProviderKind != kind || !onboardingConnectStateIsClean(state) {
-		return OnboardingState{}, fmt.Errorf(
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: onboarding connect state does not own a clean %q staging slot",
 			ErrOnboardingInvalidStagingOwnership,
 			kind,
+		)
+	}
+	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if !stages.positionsCanonical {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: selected Provider positions are not canonical",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	target, selected := stages.byKind[kind]
+	if !selected || target.Status != onboardingProviderStagePending {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: Provider %q is not selected pending staging",
+			ErrOnboardingInvalidStagingOwnership,
+			kind,
+		)
+	}
+	if state.Revision >= maxOnboardingRouteRevision {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding revision cannot advance beyond %d",
+			ErrOnboardingConflict,
+			maxOnboardingRouteRevision,
 		)
 	}
 
@@ -232,16 +281,16 @@ func (s *Store) BindOnboardingAccount(
 	if err := tx.QueryRow(
 		`SELECT kind FROM llm_providers WHERE id = ?`, account.ProviderID,
 	).Scan(&providerKind); errors.Is(err, sql.ErrNoRows) {
-		return OnboardingState{}, fmt.Errorf(
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: Provider %q is missing",
 			ErrOnboardingInvalidStagingOwnership,
 			account.ProviderID,
 		)
 	} else if err != nil {
-		return OnboardingState{}, fmt.Errorf("read onboarding Provider %q: %w", account.ProviderID, err)
+		return OnboardingSnapshot{}, fmt.Errorf("read onboarding Provider %q: %w", account.ProviderID, err)
 	}
 	if providerKind != kind {
-		return OnboardingState{}, fmt.Errorf(
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: Provider %q does not have kind %q",
 			ErrOnboardingInvalidStagingOwnership,
 			account.ProviderID,
@@ -260,7 +309,7 @@ id, provider_id, label, email, config_dir, enabled, added_at
 		0,
 		formatNullableTS(account.AddedAt),
 	); err != nil {
-		return OnboardingState{}, fmt.Errorf(
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: insert onboarding Account %q: %v",
 			ErrOnboardingInvalidStagingOwnership,
 			account.ID,
@@ -273,7 +322,7 @@ id, provider_id, label, email, config_dir, enabled, added_at
 phase = ?, provider_id = ?, account_id = ?, revision = revision + 1, updated_at = ?
 WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
   AND provider_id = '' AND account_id = '' AND model_id = '' AND staged_combo_id = ''
-  AND persona_fingerprint = '' AND test_nonce_hash = '' AND test_expires_at = ''`,
+  AND test_nonce_hash = '' AND test_expires_at = ''`,
 		OnboardingPhaseSetup,
 		account.ProviderID,
 		account.ID,
@@ -283,141 +332,312 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 		kind,
 	)
 	if err != nil {
-		return OnboardingState{}, fmt.Errorf("update onboarding Account binding: %w", err)
+		return OnboardingSnapshot{}, fmt.Errorf("update onboarding Account binding: %w", err)
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return OnboardingState{}, fmt.Errorf("read onboarding Account bind result: %w", err)
+		return OnboardingSnapshot{}, fmt.Errorf("read onboarding Account bind result: %w", err)
 	}
 	if changed != 1 {
-		return OnboardingState{}, ErrOnboardingConflict
+		return OnboardingSnapshot{}, ErrOnboardingConflict
 	}
-	updated, err := onboardingStateInTx(tx)
+	if err := writeOnboardingProviderMutationReceiptInTx(
+		tx,
+		onboardingProviderMutationBind,
+		expectedRevision,
+		expectedRevision+1,
+		onboardingProviderBindPayload(kind, account, snapshot.Stages),
+	); err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	updated, err := onboardingSnapshotInTx(tx, nil)
 	if err != nil {
-		return OnboardingState{}, err
+		return OnboardingSnapshot{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return OnboardingState{}, fmt.Errorf("commit onboarding Account bind: %w", err)
+	if err := onboardingProvidersCommit(tx); err != nil {
+		return OnboardingSnapshot{}, fmt.Errorf("commit onboarding Account bind: %w", err)
 	}
 	return updated, nil
 }
 
-// StageOnboardingSetup atomically records the selected model and a fresh Combo UUID, then advances
-// setup to persona. The original request is idempotent only across the exact one-revision lost-
-// response window; all other stale or mismatched calls fail closed.
+// StageOnboardingSetup marks exactly one selected pending Provider ready. If
+// another selected row remains pending, the singleton returns to Provider;
+// only the last ready row allocates the staged Combo and advances to Persona.
 func (s *Store) StageOnboardingSetup(
 	expectedRevision int64,
+	kind string,
 	accountID string,
 	modelID string,
-) (OnboardingSetup, error) {
+) (OnboardingSnapshot, error) {
+	canonicalKind, err := canonicalOnboardingProviderKind(kind)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	kind = canonicalKind
+	if accountID == "" || modelID == "" {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding setup requires exact Provider, Account and model",
+			ErrOnboardingInvalidStagingOwnership,
+		)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return OnboardingSetup{}, fmt.Errorf("begin onboarding setup staging: %w", err)
+		return OnboardingSnapshot{}, fmt.Errorf("begin onboarding setup staging: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	state, err := onboardingStateInTx(tx)
+	snapshot, err := onboardingSnapshotInTx(tx, nil)
 	if err != nil {
-		return OnboardingSetup{}, err
+		return OnboardingSnapshot{}, err
 	}
-	if state.Revision == expectedRevision+1 {
-		if !onboardingSetupRetryMatches(state, expectedRevision, accountID, modelID) {
-			return OnboardingSetup{}, onboardingConflict(expectedRevision, state.Revision)
+	if snapshot.State.Revision != expectedRevision {
+		if onboardingRevisionIsOneAhead(expectedRevision, snapshot.State.Revision) {
+			record, recordErr := onboardingProviderAccountRecordInTx(tx, accountID)
+			if recordErr == nil {
+				payload := onboardingProviderSetupPayload(kind, accountID, modelID, record, snapshot.Stages)
+				provenanceMatches, err := onboardingProviderMutationReceiptMatchesInTx(
+					tx,
+					onboardingProviderMutationSetup,
+					expectedRevision,
+					snapshot.State.Revision,
+					payload,
+				)
+				if err != nil {
+					return OnboardingSnapshot{}, err
+				}
+				if provenanceMatches && onboardingProviderSetupLostResponseMatchesInTx(
+					tx,
+					snapshot,
+					kind,
+					accountID,
+					modelID,
+				) {
+					return commitOnboardingProviderRead(tx, snapshot, "lost-response setup")
+				}
+			}
 		}
-		if _, err := onboardingStagingAccountInTx(tx, state); err != nil {
-			return OnboardingSetup{}, err
-		}
-		comboName, err := onboardingComboName(state.ProviderKind)
-		if err != nil {
-			return OnboardingSetup{}, err
-		}
-		if err := tx.Commit(); err != nil {
-			return OnboardingSetup{}, fmt.Errorf("commit onboarding setup retry: %w", err)
-		}
-		return OnboardingSetup{OnboardingState: state, ComboName: comboName}, nil
+		return OnboardingSnapshot{}, onboardingConflict(expectedRevision, snapshot.State.Revision)
 	}
-	if state.Revision != expectedRevision {
-		return OnboardingSetup{}, onboardingConflict(expectedRevision, state.Revision)
-	}
+	state := snapshot.State
 	if state.Phase != OnboardingPhaseSetup {
-		return OnboardingSetup{}, fmt.Errorf(
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"stage onboarding setup from %q: %w",
 			state.Phase,
 			ErrOnboardingInvalidPhase,
 		)
 	}
-	if accountID == "" || accountID != state.AccountID || modelID == "" ||
-		!onboardingSetupStateIsClean(state) {
-		return OnboardingSetup{}, fmt.Errorf(
+	if state.Revision >= maxOnboardingRouteRevision {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding revision cannot advance beyond %d",
+			ErrOnboardingConflict,
+			maxOnboardingRouteRevision,
+		)
+	}
+	if state.ProviderKind != kind || state.ProviderID != kind || state.AccountID != accountID ||
+		state.ModelID != "" || state.StagedComboID != "" ||
+		state.TestNonceHash != "" || state.TestExpiresAt != "" {
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: onboarding setup request does not match the staged state",
 			ErrOnboardingInvalidStagingOwnership,
 		)
 	}
-	if _, err := onboardingStagingAccountInTx(tx, state); err != nil {
-		return OnboardingSetup{}, err
+	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	if err != nil {
+		return OnboardingSnapshot{}, err
 	}
-	var available int64
-	err = tx.QueryRow(`SELECT available FROM llm_models
-WHERE provider_id = ? AND model_id = ?`, state.ProviderID, modelID).Scan(&available)
-	if errors.Is(err, sql.ErrNoRows) {
-		return OnboardingSetup{}, fmt.Errorf(
+	if !stages.positionsCanonical {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: selected Provider positions are not canonical",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	target, selected := stages.byKind[kind]
+	if !selected || target.Status != onboardingProviderStagePending {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: Provider %q is not selected pending staging",
+			ErrOnboardingInvalidStagingOwnership,
+			kind,
+		)
+	}
+	account, err := onboardingProviderAccountRecordInTx(tx, accountID)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if !onboardingProviderAccountOwnsSetup(account, kind, accountID) {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding Account is not the exact disabled staging owner",
+			ErrOnboardingInvalidStagingOwnership,
+		)
+	}
+	bindProvenance, err := onboardingProviderMutationReceiptMatchesInTx(
+		tx,
+		onboardingProviderMutationBind,
+		expectedRevision-1,
+		expectedRevision,
+		onboardingProviderBindRecordPayload(kind, account, snapshot.Stages),
+	)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if !bindProvenance {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding Account configuration changed after bind",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	available, err := onboardingProviderModelIsAvailableInTx(tx, state.ProviderID, modelID)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if !available {
+		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: selected model is not available for the staged Provider",
 			ErrOnboardingModelUnavailable,
 		)
 	}
+	if err := onboardingProviderSetupBeforeCAS(tx); err != nil {
+		return OnboardingSnapshot{}, fmt.Errorf("before onboarding setup CAS: %w", err)
+	}
+
+	// Re-read every owner after the pre-CAS boundary so account/config/model or
+	// stage drift cannot be committed between discovery and staging.
+	refreshed, err := onboardingSnapshotInTx(tx, nil)
 	if err != nil {
-		return OnboardingSetup{}, fmt.Errorf(
-			"read onboarding model %q/%q: %w",
-			state.ProviderID,
-			modelID,
-			err,
+		return OnboardingSnapshot{}, err
+	}
+	if refreshed.State != state || !onboardingProviderStagesEqual(refreshed.Stages, snapshot.Stages) {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding setup ownership changed before commit",
+			ErrOnboardingConfigurationChanged,
 		)
 	}
-	if available != 1 {
-		return OnboardingSetup{}, fmt.Errorf(
-			"%w: selected model is not available for the staged Provider",
+	refreshedInspection, err := inspectOnboardingProviderStages(refreshed.Stages)
+	if err != nil || !refreshedInspection.positionsCanonical {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding Provider stages changed before commit",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	refreshedTarget := refreshedInspection.byKind[kind]
+	if refreshedTarget != target {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding target stage changed before commit",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	account, err = onboardingProviderAccountRecordInTx(tx, accountID)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if !onboardingProviderAccountOwnsSetup(account, kind, accountID) {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding Account changed before commit",
+			ErrOnboardingInvalidStagingOwnership,
+		)
+	}
+	bindProvenance, err = onboardingProviderMutationReceiptMatchesInTx(
+		tx,
+		onboardingProviderMutationBind,
+		expectedRevision-1,
+		expectedRevision,
+		onboardingProviderBindRecordPayload(kind, account, refreshed.Stages),
+	)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if !bindProvenance {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding Account configuration changed before commit",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	available, err = onboardingProviderModelIsAvailableInTx(tx, state.ProviderID, modelID)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if !available {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: selected model changed before commit",
 			ErrOnboardingModelUnavailable,
 		)
 	}
-	comboName, err := onboardingComboName(state.ProviderKind)
-	if err != nil {
-		return OnboardingSetup{}, err
-	}
-	comboID := uuid.NewString()
+
 	updatedAt := ts(time.Now())
-	result, err := tx.Exec(`UPDATE app_onboarding_state SET
-phase = ?, model_id = ?, staged_combo_id = ?, revision = revision + 1, updated_at = ?
+	result, err := tx.Exec(`UPDATE app_onboarding_provider_stages SET
+status = 'ready', provider_id = ?, account_id = ?, model_id = ?, updated_at = ?
+WHERE kind = ? AND status = 'pending'
+  AND provider_id = '' AND account_id = '' AND model_id = ''`,
+		state.ProviderID,
+		accountID,
+		modelID,
+		updatedAt,
+		kind,
+	)
+	if err != nil {
+		return OnboardingSnapshot{}, fmt.Errorf("mark onboarding Provider ready: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return OnboardingSnapshot{}, ErrOnboardingConflict
+	}
+
+	remainingPending := false
+	for stageKind, stage := range refreshedInspection.byKind {
+		if stageKind != kind && stage.Status == onboardingProviderStagePending {
+			remainingPending = true
+			break
+		}
+	}
+	phase := OnboardingPhaseProvider
+	comboID := ""
+	personaFingerprint := state.PersonaFingerprint
+	if !remainingPending {
+		phase = OnboardingPhasePersona
+		comboID = uuid.NewString()
+		personaFingerprint = ""
+	}
+	result, err = tx.Exec(`UPDATE app_onboarding_state SET
+phase = ?, provider_kind = '', provider_id = '', account_id = '', model_id = '',
+staged_combo_id = ?, persona_fingerprint = ?, test_nonce_hash = '', test_expires_at = '',
+revision = revision + 1, updated_at = ?
 WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
   AND provider_id = ? AND account_id = ? AND model_id = '' AND staged_combo_id = ''
-  AND persona_fingerprint = '' AND test_nonce_hash = '' AND test_expires_at = ''`,
-		OnboardingPhasePersona,
-		modelID,
+  AND persona_fingerprint = ? AND test_nonce_hash = '' AND test_expires_at = ''`,
+		phase,
 		comboID,
+		personaFingerprint,
 		updatedAt,
 		expectedRevision,
 		OnboardingPhaseSetup,
-		state.ProviderKind,
+		kind,
 		state.ProviderID,
 		accountID,
+		state.PersonaFingerprint,
 	)
 	if err != nil {
-		return OnboardingSetup{}, fmt.Errorf("update onboarding setup staging: %w", err)
+		return OnboardingSnapshot{}, fmt.Errorf("update onboarding setup singleton: %w", err)
 	}
-	changed, err := result.RowsAffected()
+	changed, err = result.RowsAffected()
+	if err != nil || changed != 1 {
+		return OnboardingSnapshot{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingSnapshotInTx(tx, nil)
 	if err != nil {
-		return OnboardingSetup{}, fmt.Errorf("read onboarding setup staging result: %w", err)
+		return OnboardingSnapshot{}, err
 	}
-	if changed != 1 {
-		return OnboardingSetup{}, ErrOnboardingConflict
+	if err := writeOnboardingProviderMutationReceiptInTx(
+		tx,
+		onboardingProviderMutationSetup,
+		expectedRevision,
+		expectedRevision+1,
+		onboardingProviderSetupPayload(kind, accountID, modelID, account, updated.Stages),
+	); err != nil {
+		return OnboardingSnapshot{}, err
 	}
-	updated, err := onboardingStateInTx(tx)
-	if err != nil {
-		return OnboardingSetup{}, err
+	if err := onboardingProvidersCommit(tx); err != nil {
+		return OnboardingSnapshot{}, fmt.Errorf("commit onboarding setup staging: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return OnboardingSetup{}, fmt.Errorf("commit onboarding setup staging: %w", err)
-	}
-	return OnboardingSetup{OnboardingState: updated, ComboName: comboName}, nil
+	return updated, nil
 }
 
 // AdvanceOnboardingPersona atomically publishes the authoritative display name
@@ -1161,8 +1381,7 @@ func onboardingComboName(kind string) (string, error) {
 
 func onboardingConnectStateIsClean(state OnboardingState) bool {
 	return state.ProviderID == "" && state.AccountID == "" && state.ModelID == "" &&
-		state.StagedComboID == "" && state.PersonaFingerprint == "" &&
-		state.TestNonceHash == "" && state.TestExpiresAt == ""
+		state.StagedComboID == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
 }
 
 // OnboardingStagingAccount returns only a disabled Account exactly owned by

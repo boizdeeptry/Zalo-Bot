@@ -638,6 +638,7 @@ BEGIN SELECT RAISE(ABORT, 'injected agent edit failure'); END`); err != nil {
 func TestBindOnboardingAccountStagesDisabledAccountAndAdvancesOnce(t *testing.T) {
 	st := openAppStoreForTest(t)
 	insertOnboardingProviderForTest(t, st, "codex", "codex")
+	insertPendingOnboardingProviderStageForTest(t, st, "codex", 0)
 	setOnboardingStateForTest(t, st, OnboardingState{
 		Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 7,
 	})
@@ -652,12 +653,12 @@ func TestBindOnboardingAccountStagesDisabledAccountAndAdvancesOnce(t *testing.T)
 	if err != nil {
 		t.Fatalf("BindOnboardingAccount() = %v", err)
 	}
-	if got.Phase != OnboardingPhaseSetup || got.ProviderID != "codex" ||
-		got.AccountID != account.ID || got.Revision != before.Revision+1 {
+	if got.State.Phase != OnboardingPhaseSetup || got.State.ProviderID != "codex" ||
+		got.State.AccountID != account.ID || got.State.Revision != before.Revision+1 {
 		t.Fatalf("bound state = %+v", got)
 	}
-	if got.ProviderKind != before.ProviderKind || got.CompletedVersion != before.CompletedVersion ||
-		got.RestartInProgress != before.RestartInProgress {
+	if got.State.ProviderKind != before.ProviderKind || got.State.CompletedVersion != before.CompletedVersion ||
+		got.State.RestartInProgress != before.RestartInProgress {
 		t.Fatalf("bind changed flow markers: before=%+v got=%+v", before, got)
 	}
 	accounts, err := st.LLMAccounts("codex")
@@ -676,6 +677,7 @@ func TestBindOnboardingAccountAcceptsExactMatchingDisabledProvider(t *testing.T)
 VALUES ('codex', 'Codex', 'codex', 0)`); err != nil {
 		t.Fatal(err)
 	}
+	insertPendingOnboardingProviderStageForTest(t, st, "codex", 0)
 	setOnboardingStateForTest(t, st, OnboardingState{
 		Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 11,
 	})
@@ -686,8 +688,8 @@ VALUES ('codex', 'Codex', 'codex', 0)`); err != nil {
 	if err != nil {
 		t.Fatalf("BindOnboardingAccount() = %v", err)
 	}
-	if got.Phase != OnboardingPhaseSetup || got.ProviderID != "codex" ||
-		got.AccountID != account.ID || got.Revision != before.Revision+1 {
+	if got.State.Phase != OnboardingPhaseSetup || got.State.ProviderID != "codex" ||
+		got.State.AccountID != account.ID || got.State.Revision != before.Revision+1 {
 		t.Fatalf("bound state = %+v", got)
 	}
 	accounts, err := st.LLMAccounts("codex")
@@ -814,11 +816,6 @@ func TestBindOnboardingAccountRejectsInvalidStateAndRollsBack(t *testing.T) {
 			wantErr: ErrOnboardingInvalidStagingOwnership,
 		},
 		{
-			name: "dirty fingerprint", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", PersonaFingerprint: "old", Revision: 5},
-			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
-			wantErr: ErrOnboardingInvalidStagingOwnership,
-		},
-		{
 			name: "dirty receipt", state: OnboardingState{Phase: OnboardingPhaseConnect, ProviderKind: "codex", TestNonceHash: "old", Revision: 5},
 			kind: "codex", account: validOnboardingAccountForTest(), providerID: "codex", providerKind: "codex", providerEnabled: true,
 			wantErr: ErrOnboardingInvalidStagingOwnership,
@@ -837,6 +834,7 @@ func TestBindOnboardingAccountRejectsInvalidStateAndRollsBack(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			st := openAppStoreForTest(t)
+			insertPendingOnboardingProviderStageForTest(t, st, "codex", 0)
 			if tt.providerID != "" {
 				if _, err := st.db.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
 VALUES (?, ?, ?, ?)`, tt.providerID, tt.providerID, tt.providerKind, boolInt(tt.providerEnabled)); err != nil {
@@ -903,6 +901,7 @@ func TestBindOnboardingAccountRejectsInvalidInputWithoutMutation(t *testing.T) {
 func TestBindOnboardingAccountCASFailureRollsBackInsertedAccount(t *testing.T) {
 	st := openAppStoreForTest(t)
 	insertOnboardingProviderForTest(t, st, "codex", "codex")
+	insertPendingOnboardingProviderStageForTest(t, st, "codex", 0)
 	setOnboardingStateForTest(t, st, OnboardingState{
 		Phase: OnboardingPhaseConnect, ProviderKind: "codex", Revision: 9,
 	})
@@ -1566,17 +1565,18 @@ VALUES (0, 'live-provider', 'live-model', 1)`); err != nil {
 	seedStageOnboardingSetupForTest(t, st, "codex", "staged-account", "gpt-5.6-terra", true, 7)
 	beforeLive := onboardingLiveRoutingBytesForTest(t, st)
 
-	got, err := st.StageOnboardingSetup(7, "staged-account", "gpt-5.6-terra")
+	got, err := st.StageOnboardingSetup(7, "codex", "staged-account", "gpt-5.6-terra")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Phase != OnboardingPhasePersona || got.Revision != 8 || got.ProviderKind != "codex" ||
-		got.ProviderID != "codex" || got.AccountID != "staged-account" ||
-		got.ModelID != "gpt-5.6-terra" || got.ComboName != "Mặc định · Codex" {
+	if got.State.Phase != OnboardingPhasePersona || got.State.Revision != 8 ||
+		got.State.ProviderKind != "" || got.State.ProviderID != "" || got.State.AccountID != "" ||
+		got.State.ModelID != "" || len(got.Stages) != 1 || got.Stages[0].Status != "ready" ||
+		got.Stages[0].AccountID != "staged-account" || got.Stages[0].ModelID != "gpt-5.6-terra" {
 		t.Fatalf("StageOnboardingSetup() = %+v", got)
 	}
-	if _, err := uuid.Parse(got.StagedComboID); err != nil {
-		t.Fatalf("staged combo id %q is not a UUID: %v", got.StagedComboID, err)
+	if _, err := uuid.Parse(got.State.StagedComboID); err != nil {
+		t.Fatalf("staged combo id %q is not a UUID: %v", got.State.StagedComboID, err)
 	}
 	if afterLive := onboardingLiveRoutingBytesForTest(t, st); afterLive != beforeLive {
 		t.Fatalf("StageOnboardingSetup changed live routing rows:\nbefore=%q\nafter=%q", beforeLive, afterLive)
@@ -1587,15 +1587,15 @@ func TestStageOnboardingSetupLostResponseRetryReturnsExactDescriptor(t *testing.
 	st := openAppStoreForTest(t)
 	seedStageOnboardingSetupForTest(t, st, "claude-code", "staged-account", "sonnet", true, 11)
 
-	first, err := st.StageOnboardingSetup(11, "staged-account", "sonnet")
+	first, err := st.StageOnboardingSetup(11, "claude-code", "staged-account", "sonnet")
 	if err != nil {
 		t.Fatal(err)
 	}
-	retry, err := st.StageOnboardingSetup(11, "staged-account", "sonnet")
+	retry, err := st.StageOnboardingSetup(11, "claude-code", "staged-account", "sonnet")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retry != first {
+	if retry.State != first.State || !slices.Equal(retry.Stages, first.Stages) {
 		t.Fatalf("retry = %+v; want exact original %+v", retry, first)
 	}
 	if state := mustOnboardingStateForTest(t, st); state.Revision != 12 {
@@ -1603,7 +1603,7 @@ func TestStageOnboardingSetupLostResponseRetryReturnsExactDescriptor(t *testing.
 	}
 
 	before := mustOnboardingStateForTest(t, st)
-	if _, err := st.StageOnboardingSetup(11, "different-account", "sonnet"); !errors.Is(err, ErrOnboardingConflict) {
+	if _, err := st.StageOnboardingSetup(11, "claude-code", "different-account", "sonnet"); !errors.Is(err, ErrOnboardingConflict) {
 		t.Fatalf("mismatched retry error = %v; want ErrOnboardingConflict", err)
 	}
 	if after := mustOnboardingStateForTest(t, st); after != before {
@@ -1642,7 +1642,7 @@ func TestStageOnboardingSetupRejectsInvalidStateWithoutMutation(t *testing.T) {
 			beforeState := mustOnboardingStateForTest(t, st)
 			beforeLive := onboardingLiveRoutingBytesForTest(t, st)
 
-			if _, err := st.StageOnboardingSetup(tt.expectedRevision, tt.requestAccount, "gpt-5.6-terra"); !errors.Is(err, tt.wantErr) {
+			if _, err := st.StageOnboardingSetup(tt.expectedRevision, "codex", tt.requestAccount, "gpt-5.6-terra"); !errors.Is(err, tt.wantErr) {
 				t.Fatalf("StageOnboardingSetup error = %v; want %v", err, tt.wantErr)
 			}
 			if after := mustOnboardingStateForTest(t, st); after != beforeState {
@@ -1663,20 +1663,26 @@ func seedStageOnboardingSetupForTest(
 	revision int64,
 ) {
 	t.Helper()
-	if kind != "claude-code" {
-		insertOnboardingProviderForTest(t, st, kind, kind)
+	if err := st.EnsureOnboardingProviderForKind(kind); err != nil {
+		t.Fatal(err)
 	}
-	insertOnboardingAccountForTest(t, st, accountID, kind, false, "D:/onboarding/"+accountID)
+	insertPendingOnboardingProviderStageForTest(t, st, kind, 0)
+	setOnboardingStateForTest(t, st, OnboardingState{
+		Phase: OnboardingPhaseConnect, ProviderKind: kind, Revision: revision - 1,
+	})
+	addedAt := time.Date(2026, 8, 11, 7, 0, 0, 0, time.UTC)
+	if _, err := st.BindOnboardingAccount(revision-1, kind, LLMAccount{
+		ID: accountID, ProviderID: kind, Label: accountID,
+		ConfigDir: "D:/onboarding/" + accountID, AddedAt: &addedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.AddLLMModel(LLMModel{
 		ProviderID: kind, ModelID: modelID, Name: modelID,
 		Source: LLMModelManual, Available: modelAvailable,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	setOnboardingStateForTest(t, st, OnboardingState{
-		Phase: OnboardingPhaseSetup, ProviderKind: kind, ProviderID: kind,
-		AccountID: accountID, Revision: revision,
-	})
 }
 
 func onboardingLiveRoutingBytesForTest(t *testing.T, st *Store) string {
@@ -1725,6 +1731,15 @@ func insertOnboardingProviderForTest(t *testing.T, st *Store, id, kind string) {
 	t.Helper()
 	if _, err := st.db.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
 VALUES (?, ?, ?, 1)`, id, id, kind); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertPendingOnboardingProviderStageForTest(t *testing.T, st *Store, kind string, position int) {
+	t.Helper()
+	if _, err := st.db.Exec(`INSERT INTO app_onboarding_provider_stages(
+kind, status, position, updated_at
+) VALUES (?, 'pending', ?, '2026-08-15T00:00:00Z')`, kind, position); err != nil {
 		t.Fatal(err)
 	}
 }

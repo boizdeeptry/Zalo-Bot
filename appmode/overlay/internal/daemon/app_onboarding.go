@@ -104,17 +104,8 @@ type appOnboardingRestartRequest struct {
 
 type appOnboardingSetupRequest struct {
 	Revision  int64  `json:"revision"`
+	Kind      string `json:"kind"`
 	AccountID string `json:"account_id"`
-}
-
-type appOnboardingSetupResponse struct {
-	Revision      int64  `json:"revision"`
-	ProviderKind  string `json:"provider_kind"`
-	ProviderID    string `json:"provider_id"`
-	AccountID     string `json:"account_id"`
-	ModelID       string `json:"model_id"`
-	StagedComboID string `json:"staged_combo_id"`
-	ComboName     string `json:"combo_name"`
 }
 
 type appOnboardingTestChatRequest struct {
@@ -304,6 +295,10 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 	if !a.requireOnboardingRevision(w, request.Revision) {
 		return
 	}
+	if !appProviderSupportsOnboarding(request.Kind) {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingProviderUnsupported)
+		return
+	}
 	if request.AccountID == "" {
 		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
 		return
@@ -317,30 +312,33 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := a.st.OnboardingState()
+	snapshot, err := a.st.OnboardingSnapshot()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	if err := validateOnboardingState(state); err != nil {
+	if err := validateOnboardingSnapshot(snapshot); err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	if state.Revision == request.Revision+1 {
-		if state.Phase != store.OnboardingPhasePersona || state.AccountID != request.AccountID {
+	state := snapshot.State
+	if onboardingRevisionIsOneAheadForDaemon(request.Revision, state.Revision) {
+		stage, selected := onboardingStageForKind(snapshot.Stages, request.Kind)
+		if !selected || stage.Status != "ready" || stage.AccountID != request.AccountID || stage.ModelID == "" {
 			a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
 			return
 		}
 		staged, err := a.st.StageOnboardingSetup(
 			request.Revision,
+			request.Kind,
 			request.AccountID,
-			state.ModelID,
+			stage.ModelID,
 		)
 		if err != nil {
 			a.writeOnboardingStoreError(w, err)
 			return
 		}
-		a.writeOnboardingSetup(w, staged)
+		a.writeOnboardingSnapshot(w, staged)
 		return
 	}
 	if state.Revision != request.Revision {
@@ -351,15 +349,16 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidPhase)
 		return
 	}
-	if state.AccountID != request.AccountID {
+	if state.ProviderKind != request.Kind || state.AccountID != request.AccountID {
 		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
 		return
 	}
-	if _, err := a.st.OnboardingStagingAccount(request.Revision); err != nil {
-		a.writeOnboardingStoreError(w, err)
+	stage, selected := onboardingStageForKind(snapshot.Stages, request.Kind)
+	if !selected || stage.Status != "pending" {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
 		return
 	}
-	modelID, err := selectOnboardingModel(a.st, state.ProviderKind, state.ProviderID)
+	modelID, err := appSelectOnboardingModel(a.st, request.Kind, state.ProviderID)
 	if err != nil {
 		if errors.Is(err, store.ErrOnboardingModelUnavailable) {
 			a.writeOnboardingStoreError(w, err)
@@ -368,12 +367,12 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	staged, err := a.st.StageOnboardingSetup(request.Revision, request.AccountID, modelID)
+	staged, err := a.st.StageOnboardingSetup(request.Revision, request.Kind, request.AccountID, modelID)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingSetup(w, staged)
+	a.writeOnboardingSnapshot(w, staged)
 }
 
 func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
@@ -913,6 +912,8 @@ func (a *api) writeOnboardingTestContextError(
 	}
 }
 
+var appSelectOnboardingModel = selectOnboardingModel
+
 func selectOnboardingModel(st *store.Store, kind, providerID string) (string, error) {
 	descriptor, ok := cliDescriptors[kind]
 	if !ok || descriptor.onboardingModel == "" || providerID == "" {
@@ -939,16 +940,21 @@ func selectOnboardingModel(st *store.Store, kind, providerID string) (string, er
 	return "", store.ErrOnboardingModelUnavailable
 }
 
-func (a *api) writeOnboardingSetup(w http.ResponseWriter, staged store.OnboardingSetup) {
-	a.writeJSON(w, http.StatusOK, appOnboardingSetupResponse{
-		Revision:      staged.Revision,
-		ProviderKind:  staged.ProviderKind,
-		ProviderID:    staged.ProviderID,
-		AccountID:     staged.AccountID,
-		ModelID:       staged.ModelID,
-		StagedComboID: staged.StagedComboID,
-		ComboName:     staged.ComboName,
-	})
+func onboardingStageForKind(
+	stages []store.OnboardingProviderStage,
+	kind string,
+) (store.OnboardingProviderStage, bool) {
+	for _, stage := range stages {
+		if stage.Kind == kind {
+			return stage, true
+		}
+	}
+	return store.OnboardingProviderStage{}, false
+}
+
+func onboardingRevisionIsOneAheadForDaemon(expectedRevision, currentRevision int64) bool {
+	return expectedRevision > 0 && currentRevision > expectedRevision &&
+		currentRevision-expectedRevision == 1
 }
 
 // decodeOnboardingBody accepts exactly one bounded JSON object. Error details are intentionally

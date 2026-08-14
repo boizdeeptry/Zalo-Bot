@@ -214,7 +214,7 @@ type connectManager struct {
 	ensureOnboarding func(kind string) error
 	ensureModels     func(kind string) error
 	createAccount    func(store.LLMAccount) error
-	bindOnboarding   func(expectedRevision int64, kind string, account store.LLMAccount) (store.OnboardingState, error)
+	bindOnboarding   func(expectedRevision int64, kind string, account store.LLMAccount) (store.OnboardingSnapshot, error)
 	dataDir          string
 	newID            func() string
 	logger           *slog.Logger
@@ -1042,9 +1042,21 @@ func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 			onboardingMutationMu.Unlock()
 			return
 		}
-		state, ok := a.onboardingMutationState(w, *body.OnboardingRevision)
-		if !ok {
+		snapshot, err := a.st.OnboardingSnapshot()
+		if err != nil {
 			onboardingMutationMu.Unlock()
+			a.writeOnboardingStateUnavailable(w, err)
+			return
+		}
+		if err := validateOnboardingSnapshot(snapshot); err != nil {
+			onboardingMutationMu.Unlock()
+			a.writeOnboardingStateUnavailable(w, err)
+			return
+		}
+		state := snapshot.State
+		if state.Revision != *body.OnboardingRevision {
+			onboardingMutationMu.Unlock()
+			a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
 			return
 		}
 		if !onboardingRequired(state) || state.Phase != store.OnboardingPhaseConnect {
@@ -1058,6 +1070,13 @@ func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !connectOnboardingStateIsClean(state) {
+			onboardingMutationMu.Unlock()
+			a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
+			return
+		}
+		stage, selected := onboardingStageForKind(snapshot.Stages, kind)
+		if !selected || stage.Status != "pending" || stage.ProviderID != "" ||
+			stage.AccountID != "" || stage.ModelID != "" {
 			onboardingMutationMu.Unlock()
 			a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
 			return
@@ -1091,8 +1110,7 @@ func onboardingRequired(state store.OnboardingState) bool {
 
 func connectOnboardingStateIsClean(state store.OnboardingState) bool {
 	return state.ProviderID == "" && state.AccountID == "" && state.ModelID == "" &&
-		state.StagedComboID == "" && state.PersonaFingerprint == "" &&
-		state.TestNonceHash == "" && state.TestExpiresAt == ""
+		state.StagedComboID == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
 }
 
 func (a *api) handleLLMConnectStatus(w http.ResponseWriter, r *http.Request) {
