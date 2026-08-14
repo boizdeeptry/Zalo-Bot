@@ -113,6 +113,9 @@ test("provider phase uses an AGS-like Agent Setup surface with separated selecti
     service: service({ selectProvider: () => { selects++; return Promise.resolve(connectStatus()); } }),
   });
   const { dialog } = assertAGSFrame(host);
+  const dashboard = byClass(host, "onboarding-dashboard");
+  assert.match(text(dashboard), /0\/2.*chưa thiết lập.*Chưa dùng:.*Claude Code, Codex/su);
+  assert.doesNotMatch(text(dashboard), /2\/2.*sẵn sàng/su);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
   assert.match(text(host), /Agent Setup/u);
   assert.match(text(host), /Thiết lập Agent/u);
@@ -132,6 +135,7 @@ test("provider phase uses an AGS-like Agent Setup surface with separated selecti
   providerCard(host, "claude-code").click();
   assert.equal(selects, 0, "clicking a row only changes local selection");
   assert.match(text(providerCard(host, "claude-code")), /Đã chọn/u);
+  assert.equal(document.activeElement, providerCard(host, "claude-code"));
   assert.ok(button(host, "Tiếp tục"));
 });
 

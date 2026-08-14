@@ -12,7 +12,7 @@ import {
 import { createDoneStage, createPersonaStage, createTestStage } from "./onboarding-late-view.js";
 import {
   createConnectStage, createLoadingStatus, createRetryButton, createSafeErrorStage,
-  createSetupStage, createWelcomeStage, renderOnboardingShell,
+  createSetupStage, createWelcomeStage, focusProviderControl, renderOnboardingShell,
 } from "./onboarding-early-view.js";
 export { createOnboardingService };
 export function createOnboardingPage({
@@ -129,8 +129,8 @@ export function createOnboardingPage({
       message,
       listen,
       onSelect(kind) {
-        selectedProvider = kind;
-        renderWelcome(message);
+        selectedProvider = kind; renderWelcome(message);
+        focusProviderControl(root, kind);
       },
       onProceed: () => { void selectProvider(); },
       onRetry: refreshStatus,

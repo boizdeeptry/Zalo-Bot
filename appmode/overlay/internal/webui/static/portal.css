@@ -442,7 +442,7 @@
   --onboarding-border:#313647;
   --onboarding-divider:#282b38;
   --onboarding-text:#ededee;
-  --onboarding-muted:#94969f;
+  --onboarding-muted:#a8acb8;
   --onboarding-disabled:#555967;
   --onboarding-cyan:#54d9f4;
   --onboarding-orange:#f59e0b;
@@ -547,7 +547,9 @@
   border-radius:12px; color:var(--onboarding-text); background:var(--onboarding-surface);
   box-shadow:0 28px 90px rgba(0,0,0,.68),0 0 0 1px rgba(84,217,244,.04);
 }
-.onboarding-shell .onboarding-dialog:focus { outline:none; }
+.onboarding-shell .onboarding-dialog:focus-visible {
+  outline:2px solid var(--onboarding-cyan); outline-offset:2px;
+}
 .onboarding-shell .onboarding-sidebar {
   position:relative; z-index:2; display:grid; grid-template-columns:auto minmax(0,1fr);
   align-items:center; gap:16px; min-width:0; min-height:64px; padding:10px 16px;
@@ -566,15 +568,15 @@
   list-style:none; margin:0; padding:0; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px;
 }
 .onboarding-shell .onboarding-step {
-  position:relative; display:flex; min-width:0; align-items:center; gap:5px; color:#646979;
+  position:relative; display:flex; min-width:0; align-items:center; gap:5px; color:var(--onboarding-muted);
 }
 .onboarding-shell .onboarding-step-index {
   display:inline-grid; flex:0 0 auto; place-items:center; width:20px; height:20px;
   border:1px solid #343b4f; border-radius:999px; background:#0e1425;
-  color:#747989; font-size:9px; font-weight:900;
+  color:var(--onboarding-muted); font-size:10px; font-weight:900;
 }
 .onboarding-shell .onboarding-step-label {
-  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9.5px;
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px;
 }
 .onboarding-shell .onboarding-step.is-current { color:var(--onboarding-text); font-weight:800; }
 .onboarding-shell .onboarding-step.is-current .onboarding-step-index {
@@ -656,8 +658,8 @@
   color:var(--onboarding-muted); font-size:10px; font-weight:500;
 }
 .onboarding-shell .onboarding-agent-badge {
-  flex:0 0 auto; border:0; padding:0; color:var(--onboarding-disabled);
-  background:transparent; font-size:9px; font-weight:800;
+  flex:0 0 auto; border:0; padding:0; color:var(--onboarding-muted);
+  background:transparent; font-size:11px; font-weight:800;
 }
 .onboarding-shell .onboarding-agent-badge.is-selected,
 .onboarding-shell .onboarding-agent-badge.is-live {
@@ -818,7 +820,7 @@
   }
   .onboarding-shell .onboarding-step-list { gap:4px; }
   .onboarding-shell .onboarding-step { gap:4px; }
-  .onboarding-shell .onboarding-step-label { font-size:8.5px; }
+  .onboarding-shell .onboarding-step-label { font-size:11px; }
   .onboarding-shell .onboarding-stage { padding:14px; }
   .onboarding-shell .onboarding-provider-grid { margin:12px -14px; }
   .onboarding-shell .onboarding-agent-row { min-height:62px; }
@@ -826,7 +828,7 @@
   .onboarding-shell .onboarding-connect-provider-row { padding:10px 12px; }
   .onboarding-shell .onboarding-connect-provider-row { margin:12px -14px 0; }
   .onboarding-shell .onboarding-agent-row-tail { gap:6px; }
-  .onboarding-shell .onboarding-agent-badge { font-size:8px; }
+  .onboarding-shell .onboarding-agent-badge { font-size:11px; }
   .onboarding-shell .onboarding-persona-form > div,
   .onboarding-shell .onboarding-chat-form,
   .onboarding-shell .pv-connect-prompt { grid-template-columns:1fr; }

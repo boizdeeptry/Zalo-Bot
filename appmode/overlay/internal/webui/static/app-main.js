@@ -231,6 +231,7 @@ export function startApp({
   }
   const content = documentRef.querySelector("[data-portal-content]");
   const shellNodes = [
+    documentRef.querySelector(".skip-link"),
     documentRef.querySelector("#rail-toggle"),
     documentRef.querySelector("#rail"),
     documentRef.querySelector("[data-portal-nav]"),

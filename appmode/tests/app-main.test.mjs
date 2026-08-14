@@ -99,19 +99,23 @@ function appHarness(t, {
 } = {}) {
   const dom = installDOM();
   t.after(dom.restore);
+  const skip = document.createElement("a");
   const toggle = document.createElement("button");
   const rail = document.createElement("nav");
   const nav = document.createElement("div");
   const main = document.createElement("main");
+  skip.className = "skip-link";
+  skip.setAttribute("href", "#main");
   toggle.id = "rail-toggle";
   rail.id = "rail";
   nav.setAttribute("data-portal-nav", "");
   main.setAttribute("data-portal-content", "");
-  for (const node of [toggle, rail, nav]) node.inert = false;
+  for (const node of [skip, toggle, rail, nav]) node.inert = false;
   rail.append(nav);
   document.body.className = "portal-body";
-  document.body.append(toggle, rail, main);
+  document.body.append(skip, toggle, rail, main);
   const bySelector = new Map([
+    [".skip-link", skip],
     ["#rail-toggle", toggle],
     ["#rail", rail],
     ["[data-portal-nav]", nav],
@@ -178,7 +182,7 @@ function appHarness(t, {
     startPortal,
   });
   t.after(() => app.dispose());
-  return { app, events, listeners, main, nav, portals, rail, toggle, windowRef, wizards };
+  return { app, events, listeners, main, nav, portals, rail, skip, toggle, windowRef, wizards };
 }
 
 test("the top-level application exposes the sole startup owner", () => {
@@ -195,6 +199,8 @@ test("startup immediately gates the Portal while authoritative status is pending
   assert.equal(harness.portals.length, 0);
   assert.equal(harness.wizards.length, 0);
   assert.equal(harness.rail.hidden, true);
+  assert.equal(harness.skip.getAttribute("aria-hidden"), "true");
+  assert.equal(harness.skip.inert, true);
   assert.equal(harness.toggle.getAttribute("aria-hidden"), "true");
   assert.equal(harness.nav.inert, true);
   assert.equal(document.body.classList.contains("onboarding-gated"), true);
@@ -216,6 +222,8 @@ test("a completed lifecycle restores the shell and mounts Portal exactly once", 
   assert.equal(harness.wizards.length, 0);
   assert.equal(harness.rail.hidden, false);
   assert.equal(harness.rail.hasAttribute("aria-hidden"), false);
+  assert.equal(harness.skip.hasAttribute("aria-hidden"), false);
+  assert.equal(harness.skip.inert, false);
   assert.equal(harness.nav.inert, false);
   assert.equal(document.body.classList.contains("onboarding-gated"), false);
   assert.equal(Object.isFrozen(harness.app), true);

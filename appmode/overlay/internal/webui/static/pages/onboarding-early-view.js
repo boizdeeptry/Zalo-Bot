@@ -4,6 +4,17 @@ const STEP_LABELS = Object.freeze(["Kết nối", "Cá nhân hoá", "Trò chuy�
 
 export const providerName = (kind) => kind === "claude-code" ? "Claude Code" : "Codex";
 
+export function focusProviderControl(node, kind) {
+  if (node?.dataset?.providerKind === kind) {
+    node.focus({ preventScroll: true });
+    return true;
+  }
+  for (const child of node?.children ?? []) {
+    if (focusProviderControl(child, kind)) return true;
+  }
+  return false;
+}
+
 function currentStepIndex(phase) {
   if (phase === "persona") return 1;
   if (phase === "test" || phase === "completed") return 2;
@@ -51,12 +62,12 @@ function decorativeDashboard() {
       element("div", { className: "onboarding-dashboard-summary" },
         element("span", { className: "onboarding-dashboard-kicker", text: "AGENT" }),
         element("div", { className: "onboarding-dashboard-ready" },
-          element("span", { text: "2/2" }),
-          element("span", { text: "sẵn sàng" }),
+          element("span", { text: "0/2" }),
+          element("span", { text: "chưa thiết lập" }),
           element("span", { className: "onboarding-dashboard-bars", text: "▮▮" }),
         ),
         element("div", { className: "onboarding-dashboard-active" },
-          element("span", { text: "└ Đang dùng:" }),
+          element("span", { text: "└ Chưa dùng:" }),
           element("span", { text: "Claude Code, Codex" }),
         ),
         element("div", { className: "onboarding-dashboard-manage", text: "✧  Quản lý Agents" }),
