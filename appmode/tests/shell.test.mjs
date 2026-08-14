@@ -80,6 +80,18 @@ test("desktop shell loads isolated Portal CSS with the legacy rail dimensions", 
   assert.match(css, /#main:focus-visible\s*\{[^}]*outline-offset:\s*-2px/s);
 });
 
+test("onboarding CSS carries the scoped AGS visual contract", async () => {
+  const css = await readFile(new URL("portal.css", staticRoot), "utf8");
+  assert.match(css, /\.onboarding-shell\s*\{[^}]*--onboarding-topbar:\s*#070a15/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-topbar\s*\{[^}]*height:\s*47px/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-sidebar\s*\{[^}]*width:\s*292px/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-canvas\s*\{[^}]*linear-gradient\(45deg/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-backdrop\s*\{[^}]*rgba\(0,\s*0,\s*0,\s*\.5\)/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dialog\s*\{[^}]*width:\s*min\(560px,\s*calc\(100vw - 32px\)\)/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-agent-switch\s*\{[^}]*width:\s*46px[^}]*height:\s*26px/s);
+  assert.match(css, /@media\s*\(max-width:\s*900px\)[\s\S]*\.onboarding-shell \.onboarding-dashboard-sidebar/s);
+});
+
 // regionsFor lấy phần thân giữa mỗi cặp dấu <marker>:begin/end.
 //
 // Cắt theo DẤU chứ không lọc theo chữ trong selector: một luật xổng phạm vi là một
