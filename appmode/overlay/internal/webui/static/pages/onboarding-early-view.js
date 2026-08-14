@@ -49,6 +49,49 @@ function actionButton(label, primary = false) {
   });
 }
 
+function setupHeader(title, body) {
+  return [
+    element("p", { className: "onboarding-eyebrow", text: "Agent Setup" }),
+    element("h1", { text: title }),
+    element("p", { className: "onboarding-provider-intro", text: body }),
+  ];
+}
+
+function providerStatusBadge(selected) {
+  return element("span", {
+    className: `onboarding-agent-badge${selected ? " is-selected" : ""}`,
+    text: selected ? "Đã chọn" : "Chưa chọn",
+  });
+}
+
+function providerRow(kind, label, selected, listen, onSelect) {
+  const card = element("button", {
+    className: `onboarding-provider-card onboarding-agent-row${selected ? " is-selected" : ""}`,
+    attributes: {
+      type: "button",
+      "data-provider-kind": kind,
+      "aria-pressed": String(selected),
+    },
+  }, element("span", { className: "onboarding-agent-row-main" },
+    element("strong", { text: label }),
+    element("small", { text: kind === "claude-code" ? "Claude Desktop/CLI account" : "Codex local account" }),
+  ), providerStatusBadge(selected));
+  return listen(card, "click", () => onSelect(kind));
+}
+
+function setupStatusPanel({ title, status, detail, children = [] }) {
+  return element(
+    "div",
+    { className: "onboarding-agent-status-panel" },
+    element("div", { className: "onboarding-agent-status-head" },
+      element("span", { className: "onboarding-agent-status-title", text: title }),
+      element("span", { className: "onboarding-agent-badge is-live", text: status }),
+    ),
+    element("p", { className: "onboarding-agent-status-detail", text: detail }),
+    ...children,
+  );
+}
+
 export function createRetryButton(listen, action) {
   return listen(actionButton("Thử lại"), "click", () => { void action(); });
 }
@@ -79,19 +122,9 @@ export function createWelcomeStage({
   onProceed,
   onRetry,
 }) {
-  const cards = [["codex", "Codex"], ["claude-code", "Claude Code"]].map(([kind, label]) => {
-    const card = element("button", {
-      className: `onboarding-provider-card${selectedProvider === kind ? " is-selected" : ""}`,
-      attributes: {
-        type: "button",
-        "data-provider-kind": kind,
-        "aria-pressed": String(selectedProvider === kind),
-      },
-      text: label,
-    });
-    return listen(card, "click", () => onSelect(kind));
-  });
-  const proceed = actionButton("Tiếp tục", true);
+  const cards = [["codex", "Codex"], ["claude-code", "Claude Code"]]
+    .map(([kind, label]) => providerRow(kind, label, selectedProvider === kind, listen, onSelect));
+  const proceed = actionButton("Tiếp tục kết nối", true);
   proceed.disabled = !selectedProvider;
   let selecting = false;
   listen(proceed, "click", () => {
@@ -104,17 +137,22 @@ export function createWelcomeStage({
   const retry = message ? createRetryButton(listen, onRetry) : null;
   return element(
     "section",
-    { className: "onboarding-stage onboarding-provider-stage" },
-    element("p", { className: "onboarding-eyebrow", text: "Chào mừng" }),
-    element("h1", { text: "Chọn nhà cung cấp" }),
-    element("p", {
-      className: "onboarding-provider-intro",
-      text: "Chọn công cụ AI bạn muốn dùng cho trợ lý.",
+    { className: "onboarding-stage onboarding-provider-stage onboarding-agent-setup-stage" },
+    ...setupHeader(
+      "Thiết lập Agent",
+      "Chọn nhà cung cấp: Chọn provider muốn dùng cho trợ lý Zalo. Giống AGS, lựa chọn ở đây là ý định của bạn; server chỉ đổi cấu hình thật sau khi xác minh.",
+    ),
+    setupStatusPanel({
+      title: "Trạng thái",
+      status: selectedProvider ? "Đã có lựa chọn" : "Chưa chọn",
+      detail: selectedProvider
+        ? `Đang chọn ${providerName(selectedProvider)}. Bấm Tiếp tục kết nối để bắt đầu xác minh.`
+        : "Chọn một provider bên dưới để bắt đầu kết nối.",
     }),
-    element("div", { className: "onboarding-provider-grid" }, cards),
+    element("div", { className: "onboarding-provider-grid onboarding-agent-list" }, cards),
     element("p", {
       className: "onboarding-provider-warning",
-      text: "Bạn cần đăng nhập. Cấu hình đang dùng chỉ thay đổi sau khi kết nối được xác minh và bạn bấm Hoàn tất.",
+      text: "Bạn cần đăng nhập. Cấu hình đang dùng chỉ thay đổi sau khi kết nối được xác minh, Chat thử đạt yêu cầu và bạn bấm Hoàn tất.",
     }),
     message ? element("p", {
       className: "onboarding-error", attributes: { role: "alert" }, text: message,
@@ -126,11 +164,17 @@ export function createWelcomeStage({
 export function createConnectStage(kind, slot) {
   return element(
     "section",
-    { className: "onboarding-stage onboarding-connect-stage" },
+    { className: "onboarding-stage onboarding-connect-stage onboarding-agent-setup-stage" },
+    element("p", { className: "onboarding-eyebrow", text: "Agent Setup" }),
     element("h1", { text: `Kết nối ${providerName(kind)}` }),
     element("p", {
       className: "onboarding-connect-intro",
-      text: "Đăng nhập và chờ hệ thống xác minh tài khoản.",
+      text: "Đang kết nối provider đã chọn. Provider Connect giữ nguyên thanh tiến trình và log để bạn nhìn được hệ thống đang làm gì.",
+    }),
+    setupStatusPanel({
+      title: "Trạng thái",
+      status: "Đang kết nối",
+      detail: `${providerName(kind)} đang được xác minh. Nếu quay lại, cấu hình thật vẫn chưa bị đổi.`,
     }),
     slot,
   );
@@ -141,12 +185,22 @@ export function createSetupStage(status, message, retryButton) {
   const error = status === "error";
   return element(
     "section",
-    { className: "onboarding-stage onboarding-setup-stage" },
-    element("h1", { text: "Kết nối nhà cung cấp" }),
-    element("p", {
-      className: `onboarding-setup-status${complete ? " is-complete" : ""}`,
-      attributes: { role: "status" },
-      text: complete ? "✓" : "Đang chuẩn bị cấu hình…",
+    { className: "onboarding-stage onboarding-setup-stage onboarding-agent-setup-stage" },
+    ...setupHeader(
+      "Hàng đợi thiết lập",
+      "Provider đã xác minh. Portal đang tạo cấu hình staging giống hàng đợi setup của AGS trước khi chuyển sang Persona.",
+    ),
+    setupStatusPanel({
+      title: "Trạng thái",
+      status: complete ? "Hoàn tất" : (error ? "Cần thử lại" : "Đang thiết lập"),
+      detail: complete
+        ? "✓ Thiết lập xong. Đang mở bước cá nhân hoá Persona…"
+        : "Đang thiết lập… Đang chuẩn bị cấu hình, chọn model và tạo combo staging.",
+      children: [element("p", {
+        className: `onboarding-setup-status${complete ? " is-complete" : ""}`,
+        attributes: { role: "status" },
+        text: complete ? "✓" : "Đang chuẩn bị cấu hình…",
+      })],
     }),
     error ? element("p", {
       className: "onboarding-error", attributes: { role: "alert" }, text: message,

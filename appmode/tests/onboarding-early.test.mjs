@@ -178,16 +178,20 @@ test("Setup service rejects every non-successor or incomplete backend response",
   assert.throws(() => service.setup("account-7", Number.MAX_SAFE_INTEGER), /revision/i);
   assert.equal(requests, 0);
 });
-test("Welcome renders only two provider cards, an exact three-step rail, and guarded warning", (t) => {
+test("Welcome renders AGS-like provider setup, an exact three-step rail, and guarded warning", (t) => {
   const { host } = mountPage(t);
   const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
   const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
   const continueButton = button(host, "Tiếp tục");
-  assert.deepEqual(cards.map((card) => text(card)), ["Codex", "Claude Code"]);
+  assert.equal(cards.length, 2);
+  assert.match(text(cards[0]), /Codex.*Chưa chọn/u);
+  assert.match(text(cards[1]), /Claude Code.*Chưa chọn/u);
   assert.deepEqual(steps.map((step) => text(step)), [
     "Kết nối", "Cá nhân hoá", "Trò chuyện thử",
   ]);
   assert.equal(steps.some((step) => /setup|chuẩn bị/i.test(text(step))), false);
+  assert.match(text(host), /Agent Setup/u);
+  assert.match(text(host), /Thiết lập Agent/u);
   assert.equal(continueButton.disabled, true);
   assert.match(text(byClass(host, "onboarding-provider-warning")), /đăng nhập/i);
   assert.match(text(byClass(host, "onboarding-provider-warning")), /xác minh/i);
@@ -555,7 +559,7 @@ test("Setup Retry renders an authoritative non-Setup phase without stale POST", 
     ["persona", personaStatus({ revision: 9 }), "onboarding-persona-stage", "Trợ lý của bạn là ai"],
     ["test", { ...personaStatus({ revision: 9 }), phase: "test" }, "onboarding-test-stage", "Thử trò chuyện với Bé Mi"],
     ["completed", providerStatus({ phase: "completed", revision: 9 }), "onboarding-done-stage", "Bé Mi đã sẵn sàng!"],
-    ["provider", providerStatus({ revision: 9 }), "onboarding-provider-stage", "Chọn nhà cung cấp"],
+    ["provider", providerStatus({ revision: 9 }), "onboarding-provider-stage", "Thiết lập Agent"],
     ["connect", connectStatus({ revision: 9 }), "onboarding-connect-stage", "Kết nối Codex"],
   ];
   for (const [name, authoritative, className, heading] of cases) {
