@@ -95,7 +95,7 @@ export function renderOnboardingShell(root, phase, content) {
         element("span", {
           className: "onboarding-brand",
           attributes: { id: "onboarding-dialog-title" },
-          text: "Cài đặt Agent",
+          text: "Thiết lập Tư Vấn Zalo",
         }),
         element("span", { className: "onboarding-dialog-lock", attributes: { "aria-hidden": "true" }, text: "◆" }),
       ),
@@ -122,7 +122,7 @@ function actionButton(label, primary = false) {
 
 function setupHeader(title, body) {
   return [
-    element("p", { className: "onboarding-eyebrow", text: "Agent Setup" }),
+    element("p", { className: "onboarding-eyebrow", text: "Tư Vấn Zalo" }),
     element("h1", { text: title }),
     element("p", { className: "onboarding-provider-intro", text: body }),
   ];
@@ -247,8 +247,8 @@ export function createWelcomeStage({
     "section",
     { className: "onboarding-stage onboarding-provider-stage onboarding-agent-setup-stage" },
     ...setupHeader(
-      "Thiết lập Agent",
-      "Chọn nhà cung cấp: Chọn provider muốn dùng cho trợ lý Zalo. Giống AGS, lựa chọn ở đây là ý định của bạn; server chỉ đổi cấu hình thật sau khi xác minh.",
+      "Thiết lập trợ lý Zalo",
+      "Chọn nhà cung cấp muốn dùng cho trợ lý Zalo. Lựa chọn này chỉ được áp dụng sau khi kết nối được xác minh.",
     ),
     setupStatusPanel({
       title: "Trạng thái",
@@ -273,7 +273,7 @@ export function createConnectStage(kind, slot) {
   return element(
     "section",
     { className: "onboarding-stage onboarding-connect-stage onboarding-agent-setup-stage" },
-    element("p", { className: "onboarding-eyebrow", text: "Agent Setup" }),
+    element("p", { className: "onboarding-eyebrow", text: "Tư Vấn Zalo" }),
     element("h1", { text: `Kết nối ${providerName(kind)}` }),
     element("p", {
       className: "onboarding-connect-intro",
@@ -297,7 +297,7 @@ export function createSetupStage(status, message, retryButton) {
     { className: "onboarding-stage onboarding-setup-stage onboarding-agent-setup-stage" },
     ...setupHeader(
       "Hàng đợi thiết lập",
-      "Provider đã xác minh. Portal đang tạo cấu hình staging giống hàng đợi setup của AGS trước khi chuyển sang Persona.",
+      "Nhà cung cấp đã được xác minh. Tư Vấn Zalo đang chuẩn bị cấu hình trước khi chuyển sang bước cá nhân hoá.",
     ),
     setupStatusPanel({
       title: "Trạng thái",

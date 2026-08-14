@@ -80,13 +80,11 @@ test("desktop shell loads isolated Portal CSS with the legacy rail dimensions", 
   assert.match(css, /#main:focus-visible\s*\{[^}]*outline-offset:\s*-2px/s);
 });
 
-test("onboarding CSS carries the scoped AGS visual contract", async () => {
+test("onboarding CSS shows only the modal over a full-screen grid", async () => {
   const css = await readFile(new URL("portal.css", staticRoot), "utf8");
-  assert.match(css, /\.onboarding-shell\s*\{[^}]*--onboarding-topbar:\s*#070a15/s);
-  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-topbar\s*\{[^}]*height:\s*47px/s);
-  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-sidebar\s*\{[^}]*width:\s*292px/s);
-  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-canvas\s*\{[^}]*linear-gradient\(45deg/s);
-  assert.match(css, /\.onboarding-shell \.onboarding-backdrop\s*\{[^}]*rgba\(0,\s*0,\s*0,\s*\.5\)/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-topbar,\s*\.onboarding-shell \.onboarding-dashboard-sidebar,\s*\.onboarding-shell \.onboarding-dashboard-summary\s*\{[^}]*display:\s*none/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-canvas\s*\{[^}]*inset:\s*0[^}]*linear-gradient\(45deg/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-backdrop\s*\{[^}]*background:\s*transparent/s);
   assert.match(css, /\.onboarding-shell \.onboarding-dialog\s*\{[^}]*width:\s*min\(560px,\s*calc\(100vw - 32px\)\)/s);
   assert.match(css, /\.onboarding-shell \.onboarding-dialog:focus\s*\{[^}]*outline:\s*2px solid var\(--onboarding-cyan\)/s);
   assert.doesNotMatch(css, /\.onboarding-shell \.onboarding-dialog:focus\s*\{[^}]*outline:\s*none/s);
@@ -94,7 +92,7 @@ test("onboarding CSS carries the scoped AGS visual contract", async () => {
   assert.match(css, /\.onboarding-shell \.onboarding-step-label\s*\{[^}]*font-size:\s*11px/s);
   assert.match(css, /\.onboarding-shell \.onboarding-agent-badge\s*\{[^}]*color:\s*var\(--onboarding-muted\)[^}]*font-size:\s*11px/s);
   assert.match(css, /\.onboarding-shell \.onboarding-agent-switch\s*\{[^}]*width:\s*46px[^}]*height:\s*26px/s);
-  assert.match(css, /@media\s*\(max-width:\s*900px\)[\s\S]*\.onboarding-shell \.onboarding-dashboard-sidebar/s);
+  assert.doesNotMatch(css, /@media\s*\(max-width:\s*900px\)[\s\S]*\.onboarding-shell \.onboarding-dashboard-sidebar/s);
 });
 
 // regionsFor lấy phần thân giữa mỗi cặp dấu <marker>:begin/end.

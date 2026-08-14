@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { createOnboardingPage } from "../overlay/internal/webui/static/pages/onboarding.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
 import { onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
@@ -11,7 +12,7 @@ const button = (root, label) => find(root, (node) => node.tagName === "BUTTON" &
 const providerCard = (root, kind) => find(root, (node) => hasClass(node, "onboarding-provider-card")
   && node.dataset.providerKind === kind);
 
-function assertAGSFrame(host) {
+function assertModalFrame(host) {
   const dashboards = findAll(host, (node) => hasClass(node, "onboarding-dashboard"));
   const dialogs = findAll(host, (node) => node.getAttribute?.("role") === "dialog");
   assert.equal(dashboards.length, 1);
@@ -106,21 +107,21 @@ function mount(t, options = {}) {
   return { host, page };
 }
 
-test("provider phase uses an AGS-like Agent Setup surface with separated selection status", (t) => {
+test("provider phase uses a Tư Vấn Zalo modal over the retained grid canvas", (t) => {
   let selects = 0;
   const { host } = mount(t, {
     initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
     service: service({ selectProvider: () => { selects++; return Promise.resolve(connectStatus()); } }),
   });
-  const { dialog } = assertAGSFrame(host);
+  const { dialog } = assertModalFrame(host);
   const dashboard = byClass(host, "onboarding-dashboard");
   assert.match(text(dashboard), /0\/2.*chưa thiết lập.*Chưa dùng:.*Claude Code, Codex/su);
   assert.doesNotMatch(text(dashboard), /2\/2.*sẵn sàng/su);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
-  assert.match(text(host), /Agent Setup/u);
-  assert.match(text(host), /Thiết lập Agent/u);
+  assert.match(text(host), /Tư Vấn Zalo/u);
+  assert.match(text(host), /Thiết lập trợ lý Zalo/u);
   assert.match(text(host), /Trạng thái/u);
-  assert.match(text(host), /Chọn provider muốn dùng/u);
+  assert.match(text(host), /Chọn nhà cung cấp muốn dùng/u);
   assert.match(text(providerCard(host, "codex")), /Đã chọn/u);
   assert.match(text(providerCard(host, "claude-code")), /Chưa chọn/u);
   const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
@@ -139,15 +140,15 @@ test("provider phase uses an AGS-like Agent Setup surface with separated selecti
   assert.ok(button(host, "Tiếp tục"));
 });
 
-test("connect phase keeps Provider Connect inside the same Agent Setup status surface", (t) => {
+test("connect phase stays inside the same Tư Vấn Zalo modal", (t) => {
   const instances = [];
   const { host } = mount(t, {
     initialStatus: connectStatus({ revision: 6, provider_kind: "claude-code" }),
     connectFactory: connectFactory(instances),
   });
-  assertAGSFrame(host);
+  assertModalFrame(host);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
-  assert.match(text(host), /Agent Setup/u);
+  assert.match(text(host), /Tư Vấn Zalo/u);
   assert.match(text(host), /Đang kết nối/u);
   assert.match(text(host), /Claude Code/u);
   assert.match(text(host), /Provider Connect/u);
@@ -162,7 +163,7 @@ test("connect phase keeps Provider Connect inside the same Agent Setup status su
   assert.deepEqual(instances[0].starts, [{ label: "Onboarding", onboardingRevision: 6 }]);
 });
 
-test("setup phase looks like an inline AGS setup queue before Persona starts", async (t) => {
+test("setup phase stays in the Tư Vấn Zalo modal before Persona starts", async (t) => {
   const pending = new Promise(() => {});
   let setups = 0;
   const { host } = mount(t, {
@@ -177,9 +178,17 @@ test("setup phase looks like an inline AGS setup queue before Persona starts", a
   });
   await flush();
   assert.equal(setups, 1);
-  assertAGSFrame(host);
+  assertModalFrame(host);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
-  assert.match(text(host), /Agent Setup/u);
+  assert.match(text(host), /Tư Vấn Zalo/u);
   assert.match(text(host), /Hàng đợi thiết lập/u);
   assert.match(text(host), /Đang thiết lập/u);
+});
+
+test("onboarding UI source does not mention the reference product", async () => {
+  const source = await readFile(new URL(
+    "../overlay/internal/webui/static/pages/onboarding-early-view.js",
+    import.meta.url,
+  ), "utf8");
+  assert.doesNotMatch(source, /\bAGS\b|AGENTSEE/iu);
 });

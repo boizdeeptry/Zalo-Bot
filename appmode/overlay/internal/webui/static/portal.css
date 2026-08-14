@@ -505,7 +505,7 @@
   border:1px solid #242a3c; border-radius:10px; color:#bbbfc9; background:#0c101d; font-size:11px;
 }
 .onboarding-shell .onboarding-dashboard-canvas {
-  position:absolute; inset:47px 0 0 292px; display:grid; place-items:center;
+  position:absolute; inset:0; display:grid; place-items:center;
   background-color:var(--onboarding-canvas);
   background-image:linear-gradient(45deg, transparent 46%, rgba(58,72,105,.22) 48%, rgba(58,72,105,.22) 52%, transparent 54%),
     linear-gradient(-45deg, transparent 46%, rgba(58,72,105,.18) 48%, rgba(58,72,105,.18) 52%, transparent 54%);
@@ -537,9 +537,12 @@
   margin-top:auto; padding:10px; border:1px solid #30364a; border-radius:8px;
   color:#e8e9ee; text-align:center; font-size:11px; font-weight:800;
 }
+.onboarding-shell .onboarding-dashboard-topbar,
+.onboarding-shell .onboarding-dashboard-sidebar,
+.onboarding-shell .onboarding-dashboard-summary { display:none; }
 .onboarding-shell .onboarding-backdrop {
   position:absolute; z-index:3; inset:0; display:grid; place-items:center; overflow:auto;
-  padding:16px; background:rgba(0, 0, 0, .5); overscroll-behavior:contain;
+  padding:16px; background:transparent; overscroll-behavior:contain;
 }
 .onboarding-shell .onboarding-dialog {
   position:relative; width:min(560px, calc(100vw - 32px)); max-height:calc(100dvh - 32px);
@@ -803,12 +806,6 @@
 }
 .onboarding-shell .onboarding-done-stage h1 { font-size:24px; }
 .onboarding-shell .onboarding-done-stage .onboarding-actions { margin-top:20px; }
-
-@media (max-width: 900px) {
-  .onboarding-shell .onboarding-dashboard-sidebar { display:none; }
-  .onboarding-shell .onboarding-dashboard-canvas { left:0; }
-  .onboarding-shell .onboarding-dashboard-summary { width:min(430px, calc(100% - 32px)); }
-}
 
 @media (max-width: 600px) {
   .onboarding-shell .onboarding-backdrop { padding:16px; }
