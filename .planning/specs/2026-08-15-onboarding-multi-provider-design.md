@@ -169,7 +169,9 @@ Backend cung cấp catalog an toàn trong `GET /onboarding/status`:
 }
 ```
 
-Catalog đến từ một registry có thứ tự ổn định, không lặp danh sách ở Store, daemon, frontend và test.
+Catalog đến từ package dữ liệu dùng chung `internal/providercatalog` có thứ tự ổn định, không lặp danh
+sách ở Store, daemon, frontend và test. Store và daemon cùng gọi một canonicalizer nên direct Store
+caller cũng không thể đưa position trái catalog.
 `route_rank` là unique và quyết định position sau khi nén tập đã chọn. Codex có rank thấp hơn;
 Claude Code luôn có rank cao nhất trong catalog production cho tới khi adapter Claude hỗ trợ
 fall-through bình thường. Người dùng có thể đổi thứ tự sau ở trang Combo.
@@ -361,11 +363,12 @@ registry bắt buộc để OpenCode `advertised=false`; Codex/Claude multi-prov
 
 Nguồn chính thức tham khảo:
 
-- https://github.com/anomalyco/opencode
-- https://github.com/anomalyco/opencode/blob/dev/LICENSE
-- https://opencode.ai/docs/cli/
-- https://opencode.ai/docs/providers
-- https://opencode.ai/docs/permissions/
+- https://github.com/anomalyco/opencode/releases/tag/v1.18.18
+- https://github.com/anomalyco/opencode/blob/v1.18.18/LICENSE
+- https://github.com/anomalyco/opencode/blob/v1.18.18/SECURITY.md
+- https://github.com/anomalyco/opencode/blob/v1.18.18/packages/web/src/content/docs/cli.mdx
+- https://github.com/anomalyco/opencode/blob/v1.18.18/packages/web/src/content/docs/providers.mdx
+- https://github.com/anomalyco/opencode/blob/v1.18.18/packages/web/src/content/docs/permissions.mdx
 
 ## 11. Error handling và recovery
 
@@ -383,6 +386,7 @@ Nguồn chính thức tham khảo:
 
 Store:
 
+- `internal/providercatalog/catalog.go` (mới): metadata/rank/canonical selection dùng chung.
 - `app_schema.go`: V8 table/index + migration.
 - `app_onboarding_providers.go` (mới): transactional snapshot, stage-list/selection/begin/setup/back.
 - `app_onboarding.go`: Test/Complete dùng ordered stages; giữ persona/receipt logic.
