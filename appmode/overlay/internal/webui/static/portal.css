@@ -547,7 +547,7 @@
   border-radius:12px; color:var(--onboarding-text); background:var(--onboarding-surface);
   box-shadow:0 28px 90px rgba(0,0,0,.68),0 0 0 1px rgba(84,217,244,.04);
 }
-.onboarding-shell .onboarding-dialog:focus-visible {
+.onboarding-shell .onboarding-dialog:focus {
   outline:2px solid var(--onboarding-cyan); outline-offset:2px;
 }
 .onboarding-shell .onboarding-sidebar {

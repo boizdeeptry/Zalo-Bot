@@ -88,7 +88,7 @@ test("onboarding CSS carries the scoped AGS visual contract", async () => {
   assert.match(css, /\.onboarding-shell \.onboarding-dashboard-canvas\s*\{[^}]*linear-gradient\(45deg/s);
   assert.match(css, /\.onboarding-shell \.onboarding-backdrop\s*\{[^}]*rgba\(0,\s*0,\s*0,\s*\.5\)/s);
   assert.match(css, /\.onboarding-shell \.onboarding-dialog\s*\{[^}]*width:\s*min\(560px,\s*calc\(100vw - 32px\)\)/s);
-  assert.match(css, /\.onboarding-shell \.onboarding-dialog:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--onboarding-cyan\)/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dialog:focus\s*\{[^}]*outline:\s*2px solid var\(--onboarding-cyan\)/s);
   assert.doesNotMatch(css, /\.onboarding-shell \.onboarding-dialog:focus\s*\{[^}]*outline:\s*none/s);
   assert.match(css, /\.onboarding-shell \.onboarding-step\s*\{[^}]*color:\s*var\(--onboarding-muted\)/s);
   assert.match(css, /\.onboarding-shell \.onboarding-step-label\s*\{[^}]*font-size:\s*11px/s);
