@@ -97,6 +97,29 @@ function serviceWithStatus(status, calls = []) {
   };
 }
 
+test("immediate start skips the prompt and starts with the pinned onboarding context", async (t) => {
+  const calls = [];
+  const { controller, slot } = mountConnect(t, {
+    service: {
+      connectStart(kind, label, onboardingRevision) {
+        calls.push({ kind, label, onboardingRevision });
+        return Promise.resolve({ kind, phase: "detecting" });
+      },
+      connectStatus: () => new Promise(() => {}),
+      connectCancel: () => Promise.resolve({ ok: true }),
+    },
+  });
+
+  assert.equal(controller.start({
+    label: "Onboarding", onboardingRevision: 12, immediate: true,
+  }), true);
+  await flush();
+
+  assert.deepEqual(calls, [{ kind: "codex", label: "Onboarding", onboardingRevision: 12 }]);
+  assert.equal(button(slot, "Bắt đầu kết nối"), null);
+  assert.match(text(slot), /Đang kiểm tra|Đang kết nối/u);
+});
+
 test("phaseProgress preserves the Providers phase anchors", () => {
   assert.equal(phaseProgress("detecting"), 8);
   assert.equal(phaseProgress("installing"), 12);

@@ -245,13 +245,16 @@ test("deleting an account issues DELETE .../accounts/{id} and refreshes", async 
 });
 
 test("'+ Thêm account' reuses the connect flow (opens the label prompt)", async (t) => {
-  const { main } = mountPage(t, listWith([CODEX_CONNECTED]));
+  const { calls, main } = mountPage(t, listWith([CODEX_CONNECTED]));
   await flush();
   cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
   await flush();
   find(main, (n) => n.tagName === "BUTTON" && /Thêm account/.test(text(n))).click();
   await flush();
-  assert.ok(find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))), "add-account opens the connect prompt");
+  assert.ok(find(main, (node) => node.tagName === "BUTTON"
+    && /Bắt đầu kết nối/.test(text(node))), "add-account opens the connect prompt");
+  assert.equal(calls.some((call) => call.path.endsWith("/connect")
+    && call.options.method === "POST"), false);
 });
 
 test("subscription connect: click drives phases through to connected and refreshes the list", async (t) => {

@@ -618,8 +618,12 @@ export function createProviderConnect({
     return controller;
   }
 
-  function start({ label = "", onboardingRevision = 0 } = {}) {
+  function start({ label = "", onboardingRevision = 0, immediate = false } = {}) {
     if (disposed) return false;
+    if (immediate === true) {
+      void runConnect(label, onboardingRevision);
+      return true;
+    }
     generation++;
     cancelPromise = null;
     stopTimers();
