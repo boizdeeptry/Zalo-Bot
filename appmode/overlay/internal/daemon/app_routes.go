@@ -4,6 +4,7 @@ import "net/http"
 
 var appPortalRoutePatterns = []string{
 	"GET /onboarding/status",
+	"PUT /onboarding/providers",
 	"PUT /onboarding/provider",
 	"POST /onboarding/setup",
 	"POST /onboarding/test-chat",
@@ -69,6 +70,7 @@ func init() {
 
 func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /onboarding/status", a.auth(a.handleOnboardingStatus))
+	mux.Handle("PUT /onboarding/providers", a.auth(a.handleOnboardingProviders))
 	mux.Handle("PUT /onboarding/provider", a.auth(a.handleOnboardingProvider))
 	mux.Handle("POST /onboarding/setup", a.auth(a.handleOnboardingSetup))
 	mux.Handle("POST /onboarding/test-chat", a.auth(a.handleOnboardingTestChat))

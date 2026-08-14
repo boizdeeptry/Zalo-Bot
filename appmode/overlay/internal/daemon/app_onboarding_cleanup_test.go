@@ -101,7 +101,7 @@ func TestAppOnboardingCleanupRejectsCrossProviderTraversalWithoutDataLoss(t *tes
 	before := env.state(t)
 
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_CLEANUP_FAILED")
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if after := env.state(t); after != before {
 		t.Fatalf("traversal cleanup changed state: before=%+v after=%+v", before, after)
 	}
@@ -200,7 +200,7 @@ func TestAppOnboardingCleanupRejectsForcedWindowsJunctionsWithoutDataLoss(t *tes
 			before := env.state(t)
 
 			rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-			requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_CLEANUP_FAILED")
+			requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 			if after := env.state(t); after != before {
 				t.Fatalf("junction cleanup changed state: before=%+v after=%+v", before, after)
 			}
@@ -503,7 +503,7 @@ func TestAppOnboardingProviderUnsafeCleanupPreservesStateAccountAndTargets(t *te
 			fixture := tt.setup(t, env)
 			before := seedUnsafeOnboardingStagingAccount(t, env, fixture.accountID, fixture.configDir)
 			rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-			requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_CLEANUP_FAILED")
+			requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 			if after := env.state(t); after != before {
 				t.Fatalf("unsafe cleanup changed state: before=%+v after=%+v", before, after)
 			}

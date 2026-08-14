@@ -36,6 +36,7 @@ type appRouteTestCase struct {
 func appRouteTestCases() []appRouteTestCase {
 	return []appRouteTestCase{
 		{"GET /onboarding/status", "/onboarding/status"},
+		{"PUT /onboarding/providers", "/onboarding/providers"},
 		{"PUT /onboarding/provider", "/onboarding/provider"},
 		{"POST /onboarding/setup", "/onboarding/setup"},
 		{"POST /onboarding/test-chat", "/onboarding/test-chat"},

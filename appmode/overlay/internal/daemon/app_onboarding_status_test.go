@@ -275,10 +275,13 @@ func TestAppOnboardingStatusSuggestsOnlySupportedFirstEnabledRouteKind(t *testin
 func TestAppOnboardingStatusNeverSerializesInternalOrSecretFields(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	env.setState(t, store.OnboardingState{
-		Phase: store.OnboardingPhaseTest, ProviderKind: "codex", ProviderID: "provider-public",
-		AccountID: "account-public", ModelID: "model-public", StagedComboID: "HIDDEN-COMBO",
+		Phase: store.OnboardingPhaseTest, StagedComboID: "HIDDEN-COMBO",
 		PersonaFingerprint: "HIDDEN-FINGERPRINT", TestNonceHash: "HIDDEN-NONCE-HASH",
 		TestExpiresAt: "HIDDEN-EXPIRY", Revision: 4,
+	})
+	env.replaceProviderStages(t, appOnboardingProviderWire{
+		Kind: "codex", Status: "ready", ProviderID: "provider-public",
+		AccountID: "account-public", ModelID: "model-public", Position: 0,
 	})
 	rr := env.serve(http.MethodGet, "/onboarding/status", "")
 	if rr.Code != http.StatusOK {
@@ -317,6 +320,8 @@ func TestAppOnboardingStatusRejectsSemanticallyCorruptState(t *testing.T) {
 		{"setup without provider", store.OnboardingState{Phase: store.OnboardingPhaseSetup, Revision: 1}},
 		{"persona without provider", store.OnboardingState{Phase: store.OnboardingPhasePersona, Revision: 1}},
 		{"test without provider", store.OnboardingState{Phase: store.OnboardingPhaseTest, Revision: 1}},
+		{"completed unsupported provider", store.OnboardingState{CompletedVersion: 1, Phase: store.OnboardingPhaseCompleted, ProviderKind: "private-provider", Revision: 1}},
+		{"completed orphan identity", store.OnboardingState{CompletedVersion: 1, Phase: store.OnboardingPhaseCompleted, ProviderID: "HIDDEN-PROVIDER", Revision: 1}},
 		{"completed phase restarting", store.OnboardingState{CompletedVersion: 1, Phase: store.OnboardingPhaseCompleted, RestartInProgress: true, Revision: 1}},
 		{"completed version in unfinished phase", store.OnboardingState{CompletedVersion: 1, Phase: store.OnboardingPhaseProvider, Revision: 1}},
 		{"restart before completed version", store.OnboardingState{CompletedVersion: 0, Phase: store.OnboardingPhaseProvider, RestartInProgress: true, Revision: 1}},
@@ -328,7 +333,7 @@ func TestAppOnboardingStatusRejectsSemanticallyCorruptState(t *testing.T) {
 			rr := env.serve(http.MethodGet, "/onboarding/status", "")
 			requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_STATE_UNAVAILABLE")
 			body := strings.ToLower(rr.Body.String())
-			for _, forbidden := range []string{"sql", "database", "app_onboarding_state", env.dataDir, "broken-phase", "openai"} {
+			for _, forbidden := range []string{"sql", "database", "app_onboarding_state", env.dataDir, "broken-phase", "openai", "private-provider", "HIDDEN-PROVIDER"} {
 				if strings.Contains(body, strings.ToLower(forbidden)) {
 					t.Fatalf("response leaked %q: %s", forbidden, rr.Body.String())
 				}
@@ -396,14 +401,7 @@ func TestAppOnboardingUpgradeProviderPreservesLiveAccountDirectoryAndConnect(t *
 	})
 
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":4,"kind":"claude-code"}`)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	got := decodeOnboardingResponse[appOnboardingStatusResponse](t, rr)
-	if got.CompletedVersion != store.CurrentOnboardingVersion-1 || got.Phase != store.OnboardingPhaseConnect ||
-		got.ProviderKind != "claude-code" || got.AccountID != "" || got.Revision != 5 {
-		t.Fatalf("upgrade response=%+v", got)
-	}
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
 		t.Fatal("upgrade selection canceled the prior completed flow's Connect job")
 	}
@@ -426,7 +424,7 @@ func TestAppOnboardingProviderRejectsCorruptStateBeforeConnectCleanup(t *testing
 		close(job.done)
 	})
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"codex"}`)
-	requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_STATE_UNAVAILABLE")
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
 		t.Fatal("handler canceled Connect before rejecting corrupt onboarding state")
 	}
