@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +25,192 @@ func openAppStoreForTest(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { st.Close() })
 	return st
+}
+
+func openV8FixtureWithStages(t *testing.T, stages []OnboardingProviderStage) *Store {
+	t.Helper()
+	st := openAppStoreForTest(t)
+	for _, stage := range stages {
+		if _, err := st.db.Exec(`INSERT INTO app_onboarding_provider_stages(
+kind, status, position, provider_id, account_id, model_id, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			stage.Kind, stage.Status, stage.Position, stage.ProviderID,
+			stage.AccountID, stage.ModelID, "2026-08-14T03:00:00Z",
+		); err != nil {
+			t.Fatalf("insert onboarding Provider stage: %v", err)
+		}
+	}
+	return st
+}
+
+func TestOnboardingSnapshotReadsSingletonAndOrdersProviderStages(t *testing.T) {
+	stages := []OnboardingProviderStage{
+		{
+			Kind: "claude-code", Status: "pending", Position: 1,
+		},
+		{
+			Kind: "codex", Status: "ready", Position: 0,
+			ProviderID: "codex", AccountID: "codex-account", ModelID: "gpt-5.6-terra",
+		},
+	}
+	st := openV8FixtureWithStages(t, stages)
+	if _, err := st.db.Exec(`UPDATE app_onboarding_state SET
+phase = 'provider', staged_combo_id = 'combo-staged', restart_in_progress = 1,
+revision = 23, updated_at = '2026-08-14T03:00:00Z'
+WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.OnboardingSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState := OnboardingState{
+		Phase: OnboardingPhaseProvider, StagedComboID: "combo-staged",
+		RestartInProgress: true, Revision: 23, UpdatedAt: "2026-08-14T03:00:00Z",
+	}
+	if got.State != wantState {
+		t.Fatalf("snapshot state = %+v; want %+v", got.State, wantState)
+	}
+	wantStages := []OnboardingProviderStage{stages[1], stages[0]}
+	if !slices.Equal(got.Stages, wantStages) {
+		t.Fatalf("snapshot stages = %+v; want ordered %+v", got.Stages, wantStages)
+	}
+}
+
+func TestOnboardingSnapshotCannotMixConcurrentCommits(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "snapshot.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	escapedPath := strings.ReplaceAll(url.PathEscape(filepath.ToSlash(dbPath)), "%2F", "/")
+	writer, err := sql.Open(
+		"sqlite",
+		"file:"+escapedPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = writer.Close() })
+
+	oldState := OnboardingState{
+		Phase: OnboardingPhaseProvider, StagedComboID: "old-combo",
+		Revision: 23, UpdatedAt: "2026-08-14T03:00:00Z",
+	}
+	oldStages := []OnboardingProviderStage{
+		{
+			Kind: "codex", Status: "ready", Position: 0,
+			ProviderID: "codex", AccountID: "old-codex", ModelID: "old-model",
+		},
+		{Kind: "claude-code", Status: "pending", Position: 1},
+	}
+	setOnboardingStateForTest(t, st, oldState)
+	for _, stage := range oldStages {
+		if _, err := st.db.Exec(`INSERT INTO app_onboarding_provider_stages(
+kind, status, position, provider_id, account_id, model_id, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			stage.Kind, stage.Status, stage.Position, stage.ProviderID,
+			stage.AccountID, stage.ModelID, oldState.UpdatedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	newState := OnboardingState{
+		Phase: OnboardingPhaseProvider, StagedComboID: "new-combo",
+		Revision: 24, UpdatedAt: "2026-08-14T04:00:00Z",
+	}
+	newStages := []OnboardingProviderStage{
+		{
+			Kind: "claude-code", Status: "ready", Position: 0,
+			ProviderID: "claude-code", AccountID: "new-claude", ModelID: "new-model",
+		},
+		{Kind: "codex", Status: "pending", Position: 1},
+	}
+	readerAtBarrier := make(chan struct{})
+	writerResult := make(chan error, 1)
+	go func() {
+		<-readerAtBarrier
+		tx, err := writer.Begin()
+		if err != nil {
+			writerResult <- err
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.Exec(`UPDATE app_onboarding_state SET
+staged_combo_id = ?, revision = ?, updated_at = ? WHERE id = 1`,
+			newState.StagedComboID, newState.Revision, newState.UpdatedAt,
+		); err != nil {
+			writerResult <- err
+			return
+		}
+		if _, err := tx.Exec(`DELETE FROM app_onboarding_provider_stages`); err != nil {
+			writerResult <- err
+			return
+		}
+		for _, stage := range newStages {
+			if _, err := tx.Exec(`INSERT INTO app_onboarding_provider_stages(
+kind, status, position, provider_id, account_id, model_id, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				stage.Kind, stage.Status, stage.Position, stage.ProviderID,
+				stage.AccountID, stage.ModelID, newState.UpdatedAt,
+			); err != nil {
+				writerResult <- err
+				return
+			}
+		}
+		writerResult <- tx.Commit()
+	}()
+
+	oldBarrier := onboardingSnapshotAfterStateRead
+	var writerErr error
+	onboardingSnapshotAfterStateRead = func() {
+		close(readerAtBarrier)
+		writerErr = <-writerResult
+	}
+	t.Cleanup(func() { onboardingSnapshotAfterStateRead = oldBarrier })
+
+	got, err := st.OnboardingSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writerErr != nil {
+		t.Fatalf("commit concurrent onboarding snapshot: %v", writerErr)
+	}
+	switch got.State.Revision {
+	case oldState.Revision:
+		if got.State != oldState || !slices.Equal(got.Stages, oldStages) {
+			t.Fatalf("mixed old singleton with stages from another commit: %+v", got)
+		}
+	case newState.Revision:
+		if got.State != newState || !slices.Equal(got.Stages, newStages) {
+			t.Fatalf("mixed new singleton with stages from another commit: %+v", got)
+		}
+	default:
+		t.Fatalf("snapshot has unknown revision: %+v", got)
+	}
+
+	onboardingSnapshotAfterStateRead = oldBarrier
+	fresh, err := st.OnboardingSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.State != newState || !slices.Equal(fresh.Stages, newStages) {
+		t.Fatalf("fresh snapshot after writer commit = %+v; want new commit", fresh)
+	}
+}
+
+func TestOnboardingSnapshotMissingSingletonFailsClosed(t *testing.T) {
+	st := openAppStoreForTest(t)
+	if _, err := st.db.Exec(`DELETE FROM app_onboarding_state WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.OnboardingSnapshot(); !errors.Is(err, ErrOnboardingStateMissing) {
+		t.Fatalf("OnboardingSnapshot() error = %v; want ErrOnboardingStateMissing", err)
+	}
 }
 
 func TestOnboardingStateReadsSingleton(t *testing.T) {
