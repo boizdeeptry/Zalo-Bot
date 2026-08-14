@@ -9,13 +9,14 @@ import {
   terminalIdentity, testChatRecovery, testResponseError, validDisplayName, validateConnectController,
   validateOnboardingPageService,
 } from "./onboarding-contract.js";
-import { selectProviderWithReconciliation } from "./onboarding-provider-selection.js";
+import { cancelConnectAndReadStatus, selectProviderWithReconciliation } from "./onboarding-provider-selection.js";
 import { createDoneStage, createPersonaStage, createTestStage } from "./onboarding-late-view.js";
 import {
   createConnectStage, createLoadingStatus, createRetryButton, createSafeErrorStage,
   createSetupStage, createWelcomeStage, focusProviderControl, renderOnboardingShell,
 } from "./onboarding-early-view.js";
 export { createOnboardingService };
+const CONNECT_STOPPED = "Kết nối đã dừng. Bấm Thử lại để tải trạng thái và tiếp tục.";
 export function createOnboardingPage({
   initialStatus, service = createOnboardingService(), connectService = createProviderService(),
   connectFactory = createProviderConnect, onComplete = () => {}, setupSuccessDelayMs = 0,
@@ -213,19 +214,12 @@ export function createOnboardingPage({
     if (!owns(stageRun)) return Promise.resolve(false);
     clearReceipt();
     agentName = "";
-    const run = invalidate();
+    const { run, controller } = beginOperation();
     const instance = connectController;
     connectBackPromise = (async () => {
-      try {
-        await Promise.resolve(instance?.cancel());
-      } catch {
-        // The page still releases an unhealthy child controller and returns to Welcome.
-      }
-      try {
-        instance?.dispose();
-      } catch {
-        // The owned host is cleared below even if the child cleanup throws.
-      }
+      const nextState = await cancelConnectAndReadStatus({
+        connect: instance, service, signal: controller.signal,
+      });
       if (connectController === instance) {
         connectController = null;
         connectKey = "";
@@ -233,13 +227,14 @@ export function createOnboardingPage({
       }
       connectBackPromise = null;
       if (!owns(run)) return false;
-      state = { ...state, phase: "provider" };
-      selectedProvider = SUPPORTED_PROVIDERS.has(state.provider_kind)
-        ? state.provider_kind
-        : "";
-      renderWelcome();
+      if (!nextState) { renderSafeError(); return false; }
+      state = nextState;
+      selectedProvider = state.phase === "provider"
+        ? state.provider_kind || state.suggested_provider_kind : "";
+      if (state.phase === "connect") { renderSafeError(CONNECT_STOPPED); return true; }
+      renderCurrent();
       return true;
-    })();
+    })().finally(() => releaseOperation(run, controller));
     return connectBackPromise;
   }
   function renderConnect() {

@@ -126,8 +126,9 @@ export function normalizeStatus(snapshot) {
   const providerKind = SUPPORTED_PROVIDERS.has(providerKindValue) ? providerKindValue : "";
   const suggestedProviderKind = SUPPORTED_PROVIDERS.has(suggestionValue) ? suggestionValue : "";
   if (snapshot.phase !== "provider" && !completed && !providerKind) return null;
-  if (["setup", "persona", "test"].includes(snapshot.phase)
-    && (!accountID || providerID !== providerKind)) return null;
+  if ((snapshot.phase === "connect" && (providerID || accountID || modelID))
+    || (["setup", "persona", "test"].includes(snapshot.phase)
+    && (!accountID || providerID !== providerKind))) return null;
   if (["persona", "test"].includes(snapshot.phase) && !modelID) return null;
   return {
     required: snapshot.required,

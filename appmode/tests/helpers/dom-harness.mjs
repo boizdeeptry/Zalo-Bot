@@ -214,16 +214,40 @@ class TestElement extends TestNode {
     const originalPreventDefault = typeof event.preventDefault === "function"
       ? event.preventDefault.bind(event)
       : () => {};
+    const originalStopPropagation = typeof event.stopPropagation === "function"
+      ? event.stopPropagation.bind(event)
+      : () => {};
+    const originalStopImmediatePropagation = typeof event.stopImmediatePropagation === "function"
+      ? event.stopImmediatePropagation.bind(event)
+      : () => {};
     let defaultPrevented = Boolean(event.defaultPrevented);
+    let propagationStopped = false, immediatePropagationStopped = false;
     event.preventDefault = () => {
       defaultPrevented = true;
       originalPreventDefault();
     };
+    event.stopPropagation = () => {
+      propagationStopped = true;
+      originalStopPropagation();
+    };
+    event.stopImmediatePropagation = () => {
+      immediatePropagationStopped = true;
+      propagationStopped = true;
+      originalStopImmediatePropagation();
+    };
     if (event.target == null) event.target = this;
-    event.currentTarget = this;
-    for (const listener of [...(this.#listeners.get(String(event.type)) ?? [])]) {
-      if (typeof listener === "function") listener.call(this, event);
-      else listener?.handleEvent?.(event);
+    const path = [this];
+    if (event.bubbles === true) {
+      for (let parent = this.parentElement; parent; parent = parent.parentElement) path.push(parent);
+    }
+    for (const current of path) {
+      event.currentTarget = current;
+      for (const listener of [...(current.#listeners.get(String(event.type)) ?? [])]) {
+        if (typeof listener === "function") listener.call(current, event);
+        else listener?.handleEvent?.(event);
+        if (immediatePropagationStopped) break;
+      }
+      if (propagationStopped) break;
     }
     event.currentTarget = null;
     try {

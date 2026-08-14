@@ -254,8 +254,8 @@ export function createWelcomeStage({
   onProceed,
   onRetry,
 }) {
-  let installing = false;
-  let confirmationNode = null;
+  let installing = false, confirmationOpen = false;
+  let confirmationOrigin = null, replacementKind = "";
   let retry = null;
   const confirmationHost = element("div");
   const rowViews = [];
@@ -266,53 +266,59 @@ export function createWelcomeStage({
   const disableProviderControls = (disabled) => {
     for (const control of providerControls()) control.disabled = disabled;
   };
-  const dismissConfirmation = (origin, restoreFocus = true) => {
-    confirmationNode = null;
+  const dismissConfirmation = (restoreFocus = true) => {
+    const origin = confirmationOrigin;
+    confirmationOpen = false;
+    confirmationOrigin = null;
     confirmationHost.replaceChildren();
     disableProviderControls(false);
-    if (restoreFocus) origin.focus({ preventScroll: true });
+    if (restoreFocus) origin?.focus({ preventScroll: true });
   };
-  const showConfirmation = (replacementKind, origin) => {
-    if (confirmationNode || installing) return;
-    const cancel = actionButton("Huỷ");
-    const confirm = actionButton("Vẫn tắt", true);
-    confirmationNode = element(
-      "section",
-      {
-        className: "onboarding-provider-confirm",
-        attributes: {
-          role: "alertdialog",
-          "aria-labelledby": "onboarding-provider-confirm-title",
-          "aria-describedby": "onboarding-provider-confirm-description",
-        },
+  const cancel = actionButton("Huỷ");
+  const confirm = actionButton("Vẫn tắt", true);
+  const confirmationNode = element(
+    "section",
+    {
+      className: "onboarding-provider-confirm",
+      attributes: {
+        role: "alertdialog",
+        "aria-labelledby": "onboarding-provider-confirm-title",
+        "aria-describedby": "onboarding-provider-confirm-description",
       },
-      element("h2", {
-        attributes: { id: "onboarding-provider-confirm-title" },
-        text: "Xác nhận tắt provider",
-      }),
-      element("p", {
-        className: "onboarding-provider-confirm-description",
-        attributes: { id: "onboarding-provider-confirm-description" },
-        text: `Nếu tắt ${providerName(selectedProvider)} trước khi cài, lựa chọn này sẽ bị bỏ. Bạn vẫn muốn tắt chứ?`,
-      }),
-      element("div", { className: "onboarding-actions" }, cancel, confirm),
-    );
-    listen(cancel, "click", () => dismissConfirmation(origin));
-    listen(confirm, "click", () => {
-      dismissConfirmation(origin, false);
-      onSelect(replacementKind);
-    });
-    listen(confirmationNode, "keydown", (event) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      dismissConfirmation(origin);
-    });
+    },
+    element("h2", {
+      attributes: { id: "onboarding-provider-confirm-title" },
+      text: "Xác nhận tắt provider",
+    }),
+    element("p", {
+      className: "onboarding-provider-confirm-description",
+      attributes: { id: "onboarding-provider-confirm-description" },
+      text: `Nếu tắt ${providerName(selectedProvider)} trước khi cài, lựa chọn này sẽ bị bỏ. Bạn vẫn muốn tắt chứ?`,
+    }),
+    element("div", { className: "onboarding-actions" }, cancel, confirm),
+  );
+  listen(cancel, "click", () => dismissConfirmation());
+  listen(confirm, "click", () => {
+    const replacement = replacementKind;
+    dismissConfirmation(false);
+    onSelect(replacement);
+  });
+  listen(confirmationNode, "keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    dismissConfirmation();
+  });
+  const showConfirmation = (replacement, origin) => {
+    if (confirmationOpen || installing) return;
+    confirmationOpen = true;
+    confirmationOrigin = origin;
+    replacementKind = replacement;
     confirmationHost.replaceChildren(confirmationNode);
     disableProviderControls(true);
     cancel.focus({ preventScroll: true });
   };
   const toggleProvider = (kind, origin) => {
-    if (installing || confirmationNode) return;
+    if (installing || confirmationOpen) return;
     if (!selectedProvider) {
       onSelect(kind);
       return;
@@ -320,7 +326,7 @@ export function createWelcomeStage({
     showConfirmation(kind === selectedProvider ? "" : kind, origin);
   };
   const installProvider = () => {
-    if (installing || confirmationNode || !selectedProvider) return;
+    if (installing || confirmationOpen || !selectedProvider) return;
     installing = true;
     disableProviderControls(true);
     onProceed();

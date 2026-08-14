@@ -24,12 +24,13 @@ const providerToggle = (root, kind) => find(root, (node) =>
 const installButton = (root, kind) => byClass(providerRow(root, kind), "onboarding-provider-install");
 const confirmation = (root) => find(root, (node) => node.getAttribute?.("role") === "alertdialog");
 
-function mountWelcome(t, initialSelection = "", message = "") {
+function mountWelcome(t, initialSelection = "", message = "", onListen = () => {}) {
   const dom = installDOM();
   const host = document.createElement("div");
   const events = [];
   let selectedProvider = initialSelection;
   const listen = (node, type, listener) => {
+    onListen();
     node.addEventListener(type, listener);
     return node;
   };
@@ -185,14 +186,47 @@ test("Escape cancels confirmation and restores the originating toggle", (t) => {
   origin.click();
 
   const warning = confirmation(host);
-  const event = { type: "keydown", key: "Escape" };
-  warning.dispatchEvent(event);
+  const cancel = button(warning, "Huỷ");
+  assert.equal(document.activeElement, cancel);
+  const event = { type: "keydown", key: "Escape", bubbles: true };
+  cancel.dispatchEvent(event);
 
   assert.equal(event.defaultPrevented, true);
   assert.equal(confirmation(host), null);
   assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
   assert.equal(document.activeElement, origin);
   assert.deepEqual(events, []);
+});
+
+test("bubbling keyboard events honor stopPropagation in the DOM harness", (t) => {
+  const dom = installDOM();
+  t.after(() => dom.restore());
+  const parent = document.createElement("div");
+  const child = document.createElement("button");
+  let parentCalls = 0;
+  parent.append(child);
+  parent.addEventListener("keydown", () => { parentCalls++; });
+  child.addEventListener("keydown", (event) => { event.stopPropagation(); });
+
+  child.dispatchEvent({ type: "keydown", bubbles: true });
+
+  assert.equal(parentCalls, 0);
+});
+
+test("repeated confirmation cancellation retains a bounded listener set", (t) => {
+  let bindings = 0;
+  const { host } = mountWelcome(t, "codex", "", () => { bindings++; });
+  const origin = providerToggle(host, "codex");
+  origin.click();
+  button(confirmation(host), "Huỷ").click();
+  const stableBindings = bindings;
+
+  for (let cycle = 0; cycle < 5; cycle++) {
+    origin.click();
+    button(confirmation(host), "Huỷ").click();
+  }
+
+  assert.equal(bindings, stableBindings);
 });
 
 test("Vẫn tắt applies OFF only after confirmation", (t) => {
@@ -386,6 +420,57 @@ test("lost selection response reconciles its exact successor without another PUT
   assert.deepEqual(factory.instances[0].starts, [{
     label: "Onboarding", onboardingRevision: 22, immediate: true,
   }]);
+});
+
+test("dirty Connect reconciliation starts no downstream work", async (t) => {
+  let selects = 0, statuses = 0, setups = 0;
+  const factory = connectFactory();
+  const { host } = mountPage(t, {
+    initialStatus: pageStatus({ revision: 23, suggested_provider_kind: "codex" }),
+    service: pageService({
+      selectProvider() { selects++; return Promise.reject(new Error("lost")); },
+      status() {
+        statuses++;
+        return Promise.resolve(connectionStatus({
+          revision: 24, provider_id: "codex", account_id: "account-1", model_id: "model-1",
+        }));
+      },
+      setup() { setups++; return new Promise(() => {}); },
+    }),
+    connectFactory: factory,
+  });
+
+  installButton(host, "codex").click();
+  await settle();
+
+  assert.deepEqual({ selects, statuses, setups, connects: factory.instances.length }, {
+    selects: 1, statuses: 1, setups: 0, connects: 0,
+  });
+  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+});
+
+test("dirty persisted Connect snapshots fail closed before side effects", async (t) => {
+  for (const [field, value] of [
+    ["provider_id", "codex"], ["account_id", "account-1"], ["model_id", "model-1"],
+  ]) {
+    await t.test(field, (subtest) => {
+      const calls = [];
+      const factory = connectFactory();
+      const { host } = mountPage(subtest, {
+        initialStatus: connectionStatus({ [field]: value }),
+        service: pageService({
+          status: () => { calls.push("status"); },
+          selectProvider: () => { calls.push("select"); },
+          setup: () => { calls.push("setup"); },
+        }),
+        connectFactory: factory,
+      });
+
+      assert.deepEqual(calls, []);
+      assert.equal(factory.instances.length, 0);
+      assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+    });
+  }
 });
 
 test("unchanged reconciliation keeps the requested row ON and retries its revision", async (t) => {
@@ -637,4 +722,70 @@ test("persisted Connect resumes immediate mode once without selection", (t) => {
   assert.deepEqual(factory.instances[0].starts, [{
     label: "Onboarding", onboardingRevision: 61, immediate: true,
   }]);
+});
+
+test("Connect Back renders an authoritative moved phase without selection or restart", async (t) => {
+  const calls = [];
+  const factory = connectFactory();
+  const { host } = mountPage(t, {
+    initialStatus: connectionStatus({ revision: 62 }),
+    service: pageService({
+      status() {
+        calls.push("status");
+        return Promise.resolve(pageStatus({ revision: 70, suggested_provider_kind: "claude-code" }));
+      },
+      selectProvider: () => { calls.push("select"); },
+      setup: () => { calls.push("setup"); },
+    }),
+    connectFactory: factory,
+  });
+
+  await factory.instances[0].options.onBack();
+
+  assert.deepEqual(calls, ["status"]);
+  assert.equal(factory.instances.length, 1);
+  assert.equal(providerToggle(host, "claude-code").getAttribute("aria-pressed"), "true");
+});
+
+test("Connect Back status failure is retryable without restarting", async (t) => {
+  let statuses = 0;
+  const factory = connectFactory();
+  const { host } = mountPage(t, {
+    initialStatus: connectionStatus({ revision: 63 }),
+    service: pageService({
+      status() { statuses++; return Promise.reject(new Error("private status failure")); },
+    }),
+    connectFactory: factory,
+  });
+
+  await factory.instances[0].options.onBack();
+
+  assert.equal(statuses, 1);
+  assert.equal(factory.instances.length, 1);
+  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
+  assert.equal(button(host, "Thử lại").tagName, "BUTTON");
+  assert.doesNotMatch(text(host), /private status failure/u);
+});
+
+test("disposing during Connect Back aborts GET and suppresses its late status", async (t) => {
+  const statusGate = deferred();
+  let signal;
+  const factory = connectFactory();
+  const { host, page } = mountPage(t, {
+    initialStatus: connectionStatus({ revision: 64 }),
+    service: pageService({
+      status(requestSignal) { signal = requestSignal; return statusGate.promise; },
+    }),
+    connectFactory: factory,
+  });
+
+  const back = factory.instances[0].options.onBack();
+  await flush();
+  page.dispose();
+  assert.equal(signal.aborted, true);
+  statusGate.resolve(pageStatus({ revision: 65, suggested_provider_kind: "claude-code" }));
+  await back;
+
+  assert.equal(text(host), "");
+  assert.equal(factory.instances.length, 1);
 });

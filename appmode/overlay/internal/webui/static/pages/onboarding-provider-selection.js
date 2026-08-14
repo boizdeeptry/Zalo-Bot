@@ -19,6 +19,25 @@ function aborted(error, signal) {
   return signal?.aborted === true || error?.name === "AbortError";
 }
 
+export async function cancelConnectAndReadStatus({ connect, service, signal }) {
+  try {
+    await Promise.resolve(connect?.cancel());
+  } catch {
+    // Cancellation failure does not make the persisted onboarding phase authoritative.
+  }
+  try {
+    connect?.dispose();
+  } catch {
+    // The parent still releases the child reference before rendering recovery UI.
+  }
+  if (signal?.aborted) return null;
+  try {
+    return normalizeStatus(await service.status(signal));
+  } catch {
+    return null;
+  }
+}
+
 export async function selectProviderWithReconciliation({
   service, snapshot, providerKind, signal,
 }) {

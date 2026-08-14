@@ -359,13 +359,13 @@ test("Connect resume creates and starts exactly one component without re-PUT", (
   }]);
   assert.equal(connectFactory.instances[0].options.kind, "claude-code");
 });
-test("Back invalidates first, then cancels and disposes; a late terminal cannot call Setup", async (t) => {
+test("Back invalidates, cancels, disposes, then GETs without restarting a persisted Connect", async (t) => {
   const order = [];
   const cancelGate = deferred();
-  let setupCalls = 0;
-  let statusCalls = 0;
+  let setupCalls = 0, statusCalls = 0, selectCalls = 0, factoryCalls = 0;
   let captured;
   const connectFactory = (options) => {
+    factoryCalls++;
     captured = options;
     return {
       mount: () => { order.push("mount"); },
@@ -377,7 +377,8 @@ test("Back invalidates first, then cancels and disposes; a late terminal cannot 
   const { host } = mountPage(t, {
     initialStatus: connectStatus({ revision: 6 }),
     service: baseService({
-      status: () => { statusCalls++; return Promise.resolve(setupStatus()); },
+      status: () => { order.push("status"); statusCalls++; return Promise.resolve(connectStatus({ revision: 6 })); },
+      selectProvider: () => { selectCalls++; return Promise.resolve(connectStatus({ revision: 7 })); },
       setup: () => { setupCalls++; return Promise.resolve({}); },
     }),
     connectFactory,
@@ -393,10 +394,13 @@ test("Back invalidates first, then cancels and disposes; a late terminal cannot 
   assert.equal(setupCalls, 0);
   cancelGate.resolve(true);
   await Promise.all([backPromise, lateTerminal]);
-  assert.deepEqual(order.slice(-2), ["cancel", "dispose"]);
-  assert.match(text(host), /Chọn nhà cung cấp/);
-  assert.equal(statusCalls, 0);
+  assert.deepEqual(order.slice(-3), ["cancel", "dispose", "status"]);
+  assert.equal(statusCalls, 1);
+  assert.equal(selectCalls, 0);
+  assert.equal(factoryCalls, 1);
   assert.equal(setupCalls, 0);
+  assert.equal(button(host, "Thử lại").tagName, "BUTTON");
+  assert.doesNotMatch(text(host), /Chọn nhà cung cấp/u);
 });
 test("a connected terminal reconciles authoritative Setup and deduplicates the POST", async (t) => {
   const setupGate = deferred();
