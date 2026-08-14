@@ -186,9 +186,17 @@ test("setup phase stays in the Tư Vấn Zalo modal before Persona starts", asyn
 });
 
 test("onboarding UI source does not mention the reference product", async () => {
-  const source = await readFile(new URL(
+  const modules = [
+    "../overlay/internal/webui/static/app-main.js",
+    "../overlay/internal/webui/static/components/persona-fields.js",
+    "../overlay/internal/webui/static/components/provider-connect.js",
+    "../overlay/internal/webui/static/pages/onboarding.js",
+    "../overlay/internal/webui/static/pages/onboarding-contract.js",
     "../overlay/internal/webui/static/pages/onboarding-early-view.js",
-    import.meta.url,
-  ), "utf8");
+    "../overlay/internal/webui/static/pages/onboarding-late-view.js",
+  ];
+  const source = (await Promise.all(modules.map((path) => readFile(
+    new URL(path, import.meta.url), "utf8",
+  )))).join("\n");
   assert.doesNotMatch(source, /\bAGS\b|AGENTSEE/iu);
 });
