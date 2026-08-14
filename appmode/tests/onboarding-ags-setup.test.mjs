@@ -175,7 +175,9 @@ test("connect phase stays inside the same Tư Vấn Zalo modal", (t) => {
   assert.ok(find(provider, (node) => hasClass(node, "onboarding-agent-switch") && hasClass(node, "is-on")));
   assert.ok(byClass(host, "onboarding-connect-slot"));
   assert.equal(instances.length, 1);
-  assert.deepEqual(instances[0].starts, [{ label: "Onboarding", onboardingRevision: 6 }]);
+  assert.deepEqual(instances[0].starts, [{
+    label: "Onboarding", onboardingRevision: 6, immediate: true,
+  }]);
 });
 
 test("setup phase stays in the Tư Vấn Zalo modal before Persona starts", async (t) => {

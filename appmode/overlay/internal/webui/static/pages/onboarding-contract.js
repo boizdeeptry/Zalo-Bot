@@ -1,4 +1,4 @@
-import { requestJSON as sharedRequestJSON } from "../core/api.js";
+import { AppAPIError, requestJSON as sharedRequestJSON } from "../core/api.js";
 import { validatePersonaValue } from "../components/persona-fields.js";
 
 export const SUPPORTED_PROVIDERS = new Set(["codex", "claude-code"]);
@@ -7,6 +7,13 @@ export const SUPPORTED_PHASES = new Set([
 ]);
 export const SAFE_ERROR = "Không thể tiếp tục thiết lập. Trạng thái chưa hợp lệ hoặc đã thay đổi.";
 export const SAFE_SETUP_ERROR = "Chưa thể chuẩn bị cấu hình. Vui lòng thử lại.";
+
+export class OnboardingProviderResponseError extends TypeError {
+  constructor() {
+    super("Invalid onboarding provider response");
+    this.name = "OnboardingProviderResponseError";
+  }
+}
 
 const STATUS_FIELDS = Object.freeze([
   "required", "current_version", "completed_version", "phase", "provider_kind",
@@ -325,9 +332,15 @@ export function createOnboardingService({ requestJSON = sharedRequestJSON } = {}
       requireSuccessor(currentRevision);
       return Promise.resolve(requestJSON("/onboarding/provider", {
         method: "PUT", body: { kind: providerKind, revision: currentRevision }, signal,
-      })).then((response) => {
+      })).catch((error) => {
+        if (error instanceof AppAPIError && error.code === "INVALID_RESPONSE"
+          && Number.isInteger(error.status) && error.status >= 200 && error.status < 300) {
+          throw new OnboardingProviderResponseError();
+        }
+        throw error;
+      }).then((response) => {
         const normalized = normalizeProviderSelection(response, { providerKind, revision: currentRevision });
-        if (!normalized) throw new TypeError("Invalid onboarding provider response");
+        if (!normalized) throw new OnboardingProviderResponseError();
         return normalized;
       });
     },

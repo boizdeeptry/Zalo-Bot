@@ -16,6 +16,8 @@ const byClass = (root, name) => find(root, (node) => hasClass(node, name));
 function providerCard(root, kind) {
   return find(root, (node) => hasClass(node, "onboarding-provider-card") && node.dataset.providerKind === kind);
 }
+const providerToggle = (root, kind) => byClass(providerCard(root, kind), "onboarding-provider-toggle");
+const installButton = (root, kind) => byClass(providerCard(root, kind), "onboarding-provider-install");
 function providerStatus(overrides = {}) {
   return onboardingStatus("provider", { revision: 1, ...overrides });
 }
@@ -182,7 +184,6 @@ test("Welcome renders Tư Vấn Zalo provider setup, an exact three-step rail, a
   const { host } = mountPage(t);
   const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
   const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
-  const continueButton = button(host, "Tiếp tục");
   assert.equal(cards.length, 2);
   assert.match(text(cards[0]), /Claude Code.*Chưa chọn/u);
   assert.match(text(cards[1]), /Codex.*Chưa chọn/u);
@@ -192,14 +193,14 @@ test("Welcome renders Tư Vấn Zalo provider setup, an exact three-step rail, a
   assert.equal(steps.some((step) => /setup|chuẩn bị/i.test(text(step))), false);
   assert.match(text(host), /Tư Vấn Zalo/u);
   assert.match(text(host), /Thiết lập trợ lý Zalo/u);
-  assert.equal(continueButton.disabled, true);
+  assert.equal(button(host, "Tiếp tục"), null);
   assert.match(text(byClass(host, "onboarding-provider-warning")), /đăng nhập/i);
   assert.match(text(byClass(host, "onboarding-provider-warning")), /xác minh/i);
   assert.match(text(byClass(host, "onboarding-provider-warning")), /Hoàn tất/i);
-  providerCard(host, "codex").click();
-  assert.equal(providerCard(host, "codex").getAttribute("aria-pressed"), "true");
-  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "false");
-  assert.equal(button(host, "Tiếp tục").disabled, false);
+  providerToggle(host, "codex").click();
+  assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
+  assert.equal(providerToggle(host, "claude-code").getAttribute("aria-pressed"), "false");
+  assert.equal(text(installButton(host, "codex")), "Bấm để cài.");
 });
 test("Welcome preselects an eligible persisted provider before a suggestion", (t) => {
   const { host } = mountPage(t, {
@@ -208,16 +209,16 @@ test("Welcome preselects an eligible persisted provider before a suggestion", (t
       suggested_provider_kind: "codex",
     }),
   });
-  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "true");
-  assert.equal(button(host, "Tiếp tục").disabled, false);
+  assert.equal(providerToggle(host, "claude-code").getAttribute("aria-pressed"), "true");
+  assert.equal(text(installButton(host, "claude-code")), "Bấm để cài.");
 });
 test("Welcome ignores unsupported suggestions and keeps Continue disabled", (t) => {
   const { host } = mountPage(t, {
     initialStatus: providerStatus({ suggested_provider_kind: "openai" }),
   });
-  assert.equal(providerCard(host, "codex").getAttribute("aria-pressed"), "false");
-  assert.equal(providerCard(host, "claude-code").getAttribute("aria-pressed"), "false");
-  assert.equal(button(host, "Tiếp tục").disabled, true);
+  assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "false");
+  assert.equal(providerToggle(host, "claude-code").getAttribute("aria-pressed"), "false");
+  assert.equal(installButton(host, "codex"), null);
 });
 test("provider selection uses the current revision once and adopts the server Connect snapshot", async (t) => {
   const selection = deferred();
@@ -233,16 +234,16 @@ test("provider selection uses the current revision once and adopts the server Co
     }),
     connectFactory,
   });
-  const retainedContinue = button(host, "Tiếp tục");
-  retainedContinue.click();
-  retainedContinue.click();
+  const retainedInstall = installButton(host, "codex");
+  retainedInstall.click();
+  retainedInstall.click();
   assert.equal(calls.length, 1);
   assert.deepEqual({ kind: calls[0].kind, revision: calls[0].revision }, {
     kind: "codex",
     revision: 11,
   });
   assert.ok(calls[0].signal instanceof AbortSignal);
-  assert.equal(retainedContinue.disabled, true);
+  assert.equal(retainedInstall.disabled, true);
   selection.resolve(connectStatus({ revision: 12, provider_kind: "codex" }));
   await flush();
   assert.equal(connectFactory.instances.length, 1);
@@ -250,6 +251,7 @@ test("provider selection uses the current revision once and adopts the server Co
   assert.deepEqual(connectFactory.instances[0].starts, [{
     label: "Onboarding",
     onboardingRevision: 12,
+    immediate: true,
   }]);
   assert.match(text(host), /Kết nối Codex/);
 });
@@ -276,7 +278,7 @@ test("provider selection rejects non-successor, wrong-phase, wrong-kind, and sta
         } }),
         connectFactory,
       });
-      button(host, "Tiếp tục").click();
+      installButton(host, "codex").click();
       await flush();
       assert.equal(selects, 1); assert.equal(connectFactory.instances.length, 0); assert.ok(byClass(host, "onboarding-error"));
     });
@@ -288,7 +290,7 @@ test("provider selection rejects non-successor, wrong-phase, wrong-kind, and sta
       initialStatus: providerStatus({ revision: Number.MAX_SAFE_INTEGER, suggested_provider_kind: "codex" }),
       service: baseService({ selectProvider: () => { selects++; } }),
     });
-    button(host, "Tiếp tục").click(); assert.equal(selects, 0);
+    installButton(host, "codex").click(); assert.equal(selects, 0);
     assert.ok(byClass(host, "onboarding-error"));
   });
 });
@@ -300,14 +302,14 @@ test("disposed and stale provider selections cannot render Connect", async (t) =
     service: baseService({ selectProvider: () => selection.promise }),
     connectFactory,
   });
-  button(host, "Tiếp tục").click();
+  installButton(host, "codex").click();
   page.dispose();
   selection.resolve(connectStatus());
   await flush();
   assert.equal(connectFactory.instances.length, 0);
   assert.equal(text(host), "");
 });
-test("selection errors fail safely and Retry reloads an authoritative status", async (t) => {
+test("selection reconciliation fails safely and Retry reloads authoritative status", async (t) => {
   const selectCalls = [];
   let statusCalls = 0;
   const { host } = mountPage(t, {
@@ -320,19 +322,22 @@ test("selection errors fail safely and Retry reloads an authoritative status", a
       },
       status() {
         statusCalls++;
-        return Promise.resolve(providerStatus({ revision: 9, suggested_provider_kind: "codex" }));
+        return Promise.resolve(providerStatus({
+          revision: statusCalls === 1 ? 3 : 9, suggested_provider_kind: "codex",
+        }));
       },
     }),
     connectFactory: fakeConnectFactory(),
   });
-  button(host, "Tiếp tục").click();
+  installButton(host, "codex").click();
   await flush();
   assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
   assert.doesNotMatch(text(host), /SECRET|token=abc/);
+  assert.equal(statusCalls, 1);
   button(host, "Thử lại").click();
   await flush();
-  assert.equal(statusCalls, 1);
-  button(host, "Tiếp tục").click();
+  assert.equal(statusCalls, 2);
+  installButton(host, "codex").click();
   await flush();
   assert.deepEqual(selectCalls[1], { kind: "codex", revision: 9 });
 });
@@ -350,6 +355,7 @@ test("Connect resume creates and starts exactly one component without re-PUT", (
   assert.deepEqual(connectFactory.instances[0].starts, [{
     label: "Onboarding",
     onboardingRevision: 6,
+    immediate: true,
   }]);
   assert.equal(connectFactory.instances[0].options.kind, "claude-code");
 });
@@ -748,13 +754,13 @@ test("same-host remount does not duplicate provider listeners", async (t) => {
       selectProvider: () => { selects++; return gate.promise; },
     }),
   });
-  const retained = button(host, "Tiếp tục");
+  const retained = installButton(host, "codex");
   page.mount(host);
   retained.click();
   retained.click();
   assert.equal(selects, 1);
 });
-test("the real Provider Connect owns the explicit start action and receives onboarding revision", async (t) => {
+test("the real Provider Connect starts immediately and receives onboarding revision", async (t) => {
   const connectCalls = [];
   const setupCalls = [];
   const timers = controlledTimers();
@@ -779,11 +785,9 @@ test("the real Provider Connect owns the explicit start action and receives onbo
     }),
     ...timers,
   });
-  assert.equal(connectCalls.length, 0, "mounting only prepares the component prompt");
   const starts = findAll(host, (node) => node.tagName === "BUTTON"
     && text(node).includes("Bắt đầu kết nối"));
-  assert.equal(starts.length, 1, "the shared component owns the sole start action");
-  starts[0].click();
+  assert.equal(starts.length, 0, "immediate onboarding has no second start prompt");
   await flush();
   await flush();
   assert.deepEqual(connectCalls, [{ kind: "codex", label: "Onboarding", onboardingRevision: 51 }]);

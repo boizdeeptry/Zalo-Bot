@@ -4,11 +4,12 @@ import { createProviderService } from "./providers.js";
 import {
   SAFE_ERROR, SAFE_SETUP_ERROR, SUPPORTED_PROVIDERS, createOnboardingService, isRecord,
   normalizeAgentResponse, normalizeCompleteResponse, normalizeConnectedSetup,
-  normalizeProviderSelection, normalizeSetupResult, normalizeStatus, normalizeTestMessage,
+  normalizeSetupResult, normalizeStatus, normalizeTestMessage,
   normalizeTestResponse, positiveRevision, safeServerFieldCount, semanticString, successorRevision,
   terminalIdentity, testChatRecovery, testResponseError, validDisplayName, validateConnectController,
   validateOnboardingPageService,
 } from "./onboarding-contract.js";
+import { selectProviderWithReconciliation } from "./onboarding-provider-selection.js";
 import { createDoneStage, createPersonaStage, createTestStage } from "./onboarding-late-view.js";
 import {
   createConnectStage, createLoadingStatus, createRetryButton, createSafeErrorStage,
@@ -125,46 +126,43 @@ export function createOnboardingPage({
     disposeConnect();
     clearListeners();
     shell("provider", createWelcomeStage({
-      selectedProvider,
-      message,
-      listen,
+      selectedProvider, message, listen,
       onSelect(kind) {
         selectedProvider = kind; renderWelcome(message);
-        focusProviderControl(root, kind);
+        if (SUPPORTED_PROVIDERS.has(kind)) focusProviderControl(root, kind);
       },
       onProceed: () => { void selectProvider(); },
       onRetry: refreshStatus,
     }));
   }
   async function selectProvider() {
-    if (!state || !selectedProvider || !SUPPORTED_PROVIDERS.has(selectedProvider)) return false;
-    clearReceipt();
-    agentName = "";
-    if (!successorRevision(state.revision)) {
-      renderSafeError();
-      return false;
-    }
-    const requested = { providerKind: selectedProvider, revision: state.revision };
+    const requestedKind = selectedProvider;
+    const snapshot = normalizeStatus(state);
+    if (!snapshot || !SUPPORTED_PROVIDERS.has(requestedKind)) return false;
+    clearReceipt(); agentName = "";
+    if (!successorRevision(snapshot.revision)) { renderSafeError(); return false; }
     const { run, controller } = beginOperation();
     try {
-      const response = await service.selectProvider(
-        selectedProvider,
-        state.revision,
-        controller.signal,
-      );
+      const result = await selectProviderWithReconciliation({
+        service, snapshot, providerKind: requestedKind, signal: controller.signal,
+      });
       if (!owns(run)) return false;
-      const nextState = normalizeProviderSelection(response, requested);
-      if (!nextState) {
-        renderSafeError();
+      if (result.kind === "selected" || result.kind === "moved") {
+        state = result.state;
+        selectedProvider = state.provider_kind || state.suggested_provider_kind;
+        renderCurrent();
+        return result.kind === "selected";
+      }
+      if (result.kind === "retry") {
+        state = result.state;
+        selectedProvider = requestedKind;
+        renderWelcome(SAFE_ERROR);
         return false;
       }
-      state = nextState;
-      selectedProvider = nextState.provider_kind || nextState.suggested_provider_kind;
-      renderCurrent();
-      return true;
+      renderSafeError(); return false;
     } catch (error) {
       if (!owns(run) || error?.name === "AbortError") return false;
-      renderWelcome(SAFE_ERROR);
+      renderSafeError();
       return false;
     } finally {
       releaseOperation(run, controller);
@@ -270,7 +268,9 @@ export function createOnboardingPage({
       connectController = instance;
       connectKey = key;
       instance.mount(slot);
-      if (instance.start({ label: "Onboarding", onboardingRevision: state.revision }) === false) {
+      if (instance.start({
+        label: "Onboarding", onboardingRevision: state.revision, immediate: true,
+      }) === false) {
         throw new Error("Provider Connect refused to start");
       }
     } catch {
