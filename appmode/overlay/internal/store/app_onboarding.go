@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"database/sql"
@@ -12,6 +13,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"agentdc/internal/providercatalog"
 
 	"github.com/google/uuid"
 )
@@ -109,16 +112,22 @@ type OnboardingSetup struct {
 	ComboName string
 }
 
-// CompleteOnboardingInput carries only the proof and exact external snapshot needed to
-// validate completion. Now is captured once by the caller in UTC so expiry has one
-// deterministic boundary. StagingConfigDir is optional for Store-only callers; the daemon
-// supplies it to detect config identity drift between its rooted path check and this transaction.
+// OnboardingConfigBinding is a filesystem assertion captured by the daemon's final
+// preflight. It can only confirm the exact durable route; it never supplies route members.
+type OnboardingConfigBinding struct {
+	Kind      string
+	AccountID string
+	ConfigDir string
+}
+
+// CompleteOnboardingInput carries only the proof and external config assertions needed to
+// validate completion. The Store derives the ordered route exclusively from durable stages.
+// Now is captured once by the caller in UTC so expiry has one deterministic boundary.
 type CompleteOnboardingInput struct {
 	Revision           int64
 	TestNonceHash      string
 	PersonaFingerprint string
-	RouteFingerprint   string
-	StagingConfigDir   string
+	ConfigBindings     []OnboardingConfigBinding
 	Now                time.Time
 }
 
@@ -849,10 +858,11 @@ func (s *Store) CompleteOnboarding(
 	ctx context.Context,
 	input CompleteOnboardingInput,
 ) (OnboardingState, error) {
-	if input.Revision <= 0 || input.PersonaFingerprint == "" ||
+	bindings, err := onboardingCompletionBindings(input.ConfigBindings)
+	if input.Revision <= 0 || input.Revision == maxOnboardingRouteRevision ||
+		!validOnboardingSHA256Hex(input.PersonaFingerprint) ||
 		!validOnboardingSHA256Hex(input.TestNonceHash) ||
-		!validOnboardingSHA256Hex(input.RouteFingerprint) ||
-		!validOnboardingTestReceiptTime(input.Now) {
+		!validOnboardingTestReceiptTime(input.Now) || err != nil {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -889,7 +899,7 @@ func (s *Store) CompleteOnboarding(
 			return OnboardingState{}, onboardingCompleteCommitError("read staged Test route", err)
 		}
 	}
-	if route.Fingerprint != input.RouteFingerprint || len(route.Entries) != 1 {
+	if err := onboardingCompletionBindingsMatchRoute(bindings, route.Entries); err != nil {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
 	boundReceipt, err := OnboardingTestReceiptHash(input.TestNonceHash, route.Fingerprint)
@@ -907,69 +917,17 @@ func (s *Store) CompleteOnboarding(
 	if !expiresAt.After(input.Now) {
 		return OnboardingState{}, ErrOnboardingTestExpired
 	}
-	if state.PersonaFingerprint == "" || state.PersonaFingerprint != input.PersonaFingerprint {
+	storedPersona, storedPersonaOK := decodeOnboardingSHA256Hex(state.PersonaFingerprint)
+	inputPersona, inputPersonaOK := decodeOnboardingSHA256Hex(input.PersonaFingerprint)
+	if !storedPersonaOK || !inputPersonaOK || subtle.ConstantTimeCompare(storedPersona, inputPersona) != 1 {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
 	persistedState := state
-	entry := route.Entries[0]
-	state.ProviderKind = entry.Kind
-	state.ProviderID = entry.ProviderID
-	state.AccountID = entry.AccountID
-	state.ModelID = entry.ModelID
 	if err := validateOnboardingCompletionState(state); err != nil {
 		return OnboardingState{}, err
 	}
-	comboName, err := onboardingComboName(state.ProviderKind)
+	comboName, err := onboardingCompletionComboName(route.Entries)
 	if err != nil {
-		return OnboardingState{}, ErrOnboardingConfigurationChanged
-	}
-
-	var providerName, providerKind string
-	var providerEnabled int64
-	err = tx.QueryRowContext(ctx, `SELECT name, kind, enabled FROM llm_providers WHERE id = ?`,
-		state.ProviderID).Scan(&providerName, &providerKind, &providerEnabled)
-	if errors.Is(err, sql.ErrNoRows) {
-		return OnboardingState{}, ErrOnboardingConfigurationChanged
-	}
-	if err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("read selected Provider", err)
-	}
-	if providerKind != state.ProviderKind || !validOnboardingCompletionName(providerName) ||
-		(providerEnabled != 0 && providerEnabled != 1) {
-		return OnboardingState{}, ErrOnboardingConfigurationChanged
-	}
-
-	var accountProviderID, accountLabel, accountConfigDir string
-	var accountEnabled int64
-	err = tx.QueryRowContext(ctx, `SELECT provider_id, label, config_dir, enabled
-FROM llm_accounts WHERE id = ?`, state.AccountID).Scan(
-		&accountProviderID, &accountLabel, &accountConfigDir, &accountEnabled,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return OnboardingState{}, ErrOnboardingConfigurationChanged
-	}
-	if err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("read staged Account", err)
-	}
-	if accountProviderID != state.ProviderID || accountEnabled != 0 ||
-		!validOnboardingCompletionName(accountLabel) || strings.TrimSpace(accountConfigDir) == "" ||
-		(input.StagingConfigDir != "" && accountConfigDir != input.StagingConfigDir) {
-		return OnboardingState{}, ErrOnboardingConfigurationChanged
-	}
-
-	var modelName string
-	var modelAvailable int64
-	err = tx.QueryRowContext(ctx, `SELECT name, available FROM llm_models
-WHERE provider_id = ? AND model_id = ?`, state.ProviderID, state.ModelID).Scan(
-		&modelName, &modelAvailable,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return OnboardingState{}, ErrOnboardingConfigurationChanged
-	}
-	if err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("read staged model", err)
-	}
-	if modelAvailable != 1 || !validOnboardingCompletionName(modelName) {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
 
@@ -980,15 +938,26 @@ WHERE provider_id = ? AND model_id = ?`, state.ProviderID, state.ModelID).Scan(
 		return OnboardingState{}, onboardingCompleteCommitError("read route revision", err)
 	}
 	routeRevision, err := strconv.ParseInt(routeRevisionText, 10, 64)
-	if err != nil || routeRevision < 0 || routeRevision == maxOnboardingRouteRevision {
+	if err != nil || routeRevision < 1 || routeRevision == maxOnboardingRouteRevision {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
-	var comboCount, maximumComboRevision int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(revision), 0)
-FROM llm_combos`).Scan(&comboCount, &maximumComboRevision); err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("read maximum Combo revision", err)
+	var comboCount, minimumComboRevision, maximumComboRevision, malformedComboRevisions int64
+	if err := tx.QueryRowContext(ctx, `SELECT
+COUNT(*),
+COALESCE(MIN(CASE WHEN typeof(revision) = 'integer' THEN revision END), 0),
+COALESCE(MAX(CASE WHEN typeof(revision) = 'integer' THEN revision END), 0),
+COALESCE(SUM(CASE WHEN typeof(revision) = 'integer' THEN 0 ELSE 1 END), 0)
+FROM llm_combos`).Scan(
+		&comboCount,
+		&minimumComboRevision,
+		&maximumComboRevision,
+		&malformedComboRevisions,
+	); err != nil {
+		return OnboardingState{}, onboardingCompleteCommitError("read Combo revision history", err)
 	}
-	if comboCount < 0 || maximumComboRevision < 0 || maximumComboRevision == maxOnboardingRouteRevision {
+	if comboCount < 0 || maximumComboRevision < 0 || maximumComboRevision == maxOnboardingRouteRevision ||
+		malformedComboRevisions != 0 ||
+		(comboCount > 0 && (minimumComboRevision < 1 || maximumComboRevision < 1)) {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
 	var legacyRouteCount int64
@@ -1006,20 +975,92 @@ FROM llm_combos`).Scan(&comboCount, &maximumComboRevision); err != nil {
 		}
 		nextRouteRevision = maximumRouteRevision + 1
 	}
-
-	if _, err := tx.ExecContext(ctx, `UPDATE llm_providers SET enabled = 1 WHERE id = ?`, state.ProviderID); err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("enable selected Provider", err)
+	resources, err := onboardingCompletionResourcesInTx(ctx, tx)
+	if err != nil {
+		return OnboardingState{}, onboardingCompleteCommitError("snapshot completion resources", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE llm_accounts SET enabled = 0
-WHERE provider_id = ? AND id <> ?`, state.ProviderID, state.AccountID); err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("disable prior same-Provider Accounts", err)
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE llm_accounts SET enabled = 1
-WHERE id = ? AND provider_id = ? AND enabled = 0`, state.AccountID, state.ProviderID); err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("enable staged Account", err)
-	}
-	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageAccounts); err != nil {
+	expectedResources, err := onboardingCompletionExpectedResources(
+		resources,
+		route.Entries,
+		nextRouteRevision,
+	)
+	if err != nil {
 		return OnboardingState{}, err
+	}
+
+	for _, entry := range route.Entries {
+		var providerName, providerKind string
+		var providerEnabled int64
+		err = tx.QueryRowContext(ctx, `SELECT name, kind, enabled FROM llm_providers WHERE id = ?`,
+			entry.ProviderID).Scan(&providerName, &providerKind, &providerEnabled)
+		if errors.Is(err, sql.ErrNoRows) {
+			return OnboardingState{}, ErrOnboardingConfigurationChanged
+		}
+		if err != nil {
+			return OnboardingState{}, onboardingCompleteCommitError("read staged Provider", err)
+		}
+		if providerKind != entry.Kind || !validOnboardingCompletionName(providerName) ||
+			(providerEnabled != 0 && providerEnabled != 1) {
+			return OnboardingState{}, ErrOnboardingConfigurationChanged
+		}
+
+		var accountProviderID, accountLabel, accountConfigDir string
+		var accountEnabled int64
+		err = tx.QueryRowContext(ctx, `SELECT provider_id, label, config_dir, enabled
+FROM llm_accounts WHERE id = ?`, entry.AccountID).Scan(
+			&accountProviderID, &accountLabel, &accountConfigDir, &accountEnabled,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return OnboardingState{}, ErrOnboardingConfigurationChanged
+		}
+		if err != nil {
+			return OnboardingState{}, onboardingCompleteCommitError("read staged Account", err)
+		}
+		if accountProviderID != entry.ProviderID || accountEnabled != 0 ||
+			!validOnboardingCompletionName(accountLabel) || accountConfigDir != entry.ConfigDir {
+			return OnboardingState{}, ErrOnboardingConfigurationChanged
+		}
+
+		var modelName string
+		var modelAvailable int64
+		err = tx.QueryRowContext(ctx, `SELECT name, available FROM llm_models
+WHERE provider_id = ? AND model_id = ?`, entry.ProviderID, entry.ModelID).Scan(
+			&modelName, &modelAvailable,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return OnboardingState{}, ErrOnboardingConfigurationChanged
+		}
+		if err != nil {
+			return OnboardingState{}, onboardingCompleteCommitError("read staged model", err)
+		}
+		if modelAvailable != 1 || !validOnboardingCompletionName(modelName) {
+			return OnboardingState{}, ErrOnboardingConfigurationChanged
+		}
+
+		result, err := tx.ExecContext(ctx, `UPDATE llm_providers SET enabled = 1
+WHERE id = ? AND kind = ? AND enabled IN (0, 1)`, entry.ProviderID, entry.Kind)
+		if err != nil {
+			return OnboardingState{}, onboardingCompleteCommitError("enable staged Provider", err)
+		}
+		if err := onboardingCompleteRequireOne(result); err != nil {
+			return OnboardingState{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE llm_accounts SET enabled = 0
+WHERE provider_id = ? AND id <> ?`, entry.ProviderID, entry.AccountID); err != nil {
+			return OnboardingState{}, onboardingCompleteCommitError("disable prior same-Provider Accounts", err)
+		}
+		result, err = tx.ExecContext(ctx, `UPDATE llm_accounts SET enabled = 1
+WHERE id = ? AND provider_id = ? AND config_dir = ? AND enabled = 0`,
+			entry.AccountID, entry.ProviderID, entry.ConfigDir)
+		if err != nil {
+			return OnboardingState{}, onboardingCompleteCommitError("enable staged Account", err)
+		}
+		if err := onboardingCompleteRequireOne(result); err != nil {
+			return OnboardingState{}, err
+		}
+		if err := runOnboardingCompleteFailpoint(onboardingCompleteStageAccounts); err != nil {
+			return OnboardingState{}, err
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM llm_combo_members`); err != nil {
@@ -1041,57 +1082,75 @@ WHERE id = ? AND provider_id = ? AND enabled = 0`, state.AccountID, state.Provid
 		return OnboardingState{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO llm_combos(id, name, type, active, revision)
-	VALUES (?, ?, 'fallback', 1, ?)`, state.StagedComboID, comboName, nextRouteRevision); err != nil {
+	VALUES (?, ?, 'fallback', 1, ?)`, persistedState.StagedComboID, comboName, nextRouteRevision); err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("insert completed Combo", err)
 	}
 	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageComboInsert); err != nil {
 		return OnboardingState{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO llm_combo_members(
+	for _, entry := range route.Entries {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO llm_combo_members(
 combo_id, position, provider_id, model_id, enabled
-) VALUES (?, 0, ?, ?, 1)`, state.StagedComboID, state.ProviderID, state.ModelID); err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("insert completed Combo member", err)
+) VALUES (?, ?, ?, ?, 1)`, persistedState.StagedComboID, entry.Position, entry.ProviderID, entry.ModelID); err != nil {
+			return OnboardingState{}, onboardingCompleteCommitError("insert completed Combo member", err)
+		}
+		if err := runOnboardingCompleteFailpoint(onboardingCompleteStageMemberInsert); err != nil {
+			return OnboardingState{}, err
+		}
 	}
-	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageMemberInsert); err != nil {
-		return OnboardingState{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO llm_route_entries(
+	for _, entry := range route.Entries {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO llm_route_entries(
 position, provider_id, model_id, enabled
-) VALUES (0, ?, ?, 1)`, state.ProviderID, state.ModelID); err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("insert legacy route projection", err)
+) VALUES (?, ?, ?, 1)`, entry.Position, entry.ProviderID, entry.ModelID); err != nil {
+			return OnboardingState{}, onboardingCompleteCommitError("insert legacy route projection", err)
+		}
+		if err := runOnboardingCompleteFailpoint(onboardingCompleteStageRouteSync); err != nil {
+			return OnboardingState{}, err
+		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE app_meta SET value = ?
-	WHERE key = 'llm_route_revision'`, strconv.FormatInt(nextRouteRevision, 10)); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE app_meta SET value = ?
+	WHERE key = 'llm_route_revision'`, strconv.FormatInt(nextRouteRevision, 10))
+	if err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("advance route revision", err)
+	}
+	if err := onboardingCompleteRequireDurableRow(result, "advance route revision"); err != nil {
+		return OnboardingState{}, err
 	}
 	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageRouteSync); err != nil {
 		return OnboardingState{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM app_onboarding_provider_stages`); err != nil {
+	result, err = tx.ExecContext(ctx, `DELETE FROM app_onboarding_provider_stages`)
+	if err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("clear completed Provider stages", err)
 	}
+	deletedStages, err := result.RowsAffected()
+	if err != nil {
+		return OnboardingState{}, onboardingCompleteCommitError("read cleared Provider stages", err)
+	}
+	if deletedStages != int64(len(route.Entries)) {
+		return OnboardingState{}, onboardingCompleteCommitError(
+			"clear completed Provider stages",
+			errors.New("completion postcondition mismatch: Provider stage count"),
+		)
+	}
 
-	result, err := tx.ExecContext(ctx, `UPDATE app_onboarding_state SET
+	completedAt := ts(input.Now)
+	result, err = tx.ExecContext(ctx, `UPDATE app_onboarding_state SET
 completed_version = ?, phase = ?, staged_combo_id = '', persona_fingerprint = '',
 test_nonce_hash = '', test_expires_at = '', restart_in_progress = 0,
-provider_kind = ?, provider_id = ?, account_id = ?, model_id = ?,
+provider_kind = '', provider_id = '', account_id = '', model_id = '',
 revision = revision + 1, updated_at = ?
-WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
-  AND provider_id = ? AND account_id = ? AND model_id = ? AND staged_combo_id = ?
+WHERE id = 1 AND revision = ? AND completed_version = ? AND restart_in_progress = ?
+  AND phase = ? AND provider_kind = '' AND provider_id = ''
+  AND account_id = '' AND model_id = '' AND staged_combo_id = ?
   AND persona_fingerprint = ? AND test_nonce_hash = ? AND test_expires_at = ?`,
 		CurrentOnboardingVersion,
 		OnboardingPhaseCompleted,
-		state.ProviderKind,
-		state.ProviderID,
-		state.AccountID,
-		state.ModelID,
-		ts(input.Now),
+		completedAt,
 		input.Revision,
+		persistedState.CompletedVersion,
+		boolInt(persistedState.RestartInProgress),
 		OnboardingPhaseTest,
-		persistedState.ProviderKind,
-		persistedState.ProviderID,
-		persistedState.AccountID,
-		persistedState.ModelID,
 		persistedState.StagedComboID,
 		persistedState.PersonaFingerprint,
 		persistedState.TestNonceHash,
@@ -1107,15 +1166,27 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 	if changed != 1 {
 		return OnboardingState{}, ErrOnboardingConflict
 	}
-	updated, err := onboardingStateInTxContext(ctx, tx)
-	if err != nil {
-		return OnboardingState{}, onboardingCompleteCommitError("read completed singleton", err)
-	}
 	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageStateUpdate); err != nil {
 		return OnboardingState{}, err
 	}
 	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageBeforeCommit); err != nil {
 		return OnboardingState{}, err
+	}
+	updated, err := validateOnboardingCompletionDurability(ctx, tx, onboardingCompletionExpectation{
+		State: OnboardingState{
+			CompletedVersion: CurrentOnboardingVersion,
+			Phase:            OnboardingPhaseCompleted,
+			Revision:         input.Revision + 1,
+			UpdatedAt:        completedAt,
+		},
+		ComboID:       persistedState.StagedComboID,
+		ComboName:     comboName,
+		RouteRevision: nextRouteRevision,
+		Entries:       route.Entries,
+		Resources:     expectedResources,
+	})
+	if err != nil {
+		return OnboardingState{}, onboardingCompleteCommitError("validate completed durability", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("request canceled before commit", err)
@@ -1124,6 +1195,699 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 		return OnboardingState{}, onboardingCompleteCommitError("commit transaction", err)
 	}
 	return updated, nil
+}
+
+type onboardingCompletionExpectation struct {
+	State         OnboardingState
+	ComboID       string
+	ComboName     string
+	RouteRevision int64
+	Entries       []OnboardingTestRouteEntry
+	Resources     onboardingCompletionResourceSnapshot
+}
+
+func validateOnboardingCompletionDurability(
+	ctx context.Context,
+	tx *sql.Tx,
+	expected onboardingCompletionExpectation,
+) (OnboardingState, error) {
+	var stateRows int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM app_onboarding_state`).Scan(&stateRows); err != nil {
+		return OnboardingState{}, fmt.Errorf("read completed singleton count: %w", err)
+	}
+	state, err := onboardingStateInTxContext(ctx, tx)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read completed singleton: %w", err)
+	}
+	var stateTypes string
+	err = tx.QueryRowContext(ctx, `SELECT
+typeof(id) || '|' || typeof(completed_version) || '|' || typeof(phase) || '|' ||
+typeof(provider_kind) || '|' || typeof(provider_id) || '|' || typeof(account_id) || '|' ||
+typeof(model_id) || '|' || typeof(staged_combo_id) || '|' || typeof(persona_fingerprint) || '|' ||
+typeof(test_nonce_hash) || '|' || typeof(test_expires_at) || '|' ||
+typeof(restart_in_progress) || '|' || typeof(revision) || '|' || typeof(updated_at)
+FROM app_onboarding_state WHERE id = 1`).Scan(&stateTypes)
+	if err != nil {
+		return OnboardingState{}, fmt.Errorf("read completed singleton types: %w", err)
+	}
+	const completedStateTypes = "integer|integer|text|text|text|text|text|text|text|text|text|integer|integer|text"
+	if stateRows != 1 || state != expected.State || stateTypes != completedStateTypes {
+		return OnboardingState{}, onboardingCompletionDurabilityMismatch("singleton")
+	}
+
+	var stageRows int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM app_onboarding_provider_stages`).Scan(&stageRows); err != nil {
+		return OnboardingState{}, fmt.Errorf("read completed Provider stage count: %w", err)
+	}
+	if stageRows != 0 {
+		return OnboardingState{}, onboardingCompletionDurabilityMismatch("Provider stages")
+	}
+
+	var comboRows int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM llm_combos`).Scan(&comboRows); err != nil {
+		return OnboardingState{}, fmt.Errorf("read completed Combo count: %w", err)
+	}
+	var comboID, comboName, comboType, activeType, revisionType, comboTextTypes string
+	var comboActive, comboRevision int64
+	err = tx.QueryRowContext(ctx, `SELECT
+id, name, type, active, revision, typeof(active), typeof(revision),
+typeof(id) || '|' || typeof(name) || '|' || typeof(type)
+FROM llm_combos`).Scan(
+		&comboID,
+		&comboName,
+		&comboType,
+		&comboActive,
+		&comboRevision,
+		&activeType,
+		&revisionType,
+		&comboTextTypes,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return OnboardingState{}, onboardingCompletionDurabilityMismatch("Combo")
+		}
+		return OnboardingState{}, fmt.Errorf("read completed Combo: %w", err)
+	}
+	if comboRows != 1 || comboID != expected.ComboID || comboName != expected.ComboName ||
+		comboType != "fallback" || comboActive != 1 || comboRevision != expected.RouteRevision ||
+		activeType != "integer" || revisionType != "integer" || comboTextTypes != "text|text|text" {
+		return OnboardingState{}, onboardingCompletionDurabilityMismatch("Combo")
+	}
+
+	var routeRevisionText, routeRevisionType string
+	err = tx.QueryRowContext(ctx, `SELECT value, typeof(value) FROM app_meta
+WHERE key = 'llm_route_revision'`).Scan(&routeRevisionText, &routeRevisionType)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return OnboardingState{}, onboardingCompletionDurabilityMismatch("route revision")
+		}
+		return OnboardingState{}, fmt.Errorf("read completed route revision: %w", err)
+	}
+	if routeRevisionType != "text" || routeRevisionText != strconv.FormatInt(expected.RouteRevision, 10) {
+		return OnboardingState{}, onboardingCompletionDurabilityMismatch("route revision")
+	}
+
+	if err := validateOnboardingCompletedComboMembers(ctx, tx, expected); err != nil {
+		return OnboardingState{}, err
+	}
+	if err := validateOnboardingCompletedLegacyRoute(ctx, tx, expected.Entries); err != nil {
+		return OnboardingState{}, err
+	}
+	if err := validateOnboardingCompletedResources(ctx, tx, expected.Resources); err != nil {
+		return OnboardingState{}, err
+	}
+	return state, nil
+}
+
+func validateOnboardingCompletedComboMembers(
+	ctx context.Context,
+	tx *sql.Tx,
+	expected onboardingCompletionExpectation,
+) error {
+	rows, err := tx.QueryContext(ctx, `SELECT
+combo_id, position, provider_id, model_id, enabled, typeof(position), typeof(enabled),
+typeof(combo_id) || '|' || typeof(provider_id) || '|' || typeof(model_id)
+FROM llm_combo_members ORDER BY combo_id, position`)
+	if err != nil {
+		return fmt.Errorf("read completed Combo members: %w", err)
+	}
+	defer rows.Close()
+	index := 0
+	for rows.Next() {
+		if index >= len(expected.Entries) {
+			return onboardingCompletionDurabilityMismatch("Combo members")
+		}
+		var comboID, providerID, modelID, positionType, enabledType, textTypes string
+		var position, enabled int
+		if err := rows.Scan(
+			&comboID,
+			&position,
+			&providerID,
+			&modelID,
+			&enabled,
+			&positionType,
+			&enabledType,
+			&textTypes,
+		); err != nil {
+			return fmt.Errorf("scan completed Combo member: %w", err)
+		}
+		entry := expected.Entries[index]
+		if comboID != expected.ComboID || position != entry.Position ||
+			providerID != entry.ProviderID || modelID != entry.ModelID || enabled != 1 ||
+			positionType != "integer" || enabledType != "integer" || textTypes != "text|text|text" {
+			return onboardingCompletionDurabilityMismatch("Combo members")
+		}
+		index++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate completed Combo members: %w", err)
+	}
+	if index != len(expected.Entries) {
+		return onboardingCompletionDurabilityMismatch("Combo members")
+	}
+	return nil
+}
+
+func validateOnboardingCompletedLegacyRoute(
+	ctx context.Context,
+	tx *sql.Tx,
+	expected []OnboardingTestRouteEntry,
+) error {
+	rows, err := tx.QueryContext(ctx, `SELECT
+position, provider_id, model_id, enabled, typeof(position), typeof(enabled),
+typeof(provider_id) || '|' || typeof(model_id)
+FROM llm_route_entries ORDER BY position`)
+	if err != nil {
+		return fmt.Errorf("read completed legacy route: %w", err)
+	}
+	defer rows.Close()
+	index := 0
+	for rows.Next() {
+		if index >= len(expected) {
+			return onboardingCompletionDurabilityMismatch("legacy route")
+		}
+		var providerID, modelID, positionType, enabledType, textTypes string
+		var position, enabled int
+		if err := rows.Scan(
+			&position,
+			&providerID,
+			&modelID,
+			&enabled,
+			&positionType,
+			&enabledType,
+			&textTypes,
+		); err != nil {
+			return fmt.Errorf("scan completed legacy route: %w", err)
+		}
+		entry := expected[index]
+		if position != entry.Position || providerID != entry.ProviderID ||
+			modelID != entry.ModelID || enabled != 1 ||
+			positionType != "integer" || enabledType != "integer" || textTypes != "text|text" {
+			return onboardingCompletionDurabilityMismatch("legacy route")
+		}
+		index++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate completed legacy route: %w", err)
+	}
+	if index != len(expected) {
+		return onboardingCompletionDurabilityMismatch("legacy route")
+	}
+	return nil
+}
+
+type onboardingCompletionProviderResource struct {
+	ID, Name, Kind                        string
+	Enabled, SystemProvider               int64
+	CredentialCipher                      []byte
+	LastCheckStatus, LastError, CheckedAt string
+	EnabledType, OtherTypes               string
+}
+
+type onboardingCompletionAccountResource struct {
+	ID, ProviderID, Label, Email, ConfigDir, AddedAt string
+	Enabled                                          int64
+	EnabledType, OtherTypes                          string
+}
+
+type onboardingCompletionModelResource struct {
+	ProviderID, ModelID, Name, Source string
+	Available                         int64
+	ValueTypes                        string
+}
+
+type onboardingCompletionMetaResource struct {
+	Key, Value, KeyType, ValueType string
+}
+
+type onboardingCompletionResourceSnapshot struct {
+	Providers []onboardingCompletionProviderResource
+	Accounts  []onboardingCompletionAccountResource
+	Models    []onboardingCompletionModelResource
+	Meta      []onboardingCompletionMetaResource
+}
+
+func onboardingCompletionResourcesInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+) (onboardingCompletionResourceSnapshot, error) {
+	providers, err := onboardingCompletionProvidersInTx(ctx, tx)
+	if err != nil {
+		return onboardingCompletionResourceSnapshot{}, err
+	}
+	accounts, err := onboardingCompletionAccountsInTx(ctx, tx)
+	if err != nil {
+		return onboardingCompletionResourceSnapshot{}, err
+	}
+	models, err := onboardingCompletionModelsInTx(ctx, tx)
+	if err != nil {
+		return onboardingCompletionResourceSnapshot{}, err
+	}
+	meta, err := onboardingCompletionMetaInTx(ctx, tx)
+	if err != nil {
+		return onboardingCompletionResourceSnapshot{}, err
+	}
+	return onboardingCompletionResourceSnapshot{
+		Providers: providers,
+		Accounts:  accounts,
+		Models:    models,
+		Meta:      meta,
+	}, nil
+}
+
+func onboardingCompletionProvidersInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+) ([]onboardingCompletionProviderResource, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT
+id, name, kind, enabled, system_provider, credential_cipher,
+last_check_status, last_error, last_checked_at, typeof(enabled),
+typeof(id) || '|' || typeof(name) || '|' || typeof(kind) || '|' ||
+typeof(system_provider) || '|' || typeof(credential_cipher) || '|' ||
+typeof(last_check_status) || '|' || typeof(last_error) || '|' || typeof(last_checked_at)
+FROM llm_providers ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("read completion Provider resources: %w", err)
+	}
+	defer rows.Close()
+	providers := make([]onboardingCompletionProviderResource, 0)
+	for rows.Next() {
+		var provider onboardingCompletionProviderResource
+		if err := rows.Scan(
+			&provider.ID,
+			&provider.Name,
+			&provider.Kind,
+			&provider.Enabled,
+			&provider.SystemProvider,
+			&provider.CredentialCipher,
+			&provider.LastCheckStatus,
+			&provider.LastError,
+			&provider.CheckedAt,
+			&provider.EnabledType,
+			&provider.OtherTypes,
+		); err != nil {
+			return nil, fmt.Errorf("scan completion Provider resources: %w", err)
+		}
+		provider.CredentialCipher = append([]byte(nil), provider.CredentialCipher...)
+		providers = append(providers, provider)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate completion Provider resources: %w", err)
+	}
+	return providers, nil
+}
+
+func onboardingCompletionAccountsInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+) ([]onboardingCompletionAccountResource, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT
+id, provider_id, label, email, config_dir, enabled, added_at, typeof(enabled),
+typeof(id) || '|' || typeof(provider_id) || '|' || typeof(label) || '|' ||
+typeof(email) || '|' || typeof(config_dir) || '|' || typeof(added_at)
+FROM llm_accounts ORDER BY provider_id, id`)
+	if err != nil {
+		return nil, fmt.Errorf("read completion Account resources: %w", err)
+	}
+	defer rows.Close()
+	accounts := make([]onboardingCompletionAccountResource, 0)
+	for rows.Next() {
+		var account onboardingCompletionAccountResource
+		if err := rows.Scan(
+			&account.ID,
+			&account.ProviderID,
+			&account.Label,
+			&account.Email,
+			&account.ConfigDir,
+			&account.Enabled,
+			&account.AddedAt,
+			&account.EnabledType,
+			&account.OtherTypes,
+		); err != nil {
+			return nil, fmt.Errorf("scan completion Account resources: %w", err)
+		}
+		accounts = append(accounts, account)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate completion Account resources: %w", err)
+	}
+	return accounts, nil
+}
+
+func onboardingCompletionModelsInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+) ([]onboardingCompletionModelResource, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT
+provider_id, model_id, name, source, available,
+typeof(provider_id) || '|' || typeof(model_id) || '|' || typeof(name) || '|' ||
+typeof(source) || '|' || typeof(available)
+FROM llm_models ORDER BY provider_id, model_id`)
+	if err != nil {
+		return nil, fmt.Errorf("read completion model resources: %w", err)
+	}
+	defer rows.Close()
+	models := make([]onboardingCompletionModelResource, 0)
+	for rows.Next() {
+		var model onboardingCompletionModelResource
+		if err := rows.Scan(
+			&model.ProviderID,
+			&model.ModelID,
+			&model.Name,
+			&model.Source,
+			&model.Available,
+			&model.ValueTypes,
+		); err != nil {
+			return nil, fmt.Errorf("scan completion model resources: %w", err)
+		}
+		models = append(models, model)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate completion model resources: %w", err)
+	}
+	return models, nil
+}
+
+func onboardingCompletionMetaInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+) ([]onboardingCompletionMetaResource, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT key, value, typeof(key), typeof(value)
+FROM app_meta ORDER BY key`)
+	if err != nil {
+		return nil, fmt.Errorf("read completion metadata: %w", err)
+	}
+	defer rows.Close()
+	meta := make([]onboardingCompletionMetaResource, 0)
+	for rows.Next() {
+		var entry onboardingCompletionMetaResource
+		if err := rows.Scan(&entry.Key, &entry.Value, &entry.KeyType, &entry.ValueType); err != nil {
+			return nil, fmt.Errorf("scan completion metadata: %w", err)
+		}
+		meta = append(meta, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate completion metadata: %w", err)
+	}
+	return meta, nil
+}
+
+func onboardingCompletionExpectedResources(
+	before onboardingCompletionResourceSnapshot,
+	entries []OnboardingTestRouteEntry,
+	routeRevision int64,
+) (onboardingCompletionResourceSnapshot, error) {
+	expected := cloneOnboardingCompletionResources(before)
+	selectedAccounts := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		if _, duplicate := selectedAccounts[entry.ProviderID]; duplicate {
+			return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+		}
+		selectedAccounts[entry.ProviderID] = entry.AccountID
+
+		providerFound := false
+		for index := range expected.Providers {
+			provider := &expected.Providers[index]
+			if provider.ID != entry.ProviderID {
+				continue
+			}
+			providerFound = true
+			if provider.Kind != entry.Kind || !validOnboardingCompletionName(provider.Name) ||
+				(provider.Enabled != 0 && provider.Enabled != 1) || provider.EnabledType != "integer" {
+				return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+			}
+			provider.Enabled = 1
+		}
+		if !providerFound {
+			return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+		}
+
+		accountFound := false
+		for index := range expected.Accounts {
+			account := &expected.Accounts[index]
+			if account.ID != entry.AccountID {
+				continue
+			}
+			accountFound = true
+			if account.ProviderID != entry.ProviderID ||
+				!validOnboardingCompletionName(account.Label) || account.ConfigDir != entry.ConfigDir ||
+				account.Enabled != 0 || account.EnabledType != "integer" {
+				return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+			}
+		}
+		if !accountFound {
+			return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+		}
+
+		modelFound := false
+		for _, model := range expected.Models {
+			if model.ProviderID != entry.ProviderID || model.ModelID != entry.ModelID {
+				continue
+			}
+			modelFound = true
+			if !validOnboardingCompletionName(model.Name) || model.Available != 1 ||
+				model.ValueTypes != "text|text|text|text|integer" {
+				return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+			}
+		}
+		if !modelFound {
+			return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+		}
+	}
+
+	for index := range expected.Accounts {
+		account := &expected.Accounts[index]
+		selectedAccountID, stagedProvider := selectedAccounts[account.ProviderID]
+		if !stagedProvider {
+			continue
+		}
+		account.Enabled = 0
+		account.EnabledType = "integer"
+		if account.ID == selectedAccountID {
+			account.Enabled = 1
+		}
+	}
+
+	routeRevisionFound := false
+	for index := range expected.Meta {
+		entry := &expected.Meta[index]
+		if entry.Key != "llm_route_revision" {
+			continue
+		}
+		if routeRevisionFound || entry.KeyType != "text" || entry.ValueType != "text" {
+			return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+		}
+		routeRevisionFound = true
+		entry.Value = strconv.FormatInt(routeRevision, 10)
+		entry.ValueType = "text"
+	}
+	if !routeRevisionFound {
+		return onboardingCompletionResourceSnapshot{}, ErrOnboardingConfigurationChanged
+	}
+	return expected, nil
+}
+
+func cloneOnboardingCompletionResources(
+	resources onboardingCompletionResourceSnapshot,
+) onboardingCompletionResourceSnapshot {
+	cloned := onboardingCompletionResourceSnapshot{
+		Providers: append([]onboardingCompletionProviderResource(nil), resources.Providers...),
+		Accounts:  append([]onboardingCompletionAccountResource(nil), resources.Accounts...),
+		Models:    append([]onboardingCompletionModelResource(nil), resources.Models...),
+		Meta:      append([]onboardingCompletionMetaResource(nil), resources.Meta...),
+	}
+	for index := range cloned.Providers {
+		cloned.Providers[index].CredentialCipher = append(
+			[]byte(nil),
+			cloned.Providers[index].CredentialCipher...,
+		)
+	}
+	return cloned
+}
+
+func validateOnboardingCompletedResources(
+	ctx context.Context,
+	tx *sql.Tx,
+	expected onboardingCompletionResourceSnapshot,
+) error {
+	actual, err := onboardingCompletionResourcesInTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !onboardingCompletionProvidersEqual(actual.Providers, expected.Providers) {
+		return onboardingCompletionDurabilityMismatch("Provider resources")
+	}
+	if !onboardingCompletionAccountsEqual(actual.Accounts, expected.Accounts) {
+		return onboardingCompletionDurabilityMismatch("Account resources")
+	}
+	if !onboardingCompletionModelsEqual(actual.Models, expected.Models) {
+		return onboardingCompletionDurabilityMismatch("model resources")
+	}
+	if !onboardingCompletionMetaEqual(actual.Meta, expected.Meta) {
+		return onboardingCompletionDurabilityMismatch("metadata")
+	}
+	return nil
+}
+
+func onboardingCompletionProvidersEqual(
+	actual, expected []onboardingCompletionProviderResource,
+) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		left, right := actual[index], expected[index]
+		if left.ID != right.ID || left.Name != right.Name || left.Kind != right.Kind ||
+			left.Enabled != right.Enabled || left.SystemProvider != right.SystemProvider ||
+			!bytes.Equal(left.CredentialCipher, right.CredentialCipher) ||
+			left.LastCheckStatus != right.LastCheckStatus || left.LastError != right.LastError ||
+			left.CheckedAt != right.CheckedAt || left.EnabledType != right.EnabledType ||
+			left.OtherTypes != right.OtherTypes {
+			return false
+		}
+	}
+	return true
+}
+
+func onboardingCompletionAccountsEqual(
+	actual, expected []onboardingCompletionAccountResource,
+) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func onboardingCompletionModelsEqual(
+	actual, expected []onboardingCompletionModelResource,
+) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func onboardingCompletionMetaEqual(
+	actual, expected []onboardingCompletionMetaResource,
+) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func onboardingCompletionDurabilityMismatch(category string) error {
+	return fmt.Errorf("completion postcondition mismatch: %s", category)
+}
+
+type onboardingCompletionBindingKey struct {
+	kind      string
+	accountID string
+}
+
+func onboardingCompletionBindings(
+	input []OnboardingConfigBinding,
+) (map[onboardingCompletionBindingKey]string, error) {
+	if len(input) == 0 || len(input) > providercatalog.MaxSelectedKinds {
+		return nil, ErrOnboardingConfigurationChanged
+	}
+	bindings := make(map[onboardingCompletionBindingKey]string, len(input))
+	for _, binding := range input {
+		option, supported := providercatalog.OptionForKind(binding.Kind)
+		if !supported || !option.Advertised || !validOnboardingCompletionID(binding.AccountID) ||
+			!validOnboardingCompletionConfigDir(binding.ConfigDir) {
+			return nil, ErrOnboardingConfigurationChanged
+		}
+		key := onboardingCompletionBindingKey{kind: binding.Kind, accountID: binding.AccountID}
+		if _, duplicate := bindings[key]; duplicate {
+			return nil, ErrOnboardingConfigurationChanged
+		}
+		bindings[key] = binding.ConfigDir
+	}
+	return bindings, nil
+}
+
+func onboardingCompletionBindingsMatchRoute(
+	bindings map[onboardingCompletionBindingKey]string,
+	entries []OnboardingTestRouteEntry,
+) error {
+	if len(bindings) != len(entries) {
+		return ErrOnboardingConfigurationChanged
+	}
+	for _, entry := range entries {
+		configDir, ok := bindings[onboardingCompletionBindingKey{
+			kind: entry.Kind, accountID: entry.AccountID,
+		}]
+		if !ok || configDir != entry.ConfigDir {
+			return ErrOnboardingConfigurationChanged
+		}
+	}
+	return nil
+}
+
+func validOnboardingCompletionConfigDir(value string) bool {
+	if value == "" || len(value) > 32768 || !utf8.ValidString(value) || strings.TrimSpace(value) == "" {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func onboardingCompletionComboName(entries []OnboardingTestRouteEntry) (string, error) {
+	if len(entries) == 0 {
+		return "", ErrOnboardingConfigurationChanged
+	}
+	if len(entries) == 1 {
+		return onboardingComboName(entries[0].Kind)
+	}
+	return "Mặc định · Fallback", nil
+}
+
+func onboardingCompleteRequireOne(result sql.Result) error {
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return onboardingCompleteCommitError("read guarded completion mutation", err)
+	}
+	if changed != 1 {
+		return onboardingCompleteCommitError(
+			"apply guarded completion mutation",
+			errors.New("completion postcondition mismatch: durable row not updated"),
+		)
+	}
+	return nil
+}
+
+func onboardingCompleteRequireDurableRow(result sql.Result, operation string) error {
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return onboardingCompleteCommitError("read "+operation, err)
+	}
+	if changed != 1 {
+		return onboardingCompleteCommitError(
+			operation,
+			errors.New("completion postcondition mismatch: durable row not updated"),
+		)
+	}
+	return nil
 }
 
 func onboardingCompletionIsRequired(state OnboardingState) bool {
@@ -1138,9 +1902,8 @@ func onboardingCompletionIsRequired(state OnboardingState) bool {
 }
 
 func validateOnboardingCompletionState(state OnboardingState) error {
-	if !IsOnboardingProviderKind(state.ProviderKind) || state.ProviderID != state.ProviderKind ||
-		!validOnboardingCompletionID(state.AccountID) ||
-		!validOnboardingCompletionID(state.ModelID) {
+	if state.ProviderKind != "" || state.ProviderID != "" || state.AccountID != "" ||
+		state.ModelID != "" || !validOnboardingSHA256Hex(state.PersonaFingerprint) {
 		return ErrOnboardingConfigurationChanged
 	}
 	parsedComboID, err := uuid.Parse(state.StagedComboID)
@@ -1242,14 +2005,11 @@ func onboardingSetupRetryMatches(
 }
 
 func onboardingComboName(kind string) (string, error) {
-	switch kind {
-	case "codex":
-		return "Mặc định · Codex", nil
-	case "claude-code":
-		return "Mặc định · Claude", nil
-	default:
+	option, supported := providercatalog.OptionForKind(kind)
+	if !supported || !option.Advertised || !validOnboardingCompletionName(option.DisplayName) {
 		return "", fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
 	}
+	return "Mặc định · " + option.DisplayName, nil
 }
 
 func onboardingConnectStateIsClean(state OnboardingState) bool {

@@ -2418,6 +2418,278 @@ func appOnboardingLiveRoutingBytes(t *testing.T, env *onboardingRouteTestEnv) st
 
 const appOnboardingCompletionComboIDForTest = "5f9967c7-93cf-4ac8-9da8-f6a7c1af8801"
 
+func TestAppOnboardingCompleteActivatesOrderedProviderFallbackMulti(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	seedOnboardingRoute(t, env, "live-provider", "openai", true)
+	token, now := seedAppOnboardingCompletionMulti(t, env, 141)
+	oldNow := appOnboardingCompleteNow
+	appOnboardingCompleteNow = func() time.Time { return now }
+	t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+	var logs syncLogBuffer
+	env.a.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	rr := env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(
+		`{"revision":141,"test_token":%q}`, token,
+	))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	wantBody := `{"completed":true,"onboarding_version":1,"combo_id":"` + appOnboardingCompletionComboIDForTest + `"}`
+	if strings.TrimSpace(rr.Body.String()) != wantBody {
+		t.Fatalf("response = %q; want exact %q", strings.TrimSpace(rr.Body.String()), wantBody)
+	}
+
+	snapshot, err := env.a.st.OnboardingSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.State.Phase != store.OnboardingPhaseCompleted ||
+		snapshot.State.CompletedVersion != store.CurrentOnboardingVersion ||
+		snapshot.State.Revision != 142 || len(snapshot.Stages) != 0 {
+		t.Fatalf("completed snapshot = %+v", snapshot)
+	}
+	status := decodeOnboardingResponse[appOnboardingStatusResponse](t,
+		env.serve(http.MethodGet, "/onboarding/status", ""))
+	if status.Required || status.Phase != store.OnboardingPhaseCompleted ||
+		status.ProviderKind != "" || status.ProviderID != "" ||
+		status.AccountID != "" || status.ModelID != "" ||
+		status.Providers == nil || len(status.Providers) != 0 {
+		t.Fatalf("completed status = %+v", status)
+	}
+
+	combos, err := env.a.st.LLMCombos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combos) != 1 || combos[0].ID != appOnboardingCompletionComboIDForTest ||
+		!combos[0].Active || combos[0].Type != "fallback" || len(combos[0].Members) != 2 {
+		t.Fatalf("completed combos = %+v", combos)
+	}
+	wantMembers := []store.LLMRouteEntry{
+		{Position: 0, ProviderID: "codex", ModelID: "codex-model", Enabled: true},
+		{Position: 1, ProviderID: "claude-code", ModelID: "claude-model", Enabled: true},
+	}
+	if !slices.Equal(combos[0].Members, wantMembers) {
+		t.Fatalf("completed members = %+v; want %+v", combos[0].Members, wantMembers)
+	}
+	for _, tableAndID := range [][2]string{
+		{"llm_providers", "codex"}, {"llm_providers", "claude-code"},
+		{"llm_accounts", "codex-account"}, {"llm_accounts", "claude-account"},
+	} {
+		var enabled int
+		query := "SELECT enabled FROM " + tableAndID[0] + " WHERE id = ?"
+		if err := env.db.QueryRow(query, tableAndID[1]).Scan(&enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled != 1 {
+			t.Fatalf("%s %q enabled = %d; want 1", tableAndID[0], tableAndID[1], enabled)
+		}
+	}
+	for _, private := range []string{
+		token,
+		accountConfigDir(env.dataDir, "codex", "codex-account"),
+		accountConfigDir(env.dataDir, "claude-code", "claude-account"),
+		"codex-account", "claude-account", "codex-model", "claude-model",
+	} {
+		if strings.Contains(rr.Body.String(), private) || strings.Contains(logs.String(), private) {
+			t.Fatalf("completion leaked private value %q", private)
+		}
+	}
+}
+
+func TestAppOnboardingCompleteRevalidatesEveryConfigRootMulti(t *testing.T) {
+	for _, kind := range []string{"codex", "claude-code"} {
+		t.Run(kind, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			seedOnboardingRoute(t, env, "live-provider", "openai", true)
+			token, now := seedAppOnboardingCompletionMulti(t, env, 151)
+			beforeState := env.state(t)
+			beforeLive := appOnboardingTestSideEffectDigest(t, env)
+			oldNow := appOnboardingCompleteNow
+			appOnboardingCompleteNow = func() time.Time { return now }
+			t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+
+			hookCalls := 0
+			withAppOnboardingProviderAfterTestWait(t, func() {
+				hookCalls++
+				accountID := map[string]string{"codex": "codex-account", "claude-code": "claude-account"}[kind]
+				if err := os.RemoveAll(accountConfigDir(env.dataDir, kind, accountID)); err != nil {
+					t.Errorf("remove %s config root: %v", kind, err)
+				}
+			})
+
+			rr := env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(
+				`{"revision":151,"test_token":%q}`, token,
+			))
+			requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_CONFIGURATION_CHANGED")
+			if hookCalls != 1 {
+				t.Fatalf("post-wait hook calls = %d; want 1", hookCalls)
+			}
+			if after := env.state(t); after != beforeState {
+				t.Fatalf("config-root drift changed state: before=%+v after=%+v", beforeState, after)
+			}
+			if after := appOnboardingTestSideEffectDigest(t, env); after != beforeLive {
+				t.Fatalf("config-root drift changed live data:\nbefore=%s\nafter=%s", beforeLive, after)
+			}
+		})
+	}
+}
+
+func TestAppOnboardingCompleteRejectsCorruptFinalDurabilityMulti(t *testing.T) {
+	tests := []struct {
+		name        string
+		triggerName string
+		setup       func(*testing.T, *onboardingRouteTestEnv)
+	}{
+		{
+			name: "singleton trigger", triggerName: "corrupt_completed_onboarding_singleton",
+			setup: func(t *testing.T, env *onboardingRouteTestEnv) {
+				if _, err := env.db.Exec(`CREATE TRIGGER corrupt_completed_onboarding_singleton
+AFTER UPDATE OF phase ON app_onboarding_state
+WHEN NEW.id = 1 AND NEW.phase = 'completed'
+BEGIN
+  UPDATE app_onboarding_state SET provider_kind = 'SINGLETON_SECRET' WHERE id = 1;
+END`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "ignored route revision", triggerName: "ignore_completed_route_revision",
+			setup: func(t *testing.T, env *onboardingRouteTestEnv) {
+				if _, err := env.db.Exec(`UPDATE app_meta SET value='41' WHERE key='llm_route_revision'`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := env.db.Exec(`CREATE TRIGGER ignore_completed_route_revision
+BEFORE UPDATE OF value ON app_meta
+WHEN OLD.key = 'llm_route_revision'
+BEGIN SELECT RAISE(IGNORE); END`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newOnboardingRouteTestEnv(t)
+			token, now := seedAppOnboardingCompletionMulti(t, env, 156)
+			test.setup(t, env)
+			before, err := env.a.st.OnboardingSnapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeSideEffects := appOnboardingTestSideEffectDigest(t, env)
+			var beforeRouteRevision string
+			if err := env.db.QueryRow(`SELECT value FROM app_meta WHERE key='llm_route_revision'`).Scan(&beforeRouteRevision); err != nil {
+				t.Fatal(err)
+			}
+			oldNow := appOnboardingCompleteNow
+			appOnboardingCompleteNow = func() time.Time { return now }
+			t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+			var logs syncLogBuffer
+			env.a.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+			rr := env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(
+				`{"revision":156,"test_token":%q}`, token,
+			))
+			requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_COMMIT_FAILED")
+			for _, private := range []string{"SINGLETON_SECRET", token} {
+				if strings.Contains(rr.Body.String(), private) || strings.Contains(logs.String(), private) {
+					t.Fatalf("durability failure leaked %q: body=%s logs=%s", private, rr.Body.String(), logs.String())
+				}
+			}
+			after, err := env.a.st.OnboardingSnapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.State != before.State || !slices.Equal(after.Stages, before.Stages) {
+				t.Fatalf("durability failure changed onboarding snapshot: before=%+v after=%+v", before, after)
+			}
+			if afterSideEffects := appOnboardingTestSideEffectDigest(t, env); afterSideEffects != beforeSideEffects {
+				t.Fatalf("durability failure changed live state:\nbefore=%s\nafter=%s", beforeSideEffects, afterSideEffects)
+			}
+			var afterRouteRevision string
+			if err := env.db.QueryRow(`SELECT value FROM app_meta WHERE key='llm_route_revision'`).Scan(&afterRouteRevision); err != nil {
+				t.Fatal(err)
+			}
+			if afterRouteRevision != beforeRouteRevision {
+				t.Fatalf("durability failure route revision = %q; want %q", afterRouteRevision, beforeRouteRevision)
+			}
+
+			if _, err := env.db.Exec(`DROP TRIGGER ` + test.triggerName); err != nil {
+				t.Fatal(err)
+			}
+			retry := env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(
+				`{"revision":156,"test_token":%q}`, token,
+			))
+			if retry.Code != http.StatusOK {
+				t.Fatalf("retry status=%d body=%s", retry.Code, retry.Body.String())
+			}
+		})
+	}
+}
+
+func TestAppOnboardingCompleteFencesActiveAndNewTestChatMulti(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	token, now := seedAppOnboardingCompletionMulti(t, env, 161)
+	oldNow := appOnboardingCompleteNow
+	appOnboardingCompleteNow = func() time.Time { return now }
+	t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	withAppOnboardingTestSeams(t,
+		func(ctx context.Context, _ *api, _ store.OnboardingState, _ store.OnboardingStagingAccount, _ string) (string, error) {
+			close(entered)
+			<-ctx.Done()
+			close(canceled)
+			<-release
+			return "", ctx.Err()
+		},
+		func() time.Time { return now },
+		appOnboardingRandomFromReader(bytes.NewReader(make([]byte, 32))),
+		time.Second,
+	)
+	testDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		testDone <- env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":161,"message":"xin chào"}`)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("active multi Test Chat did not enter runner")
+	}
+	completeDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		completeDone <- env.serve(http.MethodPost, "/onboarding/complete", fmt.Sprintf(
+			`{"revision":161,"test_token":%q}`, token,
+		))
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("Complete did not cancel active multi Test Chat")
+	}
+	blocked := env.serve(http.MethodPost, "/onboarding/test-chat", `{"revision":161,"message":"xin chào"}`)
+	requireOnboardingCode(t, blocked, http.StatusConflict, "ONBOARDING_TEST_BUSY")
+	close(release)
+	select {
+	case rr := <-testDone:
+		requireOnboardingCode(t, rr, http.StatusRequestTimeout, "ONBOARDING_REQUEST_CANCELED")
+	case <-time.After(time.Second):
+		t.Fatal("canceled multi Test Chat did not finish")
+	}
+	select {
+	case rr := <-completeDone:
+		if rr.Code != http.StatusOK {
+			t.Fatalf("completion status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("multi completion did not finish after Test Chat cleanup")
+	}
+}
+
 func TestAppOnboardingCompleteActivatesVerifiedReceiptWithExactPrivateResponse(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	seedOnboardingRoute(t, env, "live-provider", "openai", true)
@@ -2473,8 +2745,9 @@ VALUES (0, 'live-provider', 'model', 1)`); err != nil {
 	}
 	status := env.serve(http.MethodGet, "/onboarding/status", "")
 	projected := decodeOnboardingResponse[appOnboardingStatusResponse](t, status)
-	if projected.Required || projected.ProviderID != "codex" || projected.AccountID != "staged-account" ||
-		projected.ModelID != "gpt-5.6-terra" {
+	if projected.Required || projected.ProviderKind != "" || projected.ProviderID != "" ||
+		projected.AccountID != "" || projected.ModelID != "" ||
+		projected.Providers == nil || len(projected.Providers) != 0 {
 		t.Fatalf("completed status projection = %+v", projected)
 	}
 	for _, forbidden := range []string{token, fmt.Sprintf("%x", hash[:]), "persona-fingerprint", accountConfigDir(env.dataDir, "codex", "staged-account")} {
@@ -2597,6 +2870,9 @@ BEFORE INSERT ON llm_combos BEGIN SELECT RAISE(ABORT, 'COMMIT_SECRET'); END`); e
 	requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_COMMIT_FAILED")
 	if strings.Contains(rr.Body.String(), "COMMIT_SECRET") || strings.Contains(rr.Body.String(), token) {
 		t.Fatalf("commit error leaked internals: %s", rr.Body.String())
+	}
+	if strings.Contains(logs.String(), "COMMIT_SECRET") || strings.Contains(logs.String(), token) {
+		t.Fatalf("commit error leaked internals to logs: %s", logs.String())
 	}
 	if after := env.state(t); after != beforeState {
 		t.Fatalf("failed commit changed state: before=%+v after=%+v", beforeState, after)
@@ -2745,6 +3021,34 @@ func seedAppOnboardingCompletion(
 		t.Fatal(err)
 	}
 	boundHash, err := store.OnboardingTestReceiptHash(fmt.Sprintf("%x", digest[:]), route.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.TestNonceHash = boundHash
+	env.setState(t, state)
+	return token, now
+}
+
+func seedAppOnboardingCompletionMulti(
+	t *testing.T,
+	env *onboardingRouteTestEnv,
+	revision int64,
+) (string, time.Time) {
+	t.Helper()
+	seedAppOnboardingMultiTestChatForTask6(t, env, revision)
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x6b}, 32))
+	digest := sha256.Sum256([]byte(token))
+	now := time.Date(2026, 8, 15, 12, 0, 0, 321, time.UTC)
+	state := env.state(t)
+	state.StagedComboID = appOnboardingCompletionComboIDForTest
+	state.TestNonceHash = hex.EncodeToString(digest[:])
+	state.TestExpiresAt = now.Add(time.Minute).Format(time.RFC3339Nano)
+	env.setState(t, state)
+	route, err := env.a.st.OnboardingTestRoute(context.Background(), revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundHash, err := store.OnboardingTestReceiptHash(state.TestNonceHash, route.Fingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}

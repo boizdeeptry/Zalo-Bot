@@ -697,6 +697,7 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
 		return
 	}
+	appOnboardingProviderAfterTestWait()
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
 	if r.Context().Err() != nil {
@@ -708,25 +709,21 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	stagingConfigDir := ""
-	if len(snapshot.route.Entries) == 1 {
-		stagingConfigDir = snapshot.route.Entries[0].ConfigDir
+	configBindings := make([]store.OnboardingConfigBinding, len(snapshot.route.Entries))
+	for index, entry := range snapshot.route.Entries {
+		configBindings[index] = store.OnboardingConfigBinding{
+			Kind: entry.Kind, AccountID: entry.AccountID, ConfigDir: entry.ConfigDir,
+		}
 	}
-	updated, err := a.st.CompleteOnboarding(r.Context(), store.CompleteOnboardingInput{
+	_, err := a.st.CompleteOnboarding(r.Context(), store.CompleteOnboardingInput{
 		Revision:           request.Revision,
 		TestNonceHash:      snapshot.nonceHash,
 		PersonaFingerprint: snapshot.fingerprint,
-		RouteFingerprint:   snapshot.route.Fingerprint,
-		StagingConfigDir:   stagingConfigDir,
+		ConfigBindings:     configBindings,
 		Now:                now,
 	})
 	if err != nil {
 		a.writeOnboardingCompleteError(w, err)
-		return
-	}
-	if updated.Phase != store.OnboardingPhaseCompleted ||
-		updated.CompletedVersion != store.CurrentOnboardingVersion || updated.Revision != request.Revision+1 {
-		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
 		return
 	}
 	a.writeJSON(w, http.StatusOK, appOnboardingCompleteResponse{
@@ -1692,7 +1689,7 @@ func (a *api) writeOnboardingCompleteError(w http.ResponseWriter, err error) {
 			"Cấu hình thiết lập đã thay đổi; hãy kiểm tra lại trước khi hoàn tất", nil)
 	default:
 		if a.logger != nil {
-			a.logger.Error("onboarding complete: atomic commit failed", "err", err)
+			a.logger.Error("onboarding complete: atomic commit failed", "error_kind", "commit_failed")
 		}
 		a.writeLLMErr(w, http.StatusInternalServerError, "ONBOARDING_COMMIT_FAILED",
 			"Không thể hoàn tất thiết lập an toàn; cấu hình cũ vẫn được giữ nguyên", nil)
