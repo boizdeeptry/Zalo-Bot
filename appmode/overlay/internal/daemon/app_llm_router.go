@@ -824,7 +824,8 @@ func (silentZaloRunner) Run(context.Context, string, func(string)) (string, erro
 // Đọc hỏng ở nhánh nào thì coi nhánh đó "không có": bot im là mặc định an toàn, và một lỗi đọc
 // store không được biến thành "đã nối" để rồi gửi tin của khách đi khi chưa cấu hình gì.
 func (a *api) hasAnyConnectedProvider() bool {
-	for kind := range subscriptionKinds {
+	registry := productionAppProviderRuntimeRegistry()
+	for _, kind := range registry.readinessAccountKinds() {
 		if accs, err := a.st.LLMAccounts(kind); err == nil {
 			for _, ac := range accs {
 				if ac.Enabled {
@@ -835,7 +836,7 @@ func (a *api) hasAnyConnectedProvider() bool {
 	}
 	if provs, err := a.st.LLMProviders(); err == nil {
 		for _, p := range provs {
-			if p.CredentialConfigured {
+			if p.CredentialConfigured && registry.contributesCredentialReadiness(p.Kind) {
 				return true
 			}
 		}

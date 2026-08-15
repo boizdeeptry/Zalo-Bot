@@ -508,7 +508,7 @@ func TestOpenCodeSyntheticDescriptorIsPrivateAndNeverAdvertised(t *testing.T) {
 			t.Fatal("synthetic descriptor leaked into production options")
 		}
 	}
-	if _, exists := appProviderCapabilities[descriptor.Kind]; exists {
+	if _, exists := productionAppProviderRuntimeRegistry().registration(descriptor.Kind); exists {
 		t.Fatal("synthetic descriptor leaked into production capabilities")
 	}
 	if _, exists := cliDescriptors[descriptor.Kind]; exists {

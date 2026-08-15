@@ -464,8 +464,20 @@ func TestAppOnboardingTestChatMultiRejectsRouteDriftAfterRunner(t *testing.T) {
 			if strings.Contains(rr.Body.String(), "codex-account") || strings.Contains(rr.Body.String(), "codex-model-new") {
 				t.Fatalf("route drift error leaked private identity: %s", rr.Body.String())
 			}
-			if state := env.state(t); state.TestNonceHash != "" || state.TestExpiresAt != "" || state.Revision != 91 {
-				t.Fatalf("route drift persisted receipt: %+v", state)
+			var revision int64
+			var nonceHash, expiresAt string
+			if err := env.db.QueryRow(`
+SELECT revision, test_nonce_hash, test_expires_at
+FROM app_onboarding_state WHERE id=1`).Scan(&revision, &nonceHash, &expiresAt); err != nil {
+				t.Fatal(err)
+			}
+			if nonceHash != "" || expiresAt != "" || revision != 91 {
+				t.Fatalf(
+					"route drift persisted receipt: revision=%d nonce=%q expires=%q",
+					revision,
+					nonceHash,
+					expiresAt,
+				)
 			}
 		})
 	}

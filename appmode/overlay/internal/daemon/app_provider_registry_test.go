@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"testing"
 
@@ -40,13 +39,14 @@ func TestAppProviderRegistryPublishesOnlyOrderedOnboardingOptions(t *testing.T) 
 }
 
 func TestAppProviderRegistryCapabilitiesDoNotFollowCLIDescriptorPresence(t *testing.T) {
+	registry := productionAppProviderRuntimeRegistry()
 	for _, kind := range []string{"codex", "claude-code"} {
-		if !appProviderSupportsOnboarding(kind) || !appProviderSupportsConnect(kind) {
+		if !registry.supportsOnboarding(kind) || !registry.supportsConnect(kind) {
 			t.Fatalf("%q must support onboarding and Connect", kind)
 		}
 	}
 	for _, kind := range []string{"", "gemini-cli", "openai", "Codex"} {
-		if appProviderSupportsOnboarding(kind) || appProviderSupportsConnect(kind) {
+		if registry.supportsOnboarding(kind) || registry.supportsConnect(kind) {
 			t.Fatalf("%q unexpectedly has onboarding or Connect capability", kind)
 		}
 	}
@@ -55,12 +55,7 @@ func TestAppProviderRegistryCapabilitiesDoNotFollowCLIDescriptorPresence(t *test
 	}
 
 	wantSubscriptionKinds := []string{"claude-code", "codex"}
-	gotSubscriptionKinds := make([]string, 0, len(subscriptionKinds))
-	for kind, supported := range subscriptionKinds {
-		if supported {
-			gotSubscriptionKinds = append(gotSubscriptionKinds, kind)
-		}
-	}
+	gotSubscriptionKinds := registry.readinessAccountKinds()
 	slices.Sort(gotSubscriptionKinds)
 	if !slices.Equal(gotSubscriptionKinds, wantSubscriptionKinds) {
 		t.Fatalf("subscription kinds = %q; want %q", gotSubscriptionKinds, wantSubscriptionKinds)
@@ -68,42 +63,25 @@ func TestAppProviderRegistryCapabilitiesDoNotFollowCLIDescriptorPresence(t *test
 }
 
 func TestAppProviderRegistryCapabilityOwnsDaemonValidation(t *testing.T) {
-	const kind = "future-onboarding-driver"
-	oldCapability, existed := appProviderCapabilities[kind]
-	appProviderCapabilities[kind] = appProviderCapability{Onboarding: true, Connect: true}
-	t.Cleanup(func() {
-		if existed {
-			appProviderCapabilities[kind] = oldCapability
-		} else {
-			delete(appProviderCapabilities, kind)
-		}
-	})
-
-	if !appProviderSupportsOnboarding(kind) || !appProviderSupportsConnect(kind) {
-		t.Fatalf("test capability for %q was not registered", kind)
-	}
-	if err := validateOnboardingState(store.OnboardingState{
-		Phase: store.OnboardingPhaseConnect, ProviderKind: kind, Revision: 1,
-	}); err != nil {
-		t.Fatalf("registry-supported future Provider failed daemon state validation: %v", err)
-	}
-
-	dataDir := t.TempDir()
-	configDir := accountConfigDir(dataDir, kind, "future-account")
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
+	registry, err := newAppProviderRuntimeRegistry(
+		appRuntimeSyntheticOptions(),
+		appRuntimeSyntheticRegistrations(),
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
-	staged := store.OnboardingStagingAccount{
-		AccountID: "future-account", ProviderID: kind, ProviderKind: kind, ConfigDir: configDir,
+	if !registry.supportsOnboarding("future-cli") || !registry.supportsConnect("future-cli") {
+		t.Fatal("local immutable registry did not authorize the synthetic runtime")
 	}
-	if err := validateOnboardingStagingConfigDir(dataDir, staged); err != nil {
-		t.Fatalf("registry-supported future Provider failed config ownership validation: %v", err)
+	canonical, err := registry.canonicalOnboardingKinds([]string{"claude-code", "future-cli", "codex"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := removeOwnedOnboardingAccount(dataDir, staged); err != nil {
-		t.Fatalf("registry-supported future Provider failed rooted cleanup validation: %v", err)
+	if !slices.Equal(canonical, []string{"codex", "future-cli", "claude-code"}) {
+		t.Fatalf("canonical kinds = %q", canonical)
 	}
-	if _, err := os.Stat(configDir); !os.IsNotExist(err) {
-		t.Fatalf("rooted cleanup left future Provider directory: %v", err)
+	if productionAppProviderRuntimeRegistry().supportsOnboarding("future-cli") {
+		t.Fatal("local synthetic registry mutated production validation")
 	}
 }
 
@@ -116,7 +94,7 @@ func TestProviderRegistryNeverAdvertisesOpenCodeWithoutContainment(t *testing.T)
 	if appProviderSupportsOnboarding("opencode") || appProviderSupportsConnect("opencode") {
 		t.Fatal("OpenCode unexpectedly has a production capability")
 	}
-	if appSubscriptionKinds()["opencode"] || subscriptionKinds["opencode"] {
+	if productionAppProviderRuntimeRegistry().contributesReadiness("opencode") {
 		t.Fatal("OpenCode unexpectedly has a subscription route")
 	}
 	if _, exists := cliDescriptors["opencode"]; exists {
@@ -136,22 +114,10 @@ func TestProviderRegistryOpenCodeDenyIgnoresEnvironmentFlagsAndCapabilityMutatio
 	} {
 		t.Setenv(key, `C:\explicit\opencode.exe`)
 	}
-	old, existed := appProviderCapabilities["opencode"]
-	appProviderCapabilities["opencode"] = appProviderCapability{
-		Onboarding: true, Connect: true, Subscription: true,
-	}
-	t.Cleanup(func() {
-		if existed {
-			appProviderCapabilities["opencode"] = old
-		} else {
-			delete(appProviderCapabilities, "opencode")
-		}
-	})
-
 	if appProviderSupportsOnboarding("opencode") || appProviderSupportsConnect("opencode") {
 		t.Fatal("OpenCode bypassed the production deny gate")
 	}
-	if appSubscriptionKinds()["opencode"] {
+	if productionAppProviderRuntimeRegistry().contributesReadiness("opencode") {
 		t.Fatal("OpenCode bypassed the subscription deny gate")
 	}
 	for _, option := range appProviderOptions() {

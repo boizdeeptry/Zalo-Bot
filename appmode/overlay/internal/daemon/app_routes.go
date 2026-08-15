@@ -70,6 +70,18 @@ func init() {
 }
 
 func (a *api) registerAppRoutes(mux *http.ServeMux) {
+	registerAppRoutesWithContext(mux, productionAppRuntimeContext(a))
+}
+
+// registerAppRoutesWithContext is the internal dependency-injected route
+// registration seam. Handlers remain api methods at this checkpoint; later
+// dispatch tasks bind them to ctx directly. The passed Connect manager is kept
+// intact for current handler compatibility and is never silently rebuilt.
+func registerAppRoutesWithContext(mux *http.ServeMux, ctx appRuntimeContext) {
+	if mux == nil || ctx.api == nil || !ctx.registry.valid || ctx.connect == nil {
+		panic("register app routes: invalid runtime context")
+	}
+	a := ctx.api
 	mux.Handle("GET /onboarding/status", a.auth(a.handleOnboardingStatus))
 	mux.Handle("PUT /onboarding/providers", a.auth(a.handleOnboardingProviders))
 	mux.Handle("PUT /onboarding/provider", a.auth(a.handleOnboardingProvider))
@@ -103,10 +115,9 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /llm/providers/{id}/models", a.auth(a.handleLLMModelDelete))
 	mux.Handle("DELETE /llm/providers/{id}/accounts/{accountId}", a.auth(a.handleLLMAccountDelete))
 
-	// connectMgr is refreshed on every registerAppRoutes call (not lazily nil-guarded) so it always
-	// reflects the api that registered the routes. Production registers once; tests each get their
-	// own valid manager and never inherit a prior test's closed store / nil logger.
-	connectMgr = a.newConnectManager()
+	// Compatibility until Connect handlers receive appRuntimeContext directly:
+	// register exactly the validated manager supplied by the context.
+	connectMgr = ctx.connect
 	// Gieo model tĩnh của claude-code ngay khi khởi động: nó là provider luôn có sẵn (seeded), chạy
 	// qua runClaude nên KHÔNG có adapter để discover — không gieo ở đây thì detail + combo picker
 	// trống model dù chưa ai connect. Idempotent (ReplaceLLMModels thay trọn nguồn discovered).

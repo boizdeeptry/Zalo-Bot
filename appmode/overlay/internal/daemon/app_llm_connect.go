@@ -1013,7 +1013,7 @@ func claudeEmailFromJSON(out []byte) string {
 
 func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
 	kind := r.PathValue("kind")
-	if !subscriptionKinds[kind] {
+	if !productionAppProviderRuntimeRegistry().supportsConnect(kind) {
 		a.writeLLMErr(w, http.StatusBadRequest, "CONNECT_KIND_UNSUPPORTED",
 			"loại tài khoản này chưa kết nối được ở bản này", map[string]string{"kind": kind})
 		return
