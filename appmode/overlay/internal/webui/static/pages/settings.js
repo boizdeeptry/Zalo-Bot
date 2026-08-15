@@ -1,7 +1,6 @@
 import { requestJSON as sharedRequestJSON } from "../core/api.js";
 import { element, pageHeader } from "../core/ui.js";
 import {
-  SUPPORTED_PROVIDERS,
   normalizeStatus,
   positiveRevision,
   projectStatus,
@@ -32,8 +31,7 @@ export function normalizeRestartStatus(response, revision) {
     || projected.provider_id !== ""
     || projected.account_id !== ""
     || projected.model_id !== ""
-    || (projected.suggested_provider_kind !== ""
-      && !SUPPORTED_PROVIDERS.has(projected.suggested_provider_kind))) return null;
+    || status.providers.length !== 0) return null;
   return status;
 }
 

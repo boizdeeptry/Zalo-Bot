@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import * as appMain from "../overlay/internal/webui/static/app-main.js";
 import { ROUTES, createRouteHost } from "../overlay/internal/webui/static/core/router.js";
 import { find, installDOM, text } from "./helpers/dom-harness.mjs";
-import { onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
+import { onboardingProviderOptions, onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
 
 const { createPortalController, loadRoutePage } = appMain;
 
@@ -241,6 +241,22 @@ test("required and restart lifecycles mount only the gated wizard", async (t) =>
       assert.equal(document.body.classList.contains("onboarding-gated"), true);
     });
   }
+});
+
+test("startup accepts a future advertised provider suggestion from the authoritative catalog", async (t) => {
+  const future = {
+    kind: "future-runtime", display_name: "Future Runtime",
+    description: "Server-advertised runtime", recommended: false,
+    beta: true, advertised: true, route_rank: 200,
+  };
+  const status = requiredStatus({
+    provider_options: [...onboardingProviderOptions(), future],
+    suggested_provider_kind: future.kind,
+  });
+  const harness = appHarness(t, { loadStatus: async () => status });
+  assert.equal(await harness.app.ready, true);
+  assert.equal(harness.wizards.length, 1);
+  assert.equal(harness.wizards[0].context.initialStatus.suggested_provider_kind, future.kind);
 });
 
 test("malformed status and load errors fail closed with a safe Retry", async (t) => {

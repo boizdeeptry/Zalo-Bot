@@ -27,6 +27,7 @@ function response(overrides = {}) {
     bot_name: "Bé Mi",
     provider_id: "codex",
     model_id: "gpt-5.6-terra",
+    position: 0,
     test_token: "opaque-test-token",
     expires_at: new Date(Date.now() + 600_000).toISOString(),
     revision: 8,

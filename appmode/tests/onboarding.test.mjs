@@ -50,6 +50,7 @@ function testResult(overrides = {}) {
     bot_name: "Bé Mi",
     provider_id: "codex",
     model_id: "gpt-5.6-terra",
+    position: 0,
     test_token: "opaque-test-token",
     expires_at: futureExpiry(),
     revision: 8,
