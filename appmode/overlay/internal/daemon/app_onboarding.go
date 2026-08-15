@@ -57,14 +57,13 @@ var (
 	appOnboardingProviderAfterTestWait                                 = func() {}
 	appOnboardingCompleteNow                                           = time.Now
 	appOnboardingCompleteConstantTimeCompare                           = subtle.ConstantTimeCompare
-	appOnboardingSuggestedProviderKind                                 = func(a *api) (string, error) { return a.suggestedOnboardingProviderKind() }
 )
 
 const appOnboardingReceiptCompensationTimeout = 5 * time.Second
 
 type appOnboardingTestExecutor func(
 	context.Context,
-	*api,
+	appRuntimeContext,
 	store.OnboardingTestRoute,
 	string,
 ) (appOnboardingTestResult, error)
@@ -176,24 +175,25 @@ type appOnboardingProviderResponse struct {
 	Position   int    `json:"position"`
 }
 
-func (a *api) handleOnboardingStatus(w http.ResponseWriter, _ *http.Request) {
-	snapshot, err := a.st.OnboardingSnapshot()
+func (runtimeContext appRuntimeContext) handleOnboardingStatus(w http.ResponseWriter, _ *http.Request) {
+	a := runtimeContext.api
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	response, err := onboardingStatusResponse(snapshot, "")
+	response, err := runtimeOnboardingStatusResponse(runtimeContext.registry, snapshot, "")
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
 	if response.ProviderKind == "" {
-		suggested, err := appOnboardingSuggestedProviderKind(a)
+		suggested, err := runtimeContext.suggestedOnboardingProviderKind()
 		if err != nil {
 			a.writeOnboardingStateUnavailable(w, err)
 			return
 		}
-		response, err = onboardingStatusResponse(snapshot, suggested)
+		response, err = runtimeOnboardingStatusResponse(runtimeContext.registry, snapshot, suggested)
 		if err != nil {
 			a.writeOnboardingStateUnavailable(w, err)
 			return
@@ -202,7 +202,8 @@ func (a *api) handleOnboardingStatus(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, response)
 }
 
-func (a *api) handleOnboardingProviders(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingProviders(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingProvidersRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -210,7 +211,7 @@ func (a *api) handleOnboardingProviders(w http.ResponseWriter, r *http.Request) 
 	if !a.requireOnboardingRevision(w, request.Revision) {
 		return
 	}
-	kinds, ok := a.decodeOnboardingSelectedKinds(w, request.SelectedKinds)
+	kinds, ok := runtimeContext.decodeOnboardingSelectedKinds(w, request.SelectedKinds)
 	if !ok {
 		return
 	}
@@ -221,15 +222,16 @@ func (a *api) handleOnboardingProviders(w http.ResponseWriter, r *http.Request) 
 		a.writeOnboardingCleanupFailed(w, r.Context().Err())
 		return
 	}
-	snapshot, err := a.st.ReplaceOnboardingProviderSelection(request.Revision, kinds)
+	snapshot, err := runtimeContext.onboardingStore().ReplaceOnboardingProviderSelection(request.Revision, kinds)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingSnapshot(w, snapshot)
+	runtimeContext.writeOnboardingSnapshot(w, snapshot)
 }
 
-func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingProviderRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -237,7 +239,7 @@ func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
 	if !a.requireOnboardingRevision(w, request.Revision) {
 		return
 	}
-	if !appProviderSupportsOnboarding(request.Kind) {
+	if !runtimeContext.registry.supportsOnboarding(request.Kind) {
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_PROVIDER_UNSUPPORTED",
 			"Nhà cung cấp này chưa được hỗ trợ trong bước thiết lập", nil)
 		return
@@ -249,15 +251,16 @@ func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingCleanupFailed(w, r.Context().Err())
 		return
 	}
-	snapshot, err := a.st.BeginOnboardingProvider(request.Revision, request.Kind)
+	snapshot, err := runtimeContext.onboardingStore().BeginOnboardingProvider(request.Revision, request.Kind)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingSnapshot(w, snapshot)
+	runtimeContext.writeOnboardingSnapshot(w, snapshot)
 }
 
-func (a *api) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingRestartRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -278,7 +281,7 @@ func (a *api) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, ok := a.onboardingMutationState(w, request.Revision)
+	state, ok := runtimeContext.onboardingMutationState(w, request.Revision)
 	if !ok {
 		return
 	}
@@ -298,10 +301,11 @@ func (a *api) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingStatus(w, updated)
+	runtimeContext.writeOnboardingStatus(w, updated)
 }
 
-func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingSetupRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -309,7 +313,7 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 	if !a.requireOnboardingRevision(w, request.Revision) {
 		return
 	}
-	if !appProviderSupportsOnboarding(request.Kind) {
+	if !runtimeContext.registry.supportsOnboarding(request.Kind) {
 		a.writeOnboardingStoreError(w, store.ErrOnboardingProviderUnsupported)
 		return
 	}
@@ -326,12 +330,12 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snapshot, err := a.st.OnboardingSnapshot()
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	if err := validateOnboardingSnapshot(snapshot); err != nil {
+	if err := validateRuntimeOnboardingSnapshot(runtimeContext.registry, snapshot); err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
@@ -342,7 +346,7 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 			a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
 			return
 		}
-		staged, err := a.st.StageOnboardingSetup(
+		staged, err := runtimeContext.onboardingStore().StageOnboardingSetup(
 			request.Revision,
 			request.Kind,
 			request.AccountID,
@@ -352,7 +356,7 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 			a.writeOnboardingStoreError(w, err)
 			return
 		}
-		a.writeOnboardingSnapshot(w, staged)
+		runtimeContext.writeOnboardingSnapshot(w, staged)
 		return
 	}
 	if state.Revision != request.Revision {
@@ -372,7 +376,12 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
 		return
 	}
-	modelID, err := appSelectOnboardingModel(a.st, request.Kind, state.ProviderID)
+	selector, ok := runtimeContext.registry.onboardingModelSelector(request.Kind)
+	if !ok {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingProviderUnsupported)
+		return
+	}
+	modelID, err := selector(a.st, state.ProviderID)
 	if err != nil {
 		if errors.Is(err, store.ErrOnboardingModelUnavailable) {
 			a.writeOnboardingStoreError(w, err)
@@ -381,15 +390,18 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	staged, err := a.st.StageOnboardingSetup(request.Revision, request.Kind, request.AccountID, modelID)
+	staged, err := runtimeContext.onboardingStore().StageOnboardingSetup(
+		request.Revision, request.Kind, request.AccountID, modelID,
+	)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingSnapshot(w, staged)
+	runtimeContext.writeOnboardingSnapshot(w, staged)
 }
 
-func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingTestChatRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -416,7 +428,7 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingTestCanceled(w)
 		return
 	}
-	route, persona, err := a.preflightOnboardingTestChat(r.Context(), request.Revision)
+	route, persona, err := runtimeContext.preflightOnboardingTestChat(r.Context(), request.Revision)
 	if err != nil {
 		onboardingMutationMu.Unlock()
 		a.writeOnboardingStoreError(w, err)
@@ -431,7 +443,7 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 	// can proceed (or cancel a destructive provider switch); exact postflight
 	// validation below prevents a stale receipt from being committed.
 	onboardingMutationMu.Unlock()
-	result, err := appOnboardingTestExecute(testCtx, a, route, prompt)
+	result, err := appOnboardingTestExecute(testCtx, runtimeContext, route, prompt)
 	if err != nil || testCtx.Err() != nil {
 		if !a.writeOnboardingTestContextError(w, r, testCtx) {
 			a.writeLLMErr(w, http.StatusBadGateway, "ONBOARDING_TEST_FAILED",
@@ -446,7 +458,7 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 	if a.writeOnboardingTestContextError(w, r, testCtx) {
 		return
 	}
-	if err := a.postflightOnboardingTestChat(testCtx, route, persona); err != nil {
+	if err := runtimeContext.postflightOnboardingTestChat(testCtx, route, persona); err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
@@ -485,7 +497,7 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 	if a.writeOnboardingTestContextError(w, r, testCtx) {
 		return
 	}
-	updated, err := a.st.SaveOnboardingTestReceipt(
+	updated, err := runtimeContext.onboardingStore().SaveOnboardingTestReceipt(
 		testCtx,
 		route,
 		fmt.Sprintf("%x", digest[:]),
@@ -508,7 +520,7 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 		)
 		savedRoute := route
 		savedRoute.State = updated
-		_, compensationErr := a.st.ClearOnboardingTestReceipt(
+		_, compensationErr := runtimeContext.onboardingStore().ClearOnboardingTestReceipt(
 			compensationCtx,
 			savedRoute,
 			fmt.Sprintf("%x", digest[:]),
@@ -530,7 +542,8 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 // handleOnboardingBackToProviders fences Test Chat across the intentional
 // mutation-lock gap, then delegates the exact CAS and lost-response proof to
 // Store. It never cancels Connect or removes Account configuration.
-func (a *api) handleOnboardingBackToProviders(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingBackToProviders(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingBackRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -545,25 +558,25 @@ func (a *api) handleOnboardingBackToProviders(w http.ResponseWriter, r *http.Req
 		a.writeOnboardingBackCanceled(w)
 		return
 	}
-	snapshot, err := a.st.OnboardingSnapshot()
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err != nil {
 		onboardingMutationMu.Unlock()
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	if err := validateOnboardingSnapshot(snapshot); err != nil {
+	if err := validateRuntimeOnboardingSnapshot(runtimeContext.registry, snapshot); err != nil {
 		onboardingMutationMu.Unlock()
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
 	if onboardingRevisionIsOneAheadForDaemon(request.Revision, snapshot.State.Revision) {
-		updated, err := a.st.BackOnboardingToProviders(request.Revision)
+		updated, err := runtimeContext.onboardingStore().BackOnboardingToProviders(request.Revision)
 		onboardingMutationMu.Unlock()
 		if err != nil {
 			a.writeOnboardingStoreError(w, err)
 			return
 		}
-		a.writeOnboardingSnapshot(w, updated)
+		runtimeContext.writeOnboardingSnapshot(w, updated)
 		return
 	}
 	if err := preflightOnboardingBackSnapshot(snapshot, request.Revision); err != nil {
@@ -593,21 +606,21 @@ func (a *api) handleOnboardingBackToProviders(w http.ResponseWriter, r *http.Req
 		a.writeOnboardingBackCanceled(w)
 		return
 	}
-	refreshed, err := a.st.OnboardingSnapshot()
+	refreshed, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	if err := validateOnboardingSnapshot(refreshed); err != nil {
+	if err := validateRuntimeOnboardingSnapshot(runtimeContext.registry, refreshed); err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	updated, err := a.st.BackOnboardingToProviders(request.Revision)
+	updated, err := runtimeContext.onboardingStore().BackOnboardingToProviders(request.Revision)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingSnapshot(w, updated)
+	runtimeContext.writeOnboardingSnapshot(w, updated)
 }
 
 func preflightOnboardingBackSnapshot(snapshot store.OnboardingSnapshot, expectedRevision int64) error {
@@ -663,7 +676,8 @@ type appOnboardingCompleteSnapshot struct {
 // one-time proof; it never activates routing on its own. The transition lease closes Test Chat
 // admission while an already-running test is canceled and reaped, then Store performs the only
 // validation-and-activation transaction.
-func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingCompleteRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -679,7 +693,7 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := appOnboardingCompleteNow().UTC()
-	if _, ok := a.preflightOnboardingComplete(r.Context(), w, request.Revision, request.TestToken, now); !ok {
+	if _, ok := runtimeContext.preflightOnboardingComplete(r.Context(), w, request.Revision, request.TestToken, now); !ok {
 		onboardingMutationMu.Unlock()
 		return
 	}
@@ -705,7 +719,7 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now = appOnboardingCompleteNow().UTC()
-	snapshot, ok := a.preflightOnboardingComplete(r.Context(), w, request.Revision, request.TestToken, now)
+	snapshot, ok := runtimeContext.preflightOnboardingComplete(r.Context(), w, request.Revision, request.TestToken, now)
 	if !ok {
 		return
 	}
@@ -715,7 +729,7 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 			Kind: entry.Kind, AccountID: entry.AccountID, ConfigDir: entry.ConfigDir,
 		}
 	}
-	_, err := a.st.CompleteOnboarding(r.Context(), store.CompleteOnboardingInput{
+	_, err := runtimeContext.onboardingStore().CompleteOnboarding(r.Context(), store.CompleteOnboardingInput{
 		Revision:           request.Revision,
 		TestNonceHash:      snapshot.nonceHash,
 		PersonaFingerprint: snapshot.fingerprint,
@@ -733,14 +747,15 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *api) preflightOnboardingComplete(
+func (runtimeContext appRuntimeContext) preflightOnboardingComplete(
 	ctx context.Context,
 	w http.ResponseWriter,
 	expectedRevision int64,
 	testToken string,
 	now time.Time,
 ) (appOnboardingCompleteSnapshot, bool) {
-	route, _, err := a.preflightOnboardingTestChat(ctx, expectedRevision)
+	a := runtimeContext.api
+	route, _, err := runtimeContext.preflightOnboardingTestChat(ctx, expectedRevision)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrOnboardingConflict):
@@ -904,12 +919,16 @@ func normalizeOnboardingTestMessage(raw string) (string, bool) {
 	return message, true
 }
 
-func (a *api) preflightOnboardingTestChat(
+func (runtimeContext appRuntimeContext) preflightOnboardingTestChat(
 	ctx context.Context,
 	expectedRevision int64,
 ) (store.OnboardingTestRoute, []byte, error) {
-	route, err := a.st.OnboardingTestRoute(ctx, expectedRevision)
+	a := runtimeContext.api
+	route, err := runtimeContext.onboardingStore().OnboardingTestRoute(ctx, expectedRevision)
 	if err != nil {
+		return store.OnboardingTestRoute{}, nil, err
+	}
+	if err := validateRuntimeOnboardingRouteRegistrations(runtimeContext.registry, route); err != nil {
 		return store.OnboardingTestRoute{}, nil, err
 	}
 	for _, entry := range route.Entries {
@@ -917,7 +936,9 @@ func (a *api) preflightOnboardingTestChat(
 			AccountID: entry.AccountID, ProviderID: entry.ProviderID,
 			ProviderKind: entry.Kind, ConfigDir: entry.ConfigDir,
 		}
-		if err := validateOnboardingStagingConfigDir(a.cfg.Dir, staged); err != nil {
+		if err := validateRuntimeOnboardingStagingConfigDir(
+			runtimeContext.registry, a.cfg.Dir, staged,
+		); err != nil {
 			return store.OnboardingTestRoute{}, nil, err
 		}
 	}
@@ -941,12 +962,12 @@ func (a *api) preflightOnboardingTestChat(
 	return route, persona, nil
 }
 
-func (a *api) postflightOnboardingTestChat(
+func (runtimeContext appRuntimeContext) postflightOnboardingTestChat(
 	ctx context.Context,
 	expectedRoute store.OnboardingTestRoute,
 	expectedPersona []byte,
 ) error {
-	current, persona, err := a.preflightOnboardingTestChat(ctx, expectedRoute.State.Revision)
+	current, persona, err := runtimeContext.preflightOnboardingTestChat(ctx, expectedRoute.State.Revision)
 	if err != nil {
 		return err
 	}
@@ -1013,11 +1034,11 @@ func canonicalOnboardingFoldRune(value rune) rune {
 
 func defaultAppOnboardingTestExecute(
 	ctx context.Context,
-	a *api,
+	runtimeContext appRuntimeContext,
 	route store.OnboardingTestRoute,
 	prompt string,
 ) (appOnboardingTestResult, error) {
-	runner, err := newAppOnboardingTestRunner(ctx, a, route)
+	runner, err := newAppOnboardingTestRunner(ctx, runtimeContext, route)
 	if err != nil {
 		return appOnboardingTestResult{}, err
 	}
@@ -1046,8 +1067,6 @@ func (a *api) writeOnboardingTestContextError(
 		return false
 	}
 }
-
-var appSelectOnboardingModel = selectOnboardingModel
 
 func selectOnboardingModel(st *store.Store, kind, providerID string) (string, error) {
 	descriptor, ok := cliDescriptors[kind]
@@ -1206,10 +1225,11 @@ func onboardingTopLevelJSONKeysUnique(raw []byte) bool {
 	return errors.Is(decoder.Decode(&trailing), io.EOF)
 }
 
-func (a *api) decodeOnboardingSelectedKinds(
+func (runtimeContext appRuntimeContext) decodeOnboardingSelectedKinds(
 	w http.ResponseWriter,
 	raw json.RawMessage,
 ) ([]string, bool) {
+	a := runtimeContext.api
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) < 2 || trimmed[0] != '[' || trimmed[len(trimmed)-1] != ']' {
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_PROVIDER_SELECTION_INVALID",
@@ -1222,7 +1242,7 @@ func (a *api) decodeOnboardingSelectedKinds(
 			"Danh sách nhà cung cấp không hợp lệ", nil)
 		return nil, false
 	}
-	canonical, err := appCanonicalOnboardingKinds(kinds)
+	canonical, err := runtimeContext.registry.canonicalOnboardingKinds(kinds)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return nil, false
@@ -1239,13 +1259,17 @@ func (a *api) requireOnboardingRevision(w http.ResponseWriter, revision int64) b
 	return false
 }
 
-func (a *api) onboardingMutationState(w http.ResponseWriter, expectedRevision int64) (store.OnboardingState, bool) {
-	state, err := a.st.OnboardingState()
+func (runtimeContext appRuntimeContext) onboardingMutationState(
+	w http.ResponseWriter,
+	expectedRevision int64,
+) (store.OnboardingState, bool) {
+	a := runtimeContext.api
+	state, err := runtimeContext.onboardingStore().OnboardingState()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return store.OnboardingState{}, false
 	}
-	if err := validateOnboardingState(state); err != nil {
+	if err := validateRuntimeOnboardingState(runtimeContext.registry, state); err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return store.OnboardingState{}, false
 	}
@@ -1276,11 +1300,12 @@ func preflightOnboardingProvider(state store.OnboardingState) (upgrade bool, err
 // preflightOnboardingProviderMutation performs every side-effect-free check
 // needed before a provider transition. Callers hold onboardingMutationMu so
 // the state snapshot remains authoritative until they deliberately release it.
-func (a *api) preflightOnboardingProviderMutation(
+func (runtimeContext appRuntimeContext) preflightOnboardingProviderMutation(
 	w http.ResponseWriter,
 	expectedRevision int64,
 ) (store.OnboardingState, bool, store.OnboardingStagingAccount, bool) {
-	state, ok := a.onboardingMutationState(w, expectedRevision)
+	a := runtimeContext.api
+	state, ok := runtimeContext.onboardingMutationState(w, expectedRevision)
 	if !ok {
 		return store.OnboardingState{}, false, store.OnboardingStagingAccount{}, false
 	}
@@ -1292,7 +1317,7 @@ func (a *api) preflightOnboardingProviderMutation(
 	if upgrade {
 		return state, true, store.OnboardingStagingAccount{}, true
 	}
-	owned, err := a.st.OnboardingStagingAccount(expectedRevision)
+	owned, err := runtimeContext.onboardingStore().OnboardingStagingAccount(expectedRevision)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return store.OnboardingState{}, false, store.OnboardingStagingAccount{}, false
@@ -1311,11 +1336,16 @@ func preflightOnboardingRestart(state store.OnboardingState) error {
 // cancelOnboardingConnect cancels only the live job owned by the exact selected kind/revision.
 // Normal Connect and other onboarding contexts are unrelated. Waiting for done is essential:
 // connectJob closes it only after child/process/config cleanup.
-func (a *api) cancelOnboardingConnect(w http.ResponseWriter, ctx context.Context, state store.OnboardingState) bool {
-	if state.ProviderKind == "" || connectMgr == nil {
+func (runtimeContext appRuntimeContext) cancelOnboardingConnect(
+	w http.ResponseWriter,
+	ctx context.Context,
+	state store.OnboardingState,
+) bool {
+	a := runtimeContext.api
+	if state.ProviderKind == "" || runtimeContext.connect == nil {
 		return true
 	}
-	manager := connectMgr
+	manager := runtimeContext.connect
 	manager.mu.Lock()
 	job := manager.job
 	if job == nil || manager.jobKind != state.ProviderKind {
@@ -1382,7 +1412,17 @@ func onboardingStatusResponse(
 	snapshot store.OnboardingSnapshot,
 	suggested string,
 ) (appOnboardingStatusResponse, error) {
-	if err := validateOnboardingSnapshot(snapshot); err != nil {
+	return runtimeOnboardingStatusResponse(
+		productionAppProviderRuntimeRegistry(), snapshot, suggested,
+	)
+}
+
+func runtimeOnboardingStatusResponse(
+	registry appProviderRuntimeRegistry,
+	snapshot store.OnboardingSnapshot,
+	suggested string,
+) (appOnboardingStatusResponse, error) {
+	if err := validateRuntimeOnboardingSnapshot(registry, snapshot); err != nil {
 		return appOnboardingStatusResponse{}, err
 	}
 	state := snapshot.State
@@ -1400,7 +1440,7 @@ func onboardingStatusResponse(
 		projected.AccountID = snapshot.Stages[0].AccountID
 		projected.ModelID = snapshot.Stages[0].ModelID
 	}
-	if projected.ProviderKind != "" || !appProviderSupportsOnboarding(suggested) {
+	if projected.ProviderKind != "" || !registry.supportsOnboarding(suggested) {
 		suggested = ""
 	}
 	providers := make([]appOnboardingProviderResponse, len(snapshot.Stages))
@@ -1427,7 +1467,7 @@ func onboardingStatusResponse(
 		RestartInProgress:     state.RestartInProgress,
 		Revision:              state.Revision,
 		Providers:             providers,
-		ProviderOptions:       appProviderOptions(),
+		ProviderOptions:       registry.onboardingOptions(),
 	}, nil
 }
 
@@ -1441,13 +1481,20 @@ func onboardingUpgradeRequired(state store.OnboardingState) bool {
 // build, so handlers must fail closed before suggesting a route, canceling Connect, or touching a
 // staging directory. Later tasks intentionally own the finer provider/account/model relationships.
 func validateOnboardingState(state store.OnboardingState) error {
+	return validateRuntimeOnboardingState(productionAppProviderRuntimeRegistry(), state)
+}
+
+func validateRuntimeOnboardingState(
+	registry appProviderRuntimeRegistry,
+	state store.OnboardingState,
+) error {
 	if state.Revision <= 0 {
 		return errors.New("onboarding state has a nonpositive revision")
 	}
 	if state.CompletedVersion < 0 {
 		return errors.New("onboarding state has a negative completed version")
 	}
-	if state.ProviderKind != "" && !appProviderSupportsOnboarding(state.ProviderKind) {
+	if state.ProviderKind != "" && !registry.supportsOnboarding(state.ProviderKind) {
 		return errors.New("onboarding state has an unsupported selected provider")
 	}
 
@@ -1457,7 +1504,7 @@ func validateOnboardingState(state store.OnboardingState) error {
 		store.OnboardingPhaseSetup,
 		store.OnboardingPhasePersona,
 		store.OnboardingPhaseTest:
-		if !appProviderSupportsOnboarding(state.ProviderKind) {
+		if !registry.supportsOnboarding(state.ProviderKind) {
 			return errors.New("onboarding phase requires a selected provider")
 		}
 	case store.OnboardingPhaseCompleted:
@@ -1480,6 +1527,13 @@ func validateOnboardingState(state store.OnboardingState) error {
 }
 
 func validateOnboardingSnapshot(snapshot store.OnboardingSnapshot) error {
+	return validateRuntimeOnboardingSnapshot(productionAppProviderRuntimeRegistry(), snapshot)
+}
+
+func validateRuntimeOnboardingSnapshot(
+	registry appProviderRuntimeRegistry,
+	snapshot store.OnboardingSnapshot,
+) error {
 	state := snapshot.State
 	if state.Revision <= 0 {
 		return errors.New("onboarding snapshot has a nonpositive revision")
@@ -1487,7 +1541,7 @@ func validateOnboardingSnapshot(snapshot store.OnboardingSnapshot) error {
 	if state.CompletedVersion < 0 {
 		return errors.New("onboarding snapshot has a negative completed version")
 	}
-	if state.ProviderKind != "" && !appProviderSupportsOnboarding(state.ProviderKind) {
+	if state.ProviderKind != "" && !registry.supportsOnboarding(state.ProviderKind) {
 		return errors.New("onboarding snapshot has an unsupported active Provider")
 	}
 	if state.ProviderKind == "" &&
@@ -1513,7 +1567,7 @@ func validateOnboardingSnapshot(snapshot store.OnboardingSnapshot) error {
 			return errors.New("onboarding Provider has an unknown status")
 		}
 	}
-	canonical, err := appCanonicalOnboardingKinds(kinds)
+	canonical, err := registry.canonicalOnboardingKinds(kinds)
 	if err != nil || !slicesEqualStrings(canonical, kinds) {
 		return errors.New("onboarding Provider stages are not canonical")
 	}
@@ -1542,13 +1596,13 @@ func validateOnboardingSnapshot(snapshot store.OnboardingSnapshot) error {
 		}
 	case store.OnboardingPhaseConnect:
 		stage, selected := stageForKind(state.ProviderKind)
-		if !appProviderSupportsOnboarding(state.ProviderKind) || !selected || stage.Status != "pending" ||
+		if !registry.supportsOnboarding(state.ProviderKind) || !selected || stage.Status != "pending" ||
 			state.ProviderID != "" || state.AccountID != "" || state.ModelID != "" || !activeReceiptClean {
 			return errors.New("Connect phase does not own one selected pending Provider")
 		}
 	case store.OnboardingPhaseSetup:
 		stage, selected := stageForKind(state.ProviderKind)
-		if !appProviderSupportsOnboarding(state.ProviderKind) || !selected || stage.Status != "pending" ||
+		if !registry.supportsOnboarding(state.ProviderKind) || !selected || stage.Status != "pending" ||
 			state.ProviderID == "" || state.AccountID == "" || state.ModelID != "" || !activeReceiptClean {
 			return errors.New("Setup phase has inconsistent active Provider identity")
 		}
@@ -1594,7 +1648,8 @@ func slicesEqualStrings(left, right []string) bool {
 	return true
 }
 
-func (a *api) suggestedOnboardingProviderKind() (string, error) {
+func (runtimeContext appRuntimeContext) suggestedOnboardingProviderKind() (string, error) {
+	a := runtimeContext.api
 	route, err := a.st.LLMRoute()
 	if err != nil {
 		return "", err
@@ -1614,24 +1669,32 @@ func (a *api) suggestedOnboardingProviderKind() (string, error) {
 		return "", err
 	}
 	for _, provider := range providers {
-		if provider.ID == providerID && appProviderSupportsOnboarding(provider.Kind) {
+		if provider.ID == providerID && runtimeContext.registry.supportsOnboarding(provider.Kind) {
 			return provider.Kind, nil
 		}
 	}
 	return "", nil
 }
 
-func (a *api) writeOnboardingStatus(w http.ResponseWriter, _ store.OnboardingState) {
-	snapshot, err := a.st.OnboardingSnapshot()
+func (runtimeContext appRuntimeContext) writeOnboardingStatus(
+	w http.ResponseWriter,
+	_ store.OnboardingState,
+) {
+	a := runtimeContext.api
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	a.writeOnboardingSnapshot(w, snapshot)
+	runtimeContext.writeOnboardingSnapshot(w, snapshot)
 }
 
-func (a *api) writeOnboardingSnapshot(w http.ResponseWriter, snapshot store.OnboardingSnapshot) {
-	response, err := onboardingStatusResponse(snapshot, "")
+func (runtimeContext appRuntimeContext) writeOnboardingSnapshot(
+	w http.ResponseWriter,
+	snapshot store.OnboardingSnapshot,
+) {
+	a := runtimeContext.api
+	response, err := runtimeOnboardingStatusResponse(runtimeContext.registry, snapshot, "")
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
@@ -1719,10 +1782,20 @@ func validateOnboardingStagingConfigDir(
 	dataDir string,
 	staged store.OnboardingStagingAccount,
 ) error {
+	return validateRuntimeOnboardingStagingConfigDir(
+		productionAppProviderRuntimeRegistry(), dataDir, staged,
+	)
+}
+
+func validateRuntimeOnboardingStagingConfigDir(
+	registry appProviderRuntimeRegistry,
+	dataDir string,
+	staged store.OnboardingStagingAccount,
+) error {
 	unsafe := func(reason string) error {
 		return fmt.Errorf("%w: %s", store.ErrOnboardingInvalidStagingOwnership, reason)
 	}
-	if !appProviderSupportsOnboarding(staged.ProviderKind) ||
+	if !registry.supportsOnboarding(staged.ProviderKind) ||
 		!validOnboardingAccountID(staged.AccountID) || staged.ProviderID != staged.ProviderKind ||
 		staged.ConfigDir == "" || filepath.Clean(staged.ConfigDir) != staged.ConfigDir {
 		return unsafe("unsafe staging account identity or config path")
@@ -1769,10 +1842,20 @@ func validateOnboardingStagingConfigDir(
 // cannot redirect it to another pathname. Every owned path component must be a real directory;
 // links and Windows junctions are rejected even when they resolve inside the data directory.
 func removeOwnedOnboardingAccount(dataDir string, owned store.OnboardingStagingAccount) error {
+	return removeRuntimeOwnedOnboardingAccount(
+		productionAppProviderRuntimeRegistry(), dataDir, owned,
+	)
+}
+
+func removeRuntimeOwnedOnboardingAccount(
+	registry appProviderRuntimeRegistry,
+	dataDir string,
+	owned store.OnboardingStagingAccount,
+) error {
 	if owned == (store.OnboardingStagingAccount{}) {
 		return nil
 	}
-	if !appProviderSupportsOnboarding(owned.ProviderKind) ||
+	if !registry.supportsOnboarding(owned.ProviderKind) ||
 		!validOnboardingAccountID(owned.AccountID) || owned.ConfigDir == "" {
 		return errOnboardingUnsafeAccountPath
 	}

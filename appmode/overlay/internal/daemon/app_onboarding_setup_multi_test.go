@@ -14,6 +14,26 @@ import (
 
 func TestAppOnboardingSetupMultiReturnsStandardStatusAndRetriesWithoutRediscovery(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
+	discoveryCalls := 0
+	registrations := appProductionProviderRuntimeRegistrations()
+	codex := runtimeOnboardingRegistration(t, registrations, "codex")
+	baseSelector := codex.SelectOnboardingModel
+	codex.SelectOnboardingModel = func(st *store.Store, providerID string) (string, error) {
+		discoveryCalls++
+		return baseSelector(st, providerID)
+	}
+	registry, err := newAppProviderRuntimeRegistry(
+		productionAppProviderRuntimeRegistry().Catalog().Options(), registrations,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeContext := appRuntimeContext{
+		api: env.a, registry: registry, connect: env.a.newConnectManager(),
+	}
+	mux := http.NewServeMux()
+	registerAppRoutesWithContext(mux, runtimeContext)
+	env.mux = mux
 	selected, err := env.a.st.ReplaceOnboardingProviderSelection(1, []string{"claude-code", "codex"})
 	if err != nil {
 		t.Fatal(err)
@@ -23,13 +43,6 @@ func TestAppOnboardingSetupMultiReturnsStandardStatusAndRetriesWithoutRediscover
 	)
 	addAppOnboardingMultiModelForTest(t, env, "codex", "gpt-5.6-terra", true)
 
-	oldSelect := appSelectOnboardingModel
-	discoveryCalls := 0
-	appSelectOnboardingModel = func(st *store.Store, kind, providerID string) (string, error) {
-		discoveryCalls++
-		return selectOnboardingModel(st, kind, providerID)
-	}
-	t.Cleanup(func() { appSelectOnboardingModel = oldSelect })
 	body := fmt.Sprintf(`{"revision":%d,"kind":"codex","account_id":%q}`, codexBase, codexAccount.ID)
 	first := env.serve(http.MethodPost, "/onboarding/setup", body)
 	if first.Code != http.StatusOK {

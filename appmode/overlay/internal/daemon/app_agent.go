@@ -568,7 +568,8 @@ func (a *api) handleAgentGet(w http.ResponseWriter, _ *http.Request) {
 // cố định trong mã chứ không phải một ô cấu hình: một cú bấm thêm quyền Write cho con agent đang
 // tự động trả lời khách trong nhóm đông là thứ không có đường lùi. Muốn đổi thì phải sửa mã và
 // build lại — đó là chủ đích, không phải thiếu sót.
-func (a *api) handleAgentPut(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleAgentPut(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var req appAgentPutRequest
 	if err := readJSON(w, r, &req); err != nil {
 		a.writeErr(w, http.StatusBadRequest, err.Error())
@@ -597,7 +598,7 @@ func (a *api) handleAgentPut(w http.ResponseWriter, r *http.Request) {
 		if !a.requireOnboardingRevision(w, req.OnboardingRevision) {
 			return
 		}
-		a.handleAgentCompletePut(w, req.OnboardingRevision, values, displayName)
+		runtimeContext.handleAgentCompletePut(w, req.OnboardingRevision, values, displayName)
 		return
 	}
 	if len(values) == 0 {
@@ -770,12 +771,13 @@ func (a *api) handleAgentNormalPut(w http.ResponseWriter, values map[string]stri
 	})
 }
 
-func (a *api) handleAgentCompletePut(
+func (runtimeContext appRuntimeContext) handleAgentCompletePut(
 	w http.ResponseWriter,
 	expectedRevision int64,
 	values map[string]string,
 	displayName string,
 ) {
+	a := runtimeContext.api
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
 
@@ -788,12 +790,12 @@ func (a *api) handleAgentCompletePut(
 		a.writeAgentRollbackFailed(w, err)
 		return
 	}
-	snapshot, err := a.st.OnboardingSnapshot()
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err == nil {
 		if len(snapshot.Stages) == 0 {
-			err = validateOnboardingState(snapshot.State)
+			err = validateRuntimeOnboardingState(runtimeContext.registry, snapshot.State)
 		} else {
-			err = validateOnboardingSnapshot(snapshot)
+			err = validateRuntimeOnboardingSnapshot(runtimeContext.registry, snapshot)
 		}
 	}
 	if err != nil {
@@ -878,6 +880,20 @@ func (a *api) handleAgentCompletePut(
 			return
 		}
 	}
+	committed, err := runtimeContext.onboardingStore().OnboardingSnapshot()
+	validationErr := err
+	if validationErr == nil {
+		if len(committed.Stages) == 0 {
+			validationErr = validateRuntimeOnboardingState(runtimeContext.registry, committed.State)
+		} else {
+			validationErr = validateRuntimeOnboardingSnapshot(runtimeContext.registry, committed)
+		}
+	}
+	if validationErr != nil || committed.State != updated {
+		a.writeOnboardingStateUnavailable(w, errors.New("onboarding Persona post-write validation failed"))
+		return
+	}
+	updated = committed.State
 	a.zlog.add(ipc.ZaloLogInfo, "", fmt.Sprintf("văn phong: đã điền %d chỗ, sẵn sàng kiểm tra", len(keys)))
 	a.writeJSON(w, http.StatusOK, map[string]any{
 		"placeholders":        []placeholder{},

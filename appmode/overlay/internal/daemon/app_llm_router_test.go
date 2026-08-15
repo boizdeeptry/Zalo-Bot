@@ -2348,29 +2348,30 @@ func TestChainFallsFromHTTPToCLI(t *testing.T) {
 }
 
 func TestOnboardingPinnedAccountRouterUsesOnlyStagedCodexConfigAndModel(t *testing.T) {
-	const configDir = `C:\accounts\staged`
-	var gotConfigDir, gotModel, gotPrompt string
-	oldFactory := appOnboardingNewLLMAdapter
-	appOnboardingNewLLMAdapter = func(
-		kind, providerID string,
-		client *http.Client,
-		logger *slog.Logger,
-	) (providerAdapter, bool) {
-		if kind != "codex" || providerID != "codex" {
-			return nil, false
-		}
-		adapter := &codexProxyAdapter{providerID: providerID, client: client, logger: logger}
-		adapter.generate = func(
-			_ context.Context,
-			_ *http.Client,
-			configDir, model, prompt string,
-		) (string, int, error) {
-			gotConfigDir, gotModel, gotPrompt = configDir, model, prompt
-			return "Xin chào, tôi là Bé Mi.", http.StatusOK, nil
-		}
-		return adapter, true
+	env := newOnboardingRouteTestEnv(t)
+	configDir := accountConfigDir(env.dataDir, "codex", "staged")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { appOnboardingNewLLMAdapter = oldFactory })
+	var gotConfigDir, gotModel, gotPrompt string
+	registrations := appProductionProviderRuntimeRegistrations()
+	codex := runtimeOnboardingRegistration(t, registrations, "codex")
+	codex.NewOnboardingMember = func(
+		_ *api,
+		entry store.OnboardingTestRouteEntry,
+	) (appOnboardingMemberRun, error) {
+		gotConfigDir, gotModel = entry.ConfigDir, entry.ModelID
+		return func(_ context.Context, prompt string, _ func(string)) (string, error) {
+			gotPrompt = prompt
+			return "Xin chào, tôi là Bé Mi.", nil
+		}, nil
+	}
+	registry, err := newAppProviderRuntimeRegistry(
+		productionAppProviderRuntimeRegistry().Catalog().Options(), registrations,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	route := store.OnboardingTestRoute{
 		DisplayName: "Bé Mi",
 		Entries: []store.OnboardingTestRouteEntry{{
@@ -2379,7 +2380,7 @@ func TestOnboardingPinnedAccountRouterUsesOnlyStagedCodexConfigAndModel(t *testi
 		}},
 	}
 	runner, err := newAppOnboardingTestRunner(
-		context.Background(), &api{logger: slog.New(slog.DiscardHandler)}, route,
+		context.Background(), appRuntimeContext{api: env.a, registry: registry}, route,
 	)
 	if err != nil {
 		t.Fatalf("newAppOnboardingTestRunner() = %v", err)

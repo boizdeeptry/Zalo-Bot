@@ -1081,12 +1081,21 @@ func withAppOnboardingTestSeams(
 	switch execute := execute.(type) {
 	case appOnboardingTestExecutor:
 		appOnboardingTestExecute = execute
-	case func(context.Context, *api, store.OnboardingTestRoute, string) (appOnboardingTestResult, error):
+	case func(context.Context, appRuntimeContext, store.OnboardingTestRoute, string) (appOnboardingTestResult, error):
 		appOnboardingTestExecute = appOnboardingTestExecutor(execute)
+	case func(context.Context, *api, store.OnboardingTestRoute, string) (appOnboardingTestResult, error):
+		appOnboardingTestExecute = func(
+			ctx context.Context,
+			runtimeContext appRuntimeContext,
+			route store.OnboardingTestRoute,
+			prompt string,
+		) (appOnboardingTestResult, error) {
+			return execute(ctx, runtimeContext.api, route, prompt)
+		}
 	case func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error):
 		appOnboardingTestExecute = func(
 			ctx context.Context,
-			a *api,
+			runtimeContext appRuntimeContext,
 			route store.OnboardingTestRoute,
 			prompt string,
 		) (appOnboardingTestResult, error) {
@@ -1098,7 +1107,7 @@ func withAppOnboardingTestSeams(
 				AccountID: entry.AccountID, ProviderID: entry.ProviderID,
 				ProviderKind: entry.Kind, ConfigDir: entry.ConfigDir,
 			}
-			answer, err := execute(ctx, a, route.State, staged, prompt)
+			answer, err := execute(ctx, runtimeContext.api, route.State, staged, prompt)
 			return appOnboardingTestResult{
 				Answer: answer, ProviderID: entry.ProviderID,
 				ModelID: entry.ModelID, Position: entry.Position,

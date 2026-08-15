@@ -500,7 +500,7 @@ func appOnboardingReadyMemberForTest(
 
 func withAppOnboardingTestResultSeams(
 	t *testing.T,
-	execute appOnboardingTestExecutor,
+	execute any,
 	now func() time.Time,
 	random appOnboardingTestRandomFunc,
 	timeout time.Duration,
@@ -511,7 +511,23 @@ func withAppOnboardingTestResultSeams(
 	oldRandom := appOnboardingTestRandom
 	oldTimeout := appOnboardingTestTimeout
 	oldAfterCommit := appOnboardingTestAfterCommit
-	appOnboardingTestExecute = execute
+	switch execute := execute.(type) {
+	case appOnboardingTestExecutor:
+		appOnboardingTestExecute = execute
+	case func(context.Context, appRuntimeContext, store.OnboardingTestRoute, string) (appOnboardingTestResult, error):
+		appOnboardingTestExecute = appOnboardingTestExecutor(execute)
+	case func(context.Context, *api, store.OnboardingTestRoute, string) (appOnboardingTestResult, error):
+		appOnboardingTestExecute = func(
+			ctx context.Context,
+			runtimeContext appRuntimeContext,
+			route store.OnboardingTestRoute,
+			prompt string,
+		) (appOnboardingTestResult, error) {
+			return execute(ctx, runtimeContext.api, route, prompt)
+		}
+	default:
+		t.Fatalf("unsupported onboarding Test result seam %T", execute)
+	}
 	appOnboardingTestNow = now
 	appOnboardingTestRandom = random
 	appOnboardingTestTimeout = timeout

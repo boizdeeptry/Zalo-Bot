@@ -693,6 +693,7 @@ func appProductionProviderRuntimeRegistrations() []appProviderRuntimeRegistratio
 		appProductionAccountRuntime(
 			"codex", "Codex", "Kết nối tài khoản ChatGPT/Codex trên máy này",
 			"cx", "#0f7a63", 10, 10, true, appProviderExecutionProxy,
+			appProductionCodexOnboardingMemberFactory,
 			func(providerID string, st *store.Store, client *http.Client, logger *slog.Logger) (providerAdapter, error) {
 				if st == nil {
 					return nil, errors.New("Codex adapter requires a Store")
@@ -741,6 +742,7 @@ func appProductionAccountRuntime(
 	catalogRank int,
 	recommended bool,
 	execution appProviderExecutionMode,
+	onboardingMember appOnboardingMemberFactory,
 	adapter appProviderAdapterFactory,
 ) appProviderRuntimeRegistration {
 	return appProviderRuntimeRegistration{
@@ -764,7 +766,7 @@ func appProductionAccountRuntime(
 		SelectOnboardingModel: func(st *store.Store, providerID string) (string, error) {
 			return selectOnboardingModel(st, kind, providerID)
 		},
-		NewOnboardingMember: appProductionOnboardingMemberFactory(kind),
+		NewOnboardingMember: onboardingMember,
 		NewAdapter:          adapter,
 	}
 }
@@ -772,7 +774,8 @@ func appProductionAccountRuntime(
 func appProductionClaudeRuntime() appProviderRuntimeRegistration {
 	registration := appProductionAccountRuntime(
 		"claude-code", "Claude Code", "Kết nối tài khoản Claude Code trên máy này",
-		"cc", "#c8613b", 20, 100, false, appProviderExecutionOfficialCLI, nil,
+		"cc", "#c8613b", 20, 100, false, appProviderExecutionOfficialCLI,
+		appProductionClaudeOnboardingMemberFactory, nil,
 	)
 	registration.Metadata.AttachmentPolicy = appProviderAttachmentLocal
 	registration.Terminal = func(
@@ -813,17 +816,6 @@ func appProductionClaudeRuntime() appProviderRuntimeRegistration {
 		}
 	}
 	return registration
-}
-
-func appProductionOnboardingMemberFactory(kind string) appOnboardingMemberFactory {
-	return func(a *api, entry store.OnboardingTestRouteEntry) (appOnboardingMemberRun, error) {
-		if a == nil || entry.Kind != kind {
-			return nil, store.ErrOnboardingInvalidStagingOwnership
-		}
-		return func(ctx context.Context, prompt string, step func(string)) (string, error) {
-			return runAppOnboardingReadyMember(ctx, a, entry, prompt, step)
-		}, nil
-	}
 }
 
 func appProductionCredentialRuntime(
