@@ -2348,49 +2348,51 @@ func TestChainFallsFromHTTPToCLI(t *testing.T) {
 }
 
 func TestOnboardingPinnedAccountRouterUsesOnlyStagedCodexConfigAndModel(t *testing.T) {
-	state := store.OnboardingState{
-		Phase: store.OnboardingPhaseTest, ProviderKind: "codex", ProviderID: "codex",
-		AccountID: "staged", ModelID: "gpt-5.6-terra", StagedComboID: "staged-combo",
-		PersonaFingerprint: strings.Repeat("a", 64), Revision: 9,
+	const configDir = `C:\accounts\staged`
+	var gotConfigDir, gotModel, gotPrompt string
+	oldFactory := appOnboardingNewLLMAdapter
+	appOnboardingNewLLMAdapter = func(
+		kind, providerID string,
+		client *http.Client,
+		logger *slog.Logger,
+	) (providerAdapter, bool) {
+		if kind != "codex" || providerID != "codex" {
+			return nil, false
+		}
+		adapter := &codexProxyAdapter{providerID: providerID, client: client, logger: logger}
+		adapter.generate = func(
+			_ context.Context,
+			_ *http.Client,
+			configDir, model, prompt string,
+		) (string, int, error) {
+			gotConfigDir, gotModel, gotPrompt = configDir, model, prompt
+			return "Xin chào, tôi là Bé Mi.", http.StatusOK, nil
+		}
+		return adapter, true
 	}
-	staged := store.OnboardingStagingAccount{
-		AccountID: "staged", ProviderID: "codex", ProviderKind: "codex",
-		ConfigDir: `C:\accounts\staged`,
+	t.Cleanup(func() { appOnboardingNewLLMAdapter = oldFactory })
+	route := store.OnboardingTestRoute{
+		DisplayName: "Bé Mi",
+		Entries: []store.OnboardingTestRouteEntry{{
+			Position: 0, Kind: "codex", ProviderID: "codex", AccountID: "staged",
+			ModelID: "gpt-5.6-terra", ConfigDir: configDir,
+		}},
 	}
 	runner, err := newAppOnboardingTestRunner(
-		context.Background(),
-		&api{logger: slog.New(slog.DiscardHandler)},
-		state,
-		staged,
+		context.Background(), &api{logger: slog.New(slog.DiscardHandler)}, route,
 	)
 	if err != nil {
 		t.Fatalf("newAppOnboardingTestRunner() = %v", err)
 	}
-	if runner.cfg.Route.Type != "fallback" || runner.cfg.Route.ComboID != "staged-combo" ||
-		len(runner.cfg.Route.Entries) != 1 {
-		t.Fatalf("isolated route = %+v", runner.cfg.Route)
+	got, err := runner.Run(context.Background(), "exact prompt", func(string) {})
+	if err != nil {
+		t.Fatalf("Task6 runner = %v", err)
 	}
-	entry := runner.cfg.Route.Entries[0]
-	if entry.Position != 0 || entry.ProviderID != "codex" ||
-		entry.ModelID != "gpt-5.6-terra" || !entry.Enabled {
-		t.Fatalf("isolated route entry = %+v", entry)
+	if got.ProviderID != "codex" || got.ModelID != "gpt-5.6-terra" || got.Position != 0 {
+		t.Fatalf("Task6 runner result = %+v", got)
 	}
-	if len(runner.cfg.Adapters) != 1 || runner.cfg.Disabled["codex"] {
-		t.Fatalf("isolated adapters/disabled = %v/%v", runner.cfg.Adapters, runner.cfg.Disabled)
-	}
-	adapter, ok := runner.cfg.Adapters["codex"].(*codexProxyAdapter)
-	if !ok {
-		t.Fatalf("codex adapter = %T; want *codexProxyAdapter", runner.cfg.Adapters["codex"])
-	}
-	for i := 0; i < 3; i++ {
-		configDir, penalize, ok := adapter.pickConfigDir()
-		if !ok || configDir != staged.ConfigDir || penalize == nil {
-			t.Fatalf("pinned config %d = %q, penalize-nil=%t, ok=%t", i, configDir, penalize == nil, ok)
-		}
-		penalize(true)
-	}
-	if _, ok := runner.cfg.Store.(appOnboardingNoopAttemptStore); !ok {
-		t.Fatalf("attempt sink = %T; want onboarding no-op", runner.cfg.Store)
+	if gotConfigDir != configDir || gotModel != "gpt-5.6-terra" || gotPrompt != "exact prompt" {
+		t.Fatalf("pinned call config/model/prompt = %q/%q/%q", gotConfigDir, gotModel, gotPrompt)
 	}
 }
 

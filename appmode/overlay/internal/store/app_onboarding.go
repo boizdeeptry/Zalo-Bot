@@ -117,6 +117,7 @@ type CompleteOnboardingInput struct {
 	Revision           int64
 	TestNonceHash      string
 	PersonaFingerprint string
+	RouteFingerprint   string
 	StagingConfigDir   string
 	Now                time.Time
 }
@@ -841,173 +842,6 @@ WHERE id = 1 AND revision = ? AND phase = ?`,
 	return updated, nil
 }
 
-// SaveOnboardingTestReceipt atomically records proof that the exact staged
-// provider/model/persona revision produced an acceptable test answer. Only the
-// SHA-256 digest of the opaque receipt enters the database.
-func (s *Store) SaveOnboardingTestReceipt(
-	ctx context.Context,
-	expectedRevision int64,
-	personaFingerprint string,
-	nonceHash string,
-	policy OnboardingTestReceiptPolicy,
-) (OnboardingState, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return OnboardingState{}, fmt.Errorf("begin onboarding test receipt: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if !validOnboardingSHA256Hex(nonceHash) || !validOnboardingTestReceiptPolicy(policy) {
-		return OnboardingState{}, ErrOnboardingInvalidTestReceipt
-	}
-
-	state, err := onboardingStateInTxContext(ctx, tx)
-	if err != nil {
-		return OnboardingState{}, err
-	}
-	if state.Revision != expectedRevision {
-		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
-	}
-	if state.Phase != OnboardingPhaseTest ||
-		(state.CompletedVersion >= CurrentOnboardingVersion && !state.RestartInProgress) {
-		return OnboardingState{}, fmt.Errorf(
-			"save onboarding test receipt from %q: %w",
-			state.Phase,
-			ErrOnboardingInvalidPhase,
-		)
-	}
-	if personaFingerprint == "" || state.PersonaFingerprint != personaFingerprint {
-		return OnboardingState{}, ErrOnboardingPersonaMismatch
-	}
-	if !IsOnboardingProviderKind(state.ProviderKind) ||
-		state.ProviderID == "" || state.ProviderID != state.ProviderKind ||
-		state.AccountID == "" || state.ModelID == "" || state.StagedComboID == "" {
-		return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
-	}
-	if _, err := onboardingStagingAccountInTxContext(ctx, tx, state); err != nil {
-		return OnboardingState{}, err
-	}
-
-	var available int64
-	err = tx.QueryRowContext(ctx, `SELECT available FROM llm_models
-WHERE provider_id = ? AND model_id = ?`, state.ProviderID, state.ModelID).Scan(&available)
-	if errors.Is(err, sql.ErrNoRows) {
-		return OnboardingState{}, ErrOnboardingModelUnavailable
-	}
-	if err != nil {
-		return OnboardingState{}, fmt.Errorf(
-			"read onboarding test model %q/%q: %w",
-			state.ProviderID,
-			state.ModelID,
-			err,
-		)
-	}
-	if available != 1 {
-		return OnboardingState{}, ErrOnboardingModelUnavailable
-	}
-	var displayName string
-	if err := tx.QueryRowContext(ctx, `SELECT value FROM app_meta WHERE key = ?`, agentDisplayNameMetaKey).Scan(&displayName); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
-		}
-		return OnboardingState{}, fmt.Errorf("read onboarding test display name: %w", err)
-	}
-	if strings.TrimSpace(displayName) == "" {
-		return OnboardingState{}, ErrOnboardingInvalidStagingOwnership
-	}
-
-	expiresText := policy.ExpiresAt.Format(time.RFC3339Nano)
-	updatedAt := ts(policy.IssuedAt)
-	result, err := tx.ExecContext(ctx, `UPDATE app_onboarding_state SET
-test_nonce_hash = ?, test_expires_at = ?, revision = revision + 1, updated_at = ?
-WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
-  AND provider_id = ? AND account_id = ? AND model_id = ? AND staged_combo_id = ?
-  AND persona_fingerprint = ?`,
-		nonceHash,
-		expiresText,
-		updatedAt,
-		expectedRevision,
-		OnboardingPhaseTest,
-		state.ProviderKind,
-		state.ProviderID,
-		state.AccountID,
-		state.ModelID,
-		state.StagedComboID,
-		personaFingerprint,
-	)
-	if err != nil {
-		return OnboardingState{}, fmt.Errorf("save onboarding test receipt: %w", err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return OnboardingState{}, fmt.Errorf("read onboarding test receipt result: %w", err)
-	}
-	if changed != 1 {
-		return OnboardingState{}, ErrOnboardingConflict
-	}
-	updated, err := onboardingStateInTxContext(ctx, tx)
-	if err != nil {
-		return OnboardingState{}, err
-	}
-	onboardingTestReceiptBeforeCommit(ctx)
-	if err := ctx.Err(); err != nil {
-		return OnboardingState{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return OnboardingState{}, fmt.Errorf("commit onboarding test receipt: %w", err)
-	}
-	return updated, nil
-}
-
-// ClearOnboardingTestReceipt compensates a committed receipt only when every
-// captured binding still matches. A newer retry or any state transition makes
-// the CAS fail, so cancellation cleanup can never erase a later success.
-func (s *Store) ClearOnboardingTestReceipt(
-	ctx context.Context,
-	expectedRevision int64,
-	personaFingerprint string,
-	nonceHash string,
-	policy OnboardingTestReceiptPolicy,
-) (OnboardingState, error) {
-	if expectedRevision < 1 || personaFingerprint == "" ||
-		!validOnboardingSHA256Hex(nonceHash) || !validOnboardingTestReceiptPolicy(policy) {
-		return OnboardingState{}, ErrOnboardingInvalidTestReceipt
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return OnboardingState{}, fmt.Errorf("begin onboarding receipt compensation: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	result, err := tx.ExecContext(ctx, `UPDATE app_onboarding_state SET
-test_nonce_hash = '', test_expires_at = '', revision = revision + 1, updated_at = ?
-WHERE id = 1 AND revision = ? AND phase = ? AND persona_fingerprint = ?
-  AND test_nonce_hash = ? AND test_expires_at = ?`,
-		ts(policy.IssuedAt), expectedRevision, OnboardingPhaseTest, personaFingerprint,
-		nonceHash, policy.ExpiresAt.Format(time.RFC3339Nano),
-	)
-	if err != nil {
-		return OnboardingState{}, fmt.Errorf("clear onboarding test receipt: %w", err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return OnboardingState{}, fmt.Errorf("read onboarding receipt compensation result: %w", err)
-	}
-	if changed != 1 {
-		return OnboardingState{}, ErrOnboardingConflict
-	}
-	updated, err := onboardingStateInTxContext(ctx, tx)
-	if err != nil {
-		return OnboardingState{}, err
-	}
-	if err := ctx.Err(); err != nil {
-		return OnboardingState{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return OnboardingState{}, fmt.Errorf("commit onboarding receipt compensation: %w", err)
-	}
-	return updated, nil
-}
-
 // CompleteOnboarding is the sole owner of onboarding activation. Every validation read and every
 // live routing mutation is performed on the same SQLite transaction, so readers continue to see
 // the previous route until Commit and any failure restores all affected tables together.
@@ -1017,6 +851,7 @@ func (s *Store) CompleteOnboarding(
 ) (OnboardingState, error) {
 	if input.Revision <= 0 || input.PersonaFingerprint == "" ||
 		!validOnboardingSHA256Hex(input.TestNonceHash) ||
+		!validOnboardingSHA256Hex(input.RouteFingerprint) ||
 		!validOnboardingTestReceiptTime(input.Now) {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
@@ -1037,8 +872,32 @@ func (s *Store) CompleteOnboarding(
 		state.TestNonceHash == "" || state.TestExpiresAt == "" {
 		return OnboardingState{}, ErrOnboardingTestRequired
 	}
+	route, err := onboardingTestRouteInTx(ctx, tx, input.Revision)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrOnboardingConflict):
+			return OnboardingState{}, err
+		case errors.Is(err, ErrOnboardingInvalidPhase),
+			errors.Is(err, ErrOnboardingInvalidTestReceipt):
+			return OnboardingState{}, ErrOnboardingTestRequired
+		case errors.Is(err, ErrOnboardingInvalidStagingOwnership),
+			errors.Is(err, ErrOnboardingModelUnavailable),
+			errors.Is(err, ErrOnboardingConfigurationChanged),
+			errors.Is(err, ErrOnboardingProviderUnsupported):
+			return OnboardingState{}, ErrOnboardingConfigurationChanged
+		default:
+			return OnboardingState{}, onboardingCompleteCommitError("read staged Test route", err)
+		}
+	}
+	if route.Fingerprint != input.RouteFingerprint || len(route.Entries) != 1 {
+		return OnboardingState{}, ErrOnboardingConfigurationChanged
+	}
+	boundReceipt, err := OnboardingTestReceiptHash(input.TestNonceHash, route.Fingerprint)
+	if err != nil {
+		return OnboardingState{}, ErrOnboardingTestRequired
+	}
 	storedHash, ok := decodeOnboardingSHA256Hex(state.TestNonceHash)
-	if !ok || subtle.ConstantTimeCompare(storedHash, mustDecodeOnboardingSHA256Hex(input.TestNonceHash)) != 1 {
+	if !ok || subtle.ConstantTimeCompare(storedHash, mustDecodeOnboardingSHA256Hex(boundReceipt)) != 1 {
 		return OnboardingState{}, ErrOnboardingTestRequired
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, state.TestExpiresAt)
@@ -1051,6 +910,12 @@ func (s *Store) CompleteOnboarding(
 	if state.PersonaFingerprint == "" || state.PersonaFingerprint != input.PersonaFingerprint {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
+	persistedState := state
+	entry := route.Entries[0]
+	state.ProviderKind = entry.Kind
+	state.ProviderID = entry.ProviderID
+	state.AccountID = entry.AccountID
+	state.ModelID = entry.ModelID
 	if err := validateOnboardingCompletionState(state); err != nil {
 		return OnboardingState{}, err
 	}
@@ -1202,27 +1067,35 @@ position, provider_id, model_id, enabled
 	if err := runOnboardingCompleteFailpoint(onboardingCompleteStageRouteSync); err != nil {
 		return OnboardingState{}, err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM app_onboarding_provider_stages`); err != nil {
+		return OnboardingState{}, onboardingCompleteCommitError("clear completed Provider stages", err)
+	}
 
 	result, err := tx.ExecContext(ctx, `UPDATE app_onboarding_state SET
 completed_version = ?, phase = ?, staged_combo_id = '', persona_fingerprint = '',
 test_nonce_hash = '', test_expires_at = '', restart_in_progress = 0,
+provider_kind = ?, provider_id = ?, account_id = ?, model_id = ?,
 revision = revision + 1, updated_at = ?
 WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
   AND provider_id = ? AND account_id = ? AND model_id = ? AND staged_combo_id = ?
   AND persona_fingerprint = ? AND test_nonce_hash = ? AND test_expires_at = ?`,
 		CurrentOnboardingVersion,
 		OnboardingPhaseCompleted,
-		ts(input.Now),
-		input.Revision,
-		OnboardingPhaseTest,
 		state.ProviderKind,
 		state.ProviderID,
 		state.AccountID,
 		state.ModelID,
-		state.StagedComboID,
-		state.PersonaFingerprint,
-		state.TestNonceHash,
-		state.TestExpiresAt,
+		ts(input.Now),
+		input.Revision,
+		OnboardingPhaseTest,
+		persistedState.ProviderKind,
+		persistedState.ProviderID,
+		persistedState.AccountID,
+		persistedState.ModelID,
+		persistedState.StagedComboID,
+		persistedState.PersonaFingerprint,
+		persistedState.TestNonceHash,
+		persistedState.TestExpiresAt,
 	)
 	if err != nil {
 		return OnboardingState{}, onboardingCompleteCommitError("update completed singleton", err)

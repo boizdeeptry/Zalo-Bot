@@ -31,6 +31,10 @@ import (
 func TestAppOnboardingTestChatPersistsHashOnlyReceipt(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	state, persona := seedAppOnboardingTestChat(t, env, "codex", 41)
+	route, err := env.a.st.OnboardingTestRoute(context.Background(), state.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
 	const message = "Hãy giới thiệu bạn với tôi"
 	const answer = "Xin chào, tôi là BÉ\n\tMI và rất vui được gặp bạn."
 	fixedNow := time.Date(2026, 8, 11, 8, 0, 0, 123456789, time.UTC)
@@ -84,7 +88,10 @@ func TestAppOnboardingTestChatPersistsHashOnlyReceipt(t *testing.T) {
 
 	after := env.state(t)
 	wantHashBytes := sha256.Sum256([]byte(wantToken))
-	wantHash := hex.EncodeToString(wantHashBytes[:])
+	wantHash, err := store.OnboardingTestReceiptHash(hex.EncodeToString(wantHashBytes[:]), route.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if after.Revision != state.Revision+1 || after.TestNonceHash != wantHash ||
 		after.TestExpiresAt != wantExpiry || after.PersonaFingerprint != state.PersonaFingerprint {
 		t.Fatalf("persisted receipt = %+v; want hash %q", after, wantHash)
@@ -806,7 +813,7 @@ func TestAppOnboardingProviderStaleRevisionDoesNotCancelRunningTest(t *testing.T
 		t.Fatal("test chat did not finish after runner release")
 	}
 	state := env.state(t)
-	if state.Revision != 34 || state.ProviderKind != "codex" || state.TestNonceHash == "" || state.TestExpiresAt == "" {
+	if state.Revision != 34 || state.ProviderKind != "" || state.TestNonceHash == "" || state.TestExpiresAt == "" {
 		t.Fatalf("stale provider request changed or suppressed valid receipt: %+v", state)
 	}
 }
@@ -1021,16 +1028,6 @@ func TestAppOnboardingTestChatCancellationAfterCommitCompensatesReceiptAndAllows
 	if after.Revision != state.Revision+2 || after.TestNonceHash != "" || after.TestExpiresAt != "" {
 		t.Fatalf("post-commit cancellation left an orphan receipt: before=%+v after=%+v", state, after)
 	}
-	env.replaceProviderStages(t, appOnboardingProviderWire{
-		Kind: after.ProviderKind, Status: "ready", ProviderID: after.ProviderID,
-		AccountID: after.AccountID, ModelID: after.ModelID, Position: 0,
-	})
-	projected := after
-	projected.ProviderKind = ""
-	projected.ProviderID = ""
-	projected.AccountID = ""
-	projected.ModelID = ""
-	env.setState(t, projected)
 	status := env.serve(http.MethodGet, "/onboarding/status", "")
 	if status.Code != http.StatusOK {
 		t.Fatalf("status after compensation=%d body=%s", status.Code, status.Body.String())
@@ -1039,9 +1036,6 @@ func TestAppOnboardingTestChatCancellationAfterCommitCompensatesReceiptAndAllows
 	if current.Revision != after.Revision {
 		t.Fatalf("status revision = %d; want compensated revision %d", current.Revision, after.Revision)
 	}
-	env.replaceProviderStages(t)
-	env.setState(t, after)
-
 	appOnboardingTestAfterCommit = func() {}
 	appOnboardingTestRandom = appOnboardingRandomFromReader(bytes.NewReader(bytes.Repeat([]byte{0x33}, 32)))
 	retry := env.serve(http.MethodPost, "/onboarding/test-chat",
@@ -1073,7 +1067,7 @@ func appOnboardingRandomFromReader(r io.Reader) appOnboardingTestRandomFunc {
 
 func withAppOnboardingTestSeams(
 	t *testing.T,
-	execute appOnboardingTestExecutor,
+	execute any,
 	now func() time.Time,
 	random appOnboardingTestRandomFunc,
 	timeout time.Duration,
@@ -1084,7 +1078,35 @@ func withAppOnboardingTestSeams(
 	oldRandom := appOnboardingTestRandom
 	oldTimeout := appOnboardingTestTimeout
 	oldAfterCommit := appOnboardingTestAfterCommit
-	appOnboardingTestExecute = execute
+	switch execute := execute.(type) {
+	case appOnboardingTestExecutor:
+		appOnboardingTestExecute = execute
+	case func(context.Context, *api, store.OnboardingTestRoute, string) (appOnboardingTestResult, error):
+		appOnboardingTestExecute = appOnboardingTestExecutor(execute)
+	case func(context.Context, *api, store.OnboardingState, store.OnboardingStagingAccount, string) (string, error):
+		appOnboardingTestExecute = func(
+			ctx context.Context,
+			a *api,
+			route store.OnboardingTestRoute,
+			prompt string,
+		) (appOnboardingTestResult, error) {
+			if len(route.Entries) == 0 {
+				return appOnboardingTestResult{}, store.ErrOnboardingInvalidStagingOwnership
+			}
+			entry := route.Entries[0]
+			staged := store.OnboardingStagingAccount{
+				AccountID: entry.AccountID, ProviderID: entry.ProviderID,
+				ProviderKind: entry.Kind, ConfigDir: entry.ConfigDir,
+			}
+			answer, err := execute(ctx, a, route.State, staged, prompt)
+			return appOnboardingTestResult{
+				Answer: answer, ProviderID: entry.ProviderID,
+				ModelID: entry.ModelID, Position: entry.Position,
+			}, err
+		}
+	default:
+		t.Fatalf("unsupported onboarding Test seam %T", execute)
+	}
 	appOnboardingTestNow = now
 	appOnboardingTestRandom = random
 	appOnboardingTestTimeout = timeout
@@ -1116,10 +1138,11 @@ func seedAppOnboardingTestChat(
 		ModelID:   map[string]string{"codex": "gpt-5.6-terra", "claude-code": "sonnet"}[kind],
 		Available: true,
 	}})
-	// Task 6 migrates Test Chat and Complete to the ordered ready-stage model.
-	// Keep these pre-Task6 fixtures on their legacy singleton shape so Task 4
-	// does not silently change downstream production behavior.
-	env.replaceProviderStages(t)
+	modelID := map[string]string{"codex": "gpt-5.6-terra", "claude-code": "sonnet"}[kind]
+	env.replaceProviderStages(t, appOnboardingProviderWire{
+		Kind: kind, Status: "ready", ProviderID: kind,
+		AccountID: "staged-account", ModelID: modelID, Position: 0,
+	})
 	const persona = "PERSONA-SECRET: nói ngắn gọn, chân thành."
 	configureAgentPersonaForOnboardingTest(t, env, persona)
 	if err := env.a.st.SetAgentDisplayName("Bé Mi"); err != nil {
@@ -1127,8 +1150,11 @@ func seedAppOnboardingTestChat(
 	}
 	state := env.state(t)
 	state.Phase = store.OnboardingPhaseTest
-	state.ModelID = map[string]string{"codex": "gpt-5.6-terra", "claude-code": "sonnet"}[kind]
-	state.StagedComboID = "staged-combo"
+	state.ProviderKind = ""
+	state.ProviderID = ""
+	state.AccountID = ""
+	state.ModelID = ""
+	state.StagedComboID = appOnboardingCompletionComboIDForTest
 	state.PersonaFingerprint = agentPersonaFingerprint([]byte(persona), "Bé Mi")
 	env.setState(t, state)
 	return env.state(t), persona
@@ -1214,6 +1240,7 @@ func TestAgentCompletesOnboardingWithAuthoritativeNameAndFingerprint(t *testing.
 
 func TestAgentCompleteFromTestEditsPersonaAndInvalidatesReceipt(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
+	state, _ := seedAppOnboardingTestChat(t, env, "codex", 20)
 	original := []byte("Tên {{TEN_BOT}}.\n")
 	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
 	if err := env.a.st.SetAgentDisplayName("Old"); err != nil {
@@ -1221,11 +1248,10 @@ func TestAgentCompleteFromTestEditsPersonaAndInvalidatesReceipt(t *testing.T) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x6a}, 32))
 	digest := sha256.Sum256([]byte(token))
-	env.setState(t, store.OnboardingState{
-		Phase: store.OnboardingPhaseTest, ProviderKind: "codex",
-		PersonaFingerprint: "old-fingerprint", TestNonceHash: fmt.Sprintf("%x", digest[:]),
-		TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 20,
-	})
+	state.PersonaFingerprint = strings.Repeat("b", sha256.Size*2)
+	state.TestNonceHash = fmt.Sprintf("%x", digest[:])
+	state.TestExpiresAt = "2099-08-12T08:00:00Z"
+	env.setState(t, state)
 
 	rr := env.serve(http.MethodPut, "/agent", `{
 "values":{"TEN_BOT":"New"},"display_name":"New","require_complete":true,"onboarding_revision":20}`)
@@ -1246,7 +1272,7 @@ func TestAgentCompleteFromTestEditsPersonaAndInvalidatesReceipt(t *testing.T) {
 	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, wantPersona) {
 		t.Fatalf("persona = %q, %v; want %q", got, err, wantPersona)
 	}
-	state := env.state(t)
+	state = env.state(t)
 	if state.Phase != store.OnboardingPhaseTest || state.Revision != 21 ||
 		state.PersonaFingerprint != framedAgentFingerprintForTest(wantPersona, "New") ||
 		state.TestNonceHash != "" || state.TestExpiresAt != "" {
@@ -1265,24 +1291,24 @@ func TestAgentCompleteFromTestEditsPersonaAndInvalidatesReceipt(t *testing.T) {
 
 func TestAgentCompleteFromTestUnchangedPersonaStillInvalidatesReceipt(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
+	state, _ := seedAppOnboardingTestChat(t, env, "codex", 30)
 	original := []byte("Persona hoàn chỉnh.\n")
 	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
 	if err := env.a.st.SetAgentDisplayName("Bot"); err != nil {
 		t.Fatal(err)
 	}
 	fingerprint := framedAgentFingerprintForTest(original, "Bot")
-	env.setState(t, store.OnboardingState{
-		Phase: store.OnboardingPhaseTest, ProviderKind: "codex",
-		PersonaFingerprint: fingerprint, TestNonceHash: strings.Repeat("ab", sha256.Size),
-		TestExpiresAt: "2099-08-12T08:00:00Z", Revision: 30,
-	})
+	state.PersonaFingerprint = fingerprint
+	state.TestNonceHash = strings.Repeat("ab", sha256.Size)
+	state.TestExpiresAt = "2099-08-12T08:00:00Z"
+	env.setState(t, state)
 
 	rr := env.serve(http.MethodPut, "/agent",
 		`{"values":{},"display_name":"Bot","require_complete":true,"onboarding_revision":30}`)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	state := env.state(t)
+	state = env.state(t)
 	if state.Phase != store.OnboardingPhaseTest || state.Revision != 31 ||
 		state.PersonaFingerprint != fingerprint || state.TestNonceHash != "" || state.TestExpiresAt != "" {
 		t.Fatalf("unchanged Test-phase save = %+v", state)
@@ -2314,6 +2340,9 @@ func seedAppOnboardingSetup(
 	if err := env.a.st.EnsureOnboardingProviderForKind(kind); err != nil {
 		t.Fatalf("EnsureOnboardingProviderForKind(%q) = %v", kind, err)
 	}
+	if _, err := env.db.Exec(`UPDATE llm_providers SET enabled = 0 WHERE id = ?`, kind); err != nil {
+		t.Fatalf("disable staged Provider %q: %v", kind, err)
+	}
 	env.replaceProviderStages(t, appOnboardingProviderWire{
 		Kind: kind, Status: "pending", Position: 0,
 	})
@@ -2398,6 +2427,14 @@ VALUES (0, 'live-provider', 'model', 1)`); err != nil {
 	}
 	token, now := seedAppOnboardingCompletion(t, env, 101, false)
 	hash := sha256.Sum256([]byte(token))
+	stateBefore, err := env.a.st.OnboardingState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBoundHash, err := hex.DecodeString(stateBefore.TestNonceHash)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var comparedLeft, comparedRight []byte
 	oldCompare := appOnboardingCompleteConstantTimeCompare
 	appOnboardingCompleteConstantTimeCompare = func(left, right []byte) int {
@@ -2424,9 +2461,9 @@ VALUES (0, 'live-provider', 'model', 1)`); err != nil {
 	if strings.TrimSpace(rr.Body.String()) != wantBody {
 		t.Fatalf("response = %q; want exact %q", strings.TrimSpace(rr.Body.String()), wantBody)
 	}
-	if !bytes.Equal(comparedLeft, hash[:]) || !bytes.Equal(comparedRight, hash[:]) ||
+	if !bytes.Equal(comparedLeft, wantBoundHash) || !bytes.Equal(comparedRight, wantBoundHash) ||
 		len(comparedLeft) != sha256.Size || len(comparedRight) != sha256.Size {
-		t.Fatalf("constant-time compare inputs = %x / %x; want exact SHA-256 bytes", comparedLeft, comparedRight)
+		t.Fatalf("constant-time compare inputs = %x / %x; want route-bound SHA-256", comparedLeft, comparedRight)
 	}
 	state := env.state(t)
 	if state.Phase != store.OnboardingPhaseCompleted || state.CompletedVersion != store.CurrentOnboardingVersion ||
@@ -2569,6 +2606,36 @@ BEFORE INSERT ON llm_combos BEGIN SELECT RAISE(ABORT, 'COMMIT_SECRET'); END`); e
 	}
 }
 
+func TestAppOnboardingCompleteRouteDatabaseFailureIsPrivateServerError(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	token, now := seedAppOnboardingCompletion(t, env, 116, false)
+	before := env.state(t)
+	if _, err := env.db.Exec(`DROP TABLE llm_models`); err != nil {
+		t.Fatal(err)
+	}
+	oldNow := appOnboardingCompleteNow
+	appOnboardingCompleteNow = func() time.Time { return now }
+	t.Cleanup(func() { appOnboardingCompleteNow = oldNow })
+
+	rr := env.serve(http.MethodPost, "/onboarding/complete",
+		fmt.Sprintf(`{"revision":116,"test_token":%q}`, token))
+	requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_COMMIT_FAILED")
+	for _, private := range []string{
+		token,
+		"no such table",
+		"llm_models",
+		"staged-account",
+		accountConfigDir(env.dataDir, "codex", "staged-account"),
+	} {
+		if strings.Contains(rr.Body.String(), private) {
+			t.Fatalf("route DB failure response leaked %q: %s", private, rr.Body.String())
+		}
+	}
+	if after := env.state(t); after != before {
+		t.Fatalf("route DB read failure changed onboarding state: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestAppOnboardingCompleteAllowsOneConcurrentWinner(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	token, now := seedAppOnboardingCompletion(t, env, 121, false)
@@ -2672,6 +2739,16 @@ func seedAppOnboardingCompletion(
 	if restart {
 		state.CompletedVersion = store.CurrentOnboardingVersion
 	}
+	env.setState(t, state)
+	route, err := env.a.st.OnboardingTestRoute(context.Background(), revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundHash, err := store.OnboardingTestReceiptHash(fmt.Sprintf("%x", digest[:]), route.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.TestNonceHash = boundHash
 	env.setState(t, state)
 	return token, now
 }

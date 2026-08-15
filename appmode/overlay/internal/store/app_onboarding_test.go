@@ -1834,6 +1834,7 @@ func assertOnboardingStagingClearedForTest(t *testing.T, state OnboardingState, 
 func TestSaveOnboardingTestReceiptStoresHashAndExpiresAtomically(t *testing.T) {
 	st := openAppStoreForTest(t)
 	seedOnboardingTestReceiptForTest(t, st, 17)
+	route := mustOnboardingTestRouteForTest(t, st, 17)
 	beforeRouting := onboardingLiveRoutingBytesForTest(t, st)
 	issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
 	expiresAt := issuedAt.Add(10 * time.Minute)
@@ -1841,16 +1842,19 @@ func TestSaveOnboardingTestReceiptStoresHashAndExpiresAtomically(t *testing.T) {
 
 	got, err := st.SaveOnboardingTestReceipt(
 		context.Background(),
-		17,
-		"persona-fingerprint",
+		route,
 		hash,
 		OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: expiresAt},
 	)
 	if err != nil {
 		t.Fatalf("SaveOnboardingTestReceipt() = %v", err)
 	}
+	boundHash, err := OnboardingTestReceiptHash(hash, route.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Phase != OnboardingPhaseTest || got.Revision != 18 ||
-		got.PersonaFingerprint != "persona-fingerprint" || got.TestNonceHash != hash ||
+		got.PersonaFingerprint != onboardingTestPersonaFingerprintForTest || got.TestNonceHash != boundHash ||
 		got.TestExpiresAt != expiresAt.Format(time.RFC3339Nano) {
 		t.Fatalf("saved receipt state = %+v", got)
 	}
@@ -1875,22 +1879,25 @@ func TestSaveOnboardingTestReceiptRejectsInvalidStateAndInputWithoutMutation(t *
 		policy      OnboardingTestReceiptPolicy
 		wantErr     error
 	}{
-		{name: "stale revision", revision: 16, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, wantErr: ErrOnboardingConflict},
-		{name: "wrong phase", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, mutate: func(_ *Store, state *OnboardingState) { state.Phase = OnboardingPhasePersona }, wantErr: ErrOnboardingInvalidPhase},
+		{name: "stale revision", revision: 16, fingerprint: onboardingTestPersonaFingerprintForTest, hash: validHash, policy: validPolicy, wantErr: ErrOnboardingConflict},
+		{name: "wrong phase", revision: 17, fingerprint: onboardingTestPersonaFingerprintForTest, hash: validHash, policy: validPolicy, mutate: func(_ *Store, state *OnboardingState) { state.Phase = OnboardingPhasePersona }, wantErr: ErrOnboardingInvalidPhase},
 		{name: "fingerprint changed", revision: 17, fingerprint: "different", hash: validHash, policy: validPolicy, wantErr: ErrOnboardingPersonaMismatch},
-		{name: "missing combo", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, mutate: func(_ *Store, state *OnboardingState) { state.StagedComboID = "" }, wantErr: ErrOnboardingInvalidStagingOwnership},
-		{name: "enabled account", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, mutate: func(st *Store, _ *OnboardingState) {
+		{name: "missing combo", revision: 17, fingerprint: onboardingTestPersonaFingerprintForTest, hash: validHash, policy: validPolicy, mutate: func(_ *Store, state *OnboardingState) { state.StagedComboID = "" }, wantErr: ErrOnboardingInvalidStagingOwnership},
+		{name: "enabled account", revision: 17, fingerprint: onboardingTestPersonaFingerprintForTest, hash: validHash, policy: validPolicy, mutate: func(st *Store, _ *OnboardingState) {
 			_, _ = st.db.Exec(`UPDATE llm_accounts SET enabled = 1 WHERE id = 'staged-account'`)
 		}, wantErr: ErrOnboardingInvalidStagingOwnership},
-		{name: "unavailable model", revision: 17, fingerprint: "persona-fingerprint", hash: validHash, policy: validPolicy, mutate: func(st *Store, _ *OnboardingState) {
+		{name: "unavailable model", revision: 17, fingerprint: onboardingTestPersonaFingerprintForTest, hash: validHash, policy: validPolicy, mutate: func(st *Store, _ *OnboardingState) {
 			_, _ = st.db.Exec(`UPDATE llm_models SET available = 0 WHERE provider_id = 'codex'`)
 		}, wantErr: ErrOnboardingModelUnavailable},
-		{name: "bad hash", revision: 17, fingerprint: "persona-fingerprint", hash: "not-a-sha256", policy: validPolicy, wantErr: ErrOnboardingInvalidTestReceipt},
+		{name: "bad hash", revision: 17, fingerprint: onboardingTestPersonaFingerprintForTest, hash: "not-a-sha256", policy: validPolicy, wantErr: ErrOnboardingInvalidTestReceipt},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			st := openAppStoreForTest(t)
 			seedOnboardingTestReceiptForTest(t, st, 17)
+			route := mustOnboardingTestRouteForTest(t, st, 17)
+			route.State.Revision = tt.revision
+			route.State.PersonaFingerprint = tt.fingerprint
 			state := mustOnboardingStateForTest(t, st)
 			if tt.mutate != nil {
 				tt.mutate(st, &state)
@@ -1898,7 +1905,7 @@ func TestSaveOnboardingTestReceiptRejectsInvalidStateAndInputWithoutMutation(t *
 			}
 			before := mustOnboardingStateForTest(t, st)
 
-			if _, err := st.SaveOnboardingTestReceipt(context.Background(), tt.revision, tt.fingerprint, tt.hash, tt.policy); !errors.Is(err, tt.wantErr) {
+			if _, err := st.SaveOnboardingTestReceipt(context.Background(), route, tt.hash, tt.policy); !errors.Is(err, tt.wantErr) {
 				t.Fatalf("SaveOnboardingTestReceipt() error = %v; want %v", err, tt.wantErr)
 			}
 			if after := mustOnboardingStateForTest(t, st); after != before {
@@ -1928,12 +1935,12 @@ func TestSaveOnboardingTestReceiptRejectsInvalidExpiryPolicyWithoutMutation(t *t
 		t.Run(tt.name, func(t *testing.T) {
 			st := openAppStoreForTest(t)
 			seedOnboardingTestReceiptForTest(t, st, 17)
+			route := mustOnboardingTestRouteForTest(t, st, 17)
 			before := mustOnboardingStateForTest(t, st)
 
 			_, err := st.SaveOnboardingTestReceipt(
 				context.Background(),
-				17,
-				"persona-fingerprint",
+				route,
 				strings.Repeat("ab", sha256.Size),
 				tt.policy,
 			)
@@ -1972,6 +1979,7 @@ func TestSaveOnboardingTestReceiptCancellationBeforeCommitRollsBack(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			st := openAppStoreForTest(t)
 			seedOnboardingTestReceiptForTest(t, st, 17)
+			route := mustOnboardingTestRouteForTest(t, st, 17)
 			before := mustOnboardingStateForTest(t, st)
 			issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
 			ctx, cancel := tt.context()
@@ -1987,8 +1995,7 @@ func TestSaveOnboardingTestReceiptCancellationBeforeCommitRollsBack(t *testing.T
 
 			_, err := st.SaveOnboardingTestReceipt(
 				ctx,
-				17,
-				"persona-fingerprint",
+				route,
 				strings.Repeat("ab", sha256.Size),
 				OnboardingTestReceiptPolicy{IssuedAt: issuedAt, ExpiresAt: issuedAt.Add(10 * time.Minute)},
 			)
@@ -2005,18 +2012,21 @@ func TestSaveOnboardingTestReceiptCancellationBeforeCommitRollsBack(t *testing.T
 func TestClearOnboardingTestReceiptClearsOnlyExactCommittedReceipt(t *testing.T) {
 	st := openAppStoreForTest(t)
 	seedOnboardingTestReceiptForTest(t, st, 17)
+	route := mustOnboardingTestRouteForTest(t, st, 17)
 	issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
 	policy := NewOnboardingTestReceiptPolicy(issuedAt)
 	hash := strings.Repeat("ab", sha256.Size)
 	saved, err := st.SaveOnboardingTestReceipt(
-		context.Background(), 17, "persona-fingerprint", hash, policy,
+		context.Background(), route, hash, policy,
 	)
 	if err != nil {
 		t.Fatalf("SaveOnboardingTestReceipt() = %v", err)
 	}
 
+	savedRoute := route
+	savedRoute.State = saved
 	cleared, err := st.ClearOnboardingTestReceipt(
-		context.Background(), saved.Revision, "persona-fingerprint", hash, policy,
+		context.Background(), savedRoute, hash, policy,
 	)
 	if err != nil {
 		t.Fatalf("ClearOnboardingTestReceipt() = %v", err)
@@ -2034,10 +2044,10 @@ func TestClearOnboardingTestReceiptMismatchNeverClearsNewerReceipt(t *testing.T)
 		hash        string
 		policy      func(OnboardingTestReceiptPolicy) OnboardingTestReceiptPolicy
 	}{
-		{name: "stale revision", revision: func(saved OnboardingState) int64 { return saved.Revision - 1 }, fingerprint: "persona-fingerprint", hash: strings.Repeat("ab", sha256.Size)},
+		{name: "stale revision", revision: func(saved OnboardingState) int64 { return saved.Revision - 1 }, fingerprint: onboardingTestPersonaFingerprintForTest, hash: strings.Repeat("ab", sha256.Size)},
 		{name: "different fingerprint", revision: func(saved OnboardingState) int64 { return saved.Revision }, fingerprint: "other", hash: strings.Repeat("ab", sha256.Size)},
-		{name: "different hash", revision: func(saved OnboardingState) int64 { return saved.Revision }, fingerprint: "persona-fingerprint", hash: strings.Repeat("cd", sha256.Size)},
-		{name: "different expiry", revision: func(saved OnboardingState) int64 { return saved.Revision }, fingerprint: "persona-fingerprint", hash: strings.Repeat("ab", sha256.Size), policy: func(policy OnboardingTestReceiptPolicy) OnboardingTestReceiptPolicy {
+		{name: "different hash", revision: func(saved OnboardingState) int64 { return saved.Revision }, fingerprint: onboardingTestPersonaFingerprintForTest, hash: strings.Repeat("cd", sha256.Size)},
+		{name: "different expiry", revision: func(saved OnboardingState) int64 { return saved.Revision }, fingerprint: onboardingTestPersonaFingerprintForTest, hash: strings.Repeat("ab", sha256.Size), policy: func(policy OnboardingTestReceiptPolicy) OnboardingTestReceiptPolicy {
 			return NewOnboardingTestReceiptPolicy(policy.IssuedAt.Add(time.Minute))
 		}},
 	}
@@ -2045,11 +2055,12 @@ func TestClearOnboardingTestReceiptMismatchNeverClearsNewerReceipt(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			st := openAppStoreForTest(t)
 			seedOnboardingTestReceiptForTest(t, st, 17)
+			route := mustOnboardingTestRouteForTest(t, st, 17)
 			issuedAt := time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC)
 			policy := NewOnboardingTestReceiptPolicy(issuedAt)
 			hash := strings.Repeat("ab", sha256.Size)
 			saved, err := st.SaveOnboardingTestReceipt(
-				context.Background(), 17, "persona-fingerprint", hash, policy,
+				context.Background(), route, hash, policy,
 			)
 			if err != nil {
 				t.Fatalf("SaveOnboardingTestReceipt() = %v", err)
@@ -2060,8 +2071,12 @@ func TestClearOnboardingTestReceiptMismatchNeverClearsNewerReceipt(t *testing.T)
 				matchPolicy = tt.policy(policy)
 			}
 
+			savedRoute := route
+			savedRoute.State = saved
+			savedRoute.State.Revision = tt.revision(saved)
+			savedRoute.State.PersonaFingerprint = tt.fingerprint
 			_, err = st.ClearOnboardingTestReceipt(
-				context.Background(), tt.revision(saved), tt.fingerprint, tt.hash, matchPolicy,
+				context.Background(), savedRoute, tt.hash, matchPolicy,
 			)
 			if !errors.Is(err, ErrOnboardingConflict) {
 				t.Fatalf("ClearOnboardingTestReceipt() error = %v; want %v", err, ErrOnboardingConflict)
@@ -2076,6 +2091,7 @@ func TestClearOnboardingTestReceiptMismatchNeverClearsNewerReceipt(t *testing.T)
 func TestSaveOnboardingTestReceiptCASFailureRollsBack(t *testing.T) {
 	st := openAppStoreForTest(t)
 	seedOnboardingTestReceiptForTest(t, st, 8)
+	route := mustOnboardingTestRouteForTest(t, st, 8)
 	before := mustOnboardingStateForTest(t, st)
 	if _, err := st.db.Exec(`CREATE TRIGGER fail_onboarding_test_receipt
 BEFORE UPDATE ON app_onboarding_state
@@ -2085,8 +2101,7 @@ BEGIN SELECT RAISE(ABORT, 'injected receipt CAS failure'); END`); err != nil {
 
 	_, err := st.SaveOnboardingTestReceipt(
 		context.Background(),
-		8,
-		"persona-fingerprint",
+		route,
 		strings.Repeat("cd", sha256.Size),
 		OnboardingTestReceiptPolicy{
 			IssuedAt:  time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC),
@@ -2104,6 +2119,7 @@ BEGIN SELECT RAISE(ABORT, 'injected receipt CAS failure'); END`); err != nil {
 func TestSaveOnboardingTestReceiptDoesNotMaskModelReadFailure(t *testing.T) {
 	st := openAppStoreForTest(t)
 	seedOnboardingTestReceiptForTest(t, st, 8)
+	route := mustOnboardingTestRouteForTest(t, st, 8)
 	before := mustOnboardingStateForTest(t, st)
 	if _, err := st.db.Exec(`DROP TABLE llm_models`); err != nil {
 		t.Fatal(err)
@@ -2111,8 +2127,7 @@ func TestSaveOnboardingTestReceiptDoesNotMaskModelReadFailure(t *testing.T) {
 
 	_, err := st.SaveOnboardingTestReceipt(
 		context.Background(),
-		8,
-		"persona-fingerprint",
+		route,
 		strings.Repeat("ef", sha256.Size),
 		OnboardingTestReceiptPolicy{
 			IssuedAt:  time.Date(2099, 8, 11, 8, 0, 0, 0, time.UTC),
@@ -2127,9 +2142,14 @@ func TestSaveOnboardingTestReceiptDoesNotMaskModelReadFailure(t *testing.T) {
 	}
 }
 
+const onboardingTestPersonaFingerprintForTest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func seedOnboardingTestReceiptForTest(t *testing.T, st *Store, revision int64) {
 	t.Helper()
 	insertOnboardingProviderForTest(t, st, "codex", "codex")
+	if _, err := st.db.Exec(`UPDATE llm_providers SET enabled = 0 WHERE id = 'codex'`); err != nil {
+		t.Fatal(err)
+	}
 	insertOnboardingAccountForTest(t, st, "staged-account", "codex", false, "D:/onboarding/staged-account")
 	if err := st.AddLLMModel(LLMModel{
 		ProviderID: "codex", ModelID: "gpt-5.6-terra", Name: "Terra",
@@ -2140,11 +2160,24 @@ func seedOnboardingTestReceiptForTest(t *testing.T, st *Store, revision int64) {
 	if err := st.SetAgentDisplayName("Bé Mi"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.db.Exec(`INSERT INTO app_onboarding_provider_stages(
+kind, status, position, provider_id, account_id, model_id, updated_at
+) VALUES ('codex', 'ready', 0, 'codex', 'staged-account', 'gpt-5.6-terra', '2026-08-15T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
 	setOnboardingStateForTest(t, st, OnboardingState{
-		Phase: OnboardingPhaseTest, ProviderKind: "codex", ProviderID: "codex",
-		AccountID: "staged-account", ModelID: "gpt-5.6-terra", StagedComboID: "staged-combo",
-		PersonaFingerprint: "persona-fingerprint", Revision: revision,
+		Phase: OnboardingPhaseTest, StagedComboID: onboardingCompletionComboIDForTest,
+		PersonaFingerprint: onboardingTestPersonaFingerprintForTest, Revision: revision,
 	})
+}
+
+func mustOnboardingTestRouteForTest(t *testing.T, st *Store, revision int64) OnboardingTestRoute {
+	t.Helper()
+	route, err := st.OnboardingTestRoute(context.Background(), revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return route
 }
 
 const onboardingCompletionComboIDForTest = "5f9967c7-93cf-4ac8-9da8-f6a7c1af8801"
@@ -2154,11 +2187,8 @@ func TestCompleteOnboardingActivatesVerifiedReceiptAtomically(t *testing.T) {
 	now := seedCompleteOnboardingForTest(t, st, false, 51)
 	beforeRevision := onboardingRouteRevisionForTest(t, st)
 
-	got, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-		Revision: 51, TestNonceHash: completeOnboardingHashForTest(),
-		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account",
-		Now: now,
-	})
+	input := completeOnboardingInputForTest(t, st, 51, now)
+	got, err := st.CompleteOnboarding(context.Background(), input)
 	if err != nil {
 		t.Fatalf("CompleteOnboarding() = %v", err)
 	}
@@ -2228,10 +2258,7 @@ func TestCompleteOnboardingActivatesVerifiedReceiptAtomically(t *testing.T) {
 		t.Fatalf("legacy route revision = %d; want %d", revision, wantRouteRevision)
 	}
 
-	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-		Revision: 51, TestNonceHash: completeOnboardingHashForTest(),
-		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-	}); !errors.Is(err, ErrOnboardingConflict) {
+	if _, err := st.CompleteOnboarding(context.Background(), input); !errors.Is(err, ErrOnboardingConflict) {
 		t.Fatalf("one-time retry error = %v; want ErrOnboardingConflict", err)
 	}
 }
@@ -2248,10 +2275,7 @@ func TestCompleteOnboardingRouteRevisionCannotABAStaleDraft(t *testing.T) {
 	}}
 	legacyRevision := onboardingRouteRevisionForTest(t, st)
 
-	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-		Revision: 53, TestNonceHash: completeOnboardingHashForTest(),
-		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-	}); err != nil {
+	if _, err := st.CompleteOnboarding(context.Background(), completeOnboardingInputForTest(t, st, 53, now)); err != nil {
 		t.Fatal(err)
 	}
 	completed, err := st.LLMRoute()
@@ -2293,10 +2317,7 @@ func TestCompleteOnboardingRouteRevisionUsesDivergentMaximum(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-				Revision: 54, TestNonceHash: completeOnboardingHashForTest(),
-				PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-			}); err != nil {
+			if _, err := st.CompleteOnboarding(context.Background(), completeOnboardingInputForTest(t, st, 54, now)); err != nil {
 				t.Fatal(err)
 			}
 			route, err := st.LLMRoute()
@@ -2327,10 +2348,7 @@ func TestCompleteOnboardingFreshRouteStartsAtRevisionOne(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-		Revision: 55, TestNonceHash: completeOnboardingHashForTest(),
-		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-	}); err != nil {
+	if _, err := st.CompleteOnboarding(context.Background(), completeOnboardingInputForTest(t, st, 55, now)); err != nil {
 		t.Fatal(err)
 	}
 	route, err := st.LLMRoute()
@@ -2359,10 +2377,7 @@ func TestCompleteOnboardingPreservesLegacyRevisionWithoutProjectionRows(t *testi
 		t.Fatal(err)
 	}
 
-	if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-		Revision: 57, TestNonceHash: completeOnboardingHashForTest(),
-		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-	}); err != nil {
+	if _, err := st.CompleteOnboarding(context.Background(), completeOnboardingInputForTest(t, st, 57, now)); err != nil {
 		t.Fatal(err)
 	}
 	route, err := st.LLMRoute()
@@ -2396,10 +2411,7 @@ func TestCompleteOnboardingRouteRevisionOverflowRollsBack(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := completeOnboardingDigestForTest(t, st)
-			if _, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-				Revision: 56, TestNonceHash: completeOnboardingHashForTest(),
-				PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-			}); !errors.Is(err, ErrOnboardingConfigurationChanged) {
+			if _, err := st.CompleteOnboarding(context.Background(), completeOnboardingInputForTest(t, st, 56, now)); !errors.Is(err, ErrOnboardingConfigurationChanged) {
 				t.Fatalf("CompleteOnboarding() error = %v; want ErrOnboardingConfigurationChanged", err)
 			}
 			if after := completeOnboardingDigestForTest(t, st); after != before {
@@ -2437,10 +2449,7 @@ func TestCompleteOnboardingRestartReplacesLiveRouteOnlyAtCommit(t *testing.T) {
 	}
 	t.Cleanup(func() { onboardingCompleteFailpoint = oldFailpoint })
 
-	got, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-		Revision: 61, TestNonceHash: completeOnboardingHashForTest(),
-		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-	})
+	got, err := st.CompleteOnboarding(context.Background(), completeOnboardingInputForTest(t, st, 61, now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2478,10 +2487,7 @@ func TestCompleteOnboardingRollsBackEveryStatementGroup(t *testing.T) {
 			}
 			t.Cleanup(func() { onboardingCompleteFailpoint = oldFailpoint })
 
-			_, err := st.CompleteOnboarding(context.Background(), CompleteOnboardingInput{
-				Revision: 71, TestNonceHash: completeOnboardingHashForTest(),
-				PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-			})
+			_, err := st.CompleteOnboarding(context.Background(), completeOnboardingInputForTest(t, st, 71, now))
 			if !errors.Is(err, ErrOnboardingCommitFailed) {
 				t.Fatalf("stage %q error = %v; want ErrOnboardingCommitFailed", stage, err)
 			}
@@ -2504,10 +2510,7 @@ func TestCompleteOnboardingActualCommitErrorRollsBackAndReceiptCanRetry(t *testi
 		return errors.New("injected actual Commit error")
 	}
 	t.Cleanup(func() { onboardingCompleteCommit = oldCommit })
-	input := CompleteOnboardingInput{
-		Revision: 72, TestNonceHash: completeOnboardingHashForTest(),
-		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-	}
+	input := completeOnboardingInputForTest(t, st, 72, now)
 
 	if _, err := st.CompleteOnboarding(context.Background(), input); !errors.Is(err, ErrOnboardingCommitFailed) {
 		t.Fatalf("CompleteOnboarding() actual Commit error = %v; want ErrOnboardingCommitFailed", err)
@@ -2519,7 +2522,11 @@ func TestCompleteOnboardingActualCommitErrorRollsBackAndReceiptCanRetry(t *testi
 		t.Fatalf("actual Commit error escaped rollback:\nbefore=%s\nafter=%s", before, after)
 	}
 	state := mustOnboardingStateForTest(t, st)
-	if state.TestNonceHash != completeOnboardingHashForTest() || state.TestExpiresAt == "" || state.Revision != 72 {
+	wantBoundHash, err := OnboardingTestReceiptHash(input.TestNonceHash, input.RouteFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.TestNonceHash != wantBoundHash || state.TestExpiresAt == "" || state.Revision != 72 {
 		t.Fatalf("actual Commit error consumed reusable receipt: %+v", state)
 	}
 	if _, err := st.LLMRoute(); err != nil {
@@ -2533,6 +2540,24 @@ func TestCompleteOnboardingActualCommitErrorRollsBackAndReceiptCanRetry(t *testi
 	}
 	if completed.Phase != OnboardingPhaseCompleted || completed.Revision != 73 {
 		t.Fatalf("retry completion = %+v", completed)
+	}
+}
+
+func TestCompleteOnboardingRouteDatabaseFailureIsNotConfigurationDrift(t *testing.T) {
+	st := openAppStoreForTest(t)
+	now := seedCompleteOnboardingForTest(t, st, false, 76)
+	input := completeOnboardingInputForTest(t, st, 76, now)
+	before := mustOnboardingStateForTest(t, st)
+	if _, err := st.db.Exec(`DROP TABLE llm_models`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := st.CompleteOnboarding(context.Background(), input)
+	if !errors.Is(err, ErrOnboardingCommitFailed) || errors.Is(err, ErrOnboardingConfigurationChanged) {
+		t.Fatalf("CompleteOnboarding() route DB error = %v; want commit failure, not configuration drift", err)
+	}
+	if after := mustOnboardingStateForTest(t, st); after != before {
+		t.Fatalf("route DB read failure changed onboarding state: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -2588,10 +2613,7 @@ func TestCompleteOnboardingRejectsInvalidReceiptAndConfigurationWithoutMutation(
 			st := openAppStoreForTest(t)
 			now := seedCompleteOnboardingForTest(t, st, false, 81)
 			state := mustOnboardingStateForTest(t, st)
-			input := CompleteOnboardingInput{
-				Revision: 81, TestNonceHash: completeOnboardingHashForTest(),
-				PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-			}
+			input := completeOnboardingInputForTest(t, st, 81, now)
 			tt.mutate(st, &state, &input)
 			setOnboardingStateForTest(t, st, state)
 			before := completeOnboardingDigestForTest(t, st)
@@ -2608,10 +2630,7 @@ func TestCompleteOnboardingRejectsInvalidReceiptAndConfigurationWithoutMutation(
 func TestCompleteOnboardingAllowsExactlyOneConcurrentWinner(t *testing.T) {
 	st := openAppStoreForTest(t)
 	now := seedCompleteOnboardingForTest(t, st, false, 91)
-	input := CompleteOnboardingInput{
-		Revision: 91, TestNonceHash: completeOnboardingHashForTest(),
-		PersonaFingerprint: "persona-fingerprint", StagingConfigDir: "D:/onboarding/staged-account", Now: now,
-	}
+	input := completeOnboardingInputForTest(t, st, 91, now)
 	start := make(chan struct{})
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
@@ -2646,6 +2665,9 @@ func TestCompleteOnboardingAllowsExactlyOneConcurrentWinner(t *testing.T) {
 func seedCompleteOnboardingForTest(t *testing.T, st *Store, restart bool, revision int64) time.Time {
 	t.Helper()
 	if err := st.EnsureOnboardingProviderForKind("codex"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE llm_providers SET enabled = 0 WHERE id = 'codex'`); err != nil {
 		t.Fatal(err)
 	}
 	insertOnboardingAccountForTest(t, st, "staged-account", "codex", false, "D:/onboarding/staged-account")
@@ -2684,6 +2706,14 @@ VALUES (0, 'other-provider', 'old-model', 1)`); err != nil {
 	if _, err := st.db.Exec(`UPDATE app_meta SET value = '41' WHERE key = 'llm_route_revision'`); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.SetAgentDisplayName("Bé Mi"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`INSERT INTO app_onboarding_provider_stages(
+kind, status, position, provider_id, account_id, model_id, updated_at
+) VALUES ('codex', 'ready', 0, 'codex', 'staged-account', 'gpt-5.6-terra', '2026-08-15T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 8, 11, 12, 0, 0, 123, time.UTC)
 	completedVersion := int64(0)
 	if restart {
@@ -2691,13 +2721,36 @@ VALUES (0, 'other-provider', 'old-model', 1)`); err != nil {
 	}
 	setOnboardingStateForTest(t, st, OnboardingState{
 		CompletedVersion: completedVersion, Phase: OnboardingPhaseTest,
-		ProviderKind: "codex", ProviderID: "codex", AccountID: "staged-account",
-		ModelID: "gpt-5.6-terra", StagedComboID: onboardingCompletionComboIDForTest,
-		PersonaFingerprint: "persona-fingerprint", TestNonceHash: completeOnboardingHashForTest(),
-		TestExpiresAt:     now.Add(time.Minute).Format(time.RFC3339Nano),
-		RestartInProgress: restart, Revision: revision,
+		StagedComboID:      onboardingCompletionComboIDForTest,
+		PersonaFingerprint: onboardingTestPersonaFingerprintForTest,
+		RestartInProgress:  restart, Revision: revision,
 	})
+	route := mustOnboardingTestRouteForTest(t, st, revision)
+	boundHash, err := OnboardingTestReceiptHash(completeOnboardingHashForTest(), route.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mustOnboardingStateForTest(t, st)
+	state.TestNonceHash = boundHash
+	state.TestExpiresAt = now.Add(time.Minute).Format(time.RFC3339Nano)
+	setOnboardingStateForTest(t, st, state)
 	return now
+}
+
+func completeOnboardingInputForTest(
+	t *testing.T,
+	st *Store,
+	revision int64,
+	now time.Time,
+) CompleteOnboardingInput {
+	t.Helper()
+	route := mustOnboardingTestRouteForTest(t, st, revision)
+	return CompleteOnboardingInput{
+		Revision: revision, TestNonceHash: completeOnboardingHashForTest(),
+		PersonaFingerprint: route.State.PersonaFingerprint,
+		RouteFingerprint:   route.Fingerprint,
+		StagingConfigDir:   route.Entries[0].ConfigDir, Now: now,
+	}
 }
 
 func completeOnboardingHashForTest() string {
@@ -2739,6 +2792,7 @@ func completeOnboardingDigestFromDBForTest(t *testing.T, db *sql.DB) string {
 		`SELECT id, name, type, active, revision FROM llm_combos ORDER BY id`,
 		`SELECT combo_id, position, provider_id, model_id, enabled FROM llm_combo_members ORDER BY combo_id, position`,
 		`SELECT position, provider_id, model_id, enabled FROM llm_route_entries ORDER BY position`,
+		`SELECT kind, status, provider_id, account_id, model_id, position, updated_at FROM app_onboarding_provider_stages ORDER BY position`,
 		`SELECT key, value FROM app_meta WHERE key = 'llm_route_revision'`,
 	}
 	var digest strings.Builder

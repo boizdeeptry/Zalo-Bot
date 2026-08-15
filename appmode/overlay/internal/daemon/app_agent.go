@@ -788,8 +788,21 @@ func (a *api) handleAgentCompletePut(
 		a.writeAgentRollbackFailed(w, err)
 		return
 	}
-	state, ok := a.onboardingMutationState(w, expectedRevision)
-	if !ok {
+	snapshot, err := a.st.OnboardingSnapshot()
+	if err == nil {
+		if len(snapshot.Stages) == 0 {
+			err = validateOnboardingState(snapshot.State)
+		} else {
+			err = validateOnboardingSnapshot(snapshot)
+		}
+	}
+	if err != nil {
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	state := snapshot.State
+	if state.Revision != expectedRevision {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
 		return
 	}
 	if state.Phase != store.OnboardingPhasePersona && state.Phase != store.OnboardingPhaseTest {
