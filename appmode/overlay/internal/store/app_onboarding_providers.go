@@ -34,6 +34,7 @@ const (
 	onboardingProviderMutationBegin          = "begin-provider"
 	onboardingProviderMutationBind           = "bind-account"
 	onboardingProviderMutationSetup          = "stage-setup"
+	onboardingProviderMutationBack           = "back-to-providers"
 )
 
 type onboardingProviderMutationReceipt struct {
@@ -112,7 +113,7 @@ func (s *Store) ReplaceOnboardingProviderSelection(
 				onboardingProviderMutationReplace,
 				expectedRevision,
 				snapshot.State.Revision,
-				canonicalKinds,
+				onboardingProviderSelectionPayload(canonicalKinds, snapshot.State.PersonaFingerprint),
 			)
 			if err != nil {
 				return OnboardingSnapshot{}, err
@@ -133,6 +134,12 @@ func (s *Store) ReplaceOnboardingProviderSelection(
 	if !onboardingProviderInactiveStateIsClean(snapshot.State) {
 		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: Provider phase owns dirty active or receipt fields",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	if !validOptionalOnboardingPersonaFingerprint(snapshot.State.PersonaFingerprint) {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: Provider phase owns an invalid persona fingerprint",
 			ErrOnboardingConfigurationChanged,
 		)
 	}
@@ -193,7 +200,7 @@ func (s *Store) ReplaceOnboardingProviderSelection(
 		onboardingProviderMutationReplace,
 		expectedRevision,
 		expectedRevision+1,
-		canonicalKinds,
+		onboardingProviderSelectionPayload(canonicalKinds, snapshot.State.PersonaFingerprint),
 	); err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -312,6 +319,106 @@ func (s *Store) BeginOnboardingProvider(
 	}
 	if err := onboardingProvidersCommit(tx); err != nil {
 		return OnboardingSnapshot{}, fmt.Errorf("commit onboarding Provider begin: %w", err)
+	}
+	return updated, nil
+}
+
+// BackOnboardingToProviders returns an exact Persona/Test draft to Provider
+// selection without deleting any staged Provider, Account, model or persona.
+// The persisted operation receipt makes a one-revision retry distinguishable
+// from an unrelated transition that happens to have the same visible shape.
+func (s *Store) BackOnboardingToProviders(expectedRevision int64) (OnboardingSnapshot, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return OnboardingSnapshot{}, fmt.Errorf("begin onboarding Back transition: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	snapshot, err := onboardingSnapshotInTx(tx, nil)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if snapshot.State.Revision != expectedRevision {
+		if onboardingRevisionIsOneAhead(expectedRevision, snapshot.State.Revision) {
+			payload := onboardingProviderBackPayload(snapshot)
+			provenanceMatches, err := onboardingProviderMutationReceiptMatchesInTx(
+				tx,
+				onboardingProviderMutationBack,
+				expectedRevision,
+				snapshot.State.Revision,
+				payload,
+			)
+			if err != nil {
+				return OnboardingSnapshot{}, err
+			}
+			if provenanceMatches && onboardingProviderBackSuccessorMatchesInTx(tx, snapshot) {
+				return commitOnboardingProviderRead(tx, snapshot, "Back lost response")
+			}
+		}
+		return OnboardingSnapshot{}, onboardingConflict(expectedRevision, snapshot.State.Revision)
+	}
+	if snapshot.State.Phase != OnboardingPhasePersona && snapshot.State.Phase != OnboardingPhaseTest {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"Back onboarding from %q: %w",
+			snapshot.State.Phase,
+			ErrOnboardingInvalidPhase,
+		)
+	}
+	if err := validateOnboardingProviderBackSourceInTx(tx, snapshot); err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if snapshot.State.Revision >= maxOnboardingRouteRevision {
+		return OnboardingSnapshot{}, fmt.Errorf(
+			"%w: onboarding revision cannot advance beyond %d",
+			ErrOnboardingConflict,
+			maxOnboardingRouteRevision,
+		)
+	}
+
+	state := snapshot.State
+	updatedAt := ts(time.Now())
+	result, err := tx.Exec(`UPDATE app_onboarding_state SET
+phase = ?, provider_kind = '', provider_id = '', account_id = '', model_id = '',
+staged_combo_id = '', test_nonce_hash = '', test_expires_at = '',
+revision = revision + 1, updated_at = ?
+WHERE id = 1 AND revision = ? AND phase = ?
+  AND provider_kind = '' AND provider_id = '' AND account_id = '' AND model_id = ''
+  AND staged_combo_id = ? AND persona_fingerprint = ?
+  AND test_nonce_hash = ? AND test_expires_at = ?
+  AND completed_version = ? AND restart_in_progress = ?`,
+		OnboardingPhaseProvider,
+		updatedAt,
+		expectedRevision,
+		state.Phase,
+		state.StagedComboID,
+		state.PersonaFingerprint,
+		state.TestNonceHash,
+		state.TestExpiresAt,
+		state.CompletedVersion,
+		boolInt(state.RestartInProgress),
+	)
+	if err != nil {
+		return OnboardingSnapshot{}, fmt.Errorf("update onboarding Back transition: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return OnboardingSnapshot{}, ErrOnboardingConflict
+	}
+	updated, err := onboardingSnapshotInTx(tx, nil)
+	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if err := writeOnboardingProviderMutationReceiptInTx(
+		tx,
+		onboardingProviderMutationBack,
+		expectedRevision,
+		expectedRevision+1,
+		onboardingProviderBackPayload(updated),
+	); err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if err := onboardingProvidersCommit(tx); err != nil {
+		return OnboardingSnapshot{}, fmt.Errorf("commit onboarding Back transition: %w", err)
 	}
 	return updated, nil
 }
@@ -788,6 +895,9 @@ func replaceOnboardingProviderLostResponseMatches(
 	snapshot OnboardingSnapshot,
 	canonicalKinds []string,
 ) bool {
+	if !validOptionalOnboardingPersonaFingerprint(snapshot.State.PersonaFingerprint) {
+		return false
+	}
 	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
 	if err != nil || !stages.positionsCanonical ||
 		!providerStagesMatchCanonicalSelection(snapshot.Stages, canonicalKinds) {
@@ -813,6 +923,20 @@ func replaceOnboardingProviderLostResponseMatches(
 	default:
 		return false
 	}
+}
+
+func onboardingProviderSelectionPayload(
+	canonicalKinds []string,
+	personaFingerprint string,
+) []string {
+	payload := make([]string, 0, len(canonicalKinds)+2)
+	payload = append(payload, strconv.Itoa(len(canonicalKinds)))
+	payload = append(payload, canonicalKinds...)
+	return append(payload, personaFingerprint)
+}
+
+func validOptionalOnboardingPersonaFingerprint(value string) bool {
+	return value == "" || validOnboardingSHA256Hex(value)
 }
 
 func beginOnboardingProviderLostResponseMatches(snapshot OnboardingSnapshot, kind string) bool {
@@ -891,6 +1015,122 @@ func onboardingProviderSetupLostResponseMatchesInTx(
 		return err == nil && parsed.String() == state.StagedComboID
 	}
 	return state.Phase == OnboardingPhaseProvider && state.StagedComboID == ""
+}
+
+func onboardingProviderBackPayload(snapshot OnboardingSnapshot) []string {
+	payload := []string{
+		strconv.FormatInt(snapshot.State.CompletedVersion, 10),
+		strconv.FormatBool(snapshot.State.RestartInProgress),
+		snapshot.State.PersonaFingerprint,
+	}
+	return appendOnboardingProviderStagesToPayload(payload, snapshot.Stages)
+}
+
+func validateOnboardingProviderBackSourceInTx(tx *sql.Tx, snapshot OnboardingSnapshot) error {
+	state := snapshot.State
+	if state.ProviderKind != "" || state.ProviderID != "" || state.AccountID != "" ||
+		state.ModelID != "" || state.StagedComboID == "" {
+		return fmt.Errorf(
+			"%w: Back source owns invalid active staging identity",
+			ErrOnboardingInvalidStagingOwnership,
+		)
+	}
+	comboID, err := uuid.Parse(state.StagedComboID)
+	if err != nil || comboID.String() != state.StagedComboID {
+		return fmt.Errorf(
+			"%w: Back source has an invalid staged Combo",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	if state.CompletedVersion >= CurrentOnboardingVersion && !state.RestartInProgress {
+		return fmt.Errorf("%w: completed onboarding is not an active draft", ErrOnboardingInvalidPhase)
+	}
+	if state.RestartInProgress && state.CompletedVersion < CurrentOnboardingVersion {
+		return fmt.Errorf("%w: onboarding restart markers are inconsistent", ErrOnboardingConfigurationChanged)
+	}
+	if state.Phase == OnboardingPhasePersona {
+		if !validOptionalOnboardingPersonaFingerprint(state.PersonaFingerprint) ||
+			state.TestNonceHash != "" || state.TestExpiresAt != "" {
+			return fmt.Errorf("%w: Persona Back source owns a Test receipt", ErrOnboardingConfigurationChanged)
+		}
+	} else if !validOnboardingProviderBackTestReceipt(state) {
+		return fmt.Errorf("%w: Test Back source has an invalid receipt", ErrOnboardingConfigurationChanged)
+	}
+	return validateOnboardingProviderBackReadyStagesInTx(tx, snapshot.Stages)
+}
+
+func onboardingProviderBackSuccessorMatchesInTx(tx *sql.Tx, snapshot OnboardingSnapshot) bool {
+	state := snapshot.State
+	if state.Phase != OnboardingPhaseProvider || state.ProviderKind != "" ||
+		state.ProviderID != "" || state.AccountID != "" || state.ModelID != "" ||
+		state.StagedComboID != "" || state.TestNonceHash != "" || state.TestExpiresAt != "" ||
+		!validOptionalOnboardingPersonaFingerprint(state.PersonaFingerprint) ||
+		(state.CompletedVersion >= CurrentOnboardingVersion && !state.RestartInProgress) ||
+		(state.RestartInProgress && state.CompletedVersion < CurrentOnboardingVersion) {
+		return false
+	}
+	return validateOnboardingProviderBackReadyStagesInTx(tx, snapshot.Stages) == nil
+}
+
+func validateOnboardingProviderBackReadyStagesInTx(
+	tx *sql.Tx,
+	stages []OnboardingProviderStage,
+) error {
+	inspection, err := inspectOnboardingProviderStages(stages)
+	if err != nil {
+		return err
+	}
+	if len(stages) == 0 || !inspection.positionsCanonical {
+		return fmt.Errorf(
+			"%w: Back requires a nonempty canonical Provider stage set",
+			ErrOnboardingConfigurationChanged,
+		)
+	}
+	for _, stage := range stages {
+		if stage.Status != onboardingProviderStageReady || stage.ProviderID != stage.Kind {
+			return fmt.Errorf(
+				"%w: Back requires every selected Provider to be ready",
+				ErrOnboardingConfigurationChanged,
+			)
+		}
+		var providerKind string
+		if err := tx.QueryRow(`SELECT kind FROM llm_providers WHERE id = ?`, stage.ProviderID).
+			Scan(&providerKind); err != nil || providerKind != stage.Kind {
+			return fmt.Errorf(
+				"%w: staged Provider reference changed",
+				ErrOnboardingConfigurationChanged,
+			)
+		}
+		account, err := onboardingProviderAccountRecordInTx(tx, stage.AccountID)
+		if err != nil || !onboardingProviderAccountOwnsSetup(account, stage.Kind, stage.AccountID) {
+			return fmt.Errorf(
+				"%w: staged Account reference changed",
+				ErrOnboardingConfigurationChanged,
+			)
+		}
+		available, err := onboardingProviderModelIsAvailableInTx(tx, stage.ProviderID, stage.ModelID)
+		if err != nil || !available {
+			return fmt.Errorf(
+				"%w: staged model reference changed",
+				ErrOnboardingConfigurationChanged,
+			)
+		}
+	}
+	return nil
+}
+
+func validOnboardingProviderBackTestReceipt(state OnboardingState) bool {
+	if !validOnboardingSHA256Hex(state.PersonaFingerprint) ||
+		!validOnboardingSHA256Hex(state.TestNonceHash) ||
+		state.TestExpiresAt == "" {
+		return false
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, state.TestExpiresAt)
+	if err != nil || expiresAt.Format(time.RFC3339Nano) != state.TestExpiresAt {
+		return false
+	}
+	_, offset := expiresAt.Zone()
+	return offset == 0
 }
 
 func writeOnboardingProviderMutationReceiptInTx(
@@ -1006,7 +1246,8 @@ func validOnboardingProviderMutationOperation(operation string) bool {
 	return operation == onboardingProviderMutationReplace ||
 		operation == onboardingProviderMutationBegin ||
 		operation == onboardingProviderMutationBind ||
-		operation == onboardingProviderMutationSetup
+		operation == onboardingProviderMutationSetup ||
+		operation == onboardingProviderMutationBack
 }
 
 func onboardingRevisionIsOneAhead(expectedRevision, currentRevision int64) bool {

@@ -24,6 +24,8 @@ import (
 
 	"agentdc/internal/providercatalog"
 	"agentdc/internal/store"
+
+	"github.com/google/uuid"
 )
 
 const appOnboardingRequestCap int64 = 64 << 10
@@ -111,6 +113,10 @@ type appOnboardingSetupRequest struct {
 type appOnboardingTestChatRequest struct {
 	Revision int64  `json:"revision"`
 	Message  string `json:"message"`
+}
+
+type appOnboardingBackRequest struct {
+	Revision int64 `json:"revision"`
 }
 
 type appOnboardingTestChatResponse struct {
@@ -511,6 +517,131 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 		ModelID: state.ModelID, TestToken: token,
 		ExpiresAt: policy.ExpiresAt.Format(time.RFC3339Nano), Revision: updated.Revision,
 	})
+}
+
+// handleOnboardingBackToProviders fences Test Chat across the intentional
+// mutation-lock gap, then delegates the exact CAS and lost-response proof to
+// Store. It never cancels Connect or removes Account configuration.
+func (a *api) handleOnboardingBackToProviders(w http.ResponseWriter, r *http.Request) {
+	var request appOnboardingBackRequest
+	if !a.decodeOnboardingBody(w, r, &request) {
+		return
+	}
+	if !a.requireOnboardingRevision(w, request.Revision) {
+		return
+	}
+
+	onboardingMutationMu.Lock()
+	if r.Context().Err() != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingBackCanceled(w)
+		return
+	}
+	snapshot, err := a.st.OnboardingSnapshot()
+	if err != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	if err := validateOnboardingSnapshot(snapshot); err != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	if onboardingRevisionIsOneAheadForDaemon(request.Revision, snapshot.State.Revision) {
+		updated, err := a.st.BackOnboardingToProviders(request.Revision)
+		onboardingMutationMu.Unlock()
+		if err != nil {
+			a.writeOnboardingStoreError(w, err)
+			return
+		}
+		a.writeOnboardingSnapshot(w, updated)
+		return
+	}
+	if err := preflightOnboardingBackSnapshot(snapshot, request.Revision); err != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	transition, ok := acquireAppOnboardingProviderTransitionLease()
+	if !ok {
+		onboardingMutationMu.Unlock()
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_TRANSITION_BUSY",
+			"Một thay đổi thiết lập khác đang chạy; hãy đợi rồi thử lại", nil)
+		return
+	}
+	defer transition.release()
+	onboardingMutationMu.Unlock()
+
+	if !transition.cancelAndWait(r.Context()) {
+		a.writeOnboardingBackCanceled(w)
+		return
+	}
+	appOnboardingProviderAfterTestWait()
+
+	onboardingMutationMu.Lock()
+	defer onboardingMutationMu.Unlock()
+	if r.Context().Err() != nil {
+		a.writeOnboardingBackCanceled(w)
+		return
+	}
+	refreshed, err := a.st.OnboardingSnapshot()
+	if err != nil {
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	if err := validateOnboardingSnapshot(refreshed); err != nil {
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	updated, err := a.st.BackOnboardingToProviders(request.Revision)
+	if err != nil {
+		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	a.writeOnboardingSnapshot(w, updated)
+}
+
+func preflightOnboardingBackSnapshot(snapshot store.OnboardingSnapshot, expectedRevision int64) error {
+	state := snapshot.State
+	if state.Revision != expectedRevision {
+		return store.ErrOnboardingConflict
+	}
+	if state.Phase != store.OnboardingPhasePersona && state.Phase != store.OnboardingPhaseTest {
+		return store.ErrOnboardingInvalidPhase
+	}
+	comboID, err := uuid.Parse(state.StagedComboID)
+	if err != nil || comboID.String() != state.StagedComboID {
+		return store.ErrOnboardingConfigurationChanged
+	}
+	if state.Phase == store.OnboardingPhaseTest {
+		if !validOnboardingSHA256Text(state.PersonaFingerprint) ||
+			!validOnboardingSHA256Text(state.TestNonceHash) {
+			return store.ErrOnboardingConfigurationChanged
+		}
+		expiresAt, err := time.Parse(time.RFC3339Nano, state.TestExpiresAt)
+		if err != nil || expiresAt.Format(time.RFC3339Nano) != state.TestExpiresAt {
+			return store.ErrOnboardingConfigurationChanged
+		}
+		_, offset := expiresAt.Zone()
+		if offset != 0 {
+			return store.ErrOnboardingConfigurationChanged
+		}
+	}
+	return nil
+}
+
+func validOnboardingSHA256Text(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func (a *api) writeOnboardingBackCanceled(w http.ResponseWriter) {
+	a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_BACK_CANCELED",
+		"Đã dừng thao tác quay lại; cấu hình thiết lập chưa thay đổi", nil)
 }
 
 type appOnboardingCompleteSnapshot struct {
@@ -1419,11 +1550,13 @@ func validateOnboardingSnapshot(snapshot store.OnboardingSnapshot) error {
 		}
 	case store.OnboardingPhasePersona:
 		if !activeIdentityClean || !allReady || state.StagedComboID == "" ||
-			state.PersonaFingerprint != "" || state.TestNonceHash != "" || state.TestExpiresAt != "" {
+			(state.PersonaFingerprint != "" && !validOnboardingSHA256Text(state.PersonaFingerprint)) ||
+			state.TestNonceHash != "" || state.TestExpiresAt != "" {
 			return errors.New("Persona phase has inconsistent staged Provider ownership")
 		}
 	case store.OnboardingPhaseTest:
-		if !activeIdentityClean || !allReady || state.StagedComboID == "" || state.PersonaFingerprint == "" {
+		if !activeIdentityClean || !allReady || state.StagedComboID == "" ||
+			!validOnboardingSHA256Text(state.PersonaFingerprint) {
 			return errors.New("Test phase has inconsistent staged Provider ownership")
 		}
 	case store.OnboardingPhaseCompleted:

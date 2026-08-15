@@ -438,8 +438,9 @@ func TestReplaceOnboardingProviderSelectionAllReadyExactNoOpStaysProvider(t *tes
 	st := openV8FixtureWithStages(t, []OnboardingProviderStage{
 		readyOnboardingProviderStageForTest("codex", 0),
 	})
+	fingerprint := strings.Repeat("c", 64)
 	setOnboardingStateForTest(t, st, OnboardingState{
-		Phase: OnboardingPhaseProvider, PersonaFingerprint: "saved-persona", Revision: 41,
+		Phase: OnboardingPhaseProvider, PersonaFingerprint: fingerprint, Revision: 41,
 	})
 	before := onboardingProviderMutationDigestForTest(t, st)
 
@@ -450,7 +451,7 @@ func TestReplaceOnboardingProviderSelectionAllReadyExactNoOpStaysProvider(t *tes
 	if got.State.Phase != OnboardingPhaseProvider || got.State.Revision != 41 || got.State.StagedComboID != "" {
 		t.Fatalf("all-ready exact no-op state = %+v; want unchanged Provider revision 41", got.State)
 	}
-	if got.State.PersonaFingerprint != "saved-persona" {
+	if got.State.PersonaFingerprint != fingerprint {
 		t.Fatalf("all-ready no-op lost saved Persona fingerprint: %+v", got.State)
 	}
 	if after := onboardingProviderMutationDigestForTest(t, st); after != before {

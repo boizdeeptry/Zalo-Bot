@@ -116,7 +116,7 @@ func TestAppOnboardingStatusProjectsCatalogV8PersonaAndTestIdentity(t *testing.T
 				Phase: phase, StagedComboID: "00000000-0000-4000-8000-000000000001", Revision: 9,
 			}
 			if phase == store.OnboardingPhaseTest {
-				state.PersonaFingerprint = "persona-fingerprint"
+				state.PersonaFingerprint = strings.Repeat("a", 64)
 			}
 			env.setState(t, state)
 			env.replaceProviderStages(t, appOnboardingProviderWire{

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"io"
@@ -274,9 +275,10 @@ func TestAppOnboardingStatusSuggestsOnlySupportedFirstEnabledRouteKind(t *testin
 
 func TestAppOnboardingStatusNeverSerializesInternalOrSecretFields(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
+	hiddenFingerprint := strings.Repeat("e", sha256.Size*2)
 	env.setState(t, store.OnboardingState{
 		Phase: store.OnboardingPhaseTest, StagedComboID: "HIDDEN-COMBO",
-		PersonaFingerprint: "HIDDEN-FINGERPRINT", TestNonceHash: "HIDDEN-NONCE-HASH",
+		PersonaFingerprint: hiddenFingerprint, TestNonceHash: "HIDDEN-NONCE-HASH",
 		TestExpiresAt: "HIDDEN-EXPIRY", Revision: 4,
 	})
 	env.replaceProviderStages(t, appOnboardingProviderWire{
@@ -300,7 +302,7 @@ func TestAppOnboardingStatusNeverSerializesInternalOrSecretFields(t *testing.T) 
 		}
 	}
 	body := rr.Body.String()
-	for _, hidden := range []string{"HIDDEN-COMBO", "HIDDEN-FINGERPRINT", "HIDDEN-NONCE-HASH", "HIDDEN-EXPIRY"} {
+	for _, hidden := range []string{"HIDDEN-COMBO", hiddenFingerprint, "HIDDEN-NONCE-HASH", "HIDDEN-EXPIRY"} {
 		if strings.Contains(body, hidden) {
 			t.Fatalf("response leaked %q: %s", hidden, body)
 		}
