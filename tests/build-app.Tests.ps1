@@ -304,9 +304,10 @@ package daemon
     }
     $appSchema = [IO.File]::ReadAllText((Join-Path $stage 'internal\store\app_schema.go'))
     foreach ($signature in @(
-        'const appSchemaVersion int64 = 7',
+        'const appSchemaVersion int64 = 8',
         'llm_combos',
-        'app_memory_subject_revisions'
+        'app_memory_subject_revisions',
+        'app_onboarding_provider_stages'
       )) {
       if ($appSchema.IndexOf($signature, [StringComparison]::Ordinal) -lt 0) {
         throw "Real staged schema lost capability-bridge signature '$signature'"
