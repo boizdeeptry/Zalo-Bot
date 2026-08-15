@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createOnboardingPage, createOnboardingService } from "../overlay/internal/webui/static/pages/onboarding.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
-import { onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
+import { onboardingStatus, pendingProvider, readyProvider } from "./helpers/onboarding-fixtures.mjs";
 const flush = () => new Promise((resolve) => setImmediate(resolve)); const microtask = () => Promise.resolve();
 function deferred() {
   let resolve; let reject;
@@ -45,10 +45,25 @@ function setupResult(overrides = {}) {
     combo_name: "Codex mặc định", ...overrides,
   };
 }
+function setupSuccess({
+  revision = 4, kind = "codex", accountID = "account-1", modelID = "gpt-5.6-terra",
+} = {}) {
+  const stage = readyProvider(kind, 0, {
+    provider_id: kind, account_id: accountID, model_id: modelID,
+  });
+  return onboardingStatus("persona", { revision, providers: [stage] });
+}
 function baseService(overrides = {}) {
   return {
-    status: () => Promise.resolve(providerStatus()), selectProvider: () => Promise.resolve(connectStatus()),
-    setup: () => Promise.resolve(setupResult()), loadAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [] }),
+    status: () => Promise.resolve(providerStatus()),
+    updateProviders: (kinds, revision) => Promise.resolve(providerStatus({
+      revision: revision + 1,
+      providers: kinds.map((kind, position) => pendingProvider(kind, position)),
+    })),
+    beginProvider: () => Promise.resolve(connectStatus()),
+    backToProviders: () => Promise.resolve(providerStatus()),
+    selectProvider: () => Promise.resolve(connectStatus()),
+    setup: () => Promise.resolve(setupSuccess()), loadAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [] }),
     saveAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [], onboarding_phase: "test", onboarding_revision: 5 }), testChat: () => Promise.reject(new Error("not used")), complete: () => Promise.reject(new Error("not used")),
     ...overrides,
   };
@@ -180,13 +195,13 @@ test("Setup service rejects every non-successor or incomplete backend response",
   assert.throws(() => service.setup("account-7", Number.MAX_SAFE_INTEGER), /revision/i);
   assert.equal(requests, 0);
 });
-test("Welcome renders Tư Vấn Zalo provider setup, an exact three-step rail, and guarded warning", (t) => {
+test("Welcome renders Tư Vấn Zalo provider setup, an exact three-step rail, and guarded warning", async (t) => {
   const { host } = mountPage(t);
   const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
   const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
   assert.equal(cards.length, 2);
-  assert.match(text(cards[0]), /Claude Code.*Chưa chọn/u);
-  assert.match(text(cards[1]), /Codex.*Chưa chọn/u);
+  assert.match(text(cards[0]), /Codex.*Chưa dùng/u);
+  assert.match(text(cards[1]), /Claude Code.*Chưa dùng/u);
   assert.deepEqual(steps.map((step) => text(step)), [
     "Kết nối", "Cá nhân hoá", "Trò chuyện thử",
   ]);
@@ -198,148 +213,10 @@ test("Welcome renders Tư Vấn Zalo provider setup, an exact three-step rail, a
   assert.match(text(byClass(host, "onboarding-provider-warning")), /xác minh/i);
   assert.match(text(byClass(host, "onboarding-provider-warning")), /Hoàn tất/i);
   providerToggle(host, "codex").click();
+  await flush();
   assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
   assert.equal(providerToggle(host, "claude-code").getAttribute("aria-pressed"), "false");
   assert.equal(text(installButton(host, "codex")), "Bấm để cài.");
-});
-test("Welcome preselects an eligible persisted provider before a suggestion", (t) => {
-  const { host } = mountPage(t, {
-    initialStatus: providerStatus({
-      provider_kind: "claude-code",
-      suggested_provider_kind: "codex",
-    }),
-  });
-  assert.equal(providerToggle(host, "claude-code").getAttribute("aria-pressed"), "true");
-  assert.equal(text(installButton(host, "claude-code")), "Bấm để cài.");
-});
-test("Welcome ignores unsupported suggestions and keeps Continue disabled", (t) => {
-  const { host } = mountPage(t, {
-    initialStatus: providerStatus({ suggested_provider_kind: "openai" }),
-  });
-  assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "false");
-  assert.equal(providerToggle(host, "claude-code").getAttribute("aria-pressed"), "false");
-  assert.equal(installButton(host, "codex"), null);
-});
-test("provider selection uses the current revision once and adopts the server Connect snapshot", async (t) => {
-  const selection = deferred();
-  const calls = [];
-  const connectFactory = fakeConnectFactory();
-  const { host } = mountPage(t, {
-    initialStatus: providerStatus({ revision: 11, suggested_provider_kind: "codex" }),
-    service: baseService({
-      selectProvider(kind, revision, signal) {
-        calls.push({ kind, revision, signal });
-        return selection.promise;
-      },
-    }),
-    connectFactory,
-  });
-  const retainedInstall = installButton(host, "codex");
-  retainedInstall.click();
-  retainedInstall.click();
-  assert.equal(calls.length, 1);
-  assert.deepEqual({ kind: calls[0].kind, revision: calls[0].revision }, {
-    kind: "codex",
-    revision: 11,
-  });
-  assert.ok(calls[0].signal instanceof AbortSignal);
-  assert.equal(retainedInstall.disabled, true);
-  selection.resolve(connectStatus({ revision: 12, provider_kind: "codex" }));
-  await flush();
-  assert.equal(connectFactory.instances.length, 1);
-  assert.equal(connectFactory.instances[0].options.kind, "codex");
-  assert.deepEqual(connectFactory.instances[0].starts, [{
-    label: "Onboarding",
-    onboardingRevision: 12,
-    immediate: true,
-  }]);
-  assert.match(text(host), /Kết nối Codex/);
-});
-test("provider selection rejects non-successor, wrong-phase, wrong-kind, and staged responses", async (t) => {
-  const invalid = [
-    ["unchanged", { revision: 11 }], ["lower", { revision: 10 }],
-    ["jump", { revision: 13 }], ["unsafe", { revision: Number.MAX_SAFE_INTEGER + 1 }],
-    ["wrong phase", { phase: "setup", provider_id: "codex", account_id: "a" }],
-    ["wrong kind", { provider_kind: "claude-code" }], ["not required", { required: false }],
-    ["staged provider", { provider_id: "codex" }], ["staged account", { account_id: "a" }],
-    ["staged model", { model_id: "gpt" }],
-  ];
-  for (const [name, overrides] of invalid) {
-    await t.test(name, async (subtest) => {
-      let selects = 0;
-      const response = connectStatus({ revision: 12, ...overrides });
-      const apiService = createOnboardingService({ requestJSON: () => Promise.resolve(response) });
-      await assert.rejects(apiService.selectProvider("codex", 11), /provider response/i);
-      const connectFactory = fakeConnectFactory();
-      const { host } = mountPage(subtest, {
-        initialStatus: providerStatus({ revision: 11, suggested_provider_kind: "codex" }),
-        service: baseService({ selectProvider: () => {
-          selects++; return Promise.resolve(response);
-        } }),
-        connectFactory,
-      });
-      installButton(host, "codex").click();
-      await flush();
-      assert.equal(selects, 1); assert.equal(connectFactory.instances.length, 0); assert.ok(byClass(host, "onboarding-error"));
-    });
-  }
-  await t.test("maximum safe revision never mutates", (subtest) => {
-    let selects = 0; const apiService = createOnboardingService({ requestJSON: () => { selects++; } });
-    assert.throws(() => apiService.selectProvider("codex", Number.MAX_SAFE_INTEGER), /revision/i);
-    const { host } = mountPage(subtest, {
-      initialStatus: providerStatus({ revision: Number.MAX_SAFE_INTEGER, suggested_provider_kind: "codex" }),
-      service: baseService({ selectProvider: () => { selects++; } }),
-    });
-    installButton(host, "codex").click(); assert.equal(selects, 0);
-    assert.ok(byClass(host, "onboarding-error"));
-  });
-});
-test("disposed and stale provider selections cannot render Connect", async (t) => {
-  const selection = deferred();
-  const connectFactory = fakeConnectFactory();
-  const { page, host } = mountPage(t, {
-    initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
-    service: baseService({ selectProvider: () => selection.promise }),
-    connectFactory,
-  });
-  installButton(host, "codex").click();
-  page.dispose();
-  selection.resolve(connectStatus());
-  await flush();
-  assert.equal(connectFactory.instances.length, 0);
-  assert.equal(text(host), "");
-});
-test("selection reconciliation fails safely and Retry reloads authoritative status", async (t) => {
-  const selectCalls = [];
-  let statusCalls = 0;
-  const { host } = mountPage(t, {
-    initialStatus: providerStatus({ revision: 3, suggested_provider_kind: "codex" }),
-    service: baseService({
-      selectProvider(kind, revision) {
-        selectCalls.push({ kind, revision });
-        if (selectCalls.length === 1) return Promise.reject(new Error("SECRET token=abc"));
-        return Promise.resolve(connectStatus({ revision: 10 }));
-      },
-      status() {
-        statusCalls++;
-        return Promise.resolve(providerStatus({
-          revision: statusCalls === 1 ? 3 : 9, suggested_provider_kind: "codex",
-        }));
-      },
-    }),
-    connectFactory: fakeConnectFactory(),
-  });
-  installButton(host, "codex").click();
-  await flush();
-  assert.equal(byClass(host, "onboarding-error").getAttribute("role"), "alert");
-  assert.doesNotMatch(text(host), /SECRET|token=abc/);
-  assert.equal(statusCalls, 1);
-  button(host, "Thử lại").click();
-  await flush();
-  assert.equal(statusCalls, 2);
-  installButton(host, "codex").click();
-  await flush();
-  assert.deepEqual(selectCalls[1], { kind: "codex", revision: 9 });
 });
 test("Connect resume creates and starts exactly one component without re-PUT", (t) => {
   let selects = 0;
@@ -414,8 +291,8 @@ test("a connected terminal reconciles authoritative Setup and deduplicates the P
         calls.push({ op: "status", signal });
         return Promise.resolve(setupStatus({ revision: 7 }));
       },
-      setup(accountId, revision, signal) {
-        calls.push({ op: "setup", accountId, revision, signal });
+      setup(kind, accountId, revision, signal) {
+        calls.push({ op: "setup", kind, accountId, revision, signal });
         return setupGate.promise;
       },
     }),
@@ -438,7 +315,7 @@ test("a connected terminal reconciles authoritative Setup and deduplicates the P
     { accountId: "account-1", revision: 7 },
   );
   assert.match(text(host), /Đang chuẩn bị cấu hình…/);
-  setupGate.resolve(setupResult({ revision: 8 }));
+  setupGate.resolve(setupSuccess({ revision: 8 }));
   await microtask();
   await microtask();
   assert.match(text(host), /✓/);
@@ -447,6 +324,62 @@ test("a connected terminal reconciles authoritative Setup and deduplicates the P
   await flush();
   assert.match(text(host), /Trợ lý của bạn là ai/);
   await Promise.all([first, duplicate, whileSetupIsPending]);
+});
+test("first provider Setup keeps every row visible then returns to the provider list", async (t) => {
+  const response = deferred();
+  const calls = [];
+  const stages = [pendingProvider("codex", 0), pendingProvider("claude-code", 1)];
+  const initial = setupStatus({
+    revision: 51, providers: stages, provider_kind: "codex",
+    provider_id: "codex", account_id: "acct-codex",
+  });
+  const { host } = mountPage(t, {
+    initialStatus: initial,
+    service: baseService({
+      setup(...args) { calls.push(args); return response.promise; },
+    }),
+  });
+
+  assert.match(text(providerCard(host, "codex")), /Đang thiết lập/u);
+  assert.match(text(providerCard(host, "claude-code")), /Đang chờ/u);
+  assert.deepEqual(calls[0].slice(0, 3), ["codex", "acct-codex", 51]);
+  assert.ok(calls[0][3] instanceof AbortSignal);
+
+  response.resolve(providerStatus({
+    revision: 52,
+    providers: [
+      readyProvider("codex", 0, { account_id: "acct-codex", model_id: "model-c" }),
+      pendingProvider("claude-code", 1),
+    ],
+  }));
+  await flush(); await flush();
+  assert.match(text(host), /Chọn nhà cung cấp/u);
+  assert.match(text(providerCard(host, "codex")), /Đã sẵn sàng · Ưu tiên 1/u);
+  assert.match(text(providerCard(host, "claude-code")), /Chưa cài\. Bấm để cài\./u);
+});
+test("last provider Setup advances to Persona with the exact clicked identity", async (t) => {
+  const calls = [];
+  const readyCodex = readyProvider("codex", 0, { account_id: "acct-c", model_id: "model-c" });
+  const pendingClaude = pendingProvider("claude-code", 1);
+  const readyClaude = readyProvider("claude-code", 1, { account_id: "acct-a", model_id: "model-a" });
+  const initial = setupStatus({
+    revision: 61, providers: [readyCodex, pendingClaude], provider_kind: "claude-code",
+    provider_id: "claude-code", account_id: "acct-a",
+  });
+  const final = personaStatus({
+    revision: 62, providers: [readyCodex, readyClaude], provider_kind: "codex",
+    provider_id: "codex", account_id: "acct-c", model_id: "model-c",
+  });
+  const { host } = mountPage(t, {
+    initialStatus: initial,
+    service: baseService({
+      setup(...args) { calls.push(args); return Promise.resolve(final); },
+    }),
+  });
+
+  await flush(); await new Promise((resolve) => setTimeout(resolve, 0)); await flush();
+  assert.deepEqual(calls[0].slice(0, 3), ["claude-code", "acct-a", 61]);
+  assert.match(text(host), /Trợ lý của bạn là ai/u);
 });
 test("Connect reconciliation accepts only the exact successor Setup snapshot", async (t) => {
   const invalid = [
@@ -539,8 +472,8 @@ test("Setup resume auto-runs once, shows failure, and Retry starts exactly one n
         statusCalls++;
         return Promise.resolve(setupStatus({ revision: 21, account_id: "resume-account" }));
       },
-      setup(accountId, revision, signal) {
-        calls.push({ accountId, revision, signal });
+      setup(kind, accountId, revision, signal) {
+        calls.push({ kind, accountId, revision, signal });
         return calls.length === 1 ? first.promise : second.promise;
       },
     }),
@@ -561,7 +494,7 @@ test("Setup resume auto-runs once, shows failure, and Retry starts exactly one n
   await flush();
   assert.equal(statusCalls, 1);
   assert.equal(calls.length, 2);
-  second.resolve(setupResult({ revision: 22, account_id: "resume-account" }));
+  second.resolve(setupSuccess({ revision: 22, accountID: "resume-account" }));
   await flush();
 });
 test("Setup Retry renders an authoritative non-Setup phase without stale POST", async (t) => {
@@ -611,14 +544,12 @@ test("Setup Retry uses the refreshed revision and provider/account identity exac
         initialStatus: setupStatus({ revision: 3 }),
         service: baseService({
           status: () => Promise.resolve(authoritative),
-          setup(accountId, revision) {
-            calls.push({ accountId, revision });
+          setup(kind, accountId, revision) {
+            calls.push({ kind, accountId, revision });
             if (calls.length === 1) return Promise.reject(new Error("stale"));
-            return Promise.resolve(setupResult({
-              revision: revision + 1,
-              provider_kind: authoritative.provider_kind,
-              provider_id: authoritative.provider_id,
-              account_id: authoritative.account_id,
+            return Promise.resolve(setupSuccess({
+              revision: revision + 1, kind: authoritative.provider_kind,
+              accountID: authoritative.account_id,
             }));
           },
         }),
@@ -629,8 +560,8 @@ test("Setup Retry uses the refreshed revision and provider/account identity exac
       retry.click();
       await flush();
       assert.deepEqual(calls, [
-        { accountId: "account-1", revision: 3 },
-        { accountId: authoritative.account_id, revision: authoritative.revision },
+        { kind: "codex", accountId: "account-1", revision: 3 },
+        { kind: authoritative.provider_kind, accountId: authoritative.account_id, revision: authoritative.revision },
       ]);
     });
   }
@@ -730,7 +661,7 @@ test("dispose aborts Setup, clears timers/listeners, and suppresses stale render
   const { page, host } = mountPage(t, {
     initialStatus: setupStatus(),
     service: baseService({
-      setup(_accountId, _revision, setupSignal) {
+      setup(_kind, _accountId, _revision, setupSignal) {
         signal = setupSignal;
         return gate.promise;
       },
@@ -741,28 +672,13 @@ test("dispose aborts Setup, clears timers/listeners, and suppresses stale render
   page.dispose();
   page.dispose();
   assert.equal(signal.aborted, true);
-  gate.resolve(setupResult());
+  gate.resolve(setupSuccess());
   await flush();
   assert.equal(text(host), "");
   assert.equal(timers.size, 0);
   assert.equal(completions, 0);
   assert.equal(page.mount(host), page);
   assert.equal(text(host), "");
-});
-test("same-host remount does not duplicate provider listeners", async (t) => {
-  let selects = 0;
-  const gate = deferred();
-  const { page, host } = mountPage(t, {
-    initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
-    service: baseService({
-      selectProvider: () => { selects++; return gate.promise; },
-    }),
-  });
-  const retained = installButton(host, "codex");
-  page.mount(host);
-  retained.click();
-  retained.click();
-  assert.equal(selects, 1);
 });
 test("the real Provider Connect starts immediately and receives onboarding revision", async (t) => {
   const connectCalls = [];
@@ -782,9 +698,9 @@ test("the real Provider Connect starts immediately and receives onboarding revis
     },
     service: baseService({
       status: () => Promise.resolve(setupStatus({ revision: 52, account_id: "actual-account" })),
-      setup(accountId, revision) {
-        setupCalls.push({ accountId, revision });
-        return Promise.resolve(setupResult({ revision: 53, account_id: accountId }));
+      setup(kind, accountId, revision) {
+        setupCalls.push({ kind, accountId, revision });
+        return Promise.resolve(setupSuccess({ revision: 53, accountID: accountId }));
       },
     }),
     ...timers,
@@ -795,5 +711,5 @@ test("the real Provider Connect starts immediately and receives onboarding revis
   await flush();
   await flush();
   assert.deepEqual(connectCalls, [{ kind: "codex", label: "Onboarding", onboardingRevision: 51 }]);
-  assert.deepEqual(setupCalls, [{ accountId: "actual-account", revision: 52 }]);
+  assert.deepEqual(setupCalls, [{ kind: "codex", accountId: "actual-account", revision: 52 }]);
 });

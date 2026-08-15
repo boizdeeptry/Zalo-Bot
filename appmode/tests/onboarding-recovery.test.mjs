@@ -40,6 +40,9 @@ function result(revision, overrides = {}) {
 function service(overrides = {}) {
   return {
     status: () => Promise.resolve(onboardingStatus("test")),
+    updateProviders: () => Promise.reject(new Error("not used")),
+    beginProvider: () => Promise.reject(new Error("not used")),
+    backToProviders: () => Promise.reject(new Error("not used")),
     selectProvider: () => Promise.reject(new Error("not used")),
     setup: () => Promise.reject(new Error("not used")),
     loadAgent: () => Promise.resolve(agent()),
@@ -184,7 +187,7 @@ test("persona changed opens the shared editor and saves with the current Test re
   assert.equal(button(host, "Ổn, dùng cấu hình này"), null);
 });
 
-test("broken staging refreshes once, follows moved state, or falls back to Provider", async (t) => {
+test("broken staging refreshes once, follows moved state, or fails closed without fabricating Provider", async (t) => {
   for (const code of ["ONBOARDING_STAGING_INVALID", "ONBOARDING_NO_MODEL"]) {
     await t.test(`${code} unchanged`, async (subtest) => {
       let statuses = 0;
@@ -198,8 +201,8 @@ test("broken staging refreshes once, follows moved state, or falls back to Provi
       submit(host);
       await settle();
       assert.equal(statuses, 1);
-      assert.match(text(host), /Chọn nhà cung cấp/u);
-      assert.match(text(host), /chọn lại nhà cung cấp/i);
+      assert.match(text(host), /Cấu hình kết nối không còn hợp lệ/u);
+      assert.doesNotMatch(text(host), /Chọn nhà cung cấp/u);
       assert.doesNotMatch(text(host), /Thử trò chuyện với/u);
     });
 
@@ -225,7 +228,7 @@ test("broken staging refreshes once, follows moved state, or falls back to Provi
   }
 });
 
-test("broken staging corruption and refresh failure fail closed at Provider", async (t) => {
+test("broken staging corruption and refresh failure stay safe without a local phase rewrite", async (t) => {
   for (const [name, statusResult] of [
     ["corrupt", () => {
       const malformed = onboardingStatus("test");
@@ -246,7 +249,8 @@ test("broken staging corruption and refresh failure fail closed at Provider", as
       submit(host);
       await settle();
       assert.equal(statuses, 1);
-      assert.match(text(host), /Chọn nhà cung cấp/u);
+      assert.match(text(host), /Chưa thể tiếp tục/u);
+      assert.doesNotMatch(text(host), /Chọn nhà cung cấp/u);
       assert.doesNotMatch(text(host), /private status detail|Thử trò chuyện với/u);
     });
   }

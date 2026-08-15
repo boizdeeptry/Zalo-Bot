@@ -62,6 +62,9 @@ function setupResult(overrides = {}) {
 function service(overrides = {}) {
   return {
     status: () => Promise.resolve(providerStatus()),
+    updateProviders: () => Promise.reject(new Error("not used")),
+    beginProvider: () => Promise.reject(new Error("not used")),
+    backToProviders: () => Promise.reject(new Error("not used")),
     selectProvider: () => Promise.resolve(connectStatus()),
     setup: () => Promise.resolve(setupResult()),
     loadAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [] }),
@@ -110,10 +113,8 @@ function mount(t, options = {}) {
 }
 
 test("provider phase uses a Tư Vấn Zalo modal over the retained grid canvas", (t) => {
-  let selects = 0;
   const { host } = mount(t, {
     initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
-    service: service({ selectProvider: () => { selects++; return Promise.resolve(connectStatus()); } }),
   });
   const { dialog } = assertModalFrame(host);
   const dashboard = byClass(host, "onboarding-dashboard");
@@ -124,35 +125,28 @@ test("provider phase uses a Tư Vấn Zalo modal over the retained grid canvas",
   assert.match(text(host), /Thiết lập trợ lý Zalo/u);
   assert.match(text(host), /Trạng thái/u);
   assert.match(text(host), /Chọn nhà cung cấp muốn dùng/u);
-  assert.match(text(providerCard(host, "codex")), /Đã chọn/u);
-  assert.match(text(providerCard(host, "codex")), /Chưa cài\. Bấm để cài\./u);
+  assert.match(text(providerCard(host, "codex")), /Đề xuất/u);
+  assert.match(text(providerCard(host, "codex")), /Chưa dùng/u);
   assert.match(text(providerCard(host, "claude-code")), /Chưa dùng/u);
   const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
-  assert.deepEqual(cards.map((card) => card.dataset.providerKind), ["claude-code", "codex"]);
+  assert.deepEqual(cards.map((card) => card.dataset.providerKind), ["codex", "claude-code"]);
   assert.ok(cards.every((card) => card.tagName === "DIV"));
   assert.equal(findAll(host, (node) => hasClass(node, "onboarding-provider-mark")).length, 2);
   const toggles = findAll(host, (node) => hasClass(node, "onboarding-provider-toggle"));
   assert.equal(toggles.length, 2);
-  assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
+  assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "false");
   assert.equal(providerToggle(host, "claude-code").getAttribute("aria-pressed"), "false");
-  assert.ok(button(providerCard(host, "codex"), "Bấm để cài."));
+  assert.equal(button(providerCard(host, "codex"), "Bấm để cài."), null);
   assert.equal(button(providerCard(host, "claude-code"), "Bấm để cài."), null);
   assert.equal(button(host, "Tiếp tục kết nối"), null);
   const switches = findAll(host, (node) => hasClass(node, "onboarding-agent-switch"));
   assert.equal(switches.length, 2);
-  assert.equal(switches.filter((node) => hasClass(node, "is-on")).length, 1);
+  assert.equal(switches.filter((node) => hasClass(node, "is-on")).length, 0);
   dialog.dispatchEvent({ type: "keydown", key: "Escape" });
   byClass(host, "onboarding-backdrop").click();
   assert.equal(find(host, (node) => node.getAttribute?.("role") === "dialog"), dialog);
   providerCard(host, "claude-code").click();
-  assert.equal(selects, 0, "the noninteractive row does not select or connect");
   assert.equal(find(host, (node) => node.getAttribute?.("role") === "alertdialog"), null);
-  providerToggle(host, "claude-code").click();
-  const warning = find(host, (node) => node.getAttribute?.("role") === "alertdialog");
-  assert.ok(warning);
-  button(warning, "Huỷ").click();
-  assert.equal(selects, 0, "cancelling a replacement does not call the service");
-  assert.equal(document.activeElement, providerToggle(host, "claude-code"));
 });
 
 test("connect phase stays inside the same Tư Vấn Zalo modal", (t) => {

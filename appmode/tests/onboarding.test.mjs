@@ -6,7 +6,7 @@ import {
   createOnboardingService,
 } from "../overlay/internal/webui/static/pages/onboarding.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
-import { onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
+import { onboardingStatus, readyProvider } from "./helpers/onboarding-fixtures.mjs";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -32,7 +32,7 @@ function testStatus(overrides = {}) {
 }
 
 function personaStatus(overrides = {}) {
-  return { ...testStatus({ phase: "persona", revision: 4 }), ...overrides };
+  return onboardingStatus("persona", { revision: 4, ...overrides });
 }
 
 function agent(overrides = {}) {
@@ -72,6 +72,9 @@ function personaSaveResult(overrides = {}) {
 function baseService(overrides = {}) {
   return {
     status: () => Promise.resolve(testStatus()),
+    updateProviders: () => Promise.reject(new Error("not used")),
+    beginProvider: () => Promise.reject(new Error("not used")),
+    backToProviders: () => Promise.reject(new Error("not used")),
     selectProvider: () => Promise.reject(new Error("not used")),
     setup: () => Promise.reject(new Error("not used")),
     loadAgent: () => Promise.resolve(agent()),
@@ -214,6 +217,39 @@ test("Persona mounts shared dynamic fields, updates counter, focuses errors, and
   await flush();
   assert.equal(input(host).value, "Xin chào");
   assertNoSkip(host);
+});
+
+test("Persona Back waits for the authoritative provider snapshot exactly once", async (t) => {
+  const gate = deferred();
+  const calls = [];
+  const providers = [
+    readyProvider("codex", 0),
+    readyProvider("claude-code", 1),
+  ];
+  const { host } = mountPage(t, {
+    initialStatus: personaStatus({ revision: 14, providers }),
+    service: baseService({
+      backToProviders(revision, signal) {
+        calls.push({ revision, signal });
+        return gate.promise;
+      },
+    }),
+  });
+  await flush();
+
+  const back = button(host, "Chọn lại nhà cung cấp");
+  back.click(); back.click();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].revision, 14);
+  assert.ok(calls[0].signal instanceof AbortSignal);
+  assert.equal(back.disabled, true);
+  assert.match(text(host), /Trợ lý của bạn là ai/u);
+
+  gate.resolve(onboardingStatus("provider", { revision: 15, providers }));
+  await flush(); await flush();
+  assert.match(text(host), /Chọn nhà cung cấp/u);
+  assert.match(text(host), /Đã sẵn sàng · Ưu tiên 1/u);
+  assert.match(text(host), /Đã sẵn sàng · Ưu tiên 2/u);
 });
 
 test("Persona supports legacy display-only state, retains valid names, and handles safe 422 errors", async (t) => {

@@ -98,6 +98,10 @@ test("onboarding CSS shows only the modal over a full-screen grid", async () => 
   assert.match(css, /\.onboarding-shell \.onboarding-provider-confirm\s*\{[^}]*width:\s*min\(360px,\s*100%\)[^}]*max-width:\s*100%/s);
   assert.match(css, /\.onboarding-shell \.onboarding-provider-toggle:focus-visible,\s*\.onboarding-shell \.onboarding-provider-install:focus-visible,\s*\.onboarding-shell \.onboarding-provider-confirm \.onboarding-button:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--onboarding-cyan\)/s);
   assert.match(css, /@media\s*\(max-width:\s*600px\)[\s\S]*\.onboarding-shell \.onboarding-provider-card\s*\{[^}]*min-width:\s*0[^}]*\}[\s\S]*\.onboarding-shell \.onboarding-provider-confirm\s*\{[^}]*width:\s*100%/s);
+  assert.match(css, /@media\s*\(max-width:\s*420px\)[\s\S]*\.onboarding-shell \.onboarding-backdrop\s*\{[^}]*padding:\s*8px[^}]*\}[\s\S]*\.onboarding-shell \.onboarding-dialog\s*\{[^}]*width:\s*calc\(100vw - 16px\)[^}]*max-width:\s*calc\(100vw - 16px\)/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-connect-provider-row\s*\{[^}]*margin:\s*0/s);
+  assert.match(css, /@media\s*\(max-width:\s*600px\)[\s\S]*\.onboarding-shell \.onboarding-connect-provider-row\s*\{[^}]*margin:\s*0/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-install-state\s*\{[^}]*overflow-wrap:\s*anywhere/s);
   assert.doesNotMatch(css, /@media\s*\(max-width:\s*900px\)[\s\S]*\.onboarding-shell \.onboarding-dashboard-sidebar/s);
 });
 

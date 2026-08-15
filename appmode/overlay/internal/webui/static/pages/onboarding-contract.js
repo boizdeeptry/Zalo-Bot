@@ -566,7 +566,8 @@ export function safeServerFieldCount(error) {
 
 export function validateOnboardingPageService(service) {
   for (const method of [
-    "status", "selectProvider", "setup", "loadAgent", "saveAgent", "testChat", "complete",
+    "status", "updateProviders", "beginProvider", "setup", "backToProviders",
+    "loadAgent", "saveAgent", "testChat", "complete",
   ]) {
     if (typeof service?.[method] !== "function") {
       throw new TypeError(`Onboarding page service requires ${method}()`);

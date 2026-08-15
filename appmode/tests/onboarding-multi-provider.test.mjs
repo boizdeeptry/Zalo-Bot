@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import * as contract from "../overlay/internal/webui/static/pages/onboarding-contract.js";
+import { createOnboardingPage } from "../overlay/internal/webui/static/pages/onboarding.js";
+import { find, installDOM, text } from "./helpers/dom-harness.mjs";
 import {
   onboardingProviderOptions,
   onboardingStatus,
@@ -27,6 +29,56 @@ const futureOption = Object.freeze({
 });
 
 const options = () => [...onboardingProviderOptions(), { ...futureOption }];
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+const settle = async () => { await flush(); await flush(); };
+const hasClass = (node, name) => Boolean(node?.classList?.contains(name));
+const row = (root, kind) => find(root, (node) => hasClass(node, "onboarding-provider-card")
+  && node.dataset.providerKind === kind);
+const toggle = (root, kind) => find(row(root, kind), (node) => hasClass(node, "onboarding-provider-toggle"));
+const install = (root, kind) => find(row(root, kind), (node) => hasClass(node, "onboarding-provider-install"));
+const never = () => new Promise(() => {});
+
+function pageService(overrides = {}) {
+  return {
+    status: never,
+    updateProviders: never,
+    beginProvider: never,
+    backToProviders: never,
+    selectProvider: never,
+    setup: never,
+    loadAgent: never,
+    saveAgent: never,
+    testChat: never,
+    complete: never,
+    ...overrides,
+  };
+}
+
+function pageConnectFactory() {
+  const instances = [];
+  const factory = (config) => {
+    const instance = {
+      config, starts: [], slot: null,
+      mount(slot) { this.slot = slot; return this; },
+      start(value) { this.starts.push(value); return true; },
+      cancel: async () => true,
+      dispose() { this.slot?.replaceChildren(); },
+    };
+    instances.push(instance);
+    return instance;
+  };
+  factory.instances = instances;
+  return factory;
+}
+
+function mountPage(t, initialStatus, service, connectFactory = pageConnectFactory()) {
+  const dom = installDOM();
+  const host = document.createElement("div");
+  const page = createOnboardingPage({ initialStatus, service, connectFactory, connectService: {} });
+  page.mount(host);
+  t.after(() => { page.dispose(); dom.restore(); });
+  return { connectFactory, host, page };
+}
 
 function providerStatus(overrides = {}) {
   return onboardingStatus("provider", { provider_options: options(), ...overrides });
@@ -109,6 +161,32 @@ const abortFenceScenarios = [
   },
 ];
 
+test("page service validation requires the plural runtime contract, not legacy selection", () => {
+  const methods = [
+    "status", "updateProviders", "beginProvider", "setup", "backToProviders",
+    "loadAgent", "saveAgent", "testChat", "complete",
+  ];
+  const valid = Object.fromEntries(methods.map((method) => [method, never]));
+  const create = (service) => createOnboardingPage({
+    initialStatus: providerStatus(), service, connectFactory: pageConnectFactory(),
+  });
+
+  const page = create(valid);
+  page.dispose();
+
+  for (const method of methods) {
+    const missing = { ...valid };
+    delete missing[method];
+    assert.throws(() => create(missing), new RegExp(`${method}\\(\\)`));
+  }
+
+  const legacyOnly = {
+    status: never, selectProvider: never, setup: never, loadAgent: never,
+    saveAgent: never, testChat: never, complete: never,
+  };
+  assert.throws(() => create(legacyOnly), /updateProviders\(\)/u);
+});
+
 test("status accepts a server-advertised future provider and deeply freezes catalog and stages", () => {
   assert.equal(typeof contract.normalizeProviderOptions, "function");
   assert.equal(typeof contract.normalizeProviderStages, "function");
@@ -129,6 +207,78 @@ test("status accepts a server-advertised future provider and deeply freezes cata
   raw.providers[0].kind = "mutated";
   assert.equal(normalized?.provider_options[0].display_name, "Codex");
   assert.equal(normalized?.providers[0].kind, "future-runtime");
+});
+
+test("provider selection comes only from staged rows while suggestion stays advisory", () => {
+  const normalized = contract.normalizeStatus(providerStatus({
+    suggested_provider_kind: "codex",
+    providers: [pendingProvider("claude-code", 0)],
+  }));
+
+  assert.equal(normalized?.suggested_provider_kind, "codex");
+  assert.deepEqual(normalized?.providers.map(({ kind }) => kind), ["claude-code"]);
+});
+
+test("keeps two providers on and installs only the clicked pending row", async (t) => {
+  const mutations = [];
+  const begins = [];
+  const pendingBoth = [pendingProvider("codex", 0), pendingProvider("claude-code", 1)];
+  let authoritative = providerStatus({ revision: 7, suggested_provider_kind: "codex" });
+  const service = pageService({
+    status: async () => authoritative,
+    updateProviders: async (kinds, revision, signal) => {
+      mutations.push({ kinds, revision, signal });
+      authoritative = providerStatus({
+        revision: revision + 1,
+        suggested_provider_kind: "codex",
+        providers: kinds.length === 1 ? [pendingProvider(kinds[0], 0)] : pendingBoth,
+      });
+      return authoritative;
+    },
+    beginProvider: async (kind, revision, signal) => {
+      begins.push({ kind, revision, signal });
+      authoritative = connectStatus(kind, pendingBoth, { revision: revision + 1 });
+      return authoritative;
+    },
+  });
+  const { connectFactory, host, page } = mountPage(t, authoritative, service);
+
+  assert.equal(toggle(host, "codex").getAttribute("aria-pressed"), "false");
+  toggle(host, "codex").click(); await settle();
+  toggle(host, "claude-code").click(); await settle();
+  assert.deepEqual(mutations.map(({ kinds, revision }) => ({ kinds, revision })), [
+    { kinds: ["codex"], revision: 7 },
+    { kinds: ["codex", "claude-code"], revision: 8 },
+  ]);
+  assert.equal(toggle(host, "codex").getAttribute("aria-pressed"), "true");
+  assert.equal(toggle(host, "claude-code").getAttribute("aria-pressed"), "true");
+  assert.equal(install(host, "codex").getAttribute("aria-label"), "Cài Codex");
+  assert.equal(install(host, "claude-code").getAttribute("aria-label"), "Cài Claude Code");
+
+  const cta = install(host, "claude-code");
+  cta.click(); cta.click(); page.mount(host); cta.click();
+  await settle();
+  assert.deepEqual(begins.map(({ kind, revision }) => ({ kind, revision })), [
+    { kind: "claude-code", revision: 9 },
+  ]);
+  assert.equal(connectFactory.instances.length, 1);
+  assert.deepEqual(connectFactory.instances[0].starts, [{
+    label: "Onboarding", onboardingRevision: 10, immediate: true,
+  }]);
+  assert.match(text(row(host, "codex")), /Đang chờ/u);
+  assert.doesNotMatch(text(host), /Bắt đầu kết nối/u);
+});
+
+test("renders a future advertised provider with generic copy without selecting its suggestion", (t) => {
+  const initial = providerStatus({ revision: 17, suggested_provider_kind: "future-runtime" });
+  const { host } = mountPage(t, initial, pageService());
+  const future = row(host, "future-runtime");
+
+  assert.match(text(future), /Future Runtime/u);
+  assert.match(text(future), /Runtime được quảng bá từ máy chủ/u);
+  assert.match(text(future), /Đề xuất/u);
+  assert.equal(toggle(host, "future-runtime").getAttribute("aria-pressed"), "false");
+  assert.equal(install(host, "future-runtime"), null);
 });
 
 test("catalog validation rejects duplicate, hidden, unsafe, mistyped, and noncanonical options", () => {
@@ -506,6 +656,21 @@ test("begin reconciliation preserves full staged arrays and accepts only the exa
   });
   assert.equal(result.kind, "started");
   assert.equal(result.state.provider_kind, "claude-code");
+
+  const calls = [];
+  const direct = await flow.beginProviderInstallWithReconciliation({
+    state: before,
+    kind: "claude-code",
+    beginProvider: async (revision, kind, signal) => {
+      calls.push({ revision, kind, signal });
+      return exact;
+    },
+    loadStatus: async () => { throw new Error("must not reconcile"); },
+  });
+  assert.deepEqual(calls.map(({ revision, kind }) => ({ revision, kind })), [
+    { revision: 40, kind: "claude-code" },
+  ]);
+  assert.equal(direct.kind, "started");
 
   const moved = await flow.beginProviderInstallWithReconciliation({
     state: before,

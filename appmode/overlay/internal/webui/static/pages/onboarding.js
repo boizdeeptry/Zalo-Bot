@@ -2,19 +2,18 @@ import { createProviderConnect } from "../components/provider-connect.js";
 import { element } from "../core/ui.js";
 import { createProviderService } from "./providers.js";
 import {
-  SAFE_ERROR, SAFE_SETUP_ERROR, SUPPORTED_PROVIDERS, createOnboardingService, isRecord,
+  SAFE_ERROR, SAFE_SETUP_ERROR, createOnboardingService, isRecord,
   normalizeAgentResponse, normalizeCompleteResponse, normalizeConnectedSetup,
   normalizeSetupResult, normalizeStatus, normalizeTestMessage,
   normalizeTestResponse, positiveRevision, safeServerFieldCount, semanticString, successorRevision,
   terminalIdentity, testChatRecovery, testResponseError, validDisplayName, validateConnectController,
   validateOnboardingPageService,
 } from "./onboarding-contract.js";
-import { cancelConnectAndReadStatus, selectProviderWithReconciliation } from "./onboarding-provider-selection.js";
+import { cancelConnectAndReadStatus } from "./onboarding-provider-selection.js";
+import { beginProviderInstallWithReconciliation, persistProviderSetWithReconciliation } from "./onboarding-provider-flow.js";
 import { createDoneStage, createPersonaStage, createTestStage } from "./onboarding-late-view.js";
-import {
-  createConnectStage, createLoadingStatus, createRetryButton, createSafeErrorStage,
-  createSetupStage, createWelcomeStage, focusProviderControl, renderOnboardingShell,
-} from "./onboarding-early-view.js";
+import { createConnectStage, createLoadingStatus, createRetryButton, createSafeErrorStage,
+  createSetupStage, createWelcomeStage, focusProviderControl, renderOnboardingShell } from "./onboarding-early-view.js";
 export { createOnboardingService };
 const CONNECT_STOPPED = "Kết nối đã dừng. Bấm Thử lại để tải trạng thái và tiếp tục.";
 export function createOnboardingPage({
@@ -30,49 +29,34 @@ export function createOnboardingPage({
   if (typeof onComplete !== "function") throw new TypeError("onComplete must be a function");
   if (typeof nowFn !== "function") throw new TypeError("nowFn must be a function");
   let state = normalizeStatus(initialStatus);
-  let selectedProvider = state?.phase === "provider"
-    ? state.provider_kind || state.suggested_provider_kind
-    : "";
   let host = null, root = null, activeController = null, personaTimer = null;
   let connectController = null, connectBackPromise = null, connectTerminalPromise = null;
   let setupInFlight = null, personaView = null, testView = null, doneView = null;
   let disposed = false, generation = 0, connectKey = "", agentName = "";
   let testMessage = "Xin chào", testResult = null, testError = "", testToken = "", testExpiresAt = 0, receiptTimer = null;
-  let personaBusy = false, testBusy = false, completeBusy = false, handoffDone = false;
+  let providerBusy = false, personaBusy = false, testBusy = false, completeBusy = false, handoffDone = false;
   const listeners = new Set();
   function listen(node, type, listener) {
-    node.addEventListener(type, listener);
-    listeners.add({ node, type, listener });
+    node.addEventListener(type, listener); listeners.add({ node, type, listener });
     return node;
   }
   function clearListeners() {
-    for (const binding of listeners) {
-      binding.node.removeEventListener(binding.type, binding.listener);
-    }
+    for (const binding of listeners) binding.node.removeEventListener(binding.type, binding.listener);
     listeners.clear();
   }
   function clearPersonaTimer() {
     if (personaTimer === null) return;
-    clearTimeoutFn(personaTimer);
-    personaTimer = null;
+    clearTimeoutFn(personaTimer); personaTimer = null;
   }
-  function disposePersonaView() {
-    personaView?.dispose();
-    personaView = null;
-  }
+  function disposePersonaView() { personaView?.dispose(); personaView = null; }
   function clearReceipt({ clearResult = true } = {}) {
-    testToken = "";
-    testExpiresAt = 0;
+    testToken = ""; testExpiresAt = 0;
     if (receiptTimer !== null) {
-      clearTimeoutFn(receiptTimer);
-      receiptTimer = null;
+      clearTimeoutFn(receiptTimer); receiptTimer = null;
     }
     if (clearResult) testResult = null;
   }
-  function abortActive() {
-    activeController?.abort();
-    activeController = null;
-  }
+  function abortActive() { activeController?.abort(); activeController = null; }
   function invalidate() {
     generation++;
     abortActive();
@@ -85,17 +69,13 @@ export function createOnboardingPage({
     activeController = controller;
     return { run, controller };
   }
-  function owns(run) {
-    return !disposed && root && generation === run;
-  }
+  function owns(run) { return !disposed && root && generation === run; }
   function releaseOperation(run, controller) {
     if (generation === run && activeController === controller) activeController = null;
   }
   function disposeConnect() {
     const instance = connectController;
-    connectController = null;
-    connectKey = "";
-    connectBackPromise = null;
+    connectController = null; connectKey = ""; connectBackPromise = null;
     if (!instance) return;
     try {
       instance.dispose();
@@ -103,66 +83,87 @@ export function createOnboardingPage({
       // A broken child controller must not retain the onboarding host.
     }
   }
-  function shell(phase, content) {
-    renderOnboardingShell(root, phase, content);
-  }
+  function shell(phase, content) { renderOnboardingShell(root, phase, content); }
   function renderSafeError(message = SAFE_ERROR, retry = refreshStatus) {
     disposePersonaView();
     disposeConnect();
     clearListeners();
-    shell(state?.phase || "provider", createSafeErrorStage(
-      message, createRetryButton(listen, retry),
-    ));
+    shell(state?.phase || "provider", createSafeErrorStage(message, createRetryButton(listen, retry)));
   }
   function renderLoading() {
     disposePersonaView();
-    connectTerminalPromise = null;
-    disposeConnect();
-    clearListeners();
+    connectTerminalPromise = null; disposeConnect(); clearListeners();
     shell(state?.phase || "provider", createLoadingStatus("Đang tải lại trạng thái…"));
   }
   function renderWelcome(message = "") {
     disposePersonaView();
-    connectTerminalPromise = null;
-    disposeConnect();
-    clearListeners();
+    connectTerminalPromise = null; disposeConnect(); clearListeners();
     shell("provider", createWelcomeStage({
-      selectedProvider, message, listen,
-      onSelect(kind) {
-        selectedProvider = kind; renderWelcome(message);
-        if (SUPPORTED_PROVIDERS.has(kind)) focusProviderControl(root, kind);
-      },
-      onProceed: () => { void selectProvider(); },
+      state, message, busy: providerBusy, listen,
+      onToggle: (kind, enabled) => { void updateProviderSet(kind, enabled); },
+      onInstall: (kind) => { void beginProviderInstall(kind); },
       onRetry: refreshStatus,
     }));
   }
-  async function selectProvider() {
-    const requestedKind = selectedProvider;
+  async function updateProviderSet(kind, enabled) {
     const snapshot = normalizeStatus(state);
-    if (!snapshot || !SUPPORTED_PROVIDERS.has(requestedKind)) return false;
+    if (providerBusy || snapshot?.phase !== "provider") return false;
+    const current = snapshot.providers.map((stage) => stage.kind);
+    const stage = snapshot.providers.find((candidate) => candidate.kind === kind);
+    if ((enabled && stage) || (!enabled && (!stage || stage.status === "ready"))) return false;
+    const selectedKinds = enabled ? [...current, kind] : current.filter((selected) => selected !== kind);
     clearReceipt(); agentName = "";
-    if (!successorRevision(snapshot.revision)) { renderSafeError(); return false; }
+    providerBusy = true;
     const { run, controller } = beginOperation();
+    renderWelcome();
     try {
-      const result = await selectProviderWithReconciliation({
-        service, snapshot, providerKind: requestedKind, signal: controller.signal,
+      const result = await persistProviderSetWithReconciliation({
+        state: snapshot, selectedKinds, signal: controller.signal,
+        updateProviders: (revision, kinds, signal) => service.updateProviders(kinds, revision, signal),
+        loadStatus: (signal) => service.status(signal),
       });
       if (!owns(run)) return false;
-      if (result.kind === "selected" || result.kind === "moved") {
-        state = result.state;
-        selectedProvider = state.provider_kind || state.suggested_provider_kind;
-        renderCurrent();
-        return result.kind === "selected";
-      }
-      if (result.kind === "retry") {
-        state = result.state;
-        selectedProvider = requestedKind;
+      state = result.state;
+      providerBusy = false;
+      renderCurrent();
+      if (state.phase === "provider") focusProviderControl(root, kind);
+      return result.kind === "updated";
+    } catch (error) {
+      if (!owns(run) || error?.name === "AbortError") return false;
+      providerBusy = false;
+      renderSafeError();
+      return false;
+    } finally {
+      releaseOperation(run, controller);
+    }
+  }
+  async function beginProviderInstall(kind) {
+    const snapshot = normalizeStatus(state);
+    if (providerBusy || snapshot?.phase !== "provider"
+      || snapshot.providers.find((stage) => stage.kind === kind)?.status !== "pending") return false;
+    clearReceipt(); agentName = "";
+    providerBusy = true;
+    const { run, controller } = beginOperation();
+    renderWelcome();
+    try {
+      const result = await beginProviderInstallWithReconciliation({
+        state: snapshot, kind, signal: controller.signal,
+        beginProvider: (revision, providerKind, signal) => service.beginProvider(providerKind, revision, signal),
+        loadStatus: (signal) => service.status(signal),
+      });
+      if (!owns(run)) return false;
+      state = result.state;
+      providerBusy = false;
+      if (result.kind === "moved" && state.phase === "provider"
+        && state.revision === snapshot.revision) {
         renderWelcome(SAFE_ERROR);
         return false;
       }
-      renderSafeError(); return false;
+      renderCurrent();
+      return result.kind === "started";
     } catch (error) {
       if (!owns(run) || error?.name === "AbortError") return false;
+      providerBusy = false;
       renderSafeError();
       return false;
     } finally {
@@ -212,8 +213,7 @@ export function createOnboardingPage({
   function goBackFromConnect(stageRun) {
     if (connectBackPromise) return connectBackPromise;
     if (!owns(stageRun)) return Promise.resolve(false);
-    clearReceipt();
-    agentName = "";
+    clearReceipt(); agentName = "";
     const { run, controller } = beginOperation();
     const instance = connectController;
     connectBackPromise = (async () => {
@@ -229,8 +229,7 @@ export function createOnboardingPage({
       if (!owns(run)) return false;
       if (!nextState) { renderSafeError(); return false; }
       state = nextState;
-      selectedProvider = state.phase === "provider"
-        ? state.provider_kind || state.suggested_provider_kind : "";
+      providerBusy = false;
       if (state.phase === "connect") { renderSafeError(CONNECT_STOPPED); return true; }
       renderCurrent();
       return true;
@@ -243,7 +242,7 @@ export function createOnboardingPage({
     const kind = state.provider_kind;
     const key = `${kind}\u0000${state.revision}`;
     const slot = element("div", { className: "onboarding-connect-slot" });
-    shell("connect", createConnectStage(kind, slot));
+    shell("connect", createConnectStage(state, slot));
     if (connectController && connectKey === key) {
       connectController.mount(slot);
       return;
@@ -253,9 +252,7 @@ export function createOnboardingPage({
     const stageRun = generation;
     try {
       const instance = connectFactory({
-        ...connectOptions,
-        kind,
-        service: connectService,
+        ...connectOptions, kind, service: connectService,
         onConnected: (terminal) => handleConnected(stageRun, kind, state.revision, terminal),
         onBack: () => goBackFromConnect(stageRun),
       });
@@ -274,19 +271,15 @@ export function createOnboardingPage({
     }
   }
   function renderSetup(status, message = "") {
-    disposePersonaView();
-    disposeConnect();
-    clearListeners();
+    disposePersonaView(); disposeConnect(); clearListeners();
     const retry = status === "error" ? createRetryButton(listen, refreshStatus) : null;
-    shell("setup", createSetupStage(status, message || SAFE_SETUP_ERROR, retry));
+    shell("setup", createSetupStage(state, status, message || SAFE_SETUP_ERROR, retry));
   }
   function startSetup(snapshot) {
-    const accountID = semanticString(snapshot?.account_id);
-    const revision = positiveRevision(snapshot?.revision);
-    const providerKind = semanticString(snapshot?.provider_kind);
-    const providerID = semanticString(snapshot?.provider_id);
-    if (!accountID || !revision || !SUPPORTED_PROVIDERS.has(providerKind)
-      || providerID !== providerKind) {
+    const accountID = semanticString(snapshot?.account_id), revision = positiveRevision(snapshot?.revision);
+    const providerKind = semanticString(snapshot?.provider_kind), providerID = semanticString(snapshot?.provider_id);
+    if (!accountID || !revision || !providerKind || providerID !== providerKind
+      || !snapshot.provider_options?.some((option) => option.kind === providerKind)) {
       renderSafeError();
       return Promise.resolve(false);
     }
@@ -294,13 +287,13 @@ export function createOnboardingPage({
       renderSafeError();
       return Promise.resolve(false);
     }
-    const key = `${accountID}\u0000${revision}`;
+    const key = `${providerKind}\u0000${accountID}\u0000${revision}`;
     if (setupInFlight?.key === key) return setupInFlight.promise;
     const { run, controller } = beginOperation();
     renderSetup("loading");
     const promise = (async () => {
       try {
-        const response = await service.setup(accountID, revision, controller.signal);
+        const response = await service.setup(providerKind, accountID, revision, controller.signal);
         if (!owns(run)) return false;
         const nextState = normalizeSetupResult(response, { accountID, revision, providerKind, providerID, lifecycle: snapshot });
         if (!nextState) {
@@ -309,6 +302,11 @@ export function createOnboardingPage({
           return false;
         }
         state = nextState;
+        if (nextState.phase === "provider") {
+          setupInFlight = null;
+          renderCurrent();
+          return true;
+        }
         renderSetup("complete");
         personaTimer = setTimeoutFn(() => {
           personaTimer = null;
@@ -330,28 +328,19 @@ export function createOnboardingPage({
     return promise;
   }
   function renderStageLoading(phase, message) {
-    disposePersonaView();
-    disposeConnect();
-    clearListeners();
+    disposePersonaView(); disposeConnect(); clearListeners();
     shell(phase, createLoadingStatus(message));
   }
   function mountPersona(agent) {
-    disposePersonaView();
-    disposeConnect();
-    clearListeners();
+    disposePersonaView(); disposeConnect(); clearListeners();
     personaBusy = false;
     personaView = createPersonaStage({
-      agent,
-      listen,
+      agent, listen,
       onChange(result) {
-        clearReceipt();
-        testError = "";
-        personaBusy = false;
-        invalidate();
+        clearReceipt(); testError = ""; personaBusy = false; invalidate();
         personaView?.setValidation(result);
       },
-      onSubmit: savePersona,
-      onBack: backFromPersona,
+      onSubmit: savePersona, onBack: backFromPersona,
     });
     shell("persona", personaView.content);
   }
@@ -394,10 +383,8 @@ export function createOnboardingPage({
       return false;
     }
     const payload = {
-      values: current.values,
-      display_name: current.displayName,
-      require_complete: true,
-      onboarding_revision: expected.revision,
+      values: current.values, display_name: current.displayName,
+      require_complete: true, onboarding_revision: expected.revision,
     };
     personaBusy = true;
     personaView.setBusy(true);
@@ -437,15 +424,49 @@ export function createOnboardingPage({
       releaseOperation(run, requestController);
     }
   }
-  function backFromPersona() {
+  async function backFromPersona() {
     clearReceipt();
     agentName = "";
-    personaBusy = false;
-    invalidate();
-    disposePersonaView();
-    state = { ...state, phase: "provider" };
-    selectedProvider = SUPPORTED_PROVIDERS.has(state.provider_kind) ? state.provider_kind : "";
-    renderWelcome();
+    if (personaBusy || !["persona", "test"].includes(state?.phase)
+      || !successorRevision(state.revision)) return false;
+    const snapshot = state;
+    personaBusy = true;
+    personaView?.setBusy(true);
+    const { run, controller } = beginOperation();
+    try {
+      let response;
+      try {
+        response = await service.backToProviders(snapshot.revision, controller.signal);
+      } catch (error) {
+        if (controller.signal.aborted || error?.name === "AbortError") throw error;
+        response = await service.status(controller.signal);
+      }
+      if (!owns(run)) return false;
+      const nextState = normalizeStatus(response);
+      if (!nextState) {
+        personaBusy = false;
+        renderSafeError();
+        return false;
+      }
+      if (nextState.phase === snapshot.phase && nextState.revision === snapshot.revision) {
+        personaBusy = false;
+        personaView?.setBusy(false);
+        personaView?.setError("Chưa thể quay lại danh sách nhà cung cấp. Vui lòng thử lại.");
+        return false;
+      }
+      state = nextState;
+      personaBusy = false;
+      renderCurrent();
+      return nextState.phase === "provider";
+    } catch (error) {
+      if (!owns(run) || controller.signal.aborted) return false;
+      personaBusy = false;
+      personaView?.setBusy(false);
+      personaView?.setError("Chưa thể quay lại danh sách nhà cung cấp. Vui lòng thử lại.");
+      return false;
+    } finally {
+      releaseOperation(run, controller);
+    }
   }
   function scheduleReceiptExpiry() {
     if (!testToken || !testExpiresAt) return;
@@ -463,17 +484,10 @@ export function createOnboardingPage({
     }, delay);
   }
   function renderTestUnavailable(message) {
-    disposePersonaView();
-    disposeConnect();
-    clearListeners();
+    disposePersonaView(); disposeConnect(); clearListeners();
     testView = createTestStage({
-      displayName: "trợ lý",
-      message: testMessage,
-      result: null,
-      errorMessage: message,
-      busy: false,
-      canComplete: false,
-      listen,
+      displayName: "trợ lý", message: testMessage, result: null,
+      errorMessage: message, busy: false, canComplete: false, listen,
       onInput: (value) => { testMessage = value; },
       onSend: () => { void loadTestAgent(); },
       onRetry: () => { void loadTestAgent(); },
@@ -508,17 +522,11 @@ export function createOnboardingPage({
       clearReceipt();
       testError = "Kết quả thử đã hết hạn. Vui lòng thử lại.";
     }
-    disposePersonaView();
-    disposeConnect();
-    clearListeners();
+    disposePersonaView(); disposeConnect(); clearListeners();
     testView = createTestStage({
-      displayName: agentName,
-      message: testMessage,
-      result: testResult,
-      errorMessage: testError,
-      busy: testBusy || completeBusy,
-      canComplete: Boolean(testToken),
-      listen,
+      displayName: agentName, message: testMessage, result: testResult,
+      errorMessage: testError, busy: testBusy || completeBusy,
+      canComplete: Boolean(testToken), listen,
       onInput(value) {
         testMessage = value;
         if (testToken || testResult || testBusy || completeBusy) {
@@ -560,14 +568,10 @@ export function createOnboardingPage({
     testView?.showError("");
     const { run, controller: requestController } = beginOperation();
     try {
-      const response = await service.testChat(message, expected.revision, {
-        signal: requestController.signal,
-      });
+      const response = await service.testChat(message, expected.revision, { signal: requestController.signal });
       if (!owns(run)) return false;
       const result = normalizeTestResponse(response, {
-        displayName: agentName,
-        snapshot: expected,
-        now: nowFn(),
+        displayName: agentName, snapshot: expected, now: nowFn(),
       });
       if (!result) {
         testBusy = false;
@@ -620,9 +624,7 @@ export function createOnboardingPage({
     testView?.setBusy(true);
     const { run, controller: requestController } = beginOperation();
     try {
-      const response = await service.complete(receipt, expected.revision, {
-        signal: requestController.signal,
-      });
+      const response = await service.complete(receipt, expected.revision, { signal: requestController.signal });
       if (!owns(run)) return false;
       if (!normalizeCompleteResponse(response)) {
         completeBusy = false;
@@ -672,13 +674,9 @@ export function createOnboardingPage({
       void loadCompletedAgent();
       return;
     }
-    clearReceipt();
-    disposePersonaView();
-    disposeConnect();
-    clearListeners();
+    clearReceipt(); disposePersonaView(); disposeConnect(); clearListeners();
     doneView = createDoneStage({
-      displayName: agentName,
-      listen,
+      displayName: agentName, listen,
       onPortal: () => handoff("portal"),
       onKnowledge: () => handoff("knowledge"),
     });
@@ -709,16 +707,9 @@ export function createOnboardingPage({
       default: renderSafeError();
     }
   }
-  function renderProviderRecovery(snapshot) {
-    state = { ...snapshot, phase: "provider" };
-    selectedProvider = SUPPORTED_PROVIDERS.has(state.provider_kind) ? state.provider_kind : "";
-    renderWelcome("Cấu hình kết nối không còn hợp lệ. Vui lòng chọn lại nhà cung cấp.");
-    return false;
-  }
   async function refreshStatus({ fallbackToProvider = false } = {}) {
     clearReceipt();
     agentName = ""; testBusy = false; completeBusy = false;
-    const fallbackState = state;
     const { run, controller } = beginOperation();
     renderLoading();
     try {
@@ -726,19 +717,20 @@ export function createOnboardingPage({
       if (!owns(run)) return false;
       const nextState = normalizeStatus(response);
       if (!nextState) {
-        if (fallbackToProvider) return renderProviderRecovery(fallbackState);
         state = null;
         renderSafeError();
         return false;
       }
       state = nextState;
-      if (fallbackToProvider && nextState.phase === "test") return renderProviderRecovery(nextState);
-      selectedProvider = nextState.phase === "provider" ? nextState.provider_kind || nextState.suggested_provider_kind : "";
+      providerBusy = false;
+      if (fallbackToProvider && nextState.phase === "test") {
+        renderSafeError("Cấu hình kết nối không còn hợp lệ. Vui lòng tải lại trạng thái.");
+        return false;
+      }
       renderCurrent();
       return true;
     } catch (error) {
       if (!owns(run) || error?.name === "AbortError") return false;
-      if (fallbackToProvider) return renderProviderRecovery(fallbackState);
       renderSafeError();
       return false;
     } finally {
@@ -774,21 +766,14 @@ export function createOnboardingPage({
   }
   function dispose() {
     if (disposed) return;
-    disposed = true;
-    clearReceipt();
-    agentName = "";
-    personaBusy = false;
-    testBusy = false;
-    completeBusy = false;
+    disposed = true; clearReceipt(); agentName = "";
+    providerBusy = false; personaBusy = false; testBusy = false; completeBusy = false;
     invalidate();
     clearListeners();
     disposePersonaView();
     disposeConnect();
-    connectTerminalPromise = null;
-    setupInFlight = null;
-    root?.remove();
-    root = null;
-    host = null;
+    connectTerminalPromise = null; setupInFlight = null;
+    root?.remove(); root = null; host = null;
   }
   const controller = Object.freeze({ mount, dispose });
   return controller;

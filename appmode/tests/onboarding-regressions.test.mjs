@@ -38,6 +38,9 @@ function response(overrides = {}) {
 function service(overrides = {}) {
   return {
     status: () => Promise.resolve(status()),
+    updateProviders: () => Promise.reject(new Error("not used")),
+    beginProvider: () => Promise.reject(new Error("not used")),
+    backToProviders: () => Promise.reject(new Error("not used")),
     selectProvider: () => Promise.reject(new Error("not used")),
     setup: () => Promise.reject(new Error("not used")),
     loadAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [] }),
