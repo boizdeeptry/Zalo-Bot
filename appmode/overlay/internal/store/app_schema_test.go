@@ -1056,7 +1056,7 @@ END`); err != nil {
 	if got := appSchemaVersionForTest(t, db); got != "7" {
 		t.Fatalf("schema_version after rollback = %q; want 7", got)
 	}
-	gotState, err := (&Store{db: db}).OnboardingState()
+	gotState, err := scanOnboardingState(db.QueryRow(onboardingStateSelect))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,6 +1065,39 @@ END`); err != nil {
 	}
 	if appTableExistsForTest(t, db, "app_onboarding_provider_stages") {
 		t.Fatal("rolled-back migration left app_onboarding_provider_stages behind")
+	}
+	if got := onboardingLiveProjectionForTest(t, db); got != beforeLive {
+		t.Fatalf("live route changed after rollback = %q; want %q", got, beforeLive)
+	}
+}
+
+func TestMigrateAppV7RejectsUnknownOnboardingKind(t *testing.T) {
+	beforeState := OnboardingState{
+		Phase:        OnboardingPhaseSetup,
+		ProviderKind: syntheticOnboardingProviderKind,
+		ProviderID:   syntheticOnboardingProviderKind,
+		AccountID:    "future-account-v7",
+		Revision:     47,
+		UpdatedAt:    "2026-08-16T01:02:03Z",
+	}
+	db := openV7Fixture(t, beforeState)
+	beforeLive := onboardingLiveProjectionForTest(t, db)
+
+	if err := migrateApp(db); err == nil {
+		t.Fatal("migrateApp() accepted unknown V7 onboarding kind")
+	}
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version after rollback = %q; want 7", got)
+	}
+	gotState, err := scanOnboardingState(db.QueryRow(onboardingStateSelect))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotState != beforeState {
+		t.Fatalf("singleton changed after rollback = %+v; want %+v", gotState, beforeState)
+	}
+	if appTableExistsForTest(t, db, "app_onboarding_provider_stages") {
+		t.Fatal("rejected migration left app_onboarding_provider_stages behind")
 	}
 	if got := onboardingLiveProjectionForTest(t, db); got != beforeLive {
 		t.Fatalf("live route changed after rollback = %q; want %q", got, beforeLive)

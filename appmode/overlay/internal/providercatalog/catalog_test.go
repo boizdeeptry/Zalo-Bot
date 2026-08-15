@@ -8,6 +8,48 @@ import (
 	"testing"
 )
 
+func TestValidKind(t *testing.T) {
+	valid := []string{
+		"a",
+		"codex",
+		"claude-code",
+		"future-cli",
+		"provider-2",
+		strings.Repeat("a", 64),
+	}
+	for _, kind := range valid {
+		t.Run("valid "+kind, func(t *testing.T) {
+			if !ValidKind(kind) {
+				t.Fatalf("ValidKind(%q) = false; want true", kind)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name string
+		kind string
+	}{
+		{name: "empty", kind: ""},
+		{name: "over 64 bytes", kind: strings.Repeat("a", 65)},
+		{name: "uppercase", kind: "Codex"},
+		{name: "leading hyphen", kind: "-codex"},
+		{name: "trailing hyphen", kind: "codex-"},
+		{name: "double hyphen", kind: "co--dex"},
+		{name: "slash path", kind: "codex/provider"},
+		{name: "relative path", kind: "../codex"},
+		{name: "control", kind: "codex\x00"},
+		{name: "non ASCII", kind: "c\u00f3dex"},
+		{name: "Unicode confusable", kind: "c\u043edex"},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			if ValidKind(test.kind) {
+				t.Fatalf("ValidKind(%q) = true; want false", test.kind)
+			}
+		})
+	}
+}
+
 func TestCatalogCanonicalizesSyntheticProviderByRank(t *testing.T) {
 	catalog, err := New(testCatalogOptions())
 	if err != nil {

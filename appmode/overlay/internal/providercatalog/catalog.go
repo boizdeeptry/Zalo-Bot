@@ -63,7 +63,7 @@ func New(options []Option) (Catalog, error) {
 	seenKinds := make(map[string]struct{}, len(owned))
 	seenRanks := make(map[int]string, len(owned))
 	for _, option := range owned {
-		if !validKind(option.Kind) {
+		if !ValidKind(option.Kind) {
 			return Catalog{}, fmt.Errorf("%w: invalid Provider kind %q", ErrInvalidCatalog, option.Kind)
 		}
 		if _, exists := seenKinds[option.Kind]; exists {
@@ -207,7 +207,9 @@ func CanonicalSelectedKinds(input []string) ([]string, error) {
 	return Default().CanonicalSelectedKinds(input)
 }
 
-func validKind(kind string) bool {
+// ValidKind reports whether kind uses the bounded canonical Provider-kind
+// grammar accepted by Catalog.
+func ValidKind(kind string) bool {
 	if len(kind) == 0 || len(kind) > maxKindBytes {
 		return false
 	}

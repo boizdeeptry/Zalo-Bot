@@ -65,9 +65,11 @@ type onboardingProviderAccountRecord struct {
 	AddedAt      string
 }
 
-// OnboardingSnapshot reads the singleton and its ordered Provider stages from
+// onboardingSnapshot reads the singleton and its ordered Provider stages from
 // one SQLite transaction so callers cannot observe parts of different commits.
-func (s *Store) OnboardingSnapshot() (OnboardingSnapshot, error) {
+func (s *Store) onboardingSnapshot(
+	catalog providercatalog.Catalog,
+) (OnboardingSnapshot, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return OnboardingSnapshot{}, fmt.Errorf("begin onboarding snapshot: %w", err)
@@ -78,20 +80,24 @@ func (s *Store) OnboardingSnapshot() (OnboardingSnapshot, error) {
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, snapshot); err != nil {
+		return OnboardingSnapshot{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return OnboardingSnapshot{}, fmt.Errorf("commit onboarding snapshot: %w", err)
 	}
 	return snapshot, nil
 }
 
-// ReplaceOnboardingProviderSelection persists the complete selected set while
+// replaceOnboardingProviderSelection persists the complete selected set while
 // preserving every ready row. Request order is ignored; catalog route rank owns
 // the durable stage positions.
-func (s *Store) ReplaceOnboardingProviderSelection(
+func (s *Store) replaceOnboardingProviderSelection(
+	catalog providercatalog.Catalog,
 	expectedRevision int64,
 	kinds []string,
 ) (OnboardingSnapshot, error) {
-	canonicalKinds, err := providercatalog.CanonicalSelectedKinds(kinds)
+	canonicalKinds, err := catalog.CanonicalSelectedKinds(kinds)
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -118,7 +124,11 @@ func (s *Store) ReplaceOnboardingProviderSelection(
 			if err != nil {
 				return OnboardingSnapshot{}, err
 			}
-			if provenanceMatches && replaceOnboardingProviderLostResponseMatches(snapshot, canonicalKinds) {
+			if provenanceMatches && replaceOnboardingProviderLostResponseMatchesForCatalog(
+				catalog,
+				snapshot,
+				canonicalKinds,
+			) {
 				return commitOnboardingProviderRead(tx, snapshot, "lost-response selection")
 			}
 		}
@@ -144,7 +154,7 @@ func (s *Store) ReplaceOnboardingProviderSelection(
 		)
 	}
 
-	current, err := inspectOnboardingProviderStages(snapshot.Stages)
+	current, err := inspectOnboardingProviderStageStructure(snapshot.Stages)
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -208,19 +218,23 @@ func (s *Store) ReplaceOnboardingProviderSelection(
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, updated); err != nil {
+		return OnboardingSnapshot{}, err
+	}
 	if err := onboardingProvidersCommit(tx); err != nil {
 		return OnboardingSnapshot{}, fmt.Errorf("commit onboarding Provider selection: %w", err)
 	}
 	return updated, nil
 }
 
-// BeginOnboardingProvider assigns exactly one selected pending Provider to the
+// beginOnboardingProvider assigns exactly one selected pending Provider to the
 // singleton Connect slot. Other selected rows remain unchanged.
-func (s *Store) BeginOnboardingProvider(
+func (s *Store) beginOnboardingProvider(
+	catalog providercatalog.Catalog,
 	expectedRevision int64,
 	kind string,
 ) (OnboardingSnapshot, error) {
-	canonical, err := providercatalog.CanonicalSelectedKinds([]string{kind})
+	canonical, err := catalog.CanonicalSelectedKinds([]string{kind})
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -248,7 +262,11 @@ func (s *Store) BeginOnboardingProvider(
 			if err != nil {
 				return OnboardingSnapshot{}, err
 			}
-			if provenanceMatches && beginOnboardingProviderLostResponseMatches(snapshot, kind) {
+			if provenanceMatches && beginOnboardingProviderLostResponseMatchesForCatalog(
+				catalog,
+				snapshot,
+				kind,
+			) {
 				return commitOnboardingProviderRead(tx, snapshot, "lost-response begin")
 			}
 		}
@@ -267,7 +285,7 @@ func (s *Store) BeginOnboardingProvider(
 			ErrOnboardingConfigurationChanged,
 		)
 	}
-	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	stages, err := inspectOnboardingProviderStagesForCatalog(catalog, snapshot.Stages)
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -317,17 +335,23 @@ func (s *Store) BeginOnboardingProvider(
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, updated); err != nil {
+		return OnboardingSnapshot{}, err
+	}
 	if err := onboardingProvidersCommit(tx); err != nil {
 		return OnboardingSnapshot{}, fmt.Errorf("commit onboarding Provider begin: %w", err)
 	}
 	return updated, nil
 }
 
-// BackOnboardingToProviders returns an exact Persona/Test draft to Provider
+// backOnboardingToProviders returns an exact Persona/Test draft to Provider
 // selection without deleting any staged Provider, Account, model or persona.
 // The persisted operation receipt makes a one-revision retry distinguishable
 // from an unrelated transition that happens to have the same visible shape.
-func (s *Store) BackOnboardingToProviders(expectedRevision int64) (OnboardingSnapshot, error) {
+func (s *Store) backOnboardingToProviders(
+	catalog providercatalog.Catalog,
+	expectedRevision int64,
+) (OnboardingSnapshot, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return OnboardingSnapshot{}, fmt.Errorf("begin onboarding Back transition: %w", err)
@@ -351,7 +375,11 @@ func (s *Store) BackOnboardingToProviders(expectedRevision int64) (OnboardingSna
 			if err != nil {
 				return OnboardingSnapshot{}, err
 			}
-			if provenanceMatches && onboardingProviderBackSuccessorMatchesInTx(tx, snapshot) {
+			if provenanceMatches && onboardingProviderBackSuccessorMatchesInTxForCatalog(
+				tx,
+				catalog,
+				snapshot,
+			) {
 				return commitOnboardingProviderRead(tx, snapshot, "Back lost response")
 			}
 		}
@@ -364,7 +392,7 @@ func (s *Store) BackOnboardingToProviders(expectedRevision int64) (OnboardingSna
 			ErrOnboardingInvalidPhase,
 		)
 	}
-	if err := validateOnboardingProviderBackSourceInTx(tx, snapshot); err != nil {
+	if err := validateOnboardingProviderBackSourceInTxForCatalog(tx, catalog, snapshot); err != nil {
 		return OnboardingSnapshot{}, err
 	}
 	if snapshot.State.Revision >= maxOnboardingRouteRevision {
@@ -408,6 +436,9 @@ WHERE id = 1 AND revision = ? AND phase = ?
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, updated); err != nil {
+		return OnboardingSnapshot{}, err
+	}
 	if err := writeOnboardingProviderMutationReceiptInTx(
 		tx,
 		onboardingProviderMutationBack,
@@ -432,6 +463,11 @@ type onboardingProviderStageInspection struct {
 	byKind             map[string]OnboardingProviderStage
 	canonicalKinds     []string
 	positionsCanonical bool
+}
+
+type onboardingProviderStageStructure struct {
+	byKind map[string]OnboardingProviderStage
+	kinds  []string
 }
 
 func onboardingSnapshotInTx(tx *sql.Tx, afterStateRead func()) (OnboardingSnapshot, error) {
@@ -486,53 +522,18 @@ ORDER BY position`)
 func inspectOnboardingProviderStages(
 	stages []OnboardingProviderStage,
 ) (onboardingProviderStageInspection, error) {
-	kinds := make([]string, len(stages))
-	byKind := make(map[string]OnboardingProviderStage, len(stages))
-	for index, stage := range stages {
-		if stage.Position < 0 || stage.Position >= providercatalog.MaxSelectedKinds {
-			return onboardingProviderStageInspection{}, fmt.Errorf(
-				"%w: Provider %q has unsafe position %d",
-				ErrOnboardingConfigurationChanged,
-				stage.Kind,
-				stage.Position,
-			)
-		}
-		switch stage.Status {
-		case onboardingProviderStagePending:
-			if stage.ProviderID != "" || stage.AccountID != "" || stage.ModelID != "" {
-				return onboardingProviderStageInspection{}, fmt.Errorf(
-					"%w: pending Provider %q owns identity fields",
-					ErrOnboardingConfigurationChanged,
-					stage.Kind,
-				)
-			}
-		case onboardingProviderStageReady:
-			if stage.ProviderID == "" || stage.AccountID == "" || stage.ModelID == "" {
-				return onboardingProviderStageInspection{}, fmt.Errorf(
-					"%w: ready Provider %q is missing identity fields",
-					ErrOnboardingConfigurationChanged,
-					stage.Kind,
-				)
-			}
-		default:
-			return onboardingProviderStageInspection{}, fmt.Errorf(
-				"%w: Provider %q has status %q",
-				ErrOnboardingConfigurationChanged,
-				stage.Kind,
-				stage.Status,
-			)
-		}
-		if _, duplicate := byKind[stage.Kind]; duplicate {
-			return onboardingProviderStageInspection{}, fmt.Errorf(
-				"%w: Provider %q is selected more than once",
-				ErrOnboardingConfigurationChanged,
-				stage.Kind,
-			)
-		}
-		byKind[stage.Kind] = stage
-		kinds[index] = stage.Kind
+	return inspectOnboardingProviderStagesForCatalog(providercatalog.Default(), stages)
+}
+
+func inspectOnboardingProviderStagesForCatalog(
+	catalog providercatalog.Catalog,
+	stages []OnboardingProviderStage,
+) (onboardingProviderStageInspection, error) {
+	structure, err := inspectOnboardingProviderStageStructure(stages)
+	if err != nil {
+		return onboardingProviderStageInspection{}, err
 	}
-	canonicalKinds, err := providercatalog.CanonicalSelectedKinds(kinds)
+	canonicalKinds, err := catalog.CanonicalSelectedKinds(structure.kinds)
 	if err != nil {
 		return onboardingProviderStageInspection{}, fmt.Errorf(
 			"%w: invalid persisted Provider selection: %v",
@@ -542,21 +543,87 @@ func inspectOnboardingProviderStages(
 	}
 	positionsCanonical := len(canonicalKinds) == len(stages)
 	for position, kind := range canonicalKinds {
-		stage, exists := byKind[kind]
+		stage, exists := structure.byKind[kind]
 		if !exists || stage.Position != position {
 			positionsCanonical = false
 			break
 		}
 	}
 	return onboardingProviderStageInspection{
-		byKind:             byKind,
+		byKind:             structure.byKind,
 		canonicalKinds:     canonicalKinds,
 		positionsCanonical: positionsCanonical,
 	}, nil
 }
 
+func inspectOnboardingProviderStageStructure(
+	stages []OnboardingProviderStage,
+) (onboardingProviderStageStructure, error) {
+	kinds := make([]string, len(stages))
+	byKind := make(map[string]OnboardingProviderStage, len(stages))
+	for index, stage := range stages {
+		if !providercatalog.ValidKind(stage.Kind) {
+			return onboardingProviderStageStructure{}, fmt.Errorf(
+				"%w: Provider stage has invalid kind %q",
+				ErrOnboardingConfigurationChanged,
+				stage.Kind,
+			)
+		}
+		if stage.Position < 0 || stage.Position >= providercatalog.MaxSelectedKinds {
+			return onboardingProviderStageStructure{}, fmt.Errorf(
+				"%w: Provider %q has unsafe position %d",
+				ErrOnboardingConfigurationChanged,
+				stage.Kind,
+				stage.Position,
+			)
+		}
+		switch stage.Status {
+		case onboardingProviderStagePending:
+			if stage.ProviderID != "" || stage.AccountID != "" || stage.ModelID != "" {
+				return onboardingProviderStageStructure{}, fmt.Errorf(
+					"%w: pending Provider %q owns identity fields",
+					ErrOnboardingConfigurationChanged,
+					stage.Kind,
+				)
+			}
+		case onboardingProviderStageReady:
+			if stage.ProviderID == "" || stage.AccountID == "" || stage.ModelID == "" {
+				return onboardingProviderStageStructure{}, fmt.Errorf(
+					"%w: ready Provider %q is missing identity fields",
+					ErrOnboardingConfigurationChanged,
+					stage.Kind,
+				)
+			}
+		default:
+			return onboardingProviderStageStructure{}, fmt.Errorf(
+				"%w: Provider %q has status %q",
+				ErrOnboardingConfigurationChanged,
+				stage.Kind,
+				stage.Status,
+			)
+		}
+		if _, duplicate := byKind[stage.Kind]; duplicate {
+			return onboardingProviderStageStructure{}, fmt.Errorf(
+				"%w: Provider %q is selected more than once",
+				ErrOnboardingConfigurationChanged,
+				stage.Kind,
+			)
+		}
+		byKind[stage.Kind] = stage
+		kinds[index] = stage.Kind
+	}
+	return onboardingProviderStageStructure{byKind: byKind, kinds: kinds}, nil
+}
+
 func canonicalOnboardingProviderKind(kind string) (string, error) {
-	canonical, err := providercatalog.CanonicalSelectedKinds([]string{kind})
+	return canonicalOnboardingProviderKindForCatalog(providercatalog.Default(), kind)
+}
+
+func canonicalOnboardingProviderKindForCatalog(
+	catalog providercatalog.Catalog,
+	kind string,
+) (string, error) {
+	canonical, err := catalog.CanonicalSelectedKinds([]string{kind})
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrOnboardingProviderUnsupported, err)
 	}
@@ -564,14 +631,20 @@ func canonicalOnboardingProviderKind(kind string) (string, error) {
 }
 
 func onboardingProviderDisplayName(kind string) (string, error) {
-	canonical, err := canonicalOnboardingProviderKind(kind)
+	return onboardingProviderDisplayNameForCatalog(providercatalog.Default(), kind)
+}
+
+func onboardingProviderDisplayNameForCatalog(
+	catalog providercatalog.Catalog,
+	kind string,
+) (string, error) {
+	canonical, err := canonicalOnboardingProviderKindForCatalog(catalog, kind)
 	if err != nil {
 		return "", err
 	}
-	for _, option := range providercatalog.Options() {
-		if option.Kind == canonical && option.Advertised {
-			return option.DisplayName, nil
-		}
+	option, supported := catalog.Option(canonical)
+	if supported && option.Advertised {
+		return option.DisplayName, nil
 	}
 	return "", fmt.Errorf("%w: Provider catalog metadata is unavailable", ErrOnboardingConfigurationChanged)
 }
@@ -895,10 +968,22 @@ func replaceOnboardingProviderLostResponseMatches(
 	snapshot OnboardingSnapshot,
 	canonicalKinds []string,
 ) bool {
+	return replaceOnboardingProviderLostResponseMatchesForCatalog(
+		providercatalog.Default(),
+		snapshot,
+		canonicalKinds,
+	)
+}
+
+func replaceOnboardingProviderLostResponseMatchesForCatalog(
+	catalog providercatalog.Catalog,
+	snapshot OnboardingSnapshot,
+	canonicalKinds []string,
+) bool {
 	if !validOptionalOnboardingPersonaFingerprint(snapshot.State.PersonaFingerprint) {
 		return false
 	}
-	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	stages, err := inspectOnboardingProviderStagesForCatalog(catalog, snapshot.Stages)
 	if err != nil || !stages.positionsCanonical ||
 		!providerStagesMatchCanonicalSelection(snapshot.Stages, canonicalKinds) {
 		return false
@@ -940,10 +1025,22 @@ func validOptionalOnboardingPersonaFingerprint(value string) bool {
 }
 
 func beginOnboardingProviderLostResponseMatches(snapshot OnboardingSnapshot, kind string) bool {
+	return beginOnboardingProviderLostResponseMatchesForCatalog(
+		providercatalog.Default(),
+		snapshot,
+		kind,
+	)
+}
+
+func beginOnboardingProviderLostResponseMatchesForCatalog(
+	catalog providercatalog.Catalog,
+	snapshot OnboardingSnapshot,
+	kind string,
+) bool {
 	if !onboardingProviderConnectSuccessorIsClean(snapshot.State, kind) {
 		return false
 	}
-	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	stages, err := inspectOnboardingProviderStagesForCatalog(catalog, snapshot.Stages)
 	if err != nil || !stages.positionsCanonical {
 		return false
 	}
@@ -1027,6 +1124,18 @@ func onboardingProviderBackPayload(snapshot OnboardingSnapshot) []string {
 }
 
 func validateOnboardingProviderBackSourceInTx(tx *sql.Tx, snapshot OnboardingSnapshot) error {
+	return validateOnboardingProviderBackSourceInTxForCatalog(
+		tx,
+		providercatalog.Default(),
+		snapshot,
+	)
+}
+
+func validateOnboardingProviderBackSourceInTxForCatalog(
+	tx *sql.Tx,
+	catalog providercatalog.Catalog,
+	snapshot OnboardingSnapshot,
+) error {
 	state := snapshot.State
 	if state.ProviderKind != "" || state.ProviderID != "" || state.AccountID != "" ||
 		state.ModelID != "" || state.StagedComboID == "" {
@@ -1056,10 +1165,22 @@ func validateOnboardingProviderBackSourceInTx(tx *sql.Tx, snapshot OnboardingSna
 	} else if !validOnboardingProviderBackTestReceipt(state) {
 		return fmt.Errorf("%w: Test Back source has an invalid receipt", ErrOnboardingConfigurationChanged)
 	}
-	return validateOnboardingProviderBackReadyStagesInTx(tx, snapshot.Stages)
+	return validateOnboardingProviderBackReadyStagesInTxForCatalog(tx, catalog, snapshot.Stages)
 }
 
 func onboardingProviderBackSuccessorMatchesInTx(tx *sql.Tx, snapshot OnboardingSnapshot) bool {
+	return onboardingProviderBackSuccessorMatchesInTxForCatalog(
+		tx,
+		providercatalog.Default(),
+		snapshot,
+	)
+}
+
+func onboardingProviderBackSuccessorMatchesInTxForCatalog(
+	tx *sql.Tx,
+	catalog providercatalog.Catalog,
+	snapshot OnboardingSnapshot,
+) bool {
 	state := snapshot.State
 	if state.Phase != OnboardingPhaseProvider || state.ProviderKind != "" ||
 		state.ProviderID != "" || state.AccountID != "" || state.ModelID != "" ||
@@ -1069,14 +1190,26 @@ func onboardingProviderBackSuccessorMatchesInTx(tx *sql.Tx, snapshot OnboardingS
 		(state.RestartInProgress && state.CompletedVersion < CurrentOnboardingVersion) {
 		return false
 	}
-	return validateOnboardingProviderBackReadyStagesInTx(tx, snapshot.Stages) == nil
+	return validateOnboardingProviderBackReadyStagesInTxForCatalog(tx, catalog, snapshot.Stages) == nil
 }
 
 func validateOnboardingProviderBackReadyStagesInTx(
 	tx *sql.Tx,
 	stages []OnboardingProviderStage,
 ) error {
-	inspection, err := inspectOnboardingProviderStages(stages)
+	return validateOnboardingProviderBackReadyStagesInTxForCatalog(
+		tx,
+		providercatalog.Default(),
+		stages,
+	)
+}
+
+func validateOnboardingProviderBackReadyStagesInTxForCatalog(
+	tx *sql.Tx,
+	catalog providercatalog.Catalog,
+	stages []OnboardingProviderStage,
+) error {
+	inspection, err := inspectOnboardingProviderStagesForCatalog(catalog, stages)
 	if err != nil {
 		return err
 	}

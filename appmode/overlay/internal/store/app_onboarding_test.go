@@ -124,11 +124,11 @@ kind, status, position, provider_id, account_id, model_id, updated_at
 		Revision: 24, UpdatedAt: "2026-08-14T04:00:00Z",
 	}
 	newStages := []OnboardingProviderStage{
+		{Kind: "codex", Status: "pending", Position: 0},
 		{
-			Kind: "claude-code", Status: "ready", Position: 0,
+			Kind: "claude-code", Status: "ready", Position: 1,
 			ProviderID: "claude-code", AccountID: "new-claude", ModelID: "new-model",
 		},
-		{Kind: "codex", Status: "pending", Position: 1},
 	}
 	readerAtBarrier := make(chan struct{})
 	writerResult := make(chan error, 1)
@@ -218,7 +218,7 @@ func TestOnboardingStateReadsSingleton(t *testing.T) {
 	if _, err := st.db.Exec(`UPDATE app_onboarding_state SET
 completed_version = 1,
 phase = 'test',
-provider_kind = 'openai-compatible',
+provider_kind = 'codex',
 provider_id = 'provider-1',
 account_id = 'account-1',
 model_id = 'model-1',
@@ -240,7 +240,7 @@ WHERE id = 1`); err != nil {
 	want := OnboardingState{
 		CompletedVersion:   1,
 		Phase:              OnboardingPhaseTest,
-		ProviderKind:       "openai-compatible",
+		ProviderKind:       "codex",
 		ProviderID:         "provider-1",
 		AccountID:          "account-1",
 		ModelID:            "model-1",

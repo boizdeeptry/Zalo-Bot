@@ -136,18 +136,21 @@ type CompleteOnboardingInput struct {
 type OnboardingCompletionInput = CompleteOnboardingInput
 
 func IsOnboardingProviderKind(kind string) bool {
-	return kind == "codex" || kind == "claude-code"
+	return onboardingCatalogHasAdvertisedKind(providercatalog.Default(), kind)
 }
 
-// EnsureOnboardingProviderForKind creates the exact subscription Provider needed by onboarding
+// ensureOnboardingProviderForKind creates the exact subscription Provider needed by onboarding
 // as disabled staging. An existing exact Provider is accepted without changing its enabled state.
-func (s *Store) EnsureOnboardingProviderForKind(kind string) error {
-	canonicalKind, err := canonicalOnboardingProviderKind(kind)
+func (s *Store) ensureOnboardingProviderForKind(
+	catalog providercatalog.Catalog,
+	kind string,
+) error {
+	canonicalKind, err := canonicalOnboardingProviderKindForCatalog(catalog, kind)
 	if err != nil {
 		return err
 	}
 	kind = canonicalKind
-	name, err := onboardingProviderDisplayName(kind)
+	name, err := onboardingProviderDisplayNameForCatalog(catalog, kind)
 	if err != nil {
 		return err
 	}
@@ -182,17 +185,29 @@ VALUES (?, ?, ?, 0)`, kind, name, kind); err != nil {
 	return nil
 }
 
-// OnboardingState returns the required singleton state. A missing row is an
+// onboardingState returns the required singleton state. A missing row is an
 // explicit error so callers cannot mistake a damaged database for completion.
-func (s *Store) OnboardingState() (OnboardingState, error) {
-	state, err := scanOnboardingState(s.db.QueryRow(onboardingStateSelect))
-	if errors.Is(err, sql.ErrNoRows) {
-		return OnboardingState{}, ErrOnboardingStateMissing
+func (s *Store) onboardingState(catalog providercatalog.Catalog) (OnboardingState, error) {
+	if err := validateOnboardingCatalog(catalog); err != nil {
+		return OnboardingState{}, err
 	}
+	tx, err := s.db.Begin()
 	if err != nil {
-		return OnboardingState{}, fmt.Errorf("read onboarding state: %w", err)
+		return OnboardingState{}, fmt.Errorf("begin onboarding state inspection: %w", err)
 	}
-	return state, nil
+	defer func() { _ = tx.Rollback() }()
+
+	snapshot, err := onboardingSnapshotInTx(tx, nil)
+	if err != nil {
+		return OnboardingState{}, err
+	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, snapshot); err != nil {
+		return OnboardingState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OnboardingState{}, fmt.Errorf("commit onboarding state inspection: %w", err)
+	}
+	return snapshot.State, nil
 }
 
 // BindOnboardingAccount atomically records a freshly authenticated CLI Account as disabled
@@ -1986,7 +2001,8 @@ func validOnboardingSHA256Hex(value string) bool {
 }
 
 func onboardingSetupStateIsClean(state OnboardingState) bool {
-	return IsOnboardingProviderKind(state.ProviderKind) && state.ProviderID != "" &&
+	return onboardingCatalogHasAdvertisedKind(providercatalog.Default(), state.ProviderKind) &&
+		state.ProviderID != "" &&
 		state.AccountID != "" && state.ModelID == "" && state.StagedComboID == "" &&
 		state.PersonaFingerprint == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
 }
@@ -1998,7 +2014,8 @@ func onboardingSetupRetryMatches(
 	modelID string,
 ) bool {
 	return expectedRevision > 0 && state.Phase == OnboardingPhasePersona &&
-		IsOnboardingProviderKind(state.ProviderKind) && state.ProviderID != "" &&
+		onboardingCatalogHasAdvertisedKind(providercatalog.Default(), state.ProviderKind) &&
+		state.ProviderID != "" &&
 		accountID != "" && state.AccountID == accountID && modelID != "" &&
 		state.ModelID == modelID && state.StagedComboID != "" &&
 		state.PersonaFingerprint == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
@@ -2017,22 +2034,32 @@ func onboardingConnectStateIsClean(state OnboardingState) bool {
 		state.StagedComboID == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
 }
 
-// OnboardingStagingAccount returns only a disabled Account exactly owned by
+// onboardingStagingAccount returns only a disabled Account exactly owned by
 // the requested onboarding revision. ConfigDir is metadata for the caller's
 // cleanup; Store never removes it from the filesystem.
-func (s *Store) OnboardingStagingAccount(expectedRevision int64) (OnboardingStagingAccount, error) {
+func (s *Store) onboardingStagingAccount(
+	catalog providercatalog.Catalog,
+	expectedRevision int64,
+) (OnboardingStagingAccount, error) {
+	if err := validateOnboardingCatalog(catalog); err != nil {
+		return OnboardingStagingAccount{}, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return OnboardingStagingAccount{}, fmt.Errorf("begin onboarding staging inspection: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	state, err := onboardingStateInTx(tx)
+	snapshot, err := onboardingSnapshotInTx(tx, nil)
 	if err != nil {
 		return OnboardingStagingAccount{}, err
 	}
+	state := snapshot.State
 	if state.Revision != expectedRevision {
 		return OnboardingStagingAccount{}, onboardingConflict(expectedRevision, state.Revision)
+	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, snapshot); err != nil {
+		return OnboardingStagingAccount{}, err
 	}
 	if state.AccountID == "" {
 		if err := tx.Commit(); err != nil {
@@ -2045,47 +2072,63 @@ func (s *Store) OnboardingStagingAccount(expectedRevision int64) (OnboardingStag
 	if err != nil {
 		return OnboardingStagingAccount{}, err
 	}
+	option, supported := catalog.Option(staging.ProviderKind)
+	if !supported || !option.Advertised {
+		return OnboardingStagingAccount{}, fmt.Errorf(
+			"%w: staging Provider kind %q is outside the active Catalog",
+			ErrOnboardingConfigurationChanged,
+			staging.ProviderKind,
+		)
+	}
 	if err := tx.Commit(); err != nil {
 		return OnboardingStagingAccount{}, fmt.Errorf("commit onboarding staging inspection: %w", err)
 	}
 	return staging, nil
 }
 
-// SelectOnboardingProvider starts the selected Provider's connect phase. Any
+// selectOnboardingProvider starts the selected Provider's connect phase. Any
 // prior disabled staging Account is deleted only after the caller confirms it
 // cleaned the matching Account directory.
-func (s *Store) SelectOnboardingProvider(
+func (s *Store) selectOnboardingProvider(
+	catalog providercatalog.Catalog,
 	expectedRevision int64,
 	kind string,
 	cleanedAccountID string,
 ) (OnboardingState, error) {
-	if !IsOnboardingProviderKind(kind) {
-		return OnboardingState{}, fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
+	canonicalKind, err := canonicalOnboardingProviderKindForCatalog(catalog, kind)
+	if err != nil {
+		return OnboardingState{}, err
 	}
-	return s.transitionOnboarding(expectedRevision, cleanedAccountID, func(state *OnboardingState) (bool, error) {
-		upgrade := state.Phase == OnboardingPhaseCompleted &&
-			state.CompletedVersion < CurrentOnboardingVersion && !state.RestartInProgress
-		switch state.Phase {
-		case OnboardingPhaseProvider,
-			OnboardingPhaseConnect,
-			OnboardingPhaseSetup,
-			OnboardingPhasePersona,
-			OnboardingPhaseTest:
-		case OnboardingPhaseCompleted:
-			if !upgrade {
+	kind = canonicalKind
+	return s.transitionOnboardingForCatalog(
+		catalog,
+		expectedRevision,
+		cleanedAccountID,
+		func(state *OnboardingState) (bool, error) {
+			upgrade := state.Phase == OnboardingPhaseCompleted &&
+				state.CompletedVersion < CurrentOnboardingVersion && !state.RestartInProgress
+			switch state.Phase {
+			case OnboardingPhaseProvider,
+				OnboardingPhaseConnect,
+				OnboardingPhaseSetup,
+				OnboardingPhasePersona,
+				OnboardingPhaseTest:
+			case OnboardingPhaseCompleted:
+				if !upgrade {
+					return false, fmt.Errorf("select onboarding provider from %q: %w", state.Phase, ErrOnboardingInvalidPhase)
+				}
+			default:
 				return false, fmt.Errorf("select onboarding provider from %q: %w", state.Phase, ErrOnboardingInvalidPhase)
 			}
-		default:
-			return false, fmt.Errorf("select onboarding provider from %q: %w", state.Phase, ErrOnboardingInvalidPhase)
-		}
-		state.Phase = OnboardingPhaseConnect
-		state.ProviderKind = kind
-		clearOnboardingStaging(state)
-		// A completed older-version flow may point at an enabled live Account. It is historical
-		// active configuration, not disposable onboarding staging, so starting the upgrade clears
-		// only the singleton fields and never asks the caller to delete its Account or directory.
-		return !upgrade, nil
-	})
+			state.Phase = OnboardingPhaseConnect
+			state.ProviderKind = kind
+			clearOnboardingStaging(state)
+			// A completed older-version flow may point at an enabled live Account. It is historical
+			// active configuration, not disposable onboarding staging, so starting the upgrade clears
+			// only the singleton fields and never asks the caller to delete its Account or directory.
+			return !upgrade, nil
+		},
+	)
 }
 
 // RestartOnboarding begins a new current-version flow while retaining the fact
@@ -2253,6 +2296,43 @@ func (s *Store) transitionOnboarding(
 	cleanedAccountID string,
 	apply func(*OnboardingState) (cleanupOwnedStaging bool, err error),
 ) (OnboardingState, error) {
+	return s.transitionOnboardingWithPrecondition(
+		expectedRevision,
+		cleanedAccountID,
+		nil,
+		apply,
+	)
+}
+
+func (s *Store) transitionOnboardingForCatalog(
+	catalog providercatalog.Catalog,
+	expectedRevision int64,
+	cleanedAccountID string,
+	apply func(*OnboardingState) (cleanupOwnedStaging bool, err error),
+) (OnboardingState, error) {
+	return s.transitionOnboardingWithPrecondition(
+		expectedRevision,
+		cleanedAccountID,
+		func(tx *sql.Tx, state OnboardingState) error {
+			stages, err := onboardingProviderStagesInTx(tx)
+			if err != nil {
+				return err
+			}
+			return validateOnboardingSnapshotForCatalog(
+				catalog,
+				OnboardingSnapshot{State: state, Stages: stages},
+			)
+		},
+		apply,
+	)
+}
+
+func (s *Store) transitionOnboardingWithPrecondition(
+	expectedRevision int64,
+	cleanedAccountID string,
+	precondition func(*sql.Tx, OnboardingState) error,
+	apply func(*OnboardingState) (cleanupOwnedStaging bool, err error),
+) (OnboardingState, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return OnboardingState{}, fmt.Errorf("begin onboarding transition: %w", err)
@@ -2265,6 +2345,11 @@ func (s *Store) transitionOnboarding(
 	}
 	if state.Revision != expectedRevision {
 		return OnboardingState{}, onboardingConflict(expectedRevision, state.Revision)
+	}
+	if precondition != nil {
+		if err := precondition(tx, state); err != nil {
+			return OnboardingState{}, err
+		}
 	}
 	ownedState := state
 	cleanupOwnedStaging, err := apply(&state)

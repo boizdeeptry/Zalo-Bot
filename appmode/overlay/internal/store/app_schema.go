@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"time"
+
+	"agentdc/internal/providercatalog"
 )
 
 const appSchemaVersion int64 = 8
@@ -352,6 +354,18 @@ func appMigrateOnboardingV8(tx *sql.Tx, versionExists bool, version int64) error
 	}
 	if !versionExists || version != 7 {
 		return nil
+	}
+	var providerKind string
+	err := tx.QueryRow(`SELECT provider_kind
+FROM app_onboarding_state
+WHERE id = 1 AND phase IN ('connect', 'setup', 'persona', 'test')`).Scan(&providerKind)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read V7 onboarding Provider kind: %w", err)
+	}
+	if err == nil {
+		if _, err := providercatalog.Default().CanonicalSelectedKinds([]string{providerKind}); err != nil {
+			return fmt.Errorf("validate V7 onboarding Provider kind %q: %w", providerKind, err)
+		}
 	}
 	if _, err := tx.Exec(`INSERT INTO app_onboarding_provider_stages(
 kind, status, position, provider_id, account_id, model_id, updated_at
