@@ -104,8 +104,9 @@ Constructor thực hiện:
 
 - kind/display/description/UI order unique, bounded và canonical; theme là hex cố định; kind là ASCII
   path-safe segment;
-- visible registration bắt buộc đầy đủ UI/connection/execution metadata; hidden live-only registration
-  giữ kind + compiled behavior nhưng không được project hoặc góp readiness;
+- mọi registration không-denied có safe management metadata và `visible`; visible registration dùng
+  `connection_mode=account|credential`, còn hidden live-only bắt buộc `visible=false`,
+  `connection_mode=none`, compiled behavior và không góp readiness/selectability;
 - mọi option advertised trong Onboarding Catalog phải có đúng một registration khớp kind/display/rank;
   registration credential-only có thể không nằm trong Catalog;
 - Onboarding runtime chỉ được quảng bá khi Connect + connected-model seeder + model selector + member
@@ -120,8 +121,9 @@ Constructor thực hiện:
 
 Registry production được dựng một lần từ các API-key runtime hiện có, Codex, Claude và một registration
 hidden/non-Onboarding cho `gemini-cli` để giữ live-adapter/attachment compatibility hiện tại. Hidden
-Gemini CLI không xuất hiện trong status/Providers, không có Connect và không góp readiness; nó chỉ chạy khi
-một persisted route hợp lệ đã tham chiếu nó. Tests dựng
+Gemini CLI không xuất hiện trong Onboarding, gallery/CTA/readiness, không có Connect; nó chỉ chạy khi một
+persisted route hợp lệ đã tham chiếu nó. `/llm/providers` vẫn project safe option `visible:false` để Portal
+hiểu Provider/model/Combo cũ mà không biến nó thành selectable. Tests dựng
 registry riêng có fake third runtime; không mutate production global trong parallel tests. Một value
 context giữ dependency tường minh mà không sửa upstream `api` struct:
 
@@ -268,6 +270,7 @@ chỉ có metadata trình bày:
   "connectable": true,
   "connection_mode": "account",
   "execution_mode": "proxy",
+  "visible": true,
   "prefix": "cx",
   "theme_color": "#0f7a63",
   "beta": false,
@@ -284,13 +287,16 @@ Hai projection không bị trộn domain:
 
 - `/onboarding/status.provider_options` chỉ là `registry.Catalog().Options()` và giữ `route_rank` để
   canonicalize fallback;
-- `/llm/providers.provider_options` chứa mọi visible runtime UI registration, sắp theo unique `ui_order`, không
-  dùng field này để quyết định route.
+- `/llm/providers.provider_options` chứa mọi non-denied runtime registration với safe metadata và
+  `visible`, sắp theo unique `ui_order`; chỉ `visible:true` được gallery/create/connect/add-to-combo. Hidden
+  option chỉ giúp hiển thị existing Provider/model/Combo và không dùng để quyết định route/readiness.
 
 Mỗi `llmProviderBody` thêm `connection_mode`; `isProviderConnected` chỉ đọc field này. Payload thiếu/
 invalid fail closed thành disconnected. Providers page normalize/freeze catalog trước render; không
 fallback sang static list nếu response đã malformed. Combo picker tự dùng provider bodies nên model ID
 vẫn opaque.
+`connection_mode=none` chỉ hợp lệ cho option/body hidden; status helper luôn trả disconnected và picker
+không cho thêm mới, nhưng existing Combo member vẫn render bằng safe option/provider body.
 
 ## 6. Data flow third runtime
 
@@ -374,7 +380,8 @@ tự truy cập filesystem. State machine thật vẫn được phép tạo/xoá
 ### Connect/router
 
 - existing Codex and Claude contract suites remain green;
-- hidden `gemini-cli` adapter/attachment regressions remain green while every UI/status projection omits it;
+- hidden `gemini-cli` adapter/attachment regressions remain green; Providers/Combos nhận option
+  `visible:false`, existing persisted member vẫn render nhưng gallery/create/connect/readiness/add-new đều bỏ;
 - missing driver fails before config dir/install/login;
 - terminal rank invariant and round-robin exclusion;
 - cancellation/timeout/telemetry privacy unchanged.
