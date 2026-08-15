@@ -1050,6 +1050,7 @@ func beginOnboardingProviderLostResponseMatchesForCatalog(
 
 func onboardingProviderBindLostResponseMatchesInTx(
 	tx *sql.Tx,
+	catalog providercatalog.Catalog,
 	snapshot OnboardingSnapshot,
 	kind string,
 	account LLMAccount,
@@ -1060,7 +1061,7 @@ func onboardingProviderBindLostResponseMatchesInTx(
 		state.StagedComboID != "" || state.TestNonceHash != "" || state.TestExpiresAt != "" {
 		return false
 	}
-	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	stages, err := inspectOnboardingProviderStagesForCatalog(catalog, snapshot.Stages)
 	if err != nil || !stages.positionsCanonical {
 		return false
 	}
@@ -1074,12 +1075,13 @@ func onboardingProviderBindLostResponseMatchesInTx(
 
 func onboardingProviderSetupLostResponseMatchesInTx(
 	tx *sql.Tx,
+	catalog providercatalog.Catalog,
 	snapshot OnboardingSnapshot,
 	kind string,
 	accountID string,
 	modelID string,
 ) bool {
-	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	stages, err := inspectOnboardingProviderStagesForCatalog(catalog, snapshot.Stages)
 	if err != nil || !stages.positionsCanonical {
 		return false
 	}

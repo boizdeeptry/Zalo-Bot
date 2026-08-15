@@ -154,33 +154,16 @@ func (s *Store) ensureOnboardingProviderForKind(
 	if err != nil {
 		return err
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin onboarding Provider ensure: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var existingKind string
-	err = tx.QueryRow(`SELECT kind FROM llm_providers WHERE id = ?`, kind).Scan(&existingKind)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		if _, err := tx.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
-VALUES (?, ?, ?, 0)`, kind, name, kind); err != nil {
-			return fmt.Errorf("insert disabled onboarding Provider %q: %w", kind, err)
+	if err := s.ensureAccountRuntimeProvider(kind, name, false); err != nil {
+		if !errors.Is(err, ErrLLMProviderSingletonConflict) {
+			return err
 		}
-	case err != nil:
-		return fmt.Errorf("read onboarding Provider %q: %w", kind, err)
-	case existingKind != kind:
 		return fmt.Errorf(
-			"%w: Provider %q has kind %q instead of %q",
+			"%w: Provider singleton for %q is not exact: %v",
 			ErrOnboardingInvalidStagingOwnership,
 			kind,
-			existingKind,
-			kind,
+			err,
 		)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit onboarding Provider ensure: %w", err)
 	}
 	return nil
 }
@@ -213,12 +196,13 @@ func (s *Store) onboardingState(catalog providercatalog.Catalog) (OnboardingStat
 // BindOnboardingAccount atomically records a freshly authenticated CLI Account as disabled
 // staging and advances the singleton from connect to setup. Store deliberately does not touch
 // ConfigDir: the Connect job owns filesystem cleanup unless this transaction commits.
-func (s *Store) BindOnboardingAccount(
+func (s *Store) bindOnboardingAccount(
+	catalog providercatalog.Catalog,
 	expectedRevision int64,
 	kind string,
 	account LLMAccount,
 ) (OnboardingSnapshot, error) {
-	canonicalKind, err := canonicalOnboardingProviderKind(kind)
+	canonicalKind, err := canonicalOnboardingProviderKindForCatalog(catalog, kind)
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -242,6 +226,9 @@ func (s *Store) BindOnboardingAccount(
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, snapshot); err != nil {
+		return OnboardingSnapshot{}, err
+	}
 	if snapshot.State.Revision != expectedRevision {
 		if onboardingRevisionIsOneAhead(expectedRevision, snapshot.State.Revision) {
 			payload := onboardingProviderBindPayload(kind, account, snapshot.Stages)
@@ -255,7 +242,13 @@ func (s *Store) BindOnboardingAccount(
 			if err != nil {
 				return OnboardingSnapshot{}, err
 			}
-			if provenanceMatches && onboardingProviderBindLostResponseMatchesInTx(tx, snapshot, kind, account) {
+			if provenanceMatches && onboardingProviderBindLostResponseMatchesInTx(
+				tx,
+				catalog,
+				snapshot,
+				kind,
+				account,
+			) {
 				return commitOnboardingProviderRead(tx, snapshot, "lost-response Account bind")
 			}
 		}
@@ -276,7 +269,7 @@ func (s *Store) BindOnboardingAccount(
 			kind,
 		)
 	}
-	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	stages, err := inspectOnboardingProviderStagesForCatalog(catalog, snapshot.Stages)
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -379,6 +372,9 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, updated); err != nil {
+		return OnboardingSnapshot{}, err
+	}
 	if err := onboardingProvidersCommit(tx); err != nil {
 		return OnboardingSnapshot{}, fmt.Errorf("commit onboarding Account bind: %w", err)
 	}
@@ -388,13 +384,14 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 // StageOnboardingSetup marks exactly one selected pending Provider ready. If
 // another selected row remains pending, the singleton returns to Provider;
 // only the last ready row allocates the staged Combo and advances to Persona.
-func (s *Store) StageOnboardingSetup(
+func (s *Store) stageOnboardingSetup(
+	catalog providercatalog.Catalog,
 	expectedRevision int64,
 	kind string,
 	accountID string,
 	modelID string,
 ) (OnboardingSnapshot, error) {
-	canonicalKind, err := canonicalOnboardingProviderKind(kind)
+	canonicalKind, err := canonicalOnboardingProviderKindForCatalog(catalog, kind)
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -415,6 +412,9 @@ func (s *Store) StageOnboardingSetup(
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, snapshot); err != nil {
+		return OnboardingSnapshot{}, err
+	}
 	if snapshot.State.Revision != expectedRevision {
 		if onboardingRevisionIsOneAhead(expectedRevision, snapshot.State.Revision) {
 			record, recordErr := onboardingProviderAccountRecordInTx(tx, accountID)
@@ -432,6 +432,7 @@ func (s *Store) StageOnboardingSetup(
 				}
 				if provenanceMatches && onboardingProviderSetupLostResponseMatchesInTx(
 					tx,
+					catalog,
 					snapshot,
 					kind,
 					accountID,
@@ -466,7 +467,7 @@ func (s *Store) StageOnboardingSetup(
 			ErrOnboardingInvalidStagingOwnership,
 		)
 	}
-	stages, err := inspectOnboardingProviderStages(snapshot.Stages)
+	stages, err := inspectOnboardingProviderStagesForCatalog(catalog, snapshot.Stages)
 	if err != nil {
 		return OnboardingSnapshot{}, err
 	}
@@ -536,7 +537,7 @@ func (s *Store) StageOnboardingSetup(
 			ErrOnboardingConfigurationChanged,
 		)
 	}
-	refreshedInspection, err := inspectOnboardingProviderStages(refreshed.Stages)
+	refreshedInspection, err := inspectOnboardingProviderStagesForCatalog(catalog, refreshed.Stages)
 	if err != nil || !refreshedInspection.positionsCanonical {
 		return OnboardingSnapshot{}, fmt.Errorf(
 			"%w: onboarding Provider stages changed before commit",
@@ -648,6 +649,9 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ?
 	}
 	updated, err := onboardingSnapshotInTx(tx, nil)
 	if err != nil {
+		return OnboardingSnapshot{}, err
+	}
+	if err := validateOnboardingSnapshotForCatalog(catalog, updated); err != nil {
 		return OnboardingSnapshot{}, err
 	}
 	if err := writeOnboardingProviderMutationReceiptInTx(
@@ -869,11 +873,12 @@ WHERE id = 1 AND revision = ? AND phase = ?`,
 // CompleteOnboarding is the sole owner of onboarding activation. Every validation read and every
 // live routing mutation is performed on the same SQLite transaction, so readers continue to see
 // the previous route until Commit and any failure restores all affected tables together.
-func (s *Store) CompleteOnboarding(
+func (s *Store) completeOnboarding(
 	ctx context.Context,
+	catalog providercatalog.Catalog,
 	input CompleteOnboardingInput,
 ) (OnboardingState, error) {
-	bindings, err := onboardingCompletionBindings(input.ConfigBindings)
+	bindings, err := onboardingCompletionBindings(catalog, input.ConfigBindings)
 	if input.Revision <= 0 || input.Revision == maxOnboardingRouteRevision ||
 		!validOnboardingSHA256Hex(input.PersonaFingerprint) ||
 		!validOnboardingSHA256Hex(input.TestNonceHash) ||
@@ -897,7 +902,7 @@ func (s *Store) CompleteOnboarding(
 		state.TestNonceHash == "" || state.TestExpiresAt == "" {
 		return OnboardingState{}, ErrOnboardingTestRequired
 	}
-	route, err := onboardingTestRouteInTx(ctx, tx, input.Revision)
+	route, err := onboardingTestRouteInTx(ctx, tx, catalog, input.Revision)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrOnboardingConflict):
@@ -941,7 +946,7 @@ func (s *Store) CompleteOnboarding(
 	if err := validateOnboardingCompletionState(state); err != nil {
 		return OnboardingState{}, err
 	}
-	comboName, err := onboardingCompletionComboName(route.Entries)
+	comboName, err := onboardingCompletionComboName(catalog, route.Entries)
 	if err != nil {
 		return OnboardingState{}, ErrOnboardingConfigurationChanged
 	}
@@ -1816,14 +1821,18 @@ type onboardingCompletionBindingKey struct {
 }
 
 func onboardingCompletionBindings(
+	catalog providercatalog.Catalog,
 	input []OnboardingConfigBinding,
 ) (map[onboardingCompletionBindingKey]string, error) {
+	if err := validateOnboardingCatalog(catalog); err != nil {
+		return nil, err
+	}
 	if len(input) == 0 || len(input) > providercatalog.MaxSelectedKinds {
 		return nil, ErrOnboardingConfigurationChanged
 	}
 	bindings := make(map[onboardingCompletionBindingKey]string, len(input))
 	for _, binding := range input {
-		option, supported := providercatalog.OptionForKind(binding.Kind)
+		option, supported := catalog.Option(binding.Kind)
 		if !supported || !option.Advertised || !validOnboardingCompletionID(binding.AccountID) ||
 			!validOnboardingCompletionConfigDir(binding.ConfigDir) {
 			return nil, ErrOnboardingConfigurationChanged
@@ -1867,12 +1876,15 @@ func validOnboardingCompletionConfigDir(value string) bool {
 	return true
 }
 
-func onboardingCompletionComboName(entries []OnboardingTestRouteEntry) (string, error) {
+func onboardingCompletionComboName(
+	catalog providercatalog.Catalog,
+	entries []OnboardingTestRouteEntry,
+) (string, error) {
 	if len(entries) == 0 {
 		return "", ErrOnboardingConfigurationChanged
 	}
 	if len(entries) == 1 {
-		return onboardingComboName(entries[0].Kind)
+		return onboardingComboName(catalog, entries[0].Kind)
 	}
 	return "Mặc định · Fallback", nil
 }
@@ -2000,29 +2012,8 @@ func validOnboardingSHA256Hex(value string) bool {
 	return err == nil && len(decoded) == 32
 }
 
-func onboardingSetupStateIsClean(state OnboardingState) bool {
-	return onboardingCatalogHasAdvertisedKind(providercatalog.Default(), state.ProviderKind) &&
-		state.ProviderID != "" &&
-		state.AccountID != "" && state.ModelID == "" && state.StagedComboID == "" &&
-		state.PersonaFingerprint == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
-}
-
-func onboardingSetupRetryMatches(
-	state OnboardingState,
-	expectedRevision int64,
-	accountID string,
-	modelID string,
-) bool {
-	return expectedRevision > 0 && state.Phase == OnboardingPhasePersona &&
-		onboardingCatalogHasAdvertisedKind(providercatalog.Default(), state.ProviderKind) &&
-		state.ProviderID != "" &&
-		accountID != "" && state.AccountID == accountID && modelID != "" &&
-		state.ModelID == modelID && state.StagedComboID != "" &&
-		state.PersonaFingerprint == "" && state.TestNonceHash == "" && state.TestExpiresAt == ""
-}
-
-func onboardingComboName(kind string) (string, error) {
-	option, supported := providercatalog.OptionForKind(kind)
+func onboardingComboName(catalog providercatalog.Catalog, kind string) (string, error) {
+	option, supported := catalog.Option(kind)
 	if !supported || !option.Advertised || !validOnboardingCompletionName(option.DisplayName) {
 		return "", fmt.Errorf("%w: %q", ErrOnboardingProviderUnsupported, kind)
 	}

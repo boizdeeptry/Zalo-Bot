@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"agentdc/internal/providercatalog"
 )
 
 // ErrLLMRouteConflict nói rằng có người đã ghi route giữa lúc người này đang sửa.
@@ -26,6 +28,10 @@ var ErrLLMProviderInUse = errors.New("llm provider is referenced by the route")
 // from the live-route sentinel because the Portal resolves the two conflicts
 // through different flows.
 var ErrLLMOnboardingStageInUse = errors.New("llm resource is referenced by onboarding")
+
+// ErrLLMProviderSingletonConflict reports that an account-mode runtime cannot
+// own the required exact Provider singleton without changing existing rows.
+var ErrLLMProviderSingletonConflict = errors.New("llm account-runtime provider singleton conflict")
 
 // Nguồn của một model: do khám phá từ API Provider, hay do người dùng tự nhập.
 const (
@@ -179,35 +185,109 @@ VALUES(?,?,?,?,0,x'')`, p.ID, p.Name, p.Kind, boolInt(p.Enabled)); err != nil {
 	return nil
 }
 
-// subscriptionDisplayName ánh xạ kind sang tên hiển thị cho các Provider subscription
-// (CLI tự giữ phiên đăng nhập, không qua credential_cipher).
-var subscriptionDisplayName = map[string]string{
-	"claude-code": "Claude Code",
-	"codex":       "OpenAI Codex",
-}
-
 // EnsureProviderForKind đảm bảo có ĐÚNG một hàng Provider cho một kind subscription.
 //
 // Idempotent: đã có thì không làm gì. Provider subscription không mang credential (CLI tự giữ
 // phiên riêng), nên hàng này chỉ tồn tại để lên danh sách / route trỏ tới. id = kind vì #2 mới
 // chỉ có một tài khoản; #3 (multi-account) dùng riêng bảng llm_accounts cho danh tính từng tài khoản.
 func (s *Store) EnsureProviderForKind(kind string) error {
-	name, ok := subscriptionDisplayName[kind]
-	if !ok {
+	option, supported := providercatalog.Default().Option(kind)
+	if !supported || !option.Advertised {
 		return fmt.Errorf("ensure provider %s: không phải kind subscription", kind)
 	}
-	// ponytail: check-then-insert is not atomic; safe because connect runs one job at a time
-	// from a single goroutine. Wrap in inLLMTx if this is ever called concurrently.
-	providers, err := s.LLMProviders()
-	if err != nil {
+	return s.EnsureAccountRuntimeProvider(option.Kind, option.DisplayName)
+}
+
+// EnsureAccountRuntimeProvider creates the exact Provider singleton trusted
+// account-runtime registry metadata describes. Existing exact rows are
+// immutable through this operation, including their enabled and health fields.
+func (s *Store) EnsureAccountRuntimeProvider(kind, displayName string) error {
+	return s.ensureAccountRuntimeProvider(kind, displayName, true)
+}
+
+func (s *Store) ensureAccountRuntimeProvider(kind, displayName string, enabled bool) error {
+	if err := validateAccountRuntimeProviderMetadata(kind, displayName); err != nil {
 		return err
 	}
-	for _, p := range providers {
-		if p.Kind == kind {
-			return nil
+	return s.inLLMTx("ensure account-runtime Provider "+kind, func(tx *sql.Tx) error {
+		return ensureAccountRuntimeProviderInTx(tx, kind, displayName, enabled)
+	})
+}
+
+func ensureAccountRuntimeProviderInTx(
+	tx *sql.Tx,
+	kind string,
+	displayName string,
+	enabled bool,
+) error {
+	rows, err := tx.Query(`SELECT id, kind
+FROM llm_providers
+WHERE id = ? OR kind = ?
+ORDER BY id`, kind, kind)
+	if err != nil {
+		return fmt.Errorf("inspect account-runtime Provider %q: %w", kind, err)
+	}
+	exact := false
+	for rows.Next() {
+		var providerID, providerKind string
+		if err := rows.Scan(&providerID, &providerKind); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan account-runtime Provider %q: %w", kind, err)
+		}
+		switch {
+		case providerID == kind && providerKind == kind:
+			exact = true
+		case providerID == kind:
+			_ = rows.Close()
+			return fmt.Errorf(
+				"%w: exact Provider ID %q has kind %q",
+				ErrLLMProviderSingletonConflict,
+				kind,
+				providerKind,
+			)
+		case providerKind == kind:
+			_ = rows.Close()
+			return fmt.Errorf(
+				"%w: sibling Provider %q also has kind %q",
+				ErrLLMProviderSingletonConflict,
+				providerID,
+				kind,
+			)
 		}
 	}
-	return s.CreateLLMProvider(LLMProvider{ID: kind, Name: name, Kind: kind, Enabled: true})
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate account-runtime Provider %q: %w", kind, err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close account-runtime Provider inspection %q: %w", kind, err)
+	}
+	if exact {
+		return nil
+	}
+	result, err := tx.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
+VALUES (?, ?, ?, ?)`, kind, displayName, kind, boolInt(enabled))
+	if err != nil {
+		return fmt.Errorf("insert account-runtime Provider %q: %w", kind, err)
+	}
+	return assertOneRow(result, "insert account-runtime Provider "+kind)
+}
+
+func validateAccountRuntimeProviderMetadata(kind, displayName string) error {
+	if !providercatalog.ValidKind(kind) {
+		return fmt.Errorf("ensure account-runtime Provider: invalid kind %q", kind)
+	}
+	_, err := providercatalog.New([]providercatalog.Option{{
+		Kind:        kind,
+		DisplayName: displayName,
+		Description: "Account runtime Provider",
+		Advertised:  true,
+		RouteRank:   0,
+	}})
+	if err != nil {
+		return fmt.Errorf("ensure account-runtime Provider %q: invalid display metadata: %w", kind, err)
+	}
+	return nil
 }
 
 // UpdateLLMProvider sửa phần hiển thị và trạng thái kiểm tra.

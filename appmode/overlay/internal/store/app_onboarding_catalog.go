@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 
 	"agentdc/internal/providercatalog"
@@ -65,6 +66,55 @@ func (s OnboardingStore) SelectOnboardingProvider(
 	return s.store.selectOnboardingProvider(s.catalog, expectedRevision, kind, cleanedAccountID)
 }
 
+func (s OnboardingStore) BindOnboardingAccount(
+	expectedRevision int64,
+	kind string,
+	account LLMAccount,
+) (OnboardingSnapshot, error) {
+	return s.store.bindOnboardingAccount(s.catalog, expectedRevision, kind, account)
+}
+
+func (s OnboardingStore) StageOnboardingSetup(
+	expectedRevision int64,
+	kind string,
+	accountID string,
+	modelID string,
+) (OnboardingSnapshot, error) {
+	return s.store.stageOnboardingSetup(s.catalog, expectedRevision, kind, accountID, modelID)
+}
+
+func (s OnboardingStore) OnboardingTestRoute(
+	ctx context.Context,
+	expectedRevision int64,
+) (OnboardingTestRoute, error) {
+	return s.store.onboardingTestRoute(ctx, s.catalog, expectedRevision)
+}
+
+func (s OnboardingStore) SaveOnboardingTestReceipt(
+	ctx context.Context,
+	expected OnboardingTestRoute,
+	nonceHash string,
+	policy OnboardingTestReceiptPolicy,
+) (OnboardingState, error) {
+	return s.store.saveOnboardingTestReceipt(ctx, s.catalog, expected, nonceHash, policy)
+}
+
+func (s OnboardingStore) ClearOnboardingTestReceipt(
+	ctx context.Context,
+	expected OnboardingTestRoute,
+	nonceHash string,
+	policy OnboardingTestReceiptPolicy,
+) (OnboardingState, error) {
+	return s.store.clearOnboardingTestReceipt(ctx, s.catalog, expected, nonceHash, policy)
+}
+
+func (s OnboardingStore) CompleteOnboarding(
+	ctx context.Context,
+	input CompleteOnboardingInput,
+) (OnboardingState, error) {
+	return s.store.completeOnboarding(ctx, s.catalog, input)
+}
+
 // Existing Store methods remain compatibility entry points bound to the
 // production Codex/Claude catalog.
 func (s *Store) OnboardingState() (OnboardingState, error) {
@@ -113,6 +163,59 @@ func (s *Store) SelectOnboardingProvider(
 ) (OnboardingState, error) {
 	return s.Onboarding(providercatalog.Default()).
 		SelectOnboardingProvider(expectedRevision, kind, cleanedAccountID)
+}
+
+func (s *Store) BindOnboardingAccount(
+	expectedRevision int64,
+	kind string,
+	account LLMAccount,
+) (OnboardingSnapshot, error) {
+	return s.Onboarding(providercatalog.Default()).
+		BindOnboardingAccount(expectedRevision, kind, account)
+}
+
+func (s *Store) StageOnboardingSetup(
+	expectedRevision int64,
+	kind string,
+	accountID string,
+	modelID string,
+) (OnboardingSnapshot, error) {
+	return s.Onboarding(providercatalog.Default()).
+		StageOnboardingSetup(expectedRevision, kind, accountID, modelID)
+}
+
+func (s *Store) OnboardingTestRoute(
+	ctx context.Context,
+	expectedRevision int64,
+) (OnboardingTestRoute, error) {
+	return s.Onboarding(providercatalog.Default()).OnboardingTestRoute(ctx, expectedRevision)
+}
+
+func (s *Store) SaveOnboardingTestReceipt(
+	ctx context.Context,
+	expected OnboardingTestRoute,
+	nonceHash string,
+	policy OnboardingTestReceiptPolicy,
+) (OnboardingState, error) {
+	return s.Onboarding(providercatalog.Default()).
+		SaveOnboardingTestReceipt(ctx, expected, nonceHash, policy)
+}
+
+func (s *Store) ClearOnboardingTestReceipt(
+	ctx context.Context,
+	expected OnboardingTestRoute,
+	nonceHash string,
+	policy OnboardingTestReceiptPolicy,
+) (OnboardingState, error) {
+	return s.Onboarding(providercatalog.Default()).
+		ClearOnboardingTestReceipt(ctx, expected, nonceHash, policy)
+}
+
+func (s *Store) CompleteOnboarding(
+	ctx context.Context,
+	input CompleteOnboardingInput,
+) (OnboardingState, error) {
+	return s.Onboarding(providercatalog.Default()).CompleteOnboarding(ctx, input)
 }
 
 func validateOnboardingCatalog(catalog providercatalog.Catalog) error {

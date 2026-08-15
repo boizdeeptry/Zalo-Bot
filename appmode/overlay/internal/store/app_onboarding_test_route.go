@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"agentdc/internal/providercatalog"
+
 	"github.com/google/uuid"
 )
 
@@ -98,16 +100,20 @@ func writeOnboardingFingerprintFrame(write func([]byte) (int, error), value stri
 // OnboardingTestRoute reads and validates the complete staged route in one
 // transaction. Returned slices are newly allocated and safe for the caller to
 // retain as an immutable preflight snapshot.
-func (s *Store) OnboardingTestRoute(
+func (s *Store) onboardingTestRoute(
 	ctx context.Context,
+	catalog providercatalog.Catalog,
 	expectedRevision int64,
 ) (OnboardingTestRoute, error) {
+	if err := validateOnboardingCatalog(catalog); err != nil {
+		return OnboardingTestRoute{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return OnboardingTestRoute{}, fmt.Errorf("begin onboarding Test route: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	route, err := onboardingTestRouteInTx(ctx, tx, expectedRevision)
+	route, err := onboardingTestRouteInTx(ctx, tx, catalog, expectedRevision)
 	if err != nil {
 		return OnboardingTestRoute{}, err
 	}
@@ -120,8 +126,12 @@ func (s *Store) OnboardingTestRoute(
 func onboardingTestRouteInTx(
 	ctx context.Context,
 	tx *sql.Tx,
+	catalog providercatalog.Catalog,
 	expectedRevision int64,
 ) (OnboardingTestRoute, error) {
+	if err := validateOnboardingCatalog(catalog); err != nil {
+		return OnboardingTestRoute{}, err
+	}
 	state, err := onboardingStateInTxContext(ctx, tx)
 	if err != nil {
 		return OnboardingTestRoute{}, err
@@ -162,7 +172,7 @@ func onboardingTestRouteInTx(
 	if err != nil {
 		return OnboardingTestRoute{}, err
 	}
-	inspection, err := inspectOnboardingProviderStages(stages)
+	inspection, err := inspectOnboardingProviderStagesForCatalog(catalog, stages)
 	if err != nil {
 		return OnboardingTestRoute{}, err
 	}
@@ -255,8 +265,9 @@ func onboardingTestRoutesEqual(left, right OnboardingTestRoute) bool {
 
 // SaveOnboardingTestReceipt performs the final post-I/O TOCTOU fence inside
 // the same transaction that stores the route-bound receipt.
-func (s *Store) SaveOnboardingTestReceipt(
+func (s *Store) saveOnboardingTestReceipt(
 	ctx context.Context,
+	catalog providercatalog.Catalog,
 	expected OnboardingTestRoute,
 	nonceHash string,
 	policy OnboardingTestReceiptPolicy,
@@ -266,12 +277,15 @@ func (s *Store) SaveOnboardingTestReceipt(
 		!validOnboardingSHA256Hex(nonceHash) || !validOnboardingTestReceiptPolicy(policy) {
 		return OnboardingState{}, ErrOnboardingInvalidTestReceipt
 	}
+	if err := validateOnboardingCatalog(catalog); err != nil {
+		return OnboardingState{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return OnboardingState{}, fmt.Errorf("begin onboarding test receipt: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	actual, err := onboardingTestRouteInTx(ctx, tx, expected.State.Revision)
+	actual, err := onboardingTestRouteInTx(ctx, tx, catalog, expected.State.Revision)
 	if err != nil {
 		return OnboardingState{}, err
 	}
@@ -324,8 +338,9 @@ WHERE id = 1 AND revision = ? AND phase = ? AND provider_kind = ''
 
 // ClearOnboardingTestReceipt compensates only the exact committed route-bound
 // receipt; any route, persona, name, config, receipt, or revision drift fails.
-func (s *Store) ClearOnboardingTestReceipt(
+func (s *Store) clearOnboardingTestReceipt(
 	ctx context.Context,
+	catalog providercatalog.Catalog,
 	expected OnboardingTestRoute,
 	nonceHash string,
 	policy OnboardingTestReceiptPolicy,
@@ -335,12 +350,15 @@ func (s *Store) ClearOnboardingTestReceipt(
 		!validOnboardingSHA256Hex(nonceHash) || !validOnboardingTestReceiptPolicy(policy) {
 		return OnboardingState{}, ErrOnboardingInvalidTestReceipt
 	}
+	if err := validateOnboardingCatalog(catalog); err != nil {
+		return OnboardingState{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return OnboardingState{}, fmt.Errorf("begin onboarding receipt compensation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	actual, err := onboardingTestRouteInTx(ctx, tx, expected.State.Revision)
+	actual, err := onboardingTestRouteInTx(ctx, tx, catalog, expected.State.Revision)
 	if err != nil {
 		return OnboardingState{}, err
 	}
