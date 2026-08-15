@@ -21,7 +21,7 @@ import (
 
 type onboardingRouteTestEnv struct {
 	a       *api
-	mux     *http.ServeMux
+	mux     http.Handler
 	db      *sql.DB
 	dataDir string
 }
@@ -46,14 +46,51 @@ func newOnboardingRouteTestEnv(t *testing.T) *onboardingRouteTestEnv {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		portalOpen: true,
 	}
-	mux := http.NewServeMux()
-	a.registerAppRoutes(mux)
+	runtimeMux := http.NewServeMux()
+	a.registerAppRoutes(runtimeMux)
+	mux := legacyInjectedConnectRouteHandler(a, runtimeMux)
 	t.Cleanup(func() {
 		connectMgr = nil
 		_ = raw.Close()
 		_ = st.Close()
 	})
 	return &onboardingRouteTestEnv{a: a, mux: mux, db: raw, dataDir: dataDir}
+}
+
+// legacyInjectedConnectRouteHandler is fixture-only compatibility for older
+// onboarding concurrency tests that replace connectMgr after constructing the
+// shared environment. Production/context route registration is intentionally
+// stricter and closes over its manager; these tests exercise the retained
+// direct-handler/global seam explicitly instead.
+func legacyInjectedConnectRouteHandler(a *api, next http.Handler) http.Handler {
+	start := a.auth(a.handleLLMConnectStart)
+	status := a.auth(a.handleLLMConnectStatus)
+	cancel := a.auth(a.handleLLMConnectCancel)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "/llm/providers/"
+		const suffix = "/connect"
+		if strings.HasPrefix(r.URL.Path, prefix) && strings.HasSuffix(r.URL.Path, suffix) {
+			kind := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, prefix), suffix)
+			if kind != "" && !strings.Contains(kind, "/") {
+				r.SetPathValue("kind", kind)
+				switch r.Method {
+				case http.MethodPost:
+					r.Pattern = "POST /llm/providers/{kind}/connect"
+					start.ServeHTTP(w, r)
+					return
+				case http.MethodGet:
+					r.Pattern = "GET /llm/providers/{kind}/connect"
+					status.ServeHTTP(w, r)
+					return
+				case http.MethodDelete:
+					r.Pattern = "DELETE /llm/providers/{kind}/connect"
+					cancel.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (e *onboardingRouteTestEnv) serve(method, path, body string) *httptest.ResponseRecorder {

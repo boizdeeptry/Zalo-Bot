@@ -74,9 +74,9 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 }
 
 // registerAppRoutesWithContext is the internal dependency-injected route
-// registration seam. Handlers remain api methods at this checkpoint; later
-// dispatch tasks bind them to ctx directly. The passed Connect manager is kept
-// intact for current handler compatibility and is never silently rebuilt.
+// registration seam. Connect routes close over ctx so their registry and
+// manager cannot drift after registration. The package singleton assignment is
+// retained only for legacy direct-handler and non-Connect onboarding tests.
 func registerAppRoutesWithContext(mux *http.ServeMux, ctx appRuntimeContext) {
 	if mux == nil || ctx.api == nil || !ctx.registry.valid || ctx.connect == nil {
 		panic("register app routes: invalid runtime context")
@@ -115,16 +115,17 @@ func registerAppRoutesWithContext(mux *http.ServeMux, ctx appRuntimeContext) {
 	mux.Handle("DELETE /llm/providers/{id}/models", a.auth(a.handleLLMModelDelete))
 	mux.Handle("DELETE /llm/providers/{id}/accounts/{accountId}", a.auth(a.handleLLMAccountDelete))
 
-	// Compatibility until Connect handlers receive appRuntimeContext directly:
-	// register exactly the validated manager supplied by the context.
+	// Legacy compatibility: old direct handlers and onboarding cleanup tests
+	// still inject this singleton. The three registered Connect handlers below
+	// never read it; they are bound to ctx.connect.
 	connectMgr = ctx.connect
 	// Gieo model tĩnh của claude-code ngay khi khởi động: nó là provider luôn có sẵn (seeded), chạy
 	// qua runClaude nên KHÔNG có adapter để discover — không gieo ở đây thì detail + combo picker
 	// trống model dù chưa ai connect. Idempotent (ReplaceLLMModels thay trọn nguồn discovered).
 	ensureCLIProviderModels(a.st, a.logger, "claude-code", "claude-code")
-	mux.Handle("POST /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectStart))
-	mux.Handle("GET /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectStatus))
-	mux.Handle("DELETE /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectCancel))
+	mux.Handle("POST /llm/providers/{kind}/connect", a.auth(ctx.handleLLMConnectStart))
+	mux.Handle("GET /llm/providers/{kind}/connect", a.auth(ctx.handleLLMConnectStatus))
+	mux.Handle("DELETE /llm/providers/{kind}/connect", a.auth(ctx.handleLLMConnectCancel))
 	mux.Handle("GET /llm/route", a.auth(a.handleLLMRouteGet))
 	mux.Handle("PUT /llm/route", a.auth(a.handleLLMRoutePut))
 	mux.Handle("GET /llm/combos", a.auth(a.handleLLMComboList))

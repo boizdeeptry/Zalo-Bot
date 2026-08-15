@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 
@@ -98,6 +97,7 @@ func startConnectPollTicker(interval time.Duration) connectPollTicker {
 type connectJob struct {
 	mu             sync.Mutex
 	state          connectState
+	runtime        connectRuntimeBinding
 	accountID      string
 	configDir      string
 	label          string
@@ -231,9 +231,52 @@ func (m *connectManager) start(
 	label string,
 	onboardingArgs ...*connectOnboardingContext,
 ) (connectState, error) {
+	binding := m.legacyRuntimeBinding(kind)
+
 	var onboarding *connectOnboardingContext
 	if len(onboardingArgs) > 0 && onboardingArgs[0] != nil {
 		copied := *onboardingArgs[0]
+		onboarding = &copied
+	}
+	return m.startBound(kind, label, binding, onboarding)
+}
+
+func (m *connectManager) legacyRuntimeBinding(kind string) connectRuntimeBinding {
+	// Compatibility for the existing state-machine tests and direct handler
+	// seam. Capture every injected field now so a later test/global swap cannot
+	// change an already admitted job.
+	runner := m.runner
+	ensure := m.ensure
+	ensureOnboarding := m.ensureOnboarding
+	ensureModels := m.ensureModels
+	createAccount := m.createAccount
+	bindOnboarding := m.bindOnboarding
+	binding := connectRuntimeBinding{}
+	if runner != nil {
+		binding.driver = appBoundConnectDriver{kind: kind, runner: runner}
+	}
+	if ensure != nil {
+		binding.ensureAccountProvider = func() error { return ensure(kind) }
+	}
+	if ensureOnboarding != nil {
+		binding.ensureOnboardingProvider = func() error { return ensureOnboarding(kind) }
+	}
+	if ensureModels != nil {
+		binding.seedConnectedModels = func(string) error { return ensureModels(kind) }
+	}
+	binding.createAccount = createAccount
+	binding.bindOnboarding = bindOnboarding
+	return binding
+}
+
+func (m *connectManager) startBound(
+	kind string,
+	label string,
+	binding connectRuntimeBinding,
+	onboarding *connectOnboardingContext,
+) (connectState, error) {
+	if onboarding != nil {
+		copied := *onboarding
 		onboarding = &copied
 	}
 	m.mu.Lock()
@@ -263,6 +306,10 @@ func (m *connectManager) start(
 			}
 		}
 	}
+	if appConnectDriverIsNil(binding.driver) {
+		m.mu.Unlock()
+		return connectState{}, fmt.Errorf("connect %s: driver is unavailable", kind)
+	}
 	id := m.newID()
 	dir := accountConfigDir(m.dataDir, kind, id)
 	// ponytail: MkdirAll runs under the lock; start() is user-driven and rare, so the brief
@@ -273,7 +320,7 @@ func (m *connectManager) start(
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &connectJob{
-		state: connectState{Kind: kind, Phase: phaseDetecting}, accountID: id,
+		state: connectState{Kind: kind, Phase: phaseDetecting}, runtime: binding, accountID: id,
 		configDir: dir, label: label, onboarding: onboarding, cancel: cancel, done: make(chan struct{}),
 	}
 	m.job = job
@@ -369,7 +416,8 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 			<-loginWaitDone
 		}
 	}()
-	installed, err := m.runner.detect(kind)
+	runtime := job.runtime
+	installed, err := runtime.driver.Detect()
 	if ctx.Err() != nil {
 		return
 	}
@@ -383,7 +431,7 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 		}) {
 			return
 		}
-		if err := m.runner.install(ctx, kind, func(line string) {
+		if err := runtime.driver.Install(ctx, func(line string) {
 			job.transitionActive(ctx, phaseInstalling, phaseInstalling, func(s *connectState) {
 				s.Message = line
 			})
@@ -407,12 +455,16 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	}) {
 		return
 	}
-	loginURL, code, wait, err := m.runner.login(ctx, kind, job.configDir)
+	loginURL, code, wait, err := runtime.driver.Login(ctx, job.configDir)
 	if err != nil {
 		if ctx.Err() != nil {
 			return
 		}
 		m.fail(job, kind, "không mở được đăng nhập", err)
+		return
+	}
+	if wait == nil {
+		m.fail(job, kind, "không mở được đăng nhập", errors.New("login wait callback is unavailable"))
 		return
 	}
 	// Start and retain the wait callback before checking cancellation. login may have launched a
@@ -450,7 +502,7 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	defer ticker.stop()
 	waitCompleted := false
 	for {
-		auth := m.runner.pollAuth(kind, job.configDir)
+		auth := runtime.driver.PollAuth(job.configDir)
 		if waitCompleted {
 			switch auth {
 			case authLoggedIn:
@@ -466,7 +518,7 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 		if auth == authLoggedIn {
 			// Everything above the claim is read-only preparation. requestCancel races with this
 			// claim under job.mu; all provider/account persistence stays strictly after it.
-			label := m.runner.accountLabel(kind, job.configDir)
+			label := runtime.driver.AccountLabel(job.configDir)
 			if label == "" {
 				label = job.label
 			}
@@ -479,45 +531,45 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 				return
 			}
 			if job.onboarding == nil {
-				if m.ensure == nil {
+				if runtime.ensureAccountProvider == nil {
 					m.fail(job, kind, "không lưu được kết nối", errors.New("normal Provider ensure is unavailable"))
 					return
 				}
-				if err := m.ensure(kind); err != nil {
+				if err := runtime.ensureAccountProvider(); err != nil {
 					m.fail(job, kind, "không lưu được kết nối", err)
 					return
 				}
 			} else {
-				if m.ensureOnboarding == nil {
+				if runtime.ensureOnboardingProvider == nil {
 					m.fail(job, kind, "không lưu được kết nối", errors.New("onboarding Provider ensure is unavailable"))
 					return
 				}
-				if err := m.ensureOnboarding(kind); err != nil {
+				if err := runtime.ensureOnboardingProvider(); err != nil {
 					m.fail(job, kind, "không lưu được kết nối", err)
 					return
 				}
 			}
-			if m.ensureModels != nil {
-				if err := m.ensureModels(kind); err != nil {
+			if runtime.seedConnectedModels != nil {
+				if err := runtime.seedConnectedModels(acct.ProviderID); err != nil {
 					m.fail(job, kind, "không lưu được kết nối", err)
 					return
 				}
 			}
 			if job.onboarding == nil {
-				if m.createAccount == nil {
+				if runtime.createAccount == nil {
 					m.fail(job, kind, "không lưu được kết nối", errors.New("connect Account persistence is unavailable"))
 					return
 				}
-				if err := m.createAccount(acct); err != nil {
+				if err := runtime.createAccount(acct); err != nil {
 					m.fail(job, kind, "không lưu được kết nối", err)
 					return
 				}
 			} else {
-				if m.bindOnboarding == nil {
+				if runtime.bindOnboarding == nil {
 					m.fail(job, kind, "không lưu được kết nối", errors.New("onboarding Account bind is unavailable"))
 					return
 				}
-				if _, err := m.bindOnboarding(job.onboarding.Revision, kind, acct); err != nil {
+				if _, err := runtime.bindOnboarding(job.onboarding.Revision, kind, acct); err != nil {
 					m.fail(job, kind, "không lưu được kết nối", err)
 					return
 				}
@@ -555,14 +607,15 @@ func (m *connectManager) run(ctx context.Context, kind string, job *connectJob) 
 	}
 }
 
-// connectMgr is the process-level connect manager (one connect job at a time across the daemon).
-// ponytail: package singleton for the same reason as accountSel — `api` is declared in the base
-// repo (build asserts git-clean, can't add a field) and handlers are methods on *api. Initialized
-// once by registerAppRoutes from the serving api; one daemon = one api instance. Tests assign it
-// directly (and reset to nil via t.Cleanup).
+// connectMgr remains a compatibility bridge for legacy direct-handler tests and
+// onboarding cleanup code that has not yet received appRuntimeContext. Serving
+// Connect routes close over ctx.connect and never read this singleton.
 var connectMgr *connectManager
 
 func (a *api) newConnectManager() *connectManager {
+	// runner/persistence fields are retained for the legacy start/direct-handler
+	// seam. Context routes use only the lifecycle fields below and pass a strict
+	// registry-resolved connectRuntimeBinding for each job.
 	return &connectManager{
 		runner:           newDefaultConnectRunner(a.logger),
 		ensure:           a.st.EnsureProviderForKind,
@@ -1012,96 +1065,14 @@ func claudeEmailFromJSON(out []byte) string {
 // --- HTTP handlers ---
 
 func (a *api) handleLLMConnectStart(w http.ResponseWriter, r *http.Request) {
-	kind := r.PathValue("kind")
-	if !productionAppProviderRuntimeRegistry().supportsConnect(kind) {
-		a.writeLLMErr(w, http.StatusBadRequest, "CONNECT_KIND_UNSUPPORTED",
-			"loại tài khoản này chưa kết nối được ở bản này", map[string]string{"kind": kind})
-		return
-	}
-	var body connectStartRequest
-	if !a.decodeLLMBody(w, r, &body) {
-		return // decodeLLMBody already wrote the error
-	}
-	label := strings.TrimSpace(body.Label)
-	if label == "" {
-		label = "Tài khoản"
-	}
-	// Admission shares the onboarding mutation gate. The lock order is always onboarding first,
-	// then connectManager.mu inside start/cancel, so a new Connect cannot appear between onboarding
-	// cancel/cleanup and its committed state transition.
-	onboardingMutationMu.Lock()
-	if r.Context().Err() != nil {
-		onboardingMutationMu.Unlock()
-		a.writeLLMErr(w, http.StatusRequestTimeout, "CONNECT_REQUEST_CANCELED",
-			"yêu cầu kết nối đã bị huỷ", nil)
-		return
-	}
-	var onboarding *connectOnboardingContext
-	if body.OnboardingRevision != nil {
-		if !a.requireOnboardingRevision(w, *body.OnboardingRevision) {
-			onboardingMutationMu.Unlock()
-			return
+	registry := productionAppProviderRuntimeRegistry()
+	ctx := appRuntimeContext{api: a, registry: registry, connect: connectMgr}
+	ctx.handleLLMConnectStartWithResolver(w, r, func(kind string) (connectRuntimeBinding, error) {
+		if connectMgr == nil || !registry.supportsConnect(kind) {
+			return connectRuntimeBinding{}, errRuntimeConnectUnsupported
 		}
-		snapshot, err := a.st.OnboardingSnapshot()
-		if err != nil {
-			onboardingMutationMu.Unlock()
-			a.writeOnboardingStateUnavailable(w, err)
-			return
-		}
-		if err := validateOnboardingSnapshot(snapshot); err != nil {
-			onboardingMutationMu.Unlock()
-			a.writeOnboardingStateUnavailable(w, err)
-			return
-		}
-		state := snapshot.State
-		if state.Revision != *body.OnboardingRevision {
-			onboardingMutationMu.Unlock()
-			a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
-			return
-		}
-		if !onboardingRequired(state) || state.Phase != store.OnboardingPhaseConnect {
-			onboardingMutationMu.Unlock()
-			a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidPhase)
-			return
-		}
-		if state.ProviderKind != kind {
-			onboardingMutationMu.Unlock()
-			a.writeOnboardingStoreError(w, store.ErrOnboardingProviderUnsupported)
-			return
-		}
-		if !connectOnboardingStateIsClean(state) {
-			onboardingMutationMu.Unlock()
-			a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
-			return
-		}
-		stage, selected := onboardingStageForKind(snapshot.Stages, kind)
-		if !selected || stage.Status != "pending" || stage.ProviderID != "" ||
-			stage.AccountID != "" || stage.ModelID != "" {
-			onboardingMutationMu.Unlock()
-			a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
-			return
-		}
-		onboarding = &connectOnboardingContext{Revision: state.Revision, Kind: kind}
-	}
-	st, err := connectMgr.start(kind, label, onboarding)
-	onboardingMutationMu.Unlock()
-	if errors.Is(err, errConnectBusy) {
-		// Reachable now that codex and claude-code are both subscription kinds: starting one while
-		// the other is mid-connect returns errConnectBusy (a second POST of the SAME kind returns
-		// the current state instead; unsupported kinds are rejected 400 above).
-		a.writeLLMErr(w, http.StatusConflict, "CONNECT_BUSY", "đang có phiên kết nối khác", nil)
-		return
-	}
-	if errors.Is(err, errConnectCleanupPending) {
-		a.writeLLMErr(w, http.StatusInternalServerError, "CONNECT_CLEANUP_FAILED",
-			connectCleanupFailedMessage, nil)
-		return
-	}
-	if err != nil {
-		a.writeLLMInternal(w, "không khởi động được kết nối", err)
-		return
-	}
-	a.writeJSON(w, http.StatusOK, st)
+		return connectMgr.legacyRuntimeBinding(kind), nil
+	})
 }
 
 func onboardingRequired(state store.OnboardingState) bool {
@@ -1114,15 +1085,17 @@ func connectOnboardingStateIsClean(state store.OnboardingState) bool {
 }
 
 func (a *api) handleLLMConnectStatus(w http.ResponseWriter, r *http.Request) {
-	st, ok := connectMgr.status(r.PathValue("kind"))
-	if !ok {
+	if connectMgr == nil {
 		a.writeJSON(w, http.StatusOK, map[string]any{"phase": "idle"})
 		return
 	}
-	a.writeJSON(w, http.StatusOK, st)
+	appRuntimeContext{api: a, connect: connectMgr}.handleLLMConnectStatus(w, r)
 }
 
 func (a *api) handleLLMConnectCancel(w http.ResponseWriter, r *http.Request) {
-	ok := connectMgr.cancel(r.PathValue("kind"))
-	a.writeJSON(w, http.StatusOK, map[string]any{"ok": ok})
+	if connectMgr == nil {
+		a.writeJSON(w, http.StatusOK, map[string]any{"ok": false})
+		return
+	}
+	appRuntimeContext{api: a, connect: connectMgr}.handleLLMConnectCancel(w, r)
 }
