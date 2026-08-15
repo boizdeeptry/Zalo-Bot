@@ -15,6 +15,13 @@ type appProviderCapability struct {
 	Subscription bool
 }
 
+// OpenCode remains synthetic-test-only until a separately reviewed production
+// containment design exists. Keep this deny independent from catalog metadata,
+// environment variables and capability-map contents so none can promote it.
+func appProviderProductionDenied(kind string) bool {
+	return kind == "opencode"
+}
+
 var appProviderCapabilities = map[string]appProviderCapability{
 	"codex":       {Onboarding: true, Connect: true, Subscription: true},
 	"claude-code": {Onboarding: true, Connect: true, Subscription: true},
@@ -34,6 +41,9 @@ func appProviderOptions() []appProviderOption {
 	options := providercatalog.Options()
 	result := make([]appProviderOption, 0, len(options))
 	for _, option := range options {
+		if appProviderProductionDenied(option.Kind) {
+			continue
+		}
 		capability, supported := appProviderCapabilities[option.Kind]
 		if !option.Advertised || !supported || !capability.Onboarding {
 			continue
@@ -52,16 +62,27 @@ func appProviderOptions() []appProviderOption {
 }
 
 func appProviderSupportsOnboarding(kind string) bool {
+	if appProviderProductionDenied(kind) {
+		return false
+	}
 	capability, exists := appProviderCapabilities[kind]
 	return exists && capability.Onboarding
 }
 
 func appProviderSupportsConnect(kind string) bool {
+	if appProviderProductionDenied(kind) {
+		return false
+	}
 	capability, exists := appProviderCapabilities[kind]
 	return exists && capability.Connect
 }
 
 func appCanonicalOnboardingKinds(kinds []string) ([]string, error) {
+	for _, kind := range kinds {
+		if appProviderProductionDenied(kind) {
+			return nil, fmt.Errorf("%w: Provider is not production-enabled", providercatalog.ErrUnsupportedKind)
+		}
+	}
 	canonical, err := providercatalog.CanonicalSelectedKinds(kinds)
 	if err != nil {
 		return nil, err
@@ -77,6 +98,9 @@ func appCanonicalOnboardingKinds(kinds []string) ([]string, error) {
 func appSubscriptionKinds() map[string]bool {
 	result := make(map[string]bool)
 	for kind, capability := range appProviderCapabilities {
+		if appProviderProductionDenied(kind) {
+			continue
+		}
 		if capability.Subscription {
 			result[kind] = true
 		}

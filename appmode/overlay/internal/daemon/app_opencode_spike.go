@@ -20,13 +20,15 @@ import (
 const (
 	syntheticOpenCodePrompt = "Chỉ trả lời đúng một từ: OK"
 
-	openCodePreferredModel = "opencode/deepseek-v4-flash-free"
-	openCodeOutputLimit    = 1 << 20
-	openCodeEventLimit     = 1024
-	openCodeJSONDepthLimit = 16
-	openCodeJSONTokenLimit = 4096
-	openCodeIdentifierMax  = 256
-	openCodeModelMax       = 256
+	openCodePinnedVersion         = "1.18.18"
+	openCodeExpectedSignerSubject = "Anomaly Innovations, Inc"
+	openCodePreferredModel        = "opencode/deepseek-v4-flash-free"
+	openCodeOutputLimit           = 1 << 20
+	openCodeEventLimit            = 1024
+	openCodeJSONDepthLimit        = 16
+	openCodeJSONTokenLimit        = 4096
+	openCodeIdentifierMax         = 256
+	openCodeModelMax              = 256
 
 	openCodeCanonicalConfig = `{"enabled_providers":["opencode"],"share":"disabled","snapshot":false,"autoupdate":false,"formatter":false,"lsp":false,"plugin":[],"mcp":{},"subagent_depth":0,"permission":{"*":"deny"},"agent":{"agentdc-synthetic":{"mode":"primary","steps":1,"permission":{"*":"deny"}}}}`
 )
@@ -37,7 +39,39 @@ var (
 	ErrOpenCodeNoSafeModel            = errors.New("no safe OpenCode model")
 	ErrOpenCodeInvalidProtocol        = errors.New("invalid OpenCode protocol")
 	ErrOpenCodeOutputTooLarge         = errors.New("OpenCode output too large")
+	ErrOpenCodeBinaryRejected         = errors.New("OpenCode synthetic binary rejected")
 )
+
+var openCodePinnedSHA256 = [32]byte{
+	0xB6, 0xEF, 0xA9, 0xEB, 0x3E, 0xE1, 0xD5, 0xC2,
+	0x54, 0x38, 0xF3, 0xCB, 0xA0, 0x3C, 0x47, 0x1E,
+	0x5D, 0x86, 0x61, 0xA6, 0x12, 0x1A, 0xBC, 0x47,
+	0xF2, 0x09, 0xDB, 0x3B, 0x3F, 0x05, 0xF4, 0x15,
+}
+
+// appSyntheticRuntimeDescriptor is intentionally data-only and is never read
+// by production provider catalogs, capabilities, routers or auth drivers.
+type appSyntheticRuntimeDescriptor struct {
+	Kind          string
+	Version       string
+	Advertised    bool
+	SyntheticOnly bool
+}
+
+type openCodeSmokeRootLock interface {
+	io.Closer
+	entries() ([]string, error)
+	remove() error
+}
+
+var appSyntheticRuntimeDescriptors = map[string]appSyntheticRuntimeDescriptor{
+	"opencode": {
+		Kind:          "opencode",
+		Version:       openCodePinnedVersion,
+		Advertised:    false,
+		SyntheticOnly: true,
+	},
+}
 
 type openCodeSpikeSpec struct {
 	Binary  string
@@ -671,4 +705,8 @@ func openCodeProtocolError() error {
 
 func openCodeOutputLimitError() error {
 	return fmt.Errorf("%w: output limits exceeded", ErrOpenCodeOutputTooLarge)
+}
+
+func openCodeBinaryRejectedError(category string) error {
+	return fmt.Errorf("%w: %s", ErrOpenCodeBinaryRejected, category)
 }

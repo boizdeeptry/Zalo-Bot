@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -488,5 +489,38 @@ func (r *openCodeErrorReader) Read(p []byte) (int, error) {
 func TestOpenCodeTestFixturesAreValidUTF8(t *testing.T) {
 	if !utf8.ValidString(validOpenCodeStream("ses_fixture", "OK")) {
 		t.Fatal("fixture is invalid UTF-8")
+	}
+}
+
+func TestOpenCodeSyntheticDescriptorIsPrivateAndNeverAdvertised(t *testing.T) {
+	descriptor, exists := appSyntheticRuntimeDescriptors["opencode"]
+	if !exists {
+		t.Fatal("synthetic OpenCode descriptor is missing")
+	}
+	if descriptor.Kind != "opencode" || descriptor.Version != "1.18.18" {
+		t.Fatalf("descriptor identity = %+v", descriptor)
+	}
+	if descriptor.Advertised || !descriptor.SyntheticOnly {
+		t.Fatalf("unsafe synthetic descriptor flags: %+v", descriptor)
+	}
+	for _, option := range appProviderOptions() {
+		if option.Kind == descriptor.Kind {
+			t.Fatal("synthetic descriptor leaked into production options")
+		}
+	}
+	if _, exists := appProviderCapabilities[descriptor.Kind]; exists {
+		t.Fatal("synthetic descriptor leaked into production capabilities")
+	}
+	if _, exists := cliDescriptors[descriptor.Kind]; exists {
+		t.Fatal("synthetic descriptor leaked into production runners")
+	}
+}
+
+func TestOpenCodeSyntheticDescriptorPinsReviewedWindowsRelease(t *testing.T) {
+	if got := strings.ToUpper(hex.EncodeToString(openCodePinnedSHA256[:])); got != "B6EFA9EB3EE1D5C25438F3CBA03C471E5D8661A6121ABC47F209DB3B3F05F415" {
+		t.Fatalf("pinned SHA-256 = %s", got)
+	}
+	if openCodePinnedVersion != "1.18.18" || openCodeExpectedSignerSubject != "Anomaly Innovations, Inc" {
+		t.Fatalf("pinned release identity = %q / %q", openCodePinnedVersion, openCodeExpectedSignerSubject)
 	}
 }
