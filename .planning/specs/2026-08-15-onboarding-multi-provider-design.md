@@ -26,7 +26,8 @@ OpenCode `1.18.18` đang có trên máy và đã được kiểm chứng thực 
 
 - `opencode run --pure --format json --model opencode/deepseek-v4-flash-free` trả đúng ba event
   `step_start/text/step_finish` và câu trả lời `OK`;
-- event mang `sessionID`; session thử đã được xoá thành công bằng `opencode session delete`;
+- event mang `sessionID`; lượt thử lịch sử từng tạo session và session đó đã được xoá thành công. Thiết
+  kế mới không lặp lại persistence này mà bắt buộc dùng database in-memory;
 - `XDG_DATA_HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME/XDG_STATE_HOME` thực sự cô lập được toàn bộ đường
   dữ liệu trên Windows;
 - inline config `permission: {"*":"deny"}`, `share:"disabled"`, `autoupdate:false` được resolve
@@ -341,21 +342,35 @@ nhưng chỉ xuất hiện trong catalog production nếu implementation đáp �
    native `opencode-ai/bin/opencode.exe`, không mượn binary từ phần mềm khác trên máy.
 2. Mỗi Account có app-owned XDG data/config/cache/state roots; không đọc auth/config global.
 3. Workdir là thư mục rỗng do app sở hữu, không phải repo/home của người dùng.
-4. Mọi lượt có `--pure`, config inline `permission:{"*":"deny"}`, `share:"disabled"`,
+4. Mọi lượt có `--pure --log-level ERROR`, config inline `permission:{"*":"deny"}`, `share:"disabled"`,
    `autoupdate:false`; không bao giờ có `--auto`, `--yolo`, `--dangerously-skip-permissions`, attach,
    file hoặc command flags.
 5. Prompt chỉ đi qua stdin, không xuất hiện trong argv/process listing và không thể thành CLI flag.
 6. Chỉ model discover được trong namespace `opencode/` và suffix `-free` được chấp nhận ở Beta.
-7. Parser chỉ nhận NDJSON bounded UTF-8, một session ID nhất quán, text bounded và terminal finish;
-   tool events hoặc malformed output fail closed.
-8. Exact session bị xoá sau success/error/cancel. Nếu cancel trước event đầu, cleanup tìm exact nonce
-   title trong account-isolated store; không xoá session ngoài ownership.
-9. Process nằm trong managed Windows Job Object/Unix process group hiện có; cancel đợi reap.
-10. Có OS containment thực sự giới hạn filesystem/process privilege. Job Object chỉ là lifecycle
+7. Parser chỉ nhận NDJSON bounded UTF-8 đúng schema v1.18.18: top-level timestamp/session ID; nested
+   part có exact `id/sessionID/messageID/type`; completed text có `time.end`; finish có
+   `reason/cost/tokens/cache`. Một session ID phải nhất quán ở cả hai cấp, text bounded, đúng thứ tự
+   start → text → finish; tool/reasoning/error/unknown/malformed output fail closed.
+8. Spike bắt buộc đặt `OPENCODE_DB=:memory:` và không được tạo `opencode.db`, `-wal`, `-shm` hoặc
+   artifact chứa prompt. Session ID trong NDJSON vẫn phải nhất quán để chống trộn stream, nhưng không
+   chạy một process thứ hai để `session list/delete` vì mỗi process có DB in-memory riêng. Sau
+   success/error/cancel, process phải được reap rồi exact app-owned temp root bị xoá.
+9. `--pure` không được coi là tắt bootstrap. Mọi XDG/npm/config/log path nằm trong exact owned root;
+   không dùng `OPENCODE_CONFIG_DIR`; npm ghim offline với owned cache/prefix và audit/fund/notifier tắt.
+   Không ambient proxy/registry credential được kế thừa. Discovery và run đều ghim log level `ERROR`.
+10. Bootstrap/log artifact chỉ được tồn tại trong owned root, phải được scan để bảo đảm không chứa full
+    fixed prompt/per-run nonce/raw-error canary/session ID, rồi toàn bộ root bị xoá sau khi process tree đã reap. Test phải
+    chứng minh không có npm registry egress hoặc background child sống sót.
+11. Process nằm trong managed Windows Job Object/Unix process group hiện có; cancel đợi root reap và
+    chứng minh Job/process group không còn active process trước khi scan/xoá. Windows env explicit pin
+    validated absolute `SYSTEMROOT` thay vì để `os/exec` tự chèn ambient value.
+12. Có OS containment thực sự giới hạn filesystem/process privilege. Job Object chỉ là lifecycle
     cleanup, không được tính là sandbox. Khi containment chưa có, feature flag chỉ dành cho spike với
     prompt synthetic, không nhận dữ liệu Zalo thật.
-11. Tests chứng minh env/config/argv, banned flags, no tool events, cleanup compensation và không lộ
-    prompt/output/token vào log.
+13. Tests chứng minh env allowlist/config/argv cuối cùng, npm offline, `OPENCODE_DB=:memory:`, banned flags,
+    no tool events, không có DB/WAL ngoài RAM, cleanup root và không lộ prompt/output/token vào
+    log/artifact. Artifact audit dùng rooted traversal, reject symlink/reparse/special files và có cap
+    depth/count/per-file/aggregate rõ ràng.
 
 Spike dùng model miễn phí nên không cần credential. Tích hợp upstream API key/OAuth của OpenCode là
 một capability sau, không nằm trong slice này. Nếu bất kỳ gate production nào không chứng minh được,
@@ -369,6 +384,11 @@ Nguồn chính thức tham khảo:
 - https://github.com/anomalyco/opencode/blob/v1.18.18/packages/web/src/content/docs/cli.mdx
 - https://github.com/anomalyco/opencode/blob/v1.18.18/packages/web/src/content/docs/providers.mdx
 - https://github.com/anomalyco/opencode/blob/v1.18.18/packages/web/src/content/docs/permissions.mdx
+- https://github.com/anomalyco/opencode/blob/v1.18.18/packages/core/src/database/database.ts
+- https://github.com/anomalyco/opencode/blob/v1.18.18/packages/opencode/src/config/config.ts
+- https://github.com/anomalyco/opencode/blob/v1.18.18/packages/core/src/observability/logging.ts
+- https://github.com/anomalyco/opencode/blob/v1.18.18/packages/opencode/src/cli/cmd/run.ts
+- https://github.com/anomalyco/opencode/blob/v1.18.18/packages/schema/src/v1/session.ts
 
 ## 11. Error handling và recovery
 
@@ -380,7 +400,8 @@ Nguồn chính thức tham khảo:
 - Deselect ready cleanup lỗi: giữ row/Account ownership và Retry; không báo OFF giả.
 - Model biến mất: row không ready; không làm hỏng row ready khác hoặc live route.
 - Stale tab: 409 rồi authoritative GET; không cancel job hợp lệ trước preflight.
-- OpenCode session cleanup lỗi: lượt trả lời fail closed và retry cleanup trước khi cho chạy lượt mới.
+- OpenCode process/root cleanup lỗi: spike fail closed, không chạy lượt mới trên root cũ; tuyệt đối không
+  fallback sang DB durable, npm online hoặc thư mục global.
 
 ## 12. Ranh giới mã nguồn dự kiến
 
@@ -398,7 +419,8 @@ Daemon:
 - `app_onboarding.go`: API projection, selection, orchestration, multi-stage pre/postflight.
 - `app_llm_connect.go`: active stage bind theo kind/revision.
 - `app_onboarding_runner.go` (mới): ordered pinned fallback.
-- `app_opencode.go` (mới, safety-gated): detect/discover/run/parse/session cleanup.
+- `app_opencode_spike.go` + `app_opencode_process.go` (mới, safety-gated): pure policy,
+  discover/run/parse, bounded pipe drain và exact owned-root cleanup.
 
 Portal:
 
@@ -447,9 +469,10 @@ Portal:
 
 - real-shaped NDJSON parser fixtures, malformed/tool/mixed-session/oversize rejection;
 - exact safe argv/env/workdir and banned-arg canary;
-- session delete success/error/cancel compensation;
+- in-memory DB/no DB-WAL-SHM, npm-offline bootstrap, ERROR-only log và exact root cleanup ở
+  success/error/cancel;
 - model namespace/filter/preference;
-- no global config/auth/session access;
+- no global config/auth/session access, no registry egress/background child và no prompt-bearing artifact;
 - optional local smoke only when installed, never consumes user credential.
 
 ### Gates
@@ -471,7 +494,8 @@ Portal:
 7. Test Chat chạy đúng staged fallback; Complete tạo một active Combo nhiều member atomically.
 8. Live route/Account cũ không đổi trước Complete và rollback nguyên vẹn khi lỗi.
 9. Catalog server-driven cho phép thêm runtime/model opaque mà không đổi frontend/schema.
-10. OpenCode spike chứng minh được install/discovery/JSONL/session cleanup bằng dữ liệu synthetic,
+10. OpenCode spike chứng minh được signed-binary discovery, real-shaped JSONL, zero durable session,
+    offline bootstrap và exact isolation cleanup bằng dữ liệu synthetic,
     nhưng không hiện và không nhận dữ liệu Zalo production cho tới khi có OS containment được test.
 11. Modal Tư Vấn Zalo trên nền lưới giữ nguyên; không có branding sản phẩm tham chiếu trong UI.
 12. Toàn bộ tests/build/visual verification xanh trước commit cuối và push.
