@@ -106,6 +106,42 @@ test("Hủy and native Escape close without mutation and restore connected opene
   assert.deepEqual(calls, []);
 });
 
+test("a dynamic focus fallback is resolved only when the exact opener is unavailable", (t) => {
+  const { controller, opener } = setup(t);
+  const fallback = document.createElement("button");
+  document.body.append(fallback);
+  let resolutions = 0;
+  const open = () => controller.open({
+    label: "Codex", value: "codex", opener,
+    resolveFocusFallback() { resolutions++; return fallback; },
+  });
+
+  open(); button(dialog(), "Hủy").click();
+  assert.deepEqual([document.activeElement, resolutions], [opener, 0]);
+  opener.disabled = true;
+  open(); button(dialog(), "Hủy").click();
+  assert.deepEqual([document.activeElement, resolutions], [fallback, 1]);
+  opener.disabled = false; opener.remove();
+  open(); assert.equal(dialog().cancel(), false);
+  assert.deepEqual([document.activeElement, resolutions], [fallback, 2]);
+});
+
+test("invalid or throwing focus fallbacks are ignored privately", (t) => {
+  const { controller, opener } = setup(t);
+  opener.disabled = true;
+  const detached = document.createElement("button"), disabled = document.createElement("button");
+  disabled.disabled = true; document.body.append(disabled);
+  for (const fallback of [detached, disabled, { isConnected: true }]) {
+    controller.open({ label: "Codex", value: "codex", opener, resolveFocusFallback: () => fallback });
+    assert.doesNotThrow(() => button(dialog(), "Hủy").click());
+    assert.notEqual(document.activeElement, fallback);
+  }
+  controller.open({ label: "Codex", value: "codex", opener,
+    resolveFocusFallback() { throw new Error("private focus resolver state"); } });
+  assert.doesNotThrow(() => button(dialog(), "Hủy").click());
+  assert.doesNotMatch(text(document.body), /private focus resolver state/u);
+});
+
 test("confirm is one-flight, locks the same modal, and closes only after success", async (t) => {
   const gate = deferred();
   const calls = [];

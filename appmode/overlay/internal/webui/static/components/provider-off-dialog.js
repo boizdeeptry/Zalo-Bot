@@ -72,6 +72,7 @@ export function createProviderOffDialog({ listen, onConfirm } = {}) {
   let generation = 0;
   let pendingController = null;
   let opener = null;
+  let resolveFocusFallback = null;
   let value;
 
   function owns(run) {
@@ -91,16 +92,24 @@ export function createProviderOffDialog({ listen, onConfirm } = {}) {
     confirmButton.disabled = false;
   }
 
-  function restoreFocus(target) {
-    if (target?.isConnected && typeof target.focus === "function") {
+  function restoreFocus(target, fallbackResolver) {
+    if (target?.isConnected && target.disabled !== true) {
       target.focus({ preventScroll: true });
+      return;
+    }
+    let fallback = null;
+    try { fallback = fallbackResolver?.(); } catch { return; }
+    if (fallback?.isConnected && fallback.disabled !== true && typeof fallback.focus === "function") {
+      fallback.focus({ preventScroll: true });
     }
   }
 
   function close({ restore = true, abort = true } = {}) {
     if (activeOwner !== owner && !dialog.open) return false;
     const target = opener;
+    const fallbackResolver = resolveFocusFallback;
     opener = null;
+    resolveFocusFallback = null;
     value = undefined;
     generation += 1;
     if (abort) pendingController?.abort();
@@ -109,7 +118,7 @@ export function createProviderOffDialog({ listen, onConfirm } = {}) {
     if (dialog.open) dialog.close();
     dialog.remove();
     if (activeOwner === owner) activeOwner = null;
-    if (restore) restoreFocus(target);
+    if (restore) restoreFocus(target, fallbackResolver);
     return true;
   }
 
@@ -166,6 +175,8 @@ export function createProviderOffDialog({ listen, onConfirm } = {}) {
       ? `Nếu tắt ${label}, provider này sẽ không còn được sử dụng. Bạn vẫn muốn tắt chứ?`
       : semanticText(input.description, "Provider OFF description");
     opener = input.opener;
+    resolveFocusFallback = typeof input.resolveFocusFallback === "function"
+      ? input.resolveFocusFallback : null;
     value = input.value;
     description.textContent = copy;
     resetView();
@@ -177,6 +188,7 @@ export function createProviderOffDialog({ listen, onConfirm } = {}) {
       dialog.remove();
       activeOwner = null;
       opener = null;
+      resolveFocusFallback = null;
       value = undefined;
       throw cause;
     }
