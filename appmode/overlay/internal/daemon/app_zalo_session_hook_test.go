@@ -774,7 +774,7 @@ func TestAppAnswerZaloBuildsProviderRunnerInsideThreadGate(t *testing.T) {
 		if refs != 1 {
 			t.Errorf("thread gate refs while building provider runner = %d; want 1", refs)
 		}
-		return a.appZaloRunner(gotConfig, gotBase, gotThreadID, hasNewFiles)
+		return productionAppRuntimeContext(a).appZaloRunner(gotConfig, gotBase, gotThreadID, hasNewFiles)
 	}
 
 	if err := a.appAnswerZaloWithRunnerFactory(
@@ -858,7 +858,7 @@ func TestAppRunZaloCallerCancellationStopsHangingNPMDiscovery(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, runErr := a.appRunZalo(
-			ctx, a.appZaloRunner(zc, silentZaloRunner{}, "thread", false), zc,
+			ctx, productionAppRuntimeContext(a).appZaloRunner(zc, silentZaloRunner{}, "thread", false), zc,
 			"thread", "question", "msg-1", history, nil, nil, func(string) {},
 		)
 		done <- runErr
@@ -1372,6 +1372,7 @@ func TestAppAnswerZaloResolvedClaudeBindingKeepsAPISuccessStateless(t *testing.T
 				t.Fatal("structured route selected Claude after session selection")
 				return silentZaloRunner{}
 			},
+			TerminalRoutes: appTestTerminalRoutes(),
 			ClaudeForSession: func(_ context.Context, model string, _ *store.ZaloCLISession) (zaloRunner, appZaloClaudeBinding) {
 				return &appZaloAffinityRunner{
 						mu: &callsMu, calls: &calls, accountID: "account-a", model: model,
@@ -1457,6 +1458,7 @@ func TestAppAnswerZaloDiscoveryFailurePreservesSelectedClaudeBindingAndSession(t
 				t.Fatal("structured route selected unresolved Claude after API success")
 				return silentZaloRunner{}
 			},
+			TerminalRoutes: appTestTerminalRoutes(),
 			ClaudeForSession: func(
 				ctx context.Context,
 				model string,
@@ -1521,6 +1523,7 @@ func TestAppAnswerZaloBindsClaudeAccountToThreadSessionBeforeSelection(t *testin
 				t.Fatal("structured route selected Claude after session selection")
 				return silentZaloRunner{}
 			},
+			TerminalRoutes: appTestTerminalRoutes(),
 			ClaudeForSession: func(_ context.Context, model string, current *store.ZaloCLISession) (zaloRunner, appZaloClaudeBinding) {
 				accounts, err := st.LLMAccounts(claudeCodeProviderID)
 				if err != nil {
@@ -1640,6 +1643,7 @@ func TestAppAnswerZaloNoEnabledAccountInvalidatesBindingBeforeSameAccountReturns
 				t.Fatal("structured route selected Claude before affinity resolution")
 				return silentZaloRunner{}
 			},
+			TerminalRoutes: appTestTerminalRoutes(),
 			ClaudeForSession: func(
 				ctx context.Context,
 				model string,
@@ -1747,6 +1751,7 @@ func TestAppAnswerZaloRotatesWhenRoutedClaudeModelChanges(t *testing.T) {
 				t.Fatal("structured route selected Claude after session selection")
 				return silentZaloRunner{}
 			},
+			TerminalRoutes: appTestTerminalRoutes(),
 			ClaudeForSession: func(_ context.Context, model string, current *store.ZaloCLISession) (zaloRunner, appZaloClaudeBinding) {
 				account, ok := appSelectClaudeAccountForSession(accountSel, []store.LLMAccount{{
 					ID: "account-a", ProviderID: claudeCodeProviderID,

@@ -598,9 +598,10 @@ func TestAppLLMRouterPinnedFallbackRemainsIndependentFromOnboardingRunner(t *tes
 	}}}
 	runner := newAppLLMRunner(appLLMRunnerConfig{
 		Route: route, Store: appOnboardingNoopAttemptStore{},
-		Adapters:   map[string]providerAdapter{"live-provider": okAdapter("live")},
-		Credential: func(string) ([]byte, error) { return nil, nil },
-		Claude:     func(string) zaloRunner { return silentZaloRunner{} },
+		Adapters:       map[string]providerAdapter{"live-provider": okAdapter("live")},
+		Credential:     func(string) ([]byte, error) { return nil, nil },
+		Claude:         func(string) zaloRunner { return silentZaloRunner{} },
+		TerminalRoutes: appTestTerminalRoutes(),
 	})
 	answer, err := runner.Run(context.Background(), "prompt", func(string) {})
 	if err != nil || answer != "live" {

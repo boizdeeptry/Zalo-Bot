@@ -1181,7 +1181,7 @@ package daemon
 
 // Test files are intentionally outside the production topology contract.
 func ignoredProviderRouteTestFixture() {
-	_ = a.appZaloRunner
+	_ = productionAppRuntimeContext(a).appZaloRunner
 	run := route(deps.cfg, deps.run, threadID, len(files) > 0)
 	_ = run
 	_ = a.appAnswerZalo(deps, threadID, question, reply, files)
@@ -1217,14 +1217,82 @@ async function refresh() {
   Write-TestFile (Join-Path $overlay 'internal\daemon\app_zalo_session_hook.go') @'
 package daemon
 
-func (a *api) appAnswerZalo() {
-	a.appAnswerZaloWithRunnerFactory(a.appZaloRunner)
+func (a *api) appAnswerZalo(
+	deps *zaloDeps,
+	threadID, question string,
+	reply ipc.ZaloOutboxDraft,
+	files []ipc.ZaloAttachment,
+) error {
+	return a.appAnswerZaloWithRunnerFactory(
+		deps, threadID, question, reply, files, productionAppRuntimeContext(a).appZaloRunner,
+	)
 }
 
-func (a *api) appAnswerZaloWithRunnerFactory(route appZaloRunnerFactory) {
-	_, _ = appZaloProcessThreadGate.Acquire(ctx, key)
+func (a *api) appAnswerZaloWithRunnerFactory(
+	deps *zaloDeps,
+	threadID, question string,
+	reply ipc.ZaloOutboxDraft,
+	files []ipc.ZaloAttachment,
+	route appZaloRunnerFactory,
+) error {
+	if route == nil {
+		return errors.New("zalo session runner factory is required")
+	}
+	release, err := appZaloProcessThreadGate.Acquire(
+		context.Background(),
+		fmt.Sprintf("%p\x00%s", a.st, threadID),
+	)
+	if err != nil {
+		return err
+	}
+	defer release()
 	run := route(deps.cfg, deps.run, threadID, len(files) > 0)
 	_ = run
+	effectiveConfig := deps.cfg
+	var binding appZaloClaudeBinding
+	run, effectiveConfig, binding, err = a.appResolveZaloSessionRoute(
+		ctx, run, effectiveConfig, threadID,
+	)
+	if err != nil {
+		return err
+	}
+	snapshot := a.appCaptureZaloTurnSnapshot(effectiveConfig, threadID, files)
+	if aware, ok := run.(appZaloAttachmentAwareRunner); ok {
+		run = aware.appWithZaloAttachments(snapshot.hasAttachments)
+	}
+	if aware, ok := run.(appZaloStructuredClaudeAwareRunner); ok {
+		run = aware.appWithZaloStructuredClaudeRequirement(
+			appZaloDeltaHasAttachments(snapshot.resumeDelta.delta),
+		)
+	}
+	if structured, ok := run.(appZaloStructuredRunner); ok {
+		run = &appZaloStructuredAnswerRunner{
+			a:                a,
+			run:              structured,
+			zc:               effectiveConfig,
+			threadID:         threadID,
+			question:         question,
+			currentZaloMsgID: appZaloCurrentMsgID(reply.ReplyQuote),
+			history:          snapshot.history,
+			directFiles:      snapshot.directFiles,
+			files:            snapshot.files,
+			highWater:        snapshot.highWater,
+			highWaterKnown:   snapshot.highWaterKnown,
+			resumeDelta:      snapshot.resumeDelta,
+			claudeBinding:    binding,
+			agentDisplayName: snapshot.agentDisplayName,
+		}
+	} else {
+		run = &appZaloCapturedIdentityRunner{
+			zaloRunner: run, agentDisplayName: snapshot.agentDisplayName,
+		}
+	}
+	if err := a.answerZalo(
+		ctx, deps.cfg, run, threadID, question, step, reply, files...,
+	); err != nil {
+		return err
+	}
+	return nil
 }
 '@
   Write-TestFile (Join-Path $overlay 'internal\webui\static\core\router.js') "export {};`n"
@@ -1401,8 +1469,8 @@ func duplicateServerMarker() {
     -StageRoot (Join-Path $stageTestRoot 'Provider route chỉ trong comment')
   $commentOnlyProviderHookPath = Join-Path $commentOnlyProviderStage 'internal\daemon\app_zalo_session_hook.go'
   $commentOnlyProviderHook = [IO.File]::ReadAllText($commentOnlyProviderHookPath).Replace(
-    'a.appAnswerZaloWithRunnerFactory(a.appZaloRunner)',
-    'a.appAnswerZaloWithRunnerFactory(fallbackRunner)') + "`n// a.appZaloRunner is not executable here.`n"
+    'productionAppRuntimeContext(a).appZaloRunner',
+    'fallbackRunner') + "`n// productionAppRuntimeContext(a).appZaloRunner is not executable here.`n"
   [IO.File]::WriteAllText(
     $commentOnlyProviderHookPath, $commentOnlyProviderHook, [Text.UTF8Encoding]::new($false))
   $commentOnlyProviderHashes = Get-SeamTargetHashes -Stage $commentOnlyProviderStage
@@ -1412,17 +1480,60 @@ func duplicateServerMarker() {
   Assert-SeamTargetHashes -Stage $commentOnlyProviderStage -Expected $commentOnlyProviderHashes `
     -Message 'A comment-only Provider route reference partially modified the stage'
 
+  $legacyReceiverStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route receiver cũ')
+  $legacyReceiverHookPath = Join-Path $legacyReceiverStage 'internal\daemon\app_zalo_session_hook.go'
+  $legacyReceiverHook = [IO.File]::ReadAllText($legacyReceiverHookPath).Replace(
+    'productionAppRuntimeContext(a).appZaloRunner', 'a.appZaloRunner')
+  [IO.File]::WriteAllText(
+    $legacyReceiverHookPath, $legacyReceiverHook, [Text.UTF8Encoding]::new($false))
+  $legacyReceiverHashes = Get-SeamTargetHashes -Stage $legacyReceiverStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $legacyReceiverStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'The legacy static api.appZaloRunner receiver was accepted'
+  Assert-SeamTargetHashes -Stage $legacyReceiverStage -Expected $legacyReceiverHashes `
+    -Message 'Legacy static Provider receiver rejection partially modified the stage'
+
+  $wrongContextStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route sai context')
+  $wrongContextHookPath = Join-Path $wrongContextStage 'internal\daemon\app_zalo_session_hook.go'
+  $wrongContextHook = [IO.File]::ReadAllText($wrongContextHookPath).Replace(
+    'productionAppRuntimeContext(a).appZaloRunner', 'productionAppRuntimeContext(other).appZaloRunner')
+  [IO.File]::WriteAllText(
+    $wrongContextHookPath, $wrongContextHook, [Text.UTF8Encoding]::new($false))
+  $wrongContextHashes = Get-SeamTargetHashes -Stage $wrongContextStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $wrongContextStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A production runtime context built from the wrong api receiver was accepted'
+  Assert-SeamTargetHashes -Stage $wrongContextStage -Expected $wrongContextHashes `
+    -Message 'Wrong runtime context rejection partially modified the stage'
+
+  $aliasedContextStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route qua alias')
+  $aliasedContextHookPath = Join-Path $aliasedContextStage 'internal\daemon\app_zalo_session_hook.go'
+  $aliasedContextHook = [IO.File]::ReadAllText($aliasedContextHookPath).
+    Replace('productionAppRuntimeContext(a).appZaloRunner', 'aliasedRoute').
+    Replace("`treturn a.appAnswerZaloWithRunnerFactory(`n",
+      "`taliasedRoute := productionAppRuntimeContext(a).appZaloRunner`n`treturn a.appAnswerZaloWithRunnerFactory(`n")
+  [IO.File]::WriteAllText(
+    $aliasedContextHookPath, $aliasedContextHook, [Text.UTF8Encoding]::new($false))
+  $aliasedContextHashes = Get-SeamTargetHashes -Stage $aliasedContextStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $aliasedContextStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'An aliased production runtime runner was accepted instead of the exact direct argument'
+  Assert-SeamTargetHashes -Stage $aliasedContextStage -Expected $aliasedContextHashes `
+    -Message 'Aliased runtime runner rejection partially modified the stage'
+
   $unrelatedProviderStage = New-AppStage -Repo $repo -Overlay $overlay `
     -StageRoot (Join-Path $stageTestRoot 'Provider route ngoài ngữ cảnh')
   $unrelatedProviderHookPath = Join-Path $unrelatedProviderStage 'internal\daemon\app_zalo_session_hook.go'
   $unrelatedProviderHook = [IO.File]::ReadAllText($unrelatedProviderHookPath).
-    Replace('a.appAnswerZaloWithRunnerFactory(a.appZaloRunner)',
-      'a.appAnswerZaloWithRunnerFactory(fallbackRunner)').
+    Replace('productionAppRuntimeContext(a).appZaloRunner', 'fallbackRunner').
     Replace('run := route(deps.cfg, deps.run, threadID, len(files) > 0)',
       'run := fallbackRoute(deps.cfg, deps.run, threadID, len(files) > 0)') + @'
 
 func unrelatedProviderRoute() {
-	_ = a.appZaloRunner
+	_ = productionAppRuntimeContext(a).appZaloRunner
 	run := route(deps.cfg, deps.run, threadID, len(files) > 0)
 	_ = run
 }
@@ -1439,11 +1550,11 @@ func unrelatedProviderRoute() {
   $earlyProviderRouteStage = New-AppStage -Repo $repo -Overlay $overlay `
     -StageRoot (Join-Path $stageTestRoot 'Provider route trước gate')
   $earlyProviderRouteHookPath = Join-Path $earlyProviderRouteStage 'internal\daemon\app_zalo_session_hook.go'
-  $earlyProviderRouteHook = [IO.File]::ReadAllText($earlyProviderRouteHookPath).Replace(
-    "`t_, _ = appZaloProcessThreadGate.Acquire(ctx, key)`n" +
-      "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)",
-    "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n" +
-      "`t_, _ = appZaloProcessThreadGate.Acquire(ctx, key)")
+  $earlyProviderRouteHook = [IO.File]::ReadAllText($earlyProviderRouteHookPath).
+    Replace("`trelease, err := appZaloProcessThreadGate.Acquire(`n",
+      "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`trelease, err := appZaloProcessThreadGate.Acquire(`n").
+    Replace("`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`t_ = run",
+      "`t_ = run")
   [IO.File]::WriteAllText(
     $earlyProviderRouteHookPath, $earlyProviderRouteHook, [Text.UTF8Encoding]::new($false))
   $earlyProviderRouteHashes = Get-SeamTargetHashes -Stage $earlyProviderRouteStage
@@ -1452,6 +1563,335 @@ func unrelatedProviderRoute() {
     -Message 'Provider route composition before the per-thread gate was accepted'
   Assert-SeamTargetHashes -Stage $earlyProviderRouteStage -Expected $earlyProviderRouteHashes `
     -Message 'An early Provider route call partially modified the stage'
+
+  $overwrittenProviderRouteStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route bị ghi đè')
+  $overwrittenProviderRouteHookPath = Join-Path $overwrittenProviderRouteStage 'internal\daemon\app_zalo_session_hook.go'
+  $overwrittenProviderRouteHook = [IO.File]::ReadAllText($overwrittenProviderRouteHookPath).Replace(
+    "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`t_ = run",
+    "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`trun = deps.run`n`t_ = run")
+  [IO.File]::WriteAllText(
+    $overwrittenProviderRouteHookPath, $overwrittenProviderRouteHook, [Text.UTF8Encoding]::new($false))
+  $overwrittenProviderRouteHashes = Get-SeamTargetHashes -Stage $overwrittenProviderRouteStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $overwrittenProviderRouteStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A route-derived runner overwritten before use was accepted'
+  Assert-SeamTargetHashes -Stage $overwrittenProviderRouteStage -Expected $overwrittenProviderRouteHashes `
+    -Message 'Overwritten Provider route rejection partially modified the stage'
+
+  $overwrittenRouteFactoryStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route factory bị ghi đè')
+  $overwrittenRouteFactoryHookPath = Join-Path $overwrittenRouteFactoryStage 'internal\daemon\app_zalo_session_hook.go'
+  $overwrittenRouteFactoryHook = [IO.File]::ReadAllText($overwrittenRouteFactoryHookPath).Replace(
+    "`tdefer release()`n`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)",
+    "`tdefer release()`n`troute = fallbackRunnerFactory`n`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)")
+  [IO.File]::WriteAllText(
+    $overwrittenRouteFactoryHookPath, $overwrittenRouteFactoryHook, [Text.UTF8Encoding]::new($false))
+  $overwrittenRouteFactoryHashes = Get-SeamTargetHashes -Stage $overwrittenRouteFactoryStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $overwrittenRouteFactoryStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider route factory overwritten before capture was accepted'
+  Assert-SeamTargetHashes -Stage $overwrittenRouteFactoryStage -Expected $overwrittenRouteFactoryHashes `
+    -Message 'Overwritten Provider route factory rejection partially modified the stage'
+
+  $releasedProviderRouteStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route sau khi thả gate')
+  $releasedProviderRouteHookPath = Join-Path $releasedProviderRouteStage 'internal\daemon\app_zalo_session_hook.go'
+  $releasedProviderRouteHook = [IO.File]::ReadAllText($releasedProviderRouteHookPath).Replace(
+    "`tdefer release()`n`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)",
+    "`tdefer release()`n`trelease()`n`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)")
+  [IO.File]::WriteAllText(
+    $releasedProviderRouteHookPath, $releasedProviderRouteHook, [Text.UTF8Encoding]::new($false))
+  $releasedProviderRouteHashes = Get-SeamTargetHashes -Stage $releasedProviderRouteStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $releasedProviderRouteStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'Provider route capture after releasing the thread gate was accepted'
+  Assert-SeamTargetHashes -Stage $releasedProviderRouteStage -Expected $releasedProviderRouteHashes `
+    -Message 'Released Provider route rejection partially modified the stage'
+
+  $aliasedReleaseStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider gate thả qua alias')
+  $aliasedReleaseHookPath = Join-Path $aliasedReleaseStage 'internal\daemon\app_zalo_session_hook.go'
+  $aliasedReleaseHook = [IO.File]::ReadAllText($aliasedReleaseHookPath).Replace(
+    "`tdefer release()",
+    "`tunlock := release`n`trelease = func() {}`n`tdefer release()`n`tunlock()")
+  [IO.File]::WriteAllText(
+    $aliasedReleaseHookPath, $aliasedReleaseHook, [Text.UTF8Encoding]::new($false))
+  $aliasedReleaseHashes = Get-SeamTargetHashes -Stage $aliasedReleaseStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $aliasedReleaseStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A thread-gate release hidden behind an alias was accepted'
+  Assert-SeamTargetHashes -Stage $aliasedReleaseStage -Expected $aliasedReleaseHashes `
+    -Message 'Aliased thread-gate release rejection partially modified the stage'
+
+  $disabledAttachmentStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider attachment predicate sai')
+  $disabledAttachmentHookPath = Join-Path $disabledAttachmentStage 'internal\daemon\app_zalo_session_hook.go'
+  $disabledAttachmentHook = [IO.File]::ReadAllText($disabledAttachmentHookPath).Replace(
+    'run = aware.appWithZaloAttachments(snapshot.hasAttachments)',
+    'run = aware.appWithZaloAttachments(false)')
+  [IO.File]::WriteAllText(
+    $disabledAttachmentHookPath, $disabledAttachmentHook, [Text.UTF8Encoding]::new($false))
+  $disabledAttachmentHashes = Get-SeamTargetHashes -Stage $disabledAttachmentStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $disabledAttachmentStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider runner with a forged attachment predicate was accepted'
+  Assert-SeamTargetHashes -Stage $disabledAttachmentStage -Expected $disabledAttachmentHashes `
+    -Message 'Forged attachment predicate rejection partially modified the stage'
+
+  $disabledStructuredStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider structured predicate sai')
+  $disabledStructuredHookPath = Join-Path $disabledStructuredStage 'internal\daemon\app_zalo_session_hook.go'
+  $disabledStructuredHook = [IO.File]::ReadAllText($disabledStructuredHookPath).Replace(
+    'appZaloDeltaHasAttachments(snapshot.resumeDelta.delta)', 'false')
+  [IO.File]::WriteAllText(
+    $disabledStructuredHookPath, $disabledStructuredHook, [Text.UTF8Encoding]::new($false))
+  $disabledStructuredHashes = Get-SeamTargetHashes -Stage $disabledStructuredStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $disabledStructuredStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider runner with a forged structured predicate was accepted'
+  Assert-SeamTargetHashes -Stage $disabledStructuredStage -Expected $disabledStructuredHashes `
+    -Message 'Forged structured predicate rejection partially modified the stage'
+
+  $missingResolveStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider thiếu session resolve')
+  $missingResolveHookPath = Join-Path $missingResolveStage 'internal\daemon\app_zalo_session_hook.go'
+  $missingResolveHook = [IO.File]::ReadAllText($missingResolveHookPath).Replace(
+    "`trun, effectiveConfig, binding, err = a.appResolveZaloSessionRoute(`n" +
+      "`t`tctx, run, effectiveConfig, threadID,`n`t)`n", '')
+  [IO.File]::WriteAllText(
+    $missingResolveHookPath, $missingResolveHook, [Text.UTF8Encoding]::new($false))
+  $missingResolveHashes = Get-SeamTargetHashes -Stage $missingResolveStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingResolveStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider route without session resolution was accepted'
+  Assert-SeamTargetHashes -Stage $missingResolveStage -Expected $missingResolveHashes `
+    -Message 'Missing Provider session resolution rejection partially modified the stage'
+
+  $forgedEffectiveConfigStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider effective config giả')
+  $forgedEffectiveConfigPath = Join-Path $forgedEffectiveConfigStage 'internal\daemon\app_zalo_session_hook.go'
+  $forgedEffectiveConfig = [IO.File]::ReadAllText($forgedEffectiveConfigPath).Replace(
+    'effectiveConfig := deps.cfg', 'effectiveConfig := zaloConfig{}')
+  [IO.File]::WriteAllText(
+    $forgedEffectiveConfigPath, $forgedEffectiveConfig, [Text.UTF8Encoding]::new($false))
+  $forgedEffectiveConfigHashes = Get-SeamTargetHashes -Stage $forgedEffectiveConfigStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $forgedEffectiveConfigStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A forged effective Zalo config source was accepted'
+  Assert-SeamTargetHashes -Stage $forgedEffectiveConfigStage -Expected $forgedEffectiveConfigHashes `
+    -Message 'Forged effective Zalo config rejection partially modified the stage'
+
+  $forgedSnapshotStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider turn snapshot giả')
+  $forgedSnapshotPath = Join-Path $forgedSnapshotStage 'internal\daemon\app_zalo_session_hook.go'
+  $forgedSnapshot = [IO.File]::ReadAllText($forgedSnapshotPath).Replace(
+    'snapshot := a.appCaptureZaloTurnSnapshot(effectiveConfig, threadID, files)',
+    'snapshot := appZaloTurnSnapshot{}')
+  [IO.File]::WriteAllText(
+    $forgedSnapshotPath, $forgedSnapshot, [Text.UTF8Encoding]::new($false))
+  $forgedSnapshotHashes = Get-SeamTargetHashes -Stage $forgedSnapshotStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $forgedSnapshotStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A forged Zalo turn snapshot source was accepted'
+  Assert-SeamTargetHashes -Stage $forgedSnapshotStage -Expected $forgedSnapshotHashes `
+    -Message 'Forged Zalo turn snapshot rejection partially modified the stage'
+
+  $escapedSnapshotFieldStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider snapshot field thoát qua helper')
+  $escapedSnapshotFieldPath = Join-Path $escapedSnapshotFieldStage 'internal\daemon\app_zalo_session_hook.go'
+  $escapedSnapshotField = [IO.File]::ReadAllText($escapedSnapshotFieldPath).Replace(
+    'snapshot := a.appCaptureZaloTurnSnapshot(effectiveConfig, threadID, files)',
+    "snapshot := a.appCaptureZaloTurnSnapshot(effectiveConfig, threadID, files)`n`tmutateBool(&snapshot.hasAttachments)")
+  [IO.File]::WriteAllText(
+    $escapedSnapshotFieldPath, $escapedSnapshotField, [Text.UTF8Encoding]::new($false))
+  $escapedSnapshotFieldHashes = Get-SeamTargetHashes -Stage $escapedSnapshotFieldStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $escapedSnapshotFieldStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A protected Zalo snapshot field address passed to a helper was accepted'
+  Assert-SeamTargetHashes -Stage $escapedSnapshotFieldStage -Expected $escapedSnapshotFieldHashes `
+    -Message 'Escaped Zalo snapshot field rejection partially modified the stage'
+
+  $missingAttachmentAwareStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider thiếu attachment transform')
+  $missingAttachmentAwareHookPath = Join-Path $missingAttachmentAwareStage 'internal\daemon\app_zalo_session_hook.go'
+  $missingAttachmentAwareHook = [IO.File]::ReadAllText($missingAttachmentAwareHookPath).Replace(
+    "`tif aware, ok := run.(appZaloAttachmentAwareRunner); ok {`n" +
+      "`t`trun = aware.appWithZaloAttachments(snapshot.hasAttachments)`n`t}`n", '')
+  [IO.File]::WriteAllText(
+    $missingAttachmentAwareHookPath, $missingAttachmentAwareHook, [Text.UTF8Encoding]::new($false))
+  $missingAttachmentAwareHashes = Get-SeamTargetHashes -Stage $missingAttachmentAwareStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingAttachmentAwareStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider route without the attachment transform was accepted'
+  Assert-SeamTargetHashes -Stage $missingAttachmentAwareStage -Expected $missingAttachmentAwareHashes `
+    -Message 'Missing attachment transform rejection partially modified the stage'
+
+  $missingStructuredAwareStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider thiếu structured transform')
+  $missingStructuredAwareHookPath = Join-Path $missingStructuredAwareStage 'internal\daemon\app_zalo_session_hook.go'
+  $missingStructuredAwareHook = [IO.File]::ReadAllText($missingStructuredAwareHookPath).Replace(
+    "`tif aware, ok := run.(appZaloStructuredClaudeAwareRunner); ok {`n" +
+      "`t`trun = aware.appWithZaloStructuredClaudeRequirement(`n" +
+      "`t`t`tappZaloDeltaHasAttachments(snapshot.resumeDelta.delta),`n`t`t)`n`t}`n", '')
+  [IO.File]::WriteAllText(
+    $missingStructuredAwareHookPath, $missingStructuredAwareHook, [Text.UTF8Encoding]::new($false))
+  $missingStructuredAwareHashes = Get-SeamTargetHashes -Stage $missingStructuredAwareStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingStructuredAwareStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider route without the structured attachment transform was accepted'
+  Assert-SeamTargetHashes -Stage $missingStructuredAwareStage -Expected $missingStructuredAwareHashes `
+    -Message 'Missing structured transform rejection partially modified the stage'
+
+  $missingWrapperStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider thiếu answer wrapper')
+  $missingWrapperHookPath = Join-Path $missingWrapperStage 'internal\daemon\app_zalo_session_hook.go'
+  $missingWrapperHook = [IO.File]::ReadAllText($missingWrapperHookPath).Replace(
+    'if structured, ok := run.(appZaloStructuredRunner); ok {', 'if false {')
+  [IO.File]::WriteAllText(
+    $missingWrapperHookPath, $missingWrapperHook, [Text.UTF8Encoding]::new($false))
+  $missingWrapperHashes = Get-SeamTargetHashes -Stage $missingWrapperStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $missingWrapperStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider route without the final answer wrapper was accepted'
+  Assert-SeamTargetHashes -Stage $missingWrapperStage -Expected $missingWrapperHashes `
+    -Message 'Missing Provider answer wrapper rejection partially modified the stage'
+
+  $wrongAcquireStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider gate key sai')
+  $wrongAcquireHookPath = Join-Path $wrongAcquireStage 'internal\daemon\app_zalo_session_hook.go'
+  $wrongAcquireHook = [IO.File]::ReadAllText($wrongAcquireHookPath).Replace(
+    'fmt.Sprintf("%p\x00%s", a.st, threadID)', 'fmt.Sprintf("%p\x00%s", otherStore, otherThreadID)')
+  [IO.File]::WriteAllText(
+    $wrongAcquireHookPath, $wrongAcquireHook, [Text.UTF8Encoding]::new($false))
+  $wrongAcquireHashes = Get-SeamTargetHashes -Stage $wrongAcquireStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $wrongAcquireStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider route guarded by the wrong thread key was accepted'
+  Assert-SeamTargetHashes -Stage $wrongAcquireStage -Expected $wrongAcquireHashes `
+    -Message 'Wrong Provider thread key rejection partially modified the stage'
+
+  $wrongHookArgumentsStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider hook args sai')
+  $wrongHookArgumentsPath = Join-Path $wrongHookArgumentsStage 'internal\daemon\app_zalo_session_hook.go'
+  $wrongHookArguments = [IO.File]::ReadAllText($wrongHookArgumentsPath).Replace(
+    'deps, threadID, question, reply, files, productionAppRuntimeContext(a).appZaloRunner,',
+    'deps, otherThreadID, forgedQuestion, reply, files, productionAppRuntimeContext(a).appZaloRunner,')
+  [IO.File]::WriteAllText(
+    $wrongHookArgumentsPath, $wrongHookArguments, [Text.UTF8Encoding]::new($false))
+  $wrongHookArgumentsHashes = Get-SeamTargetHashes -Stage $wrongHookArgumentsStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $wrongHookArgumentsStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A production Provider hook with forged arguments was accepted'
+  Assert-SeamTargetHashes -Stage $wrongHookArgumentsStage -Expected $wrongHookArgumentsHashes `
+    -Message 'Forged Provider hook arguments rejection partially modified the stage'
+
+  $wrongAnswerArgumentsStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider answer args sai')
+  $wrongAnswerArgumentsPath = Join-Path $wrongAnswerArgumentsStage 'internal\daemon\app_zalo_session_hook.go'
+  $wrongAnswerArguments = [IO.File]::ReadAllText($wrongAnswerArgumentsPath).Replace(
+    'ctx, deps.cfg, run, threadID, question, step, reply, files...',
+    'ctx, deps.cfg, run, otherThreadID, forgedQuestion, step, reply, files...')
+  [IO.File]::WriteAllText(
+    $wrongAnswerArgumentsPath, $wrongAnswerArguments, [Text.UTF8Encoding]::new($false))
+  $wrongAnswerArgumentsHashes = Get-SeamTargetHashes -Stage $wrongAnswerArgumentsStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $wrongAnswerArgumentsStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A final answer sink with forged arguments was accepted'
+  Assert-SeamTargetHashes -Stage $wrongAnswerArgumentsStage -Expected $wrongAnswerArgumentsHashes `
+    -Message 'Forged final answer arguments rejection partially modified the stage'
+
+  $wrongRouteArgumentsStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route args sai')
+  $wrongRouteArgumentsHookPath = Join-Path $wrongRouteArgumentsStage 'internal\daemon\app_zalo_session_hook.go'
+  $wrongRouteArgumentsHook = [IO.File]::ReadAllText($wrongRouteArgumentsHookPath).Replace(
+    'route(deps.cfg, deps.run, threadID, len(files) > 0)',
+    'route(deps.cfg, fallbackRun, otherThreadID, false)')
+  [IO.File]::WriteAllText(
+    $wrongRouteArgumentsHookPath, $wrongRouteArgumentsHook, [Text.UTF8Encoding]::new($false))
+  $wrongRouteArgumentsHashes = Get-SeamTargetHashes -Stage $wrongRouteArgumentsStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $wrongRouteArgumentsStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A Provider route capture with forged inputs was accepted'
+  Assert-SeamTargetHashes -Stage $wrongRouteArgumentsStage -Expected $wrongRouteArgumentsHashes `
+    -Message 'Forged Provider route inputs rejection partially modified the stage'
+
+  $addressedRunStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider run ghi qua con trỏ')
+  $addressedRunHookPath = Join-Path $addressedRunStage 'internal\daemon\app_zalo_session_hook.go'
+  $addressedRunHook = [IO.File]::ReadAllText($addressedRunHookPath).Replace(
+    "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`t_ = run",
+    "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`t*(&run) = deps.run`n`t_ = run")
+  [IO.File]::WriteAllText(
+    $addressedRunHookPath, $addressedRunHook, [Text.UTF8Encoding]::new($false))
+  $addressedRunHashes = Get-SeamTargetHashes -Stage $addressedRunStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $addressedRunStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A route-derived runner overwritten through its address was accepted'
+  Assert-SeamTargetHashes -Stage $addressedRunStage -Expected $addressedRunHashes `
+    -Message 'Addressed Provider runner rejection partially modified the stage'
+
+  $escapedRunStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider run thoát qua helper')
+  $escapedRunHookPath = Join-Path $escapedRunStage 'internal\daemon\app_zalo_session_hook.go'
+  $escapedRunHook = [IO.File]::ReadAllText($escapedRunHookPath).Replace(
+    "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`t_ = run",
+    "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`treplaceRunner(&run)`n`t_ = run")
+  [IO.File]::WriteAllText(
+    $escapedRunHookPath, $escapedRunHook, [Text.UTF8Encoding]::new($false))
+  $escapedRunHashes = Get-SeamTargetHashes -Stage $escapedRunStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $escapedRunStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A route-derived runner address passed to a helper was accepted'
+  Assert-SeamTargetHashes -Stage $escapedRunStage -Expected $escapedRunHashes `
+    -Message 'Escaped Provider runner rejection partially modified the stage'
+
+  $deadProviderRouteStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route trong nhánh chết')
+  $deadProviderRouteHookPath = Join-Path $deadProviderRouteStage 'internal\daemon\app_zalo_session_hook.go'
+  $deadProviderRouteHook = [IO.File]::ReadAllText($deadProviderRouteHookPath).Replace(
+    "`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`t_ = run",
+    "`tif false {`n`t`trun := route(deps.cfg, deps.run, threadID, len(files) > 0)`n`t`t_ = run`n`t}`n`trun := deps.run`n`t_ = run")
+  [IO.File]::WriteAllText(
+    $deadProviderRouteHookPath, $deadProviderRouteHook, [Text.UTF8Encoding]::new($false))
+  $deadProviderRouteHashes = Get-SeamTargetHashes -Stage $deadProviderRouteStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $deadProviderRouteStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A route capture reachable only through a dead branch was accepted'
+  Assert-SeamTargetHashes -Stage $deadProviderRouteStage -Expected $deadProviderRouteHashes `
+    -Message 'Dead-branch Provider route rejection partially modified the stage'
+
+  $deadProviderHookStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider hook trong nhánh chết')
+  $deadProviderHookPath = Join-Path $deadProviderHookStage 'internal\daemon\app_zalo_session_hook.go'
+  $deadProviderHook = [IO.File]::ReadAllText($deadProviderHookPath).Replace(
+    "`treturn a.appAnswerZaloWithRunnerFactory(`n" +
+      "`t`tdeps, threadID, question, reply, files, productionAppRuntimeContext(a).appZaloRunner,`n`t)",
+    "`tif false {`n`t`treturn a.appAnswerZaloWithRunnerFactory(`n" +
+      "`t`t`tdeps, threadID, question, reply, files, productionAppRuntimeContext(a).appZaloRunner,`n`t`t)`n`t}`n`treturn fallbackAnswer()")
+  [IO.File]::WriteAllText(
+    $deadProviderHookPath, $deadProviderHook, [Text.UTF8Encoding]::new($false))
+  $deadProviderHookHashes = Get-SeamTargetHashes -Stage $deadProviderHookStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $deadProviderHookStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'A production Provider hook reachable only through a dead branch was accepted'
+  Assert-SeamTargetHashes -Stage $deadProviderHookStage -Expected $deadProviderHookHashes `
+    -Message 'Dead Provider hook rejection partially modified the stage'
+
+  $wrongProviderSinkStage = New-AppStage -Repo $repo -Overlay $overlay `
+    -StageRoot (Join-Path $stageTestRoot 'Provider route không đi vào answer')
+  $wrongProviderSinkHookPath = Join-Path $wrongProviderSinkStage 'internal\daemon\app_zalo_session_hook.go'
+  $wrongProviderSinkHook = [IO.File]::ReadAllText($wrongProviderSinkHookPath).Replace(
+    'ctx, deps.cfg, run, threadID, question, step, reply, files...',
+    'ctx, deps.cfg, deps.run, threadID, question, step, reply, files...')
+  [IO.File]::WriteAllText(
+    $wrongProviderSinkHookPath, $wrongProviderSinkHook, [Text.UTF8Encoding]::new($false))
+  $wrongProviderSinkHashes = Get-SeamTargetHashes -Stage $wrongProviderSinkStage
+  Assert-ThrowsLike -Action { Apply-AppSeams -Stage $wrongProviderSinkStage } `
+    -Pattern 'provider route topology verification failed' `
+    -Message 'An answer path bypassing the route-derived runner was accepted'
+  Assert-SeamTargetHashes -Stage $wrongProviderSinkStage -Expected $wrongProviderSinkHashes `
+    -Message 'Bypassed Provider route sink rejection partially modified the stage'
 
   $extraProviderRouteStage = New-AppStage -Repo $repo -Overlay $overlay `
     -StageRoot (Join-Path $stageTestRoot 'Provider route dư ngoài function')
@@ -1479,7 +1919,7 @@ func extraProviderRoute() {
 package daemon
 
 func extraProviderRouteInAnotherProductionFile() {
-	_ = a.appZaloRunner
+	_ = productionAppRuntimeContext(a).appZaloRunner
 	run := route(deps.cfg, deps.run, threadID, len(files) > 0)
 	_ = run
 }
@@ -1546,7 +1986,7 @@ func extraCapturedAnswerCall() {
 
   $duplicateProviderRouteStage = New-AppStage -Repo $repo -Overlay $overlay -StageRoot (Join-Path $stageTestRoot 'Trùng Provider route')
   $duplicateProviderHookPath = Join-Path $duplicateProviderRouteStage 'internal\daemon\app_zalo_session_hook.go'
-  $duplicateProviderHook = [IO.File]::ReadAllText($duplicateProviderHookPath) + "`nvar duplicate = a.appZaloRunner`n"
+  $duplicateProviderHook = [IO.File]::ReadAllText($duplicateProviderHookPath) + "`nvar duplicate = productionAppRuntimeContext(a).appZaloRunner`n"
   [IO.File]::WriteAllText($duplicateProviderHookPath, $duplicateProviderHook, [Text.UTF8Encoding]::new($false))
   $duplicateProviderHashes = Get-SeamTargetHashes -Stage $duplicateProviderRouteStage
   Assert-ThrowsLike -Action { Apply-AppSeams -Stage $duplicateProviderRouteStage } `
@@ -1670,14 +2110,82 @@ func incoming() {
   Write-TestFile (Join-Path $crlfStage 'internal\daemon\app_zalo_session_hook.go') @'
 package daemon
 
-func (a *api) appAnswerZalo() {
-	a.appAnswerZaloWithRunnerFactory(a.appZaloRunner)
+func (a *api) appAnswerZalo(
+	deps *zaloDeps,
+	threadID, question string,
+	reply ipc.ZaloOutboxDraft,
+	files []ipc.ZaloAttachment,
+) error {
+	return a.appAnswerZaloWithRunnerFactory(
+		deps, threadID, question, reply, files, productionAppRuntimeContext(a).appZaloRunner,
+	)
 }
 
-func (a *api) appAnswerZaloWithRunnerFactory(route appZaloRunnerFactory) {
-	_, _ = appZaloProcessThreadGate.Acquire(ctx, key)
+func (a *api) appAnswerZaloWithRunnerFactory(
+	deps *zaloDeps,
+	threadID, question string,
+	reply ipc.ZaloOutboxDraft,
+	files []ipc.ZaloAttachment,
+	route appZaloRunnerFactory,
+) error {
+	if route == nil {
+		return errors.New("zalo session runner factory is required")
+	}
+	release, err := appZaloProcessThreadGate.Acquire(
+		context.Background(),
+		fmt.Sprintf("%p\x00%s", a.st, threadID),
+	)
+	if err != nil {
+		return err
+	}
+	defer release()
 	run := route(deps.cfg, deps.run, threadID, len(files) > 0)
 	_ = run
+	effectiveConfig := deps.cfg
+	var binding appZaloClaudeBinding
+	run, effectiveConfig, binding, err = a.appResolveZaloSessionRoute(
+		ctx, run, effectiveConfig, threadID,
+	)
+	if err != nil {
+		return err
+	}
+	snapshot := a.appCaptureZaloTurnSnapshot(effectiveConfig, threadID, files)
+	if aware, ok := run.(appZaloAttachmentAwareRunner); ok {
+		run = aware.appWithZaloAttachments(snapshot.hasAttachments)
+	}
+	if aware, ok := run.(appZaloStructuredClaudeAwareRunner); ok {
+		run = aware.appWithZaloStructuredClaudeRequirement(
+			appZaloDeltaHasAttachments(snapshot.resumeDelta.delta),
+		)
+	}
+	if structured, ok := run.(appZaloStructuredRunner); ok {
+		run = &appZaloStructuredAnswerRunner{
+			a:                a,
+			run:              structured,
+			zc:               effectiveConfig,
+			threadID:         threadID,
+			question:         question,
+			currentZaloMsgID: appZaloCurrentMsgID(reply.ReplyQuote),
+			history:          snapshot.history,
+			directFiles:      snapshot.directFiles,
+			files:            snapshot.files,
+			highWater:        snapshot.highWater,
+			highWaterKnown:   snapshot.highWaterKnown,
+			resumeDelta:      snapshot.resumeDelta,
+			claudeBinding:    binding,
+			agentDisplayName: snapshot.agentDisplayName,
+		}
+	} else {
+		run = &appZaloCapturedIdentityRunner{
+			zaloRunner: run, agentDisplayName: snapshot.agentDisplayName,
+		}
+	}
+	if err := a.answerZalo(
+		ctx, deps.cfg, run, threadID, question, step, reply, files...,
+	); err != nil {
+		return err
+	}
+	return nil
 }
 '@
 

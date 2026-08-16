@@ -239,7 +239,7 @@ func (a *api) appAnswerZalo(
 	files []ipc.ZaloAttachment,
 ) error {
 	return a.appAnswerZaloWithRunnerFactory(
-		deps, threadID, question, reply, files, a.appZaloRunner,
+		deps, threadID, question, reply, files, productionAppRuntimeContext(a).appZaloRunner,
 	)
 }
 

@@ -133,6 +133,7 @@ type appTerminalRouteRunner func(
 	func(string),
 ) (appZaloRunResult, error)
 type appLocalAttachmentRun func(
+	*appLLMRunner,
 	context.Context,
 	store.LLMRouteEntry,
 	appLLMRouteInput,
@@ -368,6 +369,15 @@ func validateAppProviderRuntimeDependencies(registration appProviderRuntimeRegis
 		(registration.NewLocalAttachmentRun != nil) {
 		return fmt.Errorf(
 			"%w: Provider %q attachment policy lacks its typed local runner",
+			errAppProviderRuntimeRegistry,
+			metadata.Kind,
+		)
+	}
+	if metadata.AttachmentPolicy == appProviderAttachmentLocal &&
+		metadata.ExecutionMode != appProviderExecutionLocal &&
+		metadata.ExecutionMode != appProviderExecutionOfficialCLI {
+		return fmt.Errorf(
+			"%w: Provider %q cannot attach local files through its execution mode",
 			errAppProviderRuntimeRegistry,
 			metadata.Kind,
 		)
@@ -795,12 +805,16 @@ func appProductionClaudeRuntime() appProviderRuntimeRegistration {
 			return nil
 		}
 		return func(
+			current *appLLMRunner,
 			ctx context.Context,
 			entry store.LLMRouteEntry,
 			input appLLMRouteInput,
 			step func(string),
 		) (appZaloRunResult, error) {
-			return runner.runClaude(ctx, entry, input, step)
+			if current == nil {
+				return appZaloRunResult{}, errors.New("Claude attachment runner is unavailable")
+			}
+			return current.runClaude(ctx, entry, input, step)
 		}
 	}
 	registration.NewStructuredSession = func(a *api, config zaloConfig) appStructuredSessionRunner {
@@ -860,16 +874,20 @@ func appProductionHiddenGeminiCLIRuntime() appProviderRuntimeRegistration {
 				return nil
 			}
 			return func(
+				current *appLLMRunner,
 				ctx context.Context,
 				entry store.LLMRouteEntry,
 				input appLLMRouteInput,
 				_ func(string),
 			) (appZaloRunResult, error) {
-				adapter := runner.cfg.Adapters[entry.ProviderID]
+				if current == nil {
+					return appZaloRunResult{}, errors.New("Gemini CLI attachment runner is unavailable")
+				}
+				adapter := current.cfg.Adapters[entry.ProviderID]
 				if adapter == nil {
 					return appZaloRunResult{}, errors.New("Gemini CLI attachment adapter is unavailable")
 				}
-				return runner.runCLIAttachment(ctx, adapter, entry, input.statelessPrompt)
+				return current.runCLIAttachment(ctx, adapter, entry, input.statelessPrompt)
 			}
 		},
 	}
@@ -897,9 +915,10 @@ func productionAppProviderRuntimeRegistry() appProviderRuntimeRegistry {
 }
 
 type appRuntimeContext struct {
-	api      *api
-	registry appProviderRuntimeRegistry
-	connect  *connectManager
+	api             *api
+	registry        appProviderRuntimeRegistry
+	connect         *connectManager
+	routeCheckpoint func(operation, phase string)
 }
 
 func (ctx appRuntimeContext) onboardingStore() store.OnboardingStore {

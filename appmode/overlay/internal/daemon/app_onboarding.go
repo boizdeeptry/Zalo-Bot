@@ -714,13 +714,18 @@ func (runtimeContext appRuntimeContext) handleOnboardingComplete(w http.Response
 	appOnboardingProviderAfterTestWait()
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
+	runtimeContext.appLLMRouteCheckpoint(appLLMRouteOperationComplete, appLLMRoutePhaseBeforeLock)
+	appLLMRouteMutationMu.Lock()
+	runtimeContext.appLLMRouteCheckpoint(appLLMRouteOperationComplete, appLLMRoutePhaseLocked)
 	if r.Context().Err() != nil {
+		appLLMRouteMutationMu.Unlock()
 		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
 		return
 	}
 	now = appOnboardingCompleteNow().UTC()
 	snapshot, ok := runtimeContext.preflightOnboardingComplete(r.Context(), w, request.Revision, request.TestToken, now)
 	if !ok {
+		appLLMRouteMutationMu.Unlock()
 		return
 	}
 	configBindings := make([]store.OnboardingConfigBinding, len(snapshot.route.Entries))
@@ -729,6 +734,7 @@ func (runtimeContext appRuntimeContext) handleOnboardingComplete(w http.Response
 			Kind: entry.Kind, AccountID: entry.AccountID, ConfigDir: entry.ConfigDir,
 		}
 	}
+	runtimeContext.appLLMRouteCheckpoint(appLLMRouteOperationComplete, appLLMRoutePhaseValidated)
 	_, err := runtimeContext.onboardingStore().CompleteOnboarding(r.Context(), store.CompleteOnboardingInput{
 		Revision:           request.Revision,
 		TestNonceHash:      snapshot.nonceHash,
@@ -737,9 +743,12 @@ func (runtimeContext appRuntimeContext) handleOnboardingComplete(w http.Response
 		Now:                now,
 	})
 	if err != nil {
+		appLLMRouteMutationMu.Unlock()
 		a.writeOnboardingCompleteError(w, err)
 		return
 	}
+	runtimeContext.appLLMRouteCheckpoint(appLLMRouteOperationComplete, appLLMRoutePhaseWritten)
+	appLLMRouteMutationMu.Unlock()
 	a.writeJSON(w, http.StatusOK, appOnboardingCompleteResponse{
 		Completed:         true,
 		OnboardingVersion: store.CurrentOnboardingVersion,
@@ -772,6 +781,10 @@ func (runtimeContext appRuntimeContext) preflightOnboardingComplete(
 		default:
 			a.writeOnboardingCompleteError(w, err)
 		}
+		return appOnboardingCompleteSnapshot{}, false
+	}
+	if err := runtimeContext.registry.validateOnboardingLiveRoute(route.Entries); err != nil {
+		a.writeOnboardingCompleteError(w, store.ErrOnboardingConfigurationChanged)
 		return appOnboardingCompleteSnapshot{}, false
 	}
 	state := route.State

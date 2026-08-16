@@ -497,6 +497,23 @@ func selector(expr ast.Expr, receiver, method string) bool {
 	return ok && id.Name == receiver
 }
 
+func productionRuntimeRunner(expr ast.Expr) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "appZaloRunner" {
+		return false
+	}
+	contextCall, ok := sel.X.(*ast.CallExpr)
+	if !ok || len(contextCall.Args) != 1 {
+		return false
+	}
+	contextFactory, ok := contextCall.Fun.(*ast.Ident)
+	if !ok || contextFactory.Name != "productionAppRuntimeContext" {
+		return false
+	}
+	apiArg, ok := contextCall.Args[0].(*ast.Ident)
+	return ok && apiArg.Name == "a"
+}
+
 func namedFunction(files map[string]*ast.File, name string) (*ast.FuncDecl, int) {
 	var found *ast.FuncDecl
 	count := 0
@@ -523,10 +540,391 @@ func routeAssignment(node ast.Node) (token.Pos, bool) {
 		return token.NoPos, false
 	}
 	fun, funOK := call.Fun.(*ast.Ident)
-	if !funOK || fun.Name != "route" {
+	if !funOK || fun.Name != "route" || len(call.Args) != 4 ||
+		!selector(call.Args[0], "deps", "cfg") || !selector(call.Args[1], "deps", "run") ||
+		!ident(call.Args[2], "threadID") || !exactRouteAttachmentFlag(call.Args[3]) {
 		return token.NoPos, false
 	}
 	return call.Pos(), true
+}
+
+func exactRouteAttachmentFlag(expr ast.Expr) bool {
+	comparison, ok := expr.(*ast.BinaryExpr)
+	if !ok || comparison.Op != token.GTR {
+		return false
+	}
+	zero, ok := comparison.Y.(*ast.BasicLit)
+	if !ok || zero.Kind != token.INT || zero.Value != "0" {
+		return false
+	}
+	length, ok := comparison.X.(*ast.CallExpr)
+	return ok && ident(length.Fun, "len") && len(length.Args) == 1 && ident(length.Args[0], "files")
+}
+
+func directAcquire(node ast.Node) (token.Pos, bool) {
+	assignment, ok := node.(*ast.AssignStmt)
+	if !ok || assignment.Tok != token.DEFINE || len(assignment.Lhs) != 2 ||
+		len(assignment.Rhs) != 1 || !ident(assignment.Lhs[0], "release") ||
+		!ident(assignment.Lhs[1], "err") {
+		return token.NoPos, false
+	}
+	call, ok := assignment.Rhs[0].(*ast.CallExpr)
+	if ok && selector(call.Fun, "appZaloProcessThreadGate", "Acquire") &&
+		len(call.Args) == 2 && exactBackground(call.Args[0]) && exactThreadGateKey(call.Args[1]) {
+		return call.Pos(), true
+	}
+	return token.NoPos, false
+}
+
+func exactBackground(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	return ok && selector(call.Fun, "context", "Background") && len(call.Args) == 0
+}
+
+func exactThreadGateKey(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || !selector(call.Fun, "fmt", "Sprintf") || len(call.Args) != 3 {
+		return false
+	}
+	format, ok := call.Args[0].(*ast.BasicLit)
+	return ok && format.Kind == token.STRING && format.Value == "\"%p\\x00%s\"" &&
+		selector(call.Args[1], "a", "st") && ident(call.Args[2], "threadID")
+}
+
+func ident(expr ast.Expr, name string) bool {
+	id, ok := expr.(*ast.Ident)
+	return ok && id.Name == name
+}
+
+func assignmentWrites(assignment *ast.AssignStmt, name string) bool {
+	for _, left := range assignment.Lhs {
+		if ident(left, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func directAnswerFactoryCall(statement ast.Stmt) (*ast.CallExpr, bool) {
+	var expression ast.Expr
+	switch stmt := statement.(type) {
+	case *ast.ExprStmt:
+		expression = stmt.X
+	case *ast.ReturnStmt:
+		if len(stmt.Results) != 1 {
+			return nil, false
+		}
+		expression = stmt.Results[0]
+	default:
+		return nil, false
+	}
+	call, ok := expression.(*ast.CallExpr)
+	return call, ok && selector(call.Fun, "a", "appAnswerZaloWithRunnerFactory") &&
+		len(call.Args) == 6 && ident(call.Args[0], "deps") && ident(call.Args[1], "threadID") &&
+		ident(call.Args[2], "question") && ident(call.Args[3], "reply") &&
+		ident(call.Args[4], "files") && productionRuntimeRunner(call.Args[5])
+}
+
+func directAnswerExecution(statement ast.Stmt) (*ast.CallExpr, bool) {
+	stmt, ok := statement.(*ast.IfStmt)
+	if !ok || stmt.Else != nil || len(stmt.Body.List) != 1 {
+		return nil, false
+	}
+	assignment, ok := stmt.Init.(*ast.AssignStmt)
+	if !ok || assignment.Tok != token.DEFINE || len(assignment.Lhs) != 1 ||
+		len(assignment.Rhs) != 1 || !ident(assignment.Lhs[0], "err") {
+		return nil, false
+	}
+	condition, ok := stmt.Cond.(*ast.BinaryExpr)
+	if !ok || condition.Op != token.NEQ || !ident(condition.X, "err") || !ident(condition.Y, "nil") {
+		return nil, false
+	}
+	returned, ok := stmt.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(returned.Results) != 1 || !ident(returned.Results[0], "err") {
+		return nil, false
+	}
+	call, ok := assignment.Rhs[0].(*ast.CallExpr)
+	return call, ok && selector(call.Fun, "a", "answerZalo") && len(call.Args) == 8 &&
+		ident(call.Args[0], "ctx") && selector(call.Args[1], "deps", "cfg") &&
+		ident(call.Args[2], "run") && ident(call.Args[3], "threadID") &&
+		ident(call.Args[4], "question") && ident(call.Args[5], "step") &&
+		ident(call.Args[6], "reply") && ident(call.Args[7], "files") && call.Ellipsis.IsValid()
+}
+
+func deferredRelease(statement ast.Stmt) (token.Pos, bool) {
+	deferred, ok := statement.(*ast.DeferStmt)
+	if !ok || !ident(deferred.Call.Fun, "release") || len(deferred.Call.Args) != 0 {
+		return token.NoPos, false
+	}
+	return deferred.Call.Pos(), true
+}
+
+func routeNilGuard(statement ast.Stmt) bool {
+	guard, ok := statement.(*ast.IfStmt)
+	if !ok || guard.Init != nil || guard.Else != nil || len(guard.Body.List) != 1 {
+		return false
+	}
+	condition, ok := guard.Cond.(*ast.BinaryExpr)
+	if !ok || condition.Op != token.EQL || !ident(condition.X, "route") ||
+		!ident(condition.Y, "nil") {
+		return false
+	}
+	returned, ok := guard.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(returned.Results) != 1 {
+		return false
+	}
+	call, ok := returned.Results[0].(*ast.CallExpr)
+	if !ok || !selector(call.Fun, "errors", "New") || len(call.Args) != 1 {
+		return false
+	}
+	message, ok := call.Args[0].(*ast.BasicLit)
+	return ok && message.Kind == token.STRING &&
+		message.Value == "\"zalo session runner factory is required\""
+}
+
+func exactAssignment(assignment *ast.AssignStmt, left string) (ast.Expr, bool) {
+	if assignment == nil || assignment.Tok != token.ASSIGN || len(assignment.Lhs) != 1 ||
+		len(assignment.Rhs) != 1 || !ident(assignment.Lhs[0], left) {
+		return nil, false
+	}
+	return assignment.Rhs[0], true
+}
+
+func resolvedRouteAssignment(assignment *ast.AssignStmt) bool {
+	if assignment == nil || assignment.Tok != token.ASSIGN || len(assignment.Lhs) != 4 ||
+		len(assignment.Rhs) != 1 {
+		return false
+	}
+	want := []string{"run", "effectiveConfig", "binding", "err"}
+	for i, name := range want {
+		if !ident(assignment.Lhs[i], name) {
+			return false
+		}
+	}
+	call, ok := assignment.Rhs[0].(*ast.CallExpr)
+	return ok && selector(call.Fun, "a", "appResolveZaloSessionRoute") &&
+		len(call.Args) == 4 && ident(call.Args[0], "ctx") && ident(call.Args[1], "run") &&
+		ident(call.Args[2], "effectiveConfig") && ident(call.Args[3], "threadID")
+}
+
+func effectiveConfigSource(assignment *ast.AssignStmt) bool {
+	return assignment != nil && assignment.Tok == token.DEFINE && len(assignment.Lhs) == 1 &&
+		len(assignment.Rhs) == 1 && ident(assignment.Lhs[0], "effectiveConfig") &&
+		selector(assignment.Rhs[0], "deps", "cfg")
+}
+
+func turnSnapshotSource(assignment *ast.AssignStmt) bool {
+	if assignment == nil || assignment.Tok != token.DEFINE || len(assignment.Lhs) != 1 ||
+		len(assignment.Rhs) != 1 || !ident(assignment.Lhs[0], "snapshot") {
+		return false
+	}
+	call, ok := assignment.Rhs[0].(*ast.CallExpr)
+	return ok && selector(call.Fun, "a", "appCaptureZaloTurnSnapshot") && len(call.Args) == 3 &&
+		ident(call.Args[0], "effectiveConfig") && ident(call.Args[1], "threadID") &&
+		ident(call.Args[2], "files")
+}
+
+func expressionRootedAt(expr ast.Expr, name string) bool {
+	switch value := expr.(type) {
+	case *ast.Ident:
+		return value.Name == name
+	case *ast.SelectorExpr:
+		return expressionRootedAt(value.X, name)
+	case *ast.IndexExpr:
+		return expressionRootedAt(value.X, name)
+	case *ast.ParenExpr:
+		return expressionRootedAt(value.X, name)
+	}
+	return false
+}
+
+func assignmentWritesRoot(assignment *ast.AssignStmt, name string) bool {
+	for _, left := range assignment.Lhs {
+		if expressionRootedAt(left, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func typedRunBinding(stmt *ast.IfStmt, bound, interfaceName string) bool {
+	assignment, ok := stmt.Init.(*ast.AssignStmt)
+	if !ok || assignment.Tok != token.DEFINE || len(assignment.Lhs) != 2 ||
+		len(assignment.Rhs) != 1 || !ident(assignment.Lhs[0], bound) ||
+		!ident(assignment.Lhs[1], "ok") || !ident(stmt.Cond, "ok") {
+		return false
+	}
+	assertion, ok := assignment.Rhs[0].(*ast.TypeAssertExpr)
+	return ok && ident(assertion.X, "run") && ident(assertion.Type, interfaceName)
+}
+
+func awareRouteAssignment(stmt *ast.IfStmt, interfaceName, method string) (token.Pos, bool) {
+	if !typedRunBinding(stmt, "aware", interfaceName) || stmt.Else != nil || len(stmt.Body.List) != 1 {
+		return token.NoPos, false
+	}
+	assignment, ok := stmt.Body.List[0].(*ast.AssignStmt)
+	right, okRight := exactAssignment(assignment, "run")
+	if !ok || !okRight {
+		return token.NoPos, false
+	}
+	call, ok := right.(*ast.CallExpr)
+	if !ok || !selector(call.Fun, "aware", method) || len(call.Args) != 1 {
+		return token.NoPos, false
+	}
+	switch method {
+	case "appWithZaloAttachments":
+		if !selector(call.Args[0], "snapshot", "hasAttachments") {
+			return token.NoPos, false
+		}
+	case "appWithZaloStructuredClaudeRequirement":
+		predicate, ok := call.Args[0].(*ast.CallExpr)
+		if !ok || !ident(predicate.Fun, "appZaloDeltaHasAttachments") || len(predicate.Args) != 1 {
+			return token.NoPos, false
+		}
+		delta, ok := predicate.Args[0].(*ast.SelectorExpr)
+		if !ok || delta.Sel.Name != "delta" {
+			return token.NoPos, false
+		}
+		resume, ok := delta.X.(*ast.SelectorExpr)
+		if !ok || resume.Sel.Name != "resumeDelta" || !ident(resume.X, "snapshot") {
+			return token.NoPos, false
+		}
+	default:
+		return token.NoPos, false
+	}
+	return assignment.Pos(), true
+}
+
+func pointerComposite(expr ast.Expr, typeName string) (*ast.CompositeLit, bool) {
+	address, ok := expr.(*ast.UnaryExpr)
+	if !ok || address.Op != token.AND {
+		return nil, false
+	}
+	literal, ok := address.X.(*ast.CompositeLit)
+	if !ok || !ident(literal.Type, typeName) {
+		return nil, false
+	}
+	return literal, true
+}
+
+func keyedValue(literal *ast.CompositeLit, index int, key string) (ast.Expr, bool) {
+	if literal == nil || index < 0 || index >= len(literal.Elts) {
+		return nil, false
+	}
+	pair, ok := literal.Elts[index].(*ast.KeyValueExpr)
+	return pair.Value, ok && ident(pair.Key, key)
+}
+
+func exactStructuredWrapper(expr ast.Expr) bool {
+	literal, ok := pointerComposite(expr, "appZaloStructuredAnswerRunner")
+	if !ok || len(literal.Elts) != 14 {
+		return false
+	}
+	direct := []struct {
+		key, value string
+	}{
+		{"a", "a"}, {"run", "structured"}, {"zc", "effectiveConfig"},
+		{"threadID", "threadID"}, {"question", "question"},
+	}
+	for index, want := range direct {
+		value, ok := keyedValue(literal, index, want.key)
+		if !ok || !ident(value, want.value) {
+			return false
+		}
+	}
+	current, ok := keyedValue(literal, 5, "currentZaloMsgID")
+	currentCall, callOK := current.(*ast.CallExpr)
+	if !ok || !callOK || !ident(currentCall.Fun, "appZaloCurrentMsgID") ||
+		len(currentCall.Args) != 1 || !selector(currentCall.Args[0], "reply", "ReplyQuote") {
+		return false
+	}
+	snapshotFields := []string{
+		"history", "directFiles", "files", "highWater", "highWaterKnown", "resumeDelta",
+	}
+	for offset, field := range snapshotFields {
+		value, ok := keyedValue(literal, 6+offset, field)
+		if !ok || !selector(value, "snapshot", field) {
+			return false
+		}
+	}
+	binding, ok := keyedValue(literal, 12, "claudeBinding")
+	if !ok || !ident(binding, "binding") {
+		return false
+	}
+	displayName, ok := keyedValue(literal, 13, "agentDisplayName")
+	return ok && selector(displayName, "snapshot", "agentDisplayName")
+}
+
+func exactCapturedWrapper(expr ast.Expr) bool {
+	literal, ok := pointerComposite(expr, "appZaloCapturedIdentityRunner")
+	if !ok || len(literal.Elts) != 2 {
+		return false
+	}
+	runner, runnerOK := keyedValue(literal, 0, "zaloRunner")
+	displayName, displayOK := keyedValue(literal, 1, "agentDisplayName")
+	return runnerOK && ident(runner, "run") && displayOK &&
+		selector(displayName, "snapshot", "agentDisplayName")
+}
+
+func structuredRouteAssignments(stmt *ast.IfStmt) (token.Pos, token.Pos, bool) {
+	if !typedRunBinding(stmt, "structured", "appZaloStructuredRunner") ||
+		len(stmt.Body.List) != 1 {
+		return token.NoPos, token.NoPos, false
+	}
+	otherwise, ok := stmt.Else.(*ast.BlockStmt)
+	if !ok || len(otherwise.List) != 1 {
+		return token.NoPos, token.NoPos, false
+	}
+	selected, selectedOK := stmt.Body.List[0].(*ast.AssignStmt)
+	fallback, fallbackOK := otherwise.List[0].(*ast.AssignStmt)
+	selectedRight, selectedRightOK := exactAssignment(selected, "run")
+	fallbackRight, fallbackRightOK := exactAssignment(fallback, "run")
+	if !selectedOK || !fallbackOK || !selectedRightOK || !fallbackRightOK ||
+		!exactStructuredWrapper(selectedRight) || !exactCapturedWrapper(fallbackRight) {
+		return token.NoPos, token.NoPos, false
+	}
+	return selected.Pos(), fallback.Pos(), true
+}
+
+type routeTransforms struct {
+	allowed                                      map[token.Pos]bool
+	resolved, attachments, structured, wrappers int
+	resolvePos, attachmentPos, structuredPos     token.Pos
+	wrapperPos                                   token.Pos
+}
+
+func allowedRunAssignments(body *ast.BlockStmt) routeTransforms {
+	result := routeTransforms{allowed: make(map[token.Pos]bool)}
+	for _, statement := range body.List {
+		switch stmt := statement.(type) {
+		case *ast.AssignStmt:
+			if resolvedRouteAssignment(stmt) {
+				result.allowed[stmt.Pos()] = true
+				result.resolved++
+				result.resolvePos = stmt.Pos()
+			}
+		case *ast.IfStmt:
+			if position, ok := awareRouteAssignment(
+				stmt, "appZaloAttachmentAwareRunner", "appWithZaloAttachments"); ok {
+				result.allowed[position] = true
+				result.attachments++
+				result.attachmentPos = stmt.Pos()
+			}
+			if position, ok := awareRouteAssignment(
+				stmt, "appZaloStructuredClaudeAwareRunner", "appWithZaloStructuredClaudeRequirement"); ok {
+				result.allowed[position] = true
+				result.structured++
+				result.structuredPos = stmt.Pos()
+			}
+			if selected, fallback, ok := structuredRouteAssignments(stmt); ok {
+				result.allowed[selected] = true
+				result.allowed[fallback] = true
+				result.wrappers++
+				result.wrapperPos = stmt.Pos()
+			}
+		}
+	}
+	return result
 }
 
 func fail(format string, args ...any) {
@@ -569,7 +967,7 @@ func main() {
 	answerEntrypointCalls := 0
 	for _, file := range files {
 		ast.Inspect(file, func(node ast.Node) bool {
-			if expr, ok := node.(ast.Expr); ok && selector(expr, "a", "appZaloRunner") {
+			if sel, ok := node.(*ast.SelectorExpr); ok && sel.Sel.Name == "appZaloRunner" {
 				totalRunnerSelectors++
 			}
 			if expr, ok := node.(ast.Expr); ok && selector(expr, "a", "appAnswerZalo") {
@@ -595,15 +993,27 @@ func main() {
 		}
 		answerFactoryCalls++
 		for _, arg := range call.Args {
-			if selector(arg, "a", "appZaloRunner") {
+			if productionRuntimeRunner(arg) {
 				participatingRunnerArgs++
 			}
 		}
 		return true
 	})
-	if answerFactoryCalls != 1 || participatingRunnerArgs != 1 || totalRunnerSelectors != 1 {
-		fail("expected one appZaloRunner argument in appAnswerZalo (calls=%d, arguments=%d, total selectors=%d)",
-			answerFactoryCalls, participatingRunnerArgs, totalRunnerSelectors)
+	directAnswerFactoryCalls := 0
+	directAnswerFactoryRunnerArgs := 0
+	if len(answer.Body.List) == 1 {
+		if call, ok := directAnswerFactoryCall(answer.Body.List[0]); ok {
+			directAnswerFactoryCalls++
+			if len(call.Args) > 0 && productionRuntimeRunner(call.Args[len(call.Args)-1]) {
+				directAnswerFactoryRunnerArgs++
+			}
+		}
+	}
+	if answerFactoryCalls != 1 || participatingRunnerArgs != 1 || totalRunnerSelectors != 1 ||
+		directAnswerFactoryCalls != 1 || directAnswerFactoryRunnerArgs != 1 {
+		fail("expected appAnswerZalo to be one direct factory call with the exact production appZaloRunner argument (calls=%d, arguments=%d, total selectors=%d, direct calls=%d, direct arguments=%d)",
+			answerFactoryCalls, participatingRunnerArgs, totalRunnerSelectors,
+			directAnswerFactoryCalls, directAnswerFactoryRunnerArgs)
 	}
 
 	globalRouteAssignments := 0
@@ -617,6 +1027,8 @@ func main() {
 	}
 
 	acquireCalls := 0
+	releaseCalls := 0
+	answerExecutionCalls := 0
 	var acquirePosition token.Pos
 	factoryRouteAssignments := 0
 	var routePosition token.Pos
@@ -625,15 +1037,150 @@ func main() {
 			acquireCalls++
 			acquirePosition = call.Pos()
 		}
+		if call, ok := node.(*ast.CallExpr); ok && ident(call.Fun, "release") {
+			releaseCalls++
+		}
+		if call, ok := node.(*ast.CallExpr); ok && selector(call.Fun, "a", "answerZalo") {
+			answerExecutionCalls++
+		}
 		if position, ok := routeAssignment(node); ok {
 			factoryRouteAssignments++
 			routePosition = position
 		}
 		return true
 	})
-	if globalRouteAssignments != 1 || acquireCalls != 1 || factoryRouteAssignments != 1 || routePosition <= acquirePosition {
-		fail("expected the sole global route assignment inside the factory after one thread-gate acquire (global routes=%d, acquires=%d, factory routes=%d)",
-			globalRouteAssignments, acquireCalls, factoryRouteAssignments)
+	directAcquireCalls := 0
+	directDeferredReleases := 0
+	directRouteNilGuards := 0
+	directRouteAssignments := 0
+	directAnswerExecutions := 0
+	directAnswerRunArgs := 0
+	effectiveConfigSources := 0
+	turnSnapshotSources := 0
+	var releasePosition token.Pos
+	var answerPosition token.Pos
+	var effectiveConfigPosition token.Pos
+	var turnSnapshotPosition token.Pos
+	for _, statement := range factory.Body.List {
+		if routeNilGuard(statement) {
+			directRouteNilGuards++
+		}
+		if position, ok := directAcquire(statement); ok {
+			directAcquireCalls++
+			acquirePosition = position
+		}
+		if position, ok := routeAssignment(statement); ok {
+			directRouteAssignments++
+			routePosition = position
+		}
+		if assignment, ok := statement.(*ast.AssignStmt); ok {
+			if effectiveConfigSource(assignment) {
+				effectiveConfigSources++
+				effectiveConfigPosition = assignment.Pos()
+			}
+			if turnSnapshotSource(assignment) {
+				turnSnapshotSources++
+				turnSnapshotPosition = assignment.Pos()
+			}
+		}
+		if position, ok := deferredRelease(statement); ok {
+			directDeferredReleases++
+			releasePosition = position
+		}
+		if call, ok := directAnswerExecution(statement); ok {
+			directAnswerExecutions++
+			answerPosition = call.Pos()
+			if len(call.Args) > 2 && ident(call.Args[2], "run") {
+				directAnswerRunArgs++
+			}
+		}
+	}
+	transforms := allowedRunAssignments(factory.Body)
+	unauthorizedRunWrites := 0
+	unauthorizedRouteWrites := 0
+	valueRunDefinitions := 0
+	valueRouteDefinitions := 0
+	unauthorizedEffectiveConfigWrites := 0
+	unauthorizedSnapshotWrites := 0
+	releaseIdentifiers := 0
+	routeIdentifiers := 0
+	protectedAddressTakes := 0
+	ast.Inspect(factory.Body, func(node ast.Node) bool {
+		if assignment, ok := node.(*ast.AssignStmt); ok {
+			if assignmentWrites(assignment, "run") {
+				if _, route := routeAssignment(assignment); !route &&
+					(!transforms.allowed[assignment.Pos()] || assignment.Pos() <= routePosition ||
+						assignment.Pos() >= answerPosition) {
+					unauthorizedRunWrites++
+				}
+			}
+			if assignmentWrites(assignment, "route") {
+				unauthorizedRouteWrites++
+			}
+			if assignmentWritesRoot(assignment, "effectiveConfig") &&
+				!effectiveConfigSource(assignment) && !resolvedRouteAssignment(assignment) {
+				unauthorizedEffectiveConfigWrites++
+			}
+			if assignmentWritesRoot(assignment, "snapshot") && !turnSnapshotSource(assignment) {
+				unauthorizedSnapshotWrites++
+			}
+		}
+		if spec, ok := node.(*ast.ValueSpec); ok {
+			for _, name := range spec.Names {
+				if name.Name == "run" {
+					valueRunDefinitions++
+				}
+				if name.Name == "route" {
+					valueRouteDefinitions++
+				}
+			}
+		}
+		if name, ok := node.(*ast.Ident); ok {
+			switch name.Name {
+			case "release":
+				releaseIdentifiers++
+			case "route":
+				routeIdentifiers++
+			}
+		}
+		if address, ok := node.(*ast.UnaryExpr); ok && address.Op == token.AND {
+			for _, protected := range []string{
+				"release", "route", "run", "effectiveConfig", "snapshot",
+			} {
+				if expressionRootedAt(address.X, protected) {
+					protectedAddressTakes++
+					break
+				}
+			}
+		}
+		return true
+	})
+	if globalRouteAssignments != 1 || acquireCalls != 1 || releaseCalls != 1 ||
+		factoryRouteAssignments != 1 || answerExecutionCalls != 1 || directRouteNilGuards != 1 ||
+		directAcquireCalls != 1 ||
+		directDeferredReleases != 1 || directRouteAssignments != 1 || directAnswerExecutions != 1 ||
+		directAnswerRunArgs != 1 || acquirePosition >= releasePosition || releasePosition >= routePosition ||
+		effectiveConfigSources != 1 || turnSnapshotSources != 1 ||
+		transforms.resolved != 1 || transforms.attachments != 1 || transforms.structured != 1 ||
+		transforms.wrappers != 1 || routePosition >= effectiveConfigPosition ||
+		effectiveConfigPosition >= transforms.resolvePos || transforms.resolvePos >= turnSnapshotPosition ||
+		turnSnapshotPosition >= transforms.attachmentPos ||
+		transforms.attachmentPos >= transforms.structuredPos ||
+		transforms.structuredPos >= transforms.wrapperPos || transforms.wrapperPos >= answerPosition ||
+		unauthorizedRunWrites != 0 || unauthorizedRouteWrites != 0 ||
+		unauthorizedEffectiveConfigWrites != 0 || unauthorizedSnapshotWrites != 0 ||
+		valueRunDefinitions != 0 || valueRouteDefinitions != 0 || releaseIdentifiers != 2 ||
+		routeIdentifiers != 2 || protectedAddressTakes != 0 {
+		fail("expected the exact top-level Provider hook and answer dataflow inside one deferred thread-gate lifetime (global routes=%d, acquires=%d, releases=%d, factory routes=%d, answer calls=%d, route nil guards=%d, direct acquires=%d, deferred releases=%d, direct routes=%d, direct answers=%d, direct run arguments=%d, effective config sources=%d, turn snapshot sources=%d, resolves=%d, attachment transforms=%d, structured transforms=%d, wrappers=%d, unauthorized run writes=%d, unauthorized route writes=%d, unauthorized config writes=%d, unauthorized snapshot writes=%d, run declarations=%d, route declarations=%d, release references=%d, route references=%d, protected address escapes=%d)",
+			globalRouteAssignments, acquireCalls, releaseCalls, factoryRouteAssignments,
+			answerExecutionCalls, directRouteNilGuards, directAcquireCalls,
+			directDeferredReleases, directRouteAssignments,
+			directAnswerExecutions, directAnswerRunArgs, effectiveConfigSources,
+			turnSnapshotSources, transforms.resolved,
+			transforms.attachments, transforms.structured, transforms.wrappers, unauthorizedRunWrites,
+			unauthorizedRouteWrites, unauthorizedEffectiveConfigWrites, unauthorizedSnapshotWrites,
+			valueRunDefinitions, valueRouteDefinitions,
+			releaseIdentifiers, routeIdentifiers, protectedAddressTakes)
 	}
 }
 '@

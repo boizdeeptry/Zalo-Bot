@@ -300,6 +300,12 @@ func entry(providerID, modelID string, enabled bool) store.LLMRouteEntry {
 	return store.LLMRouteEntry{ProviderID: providerID, ModelID: modelID, Enabled: enabled}
 }
 
+func appTestTerminalRoutes() map[string]appTerminalRouteRunner {
+	return map[string]appTerminalRouteRunner{
+		claudeCodeProviderID: appProductionClaudeRuntime().Terminal,
+	}
+}
+
 // newRoute gán position theo thứ tự, giống hệt cách store thật đọc chuỗi ra.
 func newRoute(entries ...store.LLMRouteEntry) store.LLMRouteSnapshot {
 	for i := range entries {
@@ -321,6 +327,7 @@ func threeEntryRoute() store.LLMRouteSnapshot {
 type routerFixture struct {
 	store    *fakeRouteStore
 	adapters map[string]providerAdapter
+	local    map[string]bool
 	claude   zaloRunner
 	creds    *fakeCredentials
 
@@ -334,6 +341,7 @@ func newRouterFixture(snapshot store.LLMRouteSnapshot, claude zaloRunner) *route
 	return &routerFixture{
 		store:    &fakeRouteStore{snapshot: snapshot},
 		adapters: map[string]providerAdapter{},
+		local:    map[string]bool{},
 		claude:   claude,
 		creds:    newFakeCredentials(map[string]string{}),
 	}
@@ -349,6 +357,7 @@ func (f *routerFixture) with(providerID, credential string, a *fakeAdapter) *rou
 // diện đúng nó là local_cli chứ không phải một Provider HTTP.
 func (f *routerFixture) withCLI(providerID, credential string, a *cliAdapter) *routerFixture {
 	f.adapters[providerID] = a
+	f.local[providerID] = true
 	f.creds.plain[providerID] = credential
 	return f
 }
@@ -374,11 +383,45 @@ func (f *routerFixture) runner(cfg appLLMRunnerConfig) *appLLMRunner {
 	cfg.Store = f.store
 	cfg.Adapters = f.adapters
 	cfg.Claude = func(string) zaloRunner { return f.claude }
+	cfg.TerminalRoutes = appTestTerminalRoutes()
+	cfg.StructuredSessions = map[string]appStructuredSessionRunner{
+		claudeCodeProviderID: func(
+			context.Context,
+			string,
+			*store.ZaloCLISession,
+		) (zaloRunner, appZaloClaudeBinding) {
+			return f.claude, appZaloClaudeBinding{}
+		},
+	}
 	cfg.Credential = f.creds.open
 	// Vứt log đi: một test cố ý làm hỏng telemetry sẽ in WARN vào slog mặc định, tức là vào
 	// giữa đầu ra của những test không liên quan.
 	cfg.Logger = slog.New(slog.DiscardHandler)
-	return newAppLLMRunner(cfg)
+	factories := map[string]appLocalAttachmentRunnerFactory{
+		claudeCodeProviderID: appProductionClaudeRuntime().NewLocalAttachmentRun,
+	}
+	for providerID := range f.local {
+		adapter := f.adapters[providerID]
+		factories[providerID] = func(runner *appLLMRunner) appLocalAttachmentRun {
+			return func(
+				current *appLLMRunner,
+				ctx context.Context,
+				entry store.LLMRouteEntry,
+				input appLLMRouteInput,
+				_ func(string),
+			) (appZaloRunResult, error) {
+				if current == nil {
+					return appZaloRunResult{}, errors.New("local attachment runner is unavailable")
+				}
+				return current.runCLIAttachment(ctx, adapter, entry, input.statelessPrompt)
+			}
+		}
+	}
+	runner, ok := newAppLLMRunnerWithLocalFactories(cfg, factories)
+	if !ok {
+		panic("router fixture local runtime factory failed")
+	}
+	return runner
 }
 
 // serialize đổ một giá trị ra JSON để soi chuỗi. Lỗi mã hoá là lỗi của test, không phải phát hiện.
@@ -1475,7 +1518,7 @@ func TestAppZaloRunnerBuildsAChainRunnerWhenConfigured(t *testing.T) {
 	connectClaudeAccount(t, a) // qua cửa hasAnyConnectedProvider
 	saveClaudeRoute(t, a, "haiku")
 
-	got := a.appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
+	got := productionAppRuntimeContext(a).appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
 	r, ok := got.(*appLLMRunner)
 	if !ok {
 		t.Fatalf("appZaloRunner = %T; want *appLLMRunner (đã nối Provider + có chuỗi)", got)
@@ -1542,7 +1585,7 @@ func TestAppZaloRunnerKeepsThreadsWithEarlierFilesOffTheAPIChain(t *testing.T) {
 			}
 
 			// hasNewFiles = false: tin của lượt này chỉ có chữ. Cờ phải đến TỪ snapshot lịch sử.
-			got := a.appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
+			got := productionAppRuntimeContext(a).appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
 			aware, ok := got.(appZaloAttachmentAwareRunner)
 			if !ok {
 				t.Fatalf("appZaloRunner = %T; want attachment-aware runner", got)
@@ -1572,7 +1615,7 @@ func TestAppZaloRunnerSilentWithoutASavedRoute(t *testing.T) {
 	}}
 
 	// Chưa gieo chuỗi nào → snapshot.Entries rỗng → im (silentZaloRunner), KHÔNG rơi về base.
-	got, err := a.appZaloRunner(zaloConfig{Model: "haiku"}, base, "t1", false).
+	got, err := productionAppRuntimeContext(a).appZaloRunner(zaloConfig{Model: "haiku"}, base, "t1", false).
 		Run(t.Context(), "câu hỏi", func(string) {})
 	if !errors.Is(err, ErrZaloSilent) {
 		t.Fatalf("Run() khi chưa có chuỗi = %q, %v; want ErrZaloSilent", got, err)
@@ -1616,7 +1659,7 @@ func TestAppZaloRunnerSkipsAProviderTurnedOffAfterTheRouteWasSaved(t *testing.T)
 		t.Fatalf("UpdateLLMProvider(openai-1, enabled=false) = %v; want nil", err)
 	}
 
-	got := a.appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
+	got := productionAppRuntimeContext(a).appZaloRunner(zaloConfig{Model: "haiku"}, okClaude("x"), "t1", false)
 	r, ok := got.(*appLLMRunner)
 	if !ok {
 		t.Fatalf("appZaloRunner = %T; want *appLLMRunner", got)
@@ -1916,7 +1959,7 @@ func TestAppZaloRunnerSilentWhenNoProvider(t *testing.T) {
 		t.Fatal("base KHÔNG được gọi khi chưa nối Provider nào")
 		return "", nil
 	}}
-	r := a.appZaloRunner(zaloConfig{}, base, "thread-1", false)
+	r := productionAppRuntimeContext(a).appZaloRunner(zaloConfig{}, base, "thread-1", false)
 	if _, err := r.Run(t.Context(), "hỏi", func(string) {}); !errors.Is(err, ErrZaloSilent) {
 		t.Fatalf("Run() = _, %v; want ErrZaloSilent", err)
 	}
@@ -2204,10 +2247,11 @@ func TestAppLLMRunnerFallsBackOverRealHTTP(t *testing.T) {
 
 	claude := okClaude(`{"clarify":"Claude Code không được gọi trong lượt này"}`)
 	runner := newAppLLMRunner(appLLMRunnerConfig{
-		Route:    snapshot,
-		Store:    a.st,
-		Adapters: adapters,
-		Claude:   func(string) zaloRunner { return claude },
+		Route:          snapshot,
+		Store:          a.st,
+		Adapters:       adapters,
+		Claude:         func(string) zaloRunner { return claude },
+		TerminalRoutes: appTestTerminalRoutes(),
 		// Bản rõ MỚI mỗi lượt: router xoá lát cắt nó vừa dùng, nên một lát cắt dùng chung sẽ phát
 		// ra toàn số 0 từ Provider thứ hai và test đỏ vì một lý do không liên quan.
 		Credential: func(string) ([]byte, error) { return []byte(llmPackageCanary), nil },
@@ -2300,12 +2344,13 @@ func TestChainFallsFromHTTPToCLI(t *testing.T) {
 
 	claude := okClaude(`{"clarify":"Claude Code không được gọi trong lượt này"}`)
 	runner := newAppLLMRunner(appLLMRunnerConfig{
-		Route:      snapshot,
-		Store:      a.st,
-		Adapters:   adapters,
-		Claude:     func(string) zaloRunner { return claude },
-		Credential: func(string) ([]byte, error) { return []byte(llmPackageCanary), nil },
-		Logger:     slog.New(slog.DiscardHandler),
+		Route:          snapshot,
+		Store:          a.st,
+		Adapters:       adapters,
+		Claude:         func(string) zaloRunner { return claude },
+		TerminalRoutes: appTestTerminalRoutes(),
+		Credential:     func(string) ([]byte, error) { return []byte(llmPackageCanary), nil },
+		Logger:         slog.New(slog.DiscardHandler),
 	})
 
 	got, err := runner.Run(t.Context(), "khách hỏi giá combo", func(string) {})

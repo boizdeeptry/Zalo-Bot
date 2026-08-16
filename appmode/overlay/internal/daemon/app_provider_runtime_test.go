@@ -119,6 +119,7 @@ func appRuntimeTerminalCallback(
 
 func appRuntimeAttachmentFactory(*appLLMRunner) appLocalAttachmentRun {
 	return func(
+		*appLLMRunner,
 		context.Context,
 		store.LLMRouteEntry,
 		appLLMRouteInput,

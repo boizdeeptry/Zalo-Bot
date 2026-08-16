@@ -20,6 +20,11 @@ import (
 // --- Provider ---
 
 func (a *api) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
+	productionAppRuntimeContext(a).handleLLMProviderList(w, nil)
+}
+
+func (ctx appRuntimeContext) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
+	a := ctx.api
 	providers, err := a.st.LLMProviders()
 	if err != nil {
 		a.writeLLMInternal(w, "không đọc được danh sách Provider", err)
@@ -39,7 +44,7 @@ func (a *api) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{
 		"providers":            out,
 		"kinds":                llmProviderKinds,
-		"hasConnectedProvider": a.hasAnyConnectedProvider(),
+		"hasConnectedProvider": ctx.hasAnyConnectedProvider(),
 	})
 }
 
@@ -543,6 +548,11 @@ type llmRouteRequest struct {
 }
 
 func (a *api) handleLLMRoutePut(w http.ResponseWriter, r *http.Request) {
+	productionAppRuntimeContext(a).handleLLMRoutePut(w, r)
+}
+
+func (ctx appRuntimeContext) handleLLMRoutePut(w http.ResponseWriter, r *http.Request) {
+	a := ctx.api
 	var req llmRouteRequest
 	if !a.decodeLLMBody(w, r, &req) {
 		return
@@ -555,7 +565,30 @@ func (a *api) handleLLMRoutePut(w http.ResponseWriter, r *http.Request) {
 			Enabled:    e.Enabled,
 		})
 	}
-	snapshot, err := a.st.ReplaceLLMRoute(req.Revision, entries)
+	entries = appCanonicalRouteEntries(entries)
+	ctx.appLLMRouteCheckpoint(appLLMRouteOperationPut, appLLMRoutePhaseBeforeLock)
+	appLLMRouteMutationMu.Lock()
+	ctx.appLLMRouteCheckpoint(appLLMRouteOperationPut, appLLMRoutePhaseLocked)
+	var snapshot store.LLMRouteSnapshot
+	current, err := a.st.LLMRoute()
+	if err == nil && current.Revision != req.Revision {
+		err = store.ErrLLMRouteConflict
+	}
+	if err == nil {
+		if validationErr := ctx.validateRouteMutation(entries); validationErr != nil {
+			appLLMRouteMutationMu.Unlock()
+			a.logger.Warn("llm api: rejected route runtime", "error_kind", "runtime_invalid")
+			a.writeLLMErr(w, http.StatusUnprocessableEntity, "ROUTE_RUNTIME_INVALID",
+				"Chuỗi dùng một Provider runtime không khả dụng", nil)
+			return
+		}
+		ctx.appLLMRouteCheckpoint(appLLMRouteOperationPut, appLLMRoutePhaseValidated)
+		snapshot, err = a.st.ReplaceLLMRoute(req.Revision, entries)
+		if err == nil {
+			ctx.appLLMRouteCheckpoint(appLLMRouteOperationPut, appLLMRoutePhaseWritten)
+		}
+	}
+	appLLMRouteMutationMu.Unlock()
 	switch {
 	case errors.Is(err, store.ErrLLMRouteConflict):
 		// Bản nháp của người dùng vẫn ĐÚNG, chỉ là nó dựa trên một bản cũ. Mã riêng để Portal
