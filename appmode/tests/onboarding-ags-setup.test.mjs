@@ -176,21 +176,25 @@ test("connect phase stays inside the same Tư Vấn Zalo card", (t) => {
 
 test("setup phase stays in the Tư Vấn Zalo card before automatic bootstrap", async (t) => {
   const pending = new Promise(() => {});
-  let setups = 0;
+  const setupCalls = [];
   const { host } = mount(t, {
     initialStatus: setupStatus({ revision: 9, account_id: "account-7" }),
     service: service({
-      setup(kind, accountId, revision) {
-        setups++;
-        assert.deepEqual({ kind, accountId, revision }, {
-          kind: "codex", accountId: "account-7", revision: 9,
-        });
+      setup(...args) {
+        setupCalls.push(args);
         return pending;
       },
     }),
   });
   await flush();
-  assert.equal(setups, 1);
+  assert.equal(setupCalls.length, 1);
+  assert.equal(setupCalls[0].length, 4);
+  const [kind, accountId, revision, signal] = setupCalls[0];
+  assert.deepEqual({ kind, accountId, revision }, {
+    kind: "codex", accountId: "account-7", revision: 9,
+  });
+  assert.ok(signal instanceof AbortSignal);
+  assert.equal(signal.aborted, false);
   assertFullPageFrame(host);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
   assert.match(text(host), /Tư Vấn Zalo/u);
