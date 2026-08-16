@@ -54,8 +54,10 @@ function setupSuccess({
   return onboardingStatus("persona", { revision, providers: [stage] });
 }
 function baseService(overrides = {}) {
+  const status = overrides.status ?? (() => Promise.resolve(providerStatus()));
   return {
-    status: () => Promise.resolve(providerStatus()),
+    status,
+    bootstrapStatus: overrides.bootstrapStatus ?? status,
     updateProviders: (kinds, revision) => Promise.resolve(providerStatus({
       revision: revision + 1,
       providers: kinds.map((kind, position) => pendingProvider(kind, position)),
@@ -64,7 +66,7 @@ function baseService(overrides = {}) {
     backToProviders: () => Promise.resolve(providerStatus()),
     selectProvider: () => Promise.resolve(connectStatus()),
     setup: () => Promise.resolve(setupSuccess()), loadAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [] }),
-    saveAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [], onboarding_phase: "test", onboarding_revision: 5 }), testChat: () => Promise.reject(new Error("not used")), complete: () => Promise.reject(new Error("not used")),
+    bootstrap: () => new Promise(() => {}),
     ...overrides,
   };
 }
@@ -97,22 +99,6 @@ function fakeConnectFactory(log = []) {
   };
   factory.instances = instances;
   return factory;
-}
-function controlledTimers() {
-  let nextID = 1;
-  const timers = new Map();
-  return {
-    setTimeoutFn(callback) {
-      const id = nextID++; timers.set(id, callback); return id;
-    },
-    clearTimeoutFn(id) { timers.delete(id); },
-    runAll() {
-      for (const [id, callback] of [...timers]) {
-        timers.delete(id); callback();
-      }
-    },
-    get size() { return timers.size; },
-  };
 }
 function mountPage(t, options = {}) {
   const dom = installDOM();
@@ -195,23 +181,21 @@ test("Setup service rejects every non-successor or incomplete backend response",
   assert.throws(() => service.setup("account-7", Number.MAX_SAFE_INTEGER), /revision/i);
   assert.equal(requests, 0);
 });
-test("Welcome renders Tư Vấn Zalo provider setup, an exact three-step rail, and guarded warning", async (t) => {
+test("Welcome renders Provider setup without a wizard rail and explains automatic bootstrap", async (t) => {
   const { host } = mountPage(t);
   const cards = findAll(host, (node) => hasClass(node, "onboarding-provider-card"));
   const steps = findAll(host, (node) => hasClass(node, "onboarding-step-label"));
   assert.equal(cards.length, 2);
   assert.match(text(cards[0]), /Codex.*Chưa dùng/u);
   assert.match(text(cards[1]), /Claude Code.*Chưa dùng/u);
-  assert.deepEqual(steps.map((step) => text(step)), [
-    "Kết nối", "Cá nhân hoá", "Trò chuyện thử",
-  ]);
-  assert.equal(steps.some((step) => /setup|chuẩn bị/i.test(text(step))), false);
+  assert.equal(steps.length, 0);
+  assert.equal(byClass(host, "onboarding-rail"), null);
   assert.match(text(host), /Tư Vấn Zalo/u);
   assert.match(text(host), /Thiết lập trợ lý Zalo/u);
   assert.equal(button(host, "Tiếp tục"), null);
-  assert.match(text(byClass(host, "onboarding-provider-warning")), /đăng nhập/i);
-  assert.match(text(byClass(host, "onboarding-provider-warning")), /xác minh/i);
-  assert.match(text(byClass(host, "onboarding-provider-warning")), /Hoàn tất/i);
+  const warning = text(byClass(host, "onboarding-provider-warning"));
+  assert.match(warning, /đăng nhập.*kết nối được xác minh.*Đang chuẩn bị trợ lý…/iu);
+  assert.doesNotMatch(warning, /Chat thử|bấm Hoàn tất|Persona|cá nhân hoá/iu);
   providerToggle(host, "codex").click();
   await flush();
   assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
@@ -281,8 +265,8 @@ test("Back invalidates, cancels, disposes, then GETs without restarting a persis
 });
 test("a connected terminal reconciles authoritative Setup and deduplicates the POST", async (t) => {
   const setupGate = deferred();
-  const timers = controlledTimers();
   const calls = [];
+  let bootstraps = 0;
   let captured;
   const { host } = mountPage(t, {
     initialStatus: connectStatus({ revision: 6 }),
@@ -295,12 +279,12 @@ test("a connected terminal reconciles authoritative Setup and deduplicates the P
         calls.push({ op: "setup", kind, accountId, revision, signal });
         return setupGate.promise;
       },
+      bootstrap: () => { bootstraps++; return new Promise(() => {}); },
     }),
     connectFactory(options) {
       captured = options;
       return { mount() {}, start() {}, cancel: () => Promise.resolve(true), dispose() {} };
     },
-    ...timers,
   });
   const terminal = { kind: "codex", providerId: "codex", accountId: "account-1" };
   const first = captured.onConnected(terminal);
@@ -315,14 +299,12 @@ test("a connected terminal reconciles authoritative Setup and deduplicates the P
     { accountId: "account-1", revision: 7 },
   );
   assert.match(text(host), /Đang chuẩn bị cấu hình…/);
+  assert.match(text(host), /Nhà cung cấp đã được xác minh.*Đang chuẩn bị trợ lý…/su);
+  assert.doesNotMatch(text(host), /cá nhân hoá|Persona|Trò chuyện thử/iu);
   setupGate.resolve(setupSuccess({ revision: 8 }));
-  await microtask();
-  await microtask();
-  assert.match(text(host), /✓/);
-  assert.equal(timers.size, 1);
-  timers.runAll();
   await flush();
-  assert.match(text(host), /Trợ lý của bạn là ai/);
+  assert.equal(bootstraps, 1);
+  assert.match(text(host), /Đang chuẩn bị trợ lý…/u);
   await Promise.all([first, duplicate, whileSetupIsPending]);
 });
 test("first provider Setup keeps every row visible then returns to the provider list", async (t) => {
@@ -357,8 +339,9 @@ test("first provider Setup keeps every row visible then returns to the provider 
   assert.match(text(providerCard(host, "codex")), /Đã sẵn sàng · Ưu tiên 1/u);
   assert.match(text(providerCard(host, "claude-code")), /Chưa cài\. Bấm để cài\./u);
 });
-test("last provider Setup advances to Persona with the exact clicked identity", async (t) => {
+test("last provider Setup advances into automatic bootstrap with the exact clicked identity", async (t) => {
   const calls = [];
+  let bootstraps = 0;
   const readyCodex = readyProvider("codex", 0, { account_id: "acct-c", model_id: "model-c" });
   const pendingClaude = pendingProvider("claude-code", 1);
   const readyClaude = readyProvider("claude-code", 1, { account_id: "acct-a", model_id: "model-a" });
@@ -374,12 +357,14 @@ test("last provider Setup advances to Persona with the exact clicked identity", 
     initialStatus: initial,
     service: baseService({
       setup(...args) { calls.push(args); return Promise.resolve(final); },
+      bootstrap: () => { bootstraps++; return new Promise(() => {}); },
     }),
   });
 
-  await flush(); await new Promise((resolve) => setTimeout(resolve, 0)); await flush();
+  await flush();
   assert.deepEqual(calls[0].slice(0, 3), ["claude-code", "acct-a", 61]);
-  assert.match(text(host), /Trợ lý của bạn là ai/u);
+  assert.equal(bootstraps, 1);
+  assert.match(text(host), /Đang chuẩn bị trợ lý…/u);
 });
 test("Connect reconciliation accepts only the exact successor Setup snapshot", async (t) => {
   const invalid = [
@@ -499,8 +484,8 @@ test("Setup resume auto-runs once, shows failure, and Retry starts exactly one n
 });
 test("Setup Retry renders an authoritative non-Setup phase without stale POST", async (t) => {
   const cases = [
-    ["persona", personaStatus({ revision: 9 }), "onboarding-persona-stage", "Trợ lý của bạn là ai"],
-    ["test", { ...personaStatus({ revision: 9 }), phase: "test" }, "onboarding-test-stage", "Thử trò chuyện với Bé Mi"],
+    ["persona", personaStatus({ revision: 9 }), "onboarding-bootstrap-stage", "Đang chuẩn bị trợ lý…"],
+    ["test", { ...personaStatus({ revision: 9 }), phase: "test" }, "onboarding-bootstrap-stage", "Đang chuẩn bị trợ lý…"],
     ["completed", providerStatus({ phase: "completed", revision: 9 }), "onboarding-done-stage", "Bé Mi đã sẵn sàng!"],
     ["provider", providerStatus({ revision: 9 }), "onboarding-provider-stage", "Thiết lập trợ lý Zalo"],
     ["connect", connectStatus({ revision: 9 }), "onboarding-connect-stage", "Kết nối Codex"],
@@ -612,19 +597,21 @@ test("malformed Setup resume fails closed until status Retry supplies an account
   await flush();
   assert.equal(statusCalls, 1); assert.equal(setupCalls, 1);
 });
-test("Persona resume renders directly without PUT, Connect, or Setup", async (t) => {
-  let selects = 0; let setups = 0;
+test("Persona resume starts bootstrap once without Provider, Connect, or Setup", async (t) => {
+  let selects = 0; let setups = 0; let bootstraps = 0;
   const connectFactory = fakeConnectFactory();
   const { host } = mountPage(t, {
     initialStatus: personaStatus(),
     service: baseService({
       selectProvider: () => { selects++; },
       setup: () => { setups++; },
+      bootstrap: () => { bootstraps++; return new Promise(() => {}); },
     }),
     connectFactory,
   });
   await flush();
-  assert.match(text(host), /Trợ lý của bạn là ai/);
+  assert.match(text(host), /Đang chuẩn bị trợ lý…/u);
+  assert.equal(bootstraps, 1);
   assert.equal(selects, 0); assert.equal(setups, 0);
   assert.equal(connectFactory.instances.length, 0);
 });
@@ -653,9 +640,8 @@ test("unknown, non-required, and malformed initial snapshots show retryable safe
     });
   }
 });
-test("dispose aborts Setup, clears timers/listeners, and suppresses stale rendering and callbacks", async (t) => {
+test("dispose aborts Setup, clears listeners, and suppresses stale rendering and callbacks", async (t) => {
   const gate = deferred();
-  const timers = controlledTimers();
   let signal;
   let completions = 0;
   const { page, host } = mountPage(t, {
@@ -667,7 +653,6 @@ test("dispose aborts Setup, clears timers/listeners, and suppresses stale render
       },
     }),
     onComplete: () => { completions++; },
-    ...timers,
   });
   page.dispose();
   page.dispose();
@@ -675,7 +660,6 @@ test("dispose aborts Setup, clears timers/listeners, and suppresses stale render
   gate.resolve(setupSuccess());
   await flush();
   assert.equal(text(host), "");
-  assert.equal(timers.size, 0);
   assert.equal(completions, 0);
   assert.equal(page.mount(host), page);
   assert.equal(text(host), "");
@@ -683,7 +667,6 @@ test("dispose aborts Setup, clears timers/listeners, and suppresses stale render
 test("the real Provider Connect starts immediately and receives onboarding revision", async (t) => {
   const connectCalls = [];
   const setupCalls = [];
-  const timers = controlledTimers();
   const { host } = mountPage(t, {
     initialStatus: connectStatus({ revision: 51 }),
     connectService: {
@@ -703,7 +686,6 @@ test("the real Provider Connect starts immediately and receives onboarding revis
         return Promise.resolve(setupSuccess({ revision: 53, accountID: accountId }));
       },
     }),
-    ...timers,
   });
   const starts = findAll(host, (node) => node.tagName === "BUTTON"
     && text(node).includes("Bắt đầu kết nối"));

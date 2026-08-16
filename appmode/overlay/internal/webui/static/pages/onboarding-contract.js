@@ -32,12 +32,11 @@ const LIFECYCLE_FIELDS = Object.freeze([
   "required", "current_version", "completed_version", "restart_in_progress",
 ]);
 const IDENTIFIER_LIMIT = 1_000;
-const OPAQUE_TOKEN_LIMIT = 4_096;
-const ANSWER_LIMIT = 100_000;
+const OPAQUE_VALUE_LIMIT = 4_096;
+const AGENT_SAMPLE_LIMIT = 100_000;
 const MAX_PROVIDER_OPTIONS = 64;
 const MAX_PROVIDER_STAGES = 8;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
-const GO_EDGE_WHITESPACE = /^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
 
 export const isRecord = (value) => Boolean(value)
   && typeof value === "object" && !Array.isArray(value);
@@ -143,7 +142,7 @@ export function normalizeProviderStages(value, providerOptions) {
     const kind = semanticString(raw.kind);
     const providerID = semanticString(raw.provider_id, { allowEmpty: true });
     const accountID = semanticString(raw.account_id, { allowEmpty: true });
-    const modelID = semanticString(raw.model_id, { allowEmpty: true, limit: OPAQUE_TOKEN_LIMIT });
+    const modelID = semanticString(raw.model_id, { allowEmpty: true, limit: OPAQUE_VALUE_LIMIT });
     const catalogIndex = optionIndex.get(kind);
     if (!kind || catalogIndex === undefined || seen.has(kind)
       || raw.position !== position || catalogIndex <= previousOptionIndex
@@ -356,6 +355,21 @@ export function normalizeStatus(snapshot) {
   });
 }
 
+function hasExactFields(value, fields) {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === fields.length && fields.every((field) => Object.hasOwn(value, field));
+}
+
+export function normalizeStrictStatus(snapshot) {
+  if (!hasExactFields(snapshot, STATUS_FIELDS)
+    || !Array.isArray(snapshot.provider_options)
+    || !snapshot.provider_options.every((entry) => hasExactFields(entry, PROVIDER_OPTION_FIELDS))
+    || !Array.isArray(snapshot.providers)
+    || !snapshot.providers.every((entry) => hasExactFields(entry, PROVIDER_STAGE_FIELDS))) return null;
+  return normalizeStatus(snapshot);
+}
+
 export function normalizeProviderSelection(snapshot, { providerKind, revision }) {
   const normalized = normalizeStatus(snapshot);
   const selected = normalized?.providers.find(({ kind }) => kind === providerKind);
@@ -446,7 +460,7 @@ export function normalizeAgentResponse(response) {
     const key = semanticString(hole.key);
     const count = Number.isSafeInteger(hole.count) && hole.count > 0 ? hole.count : 0;
     const sample = Object.hasOwn(hole, "sample") ? hole.sample : "";
-    if (!key || !count || typeof sample !== "string" || sample.length > ANSWER_LIMIT) return null;
+    if (!key || !count || typeof sample !== "string" || sample.length > AGENT_SAMPLE_LIMIT) return null;
     const projected = { key, count, sample };
     if (Object.hasOwn(hole, "value")) {
       if (typeof hole.value !== "string" || hole.value.length > IDENTIFIER_LIMIT) return null;
@@ -455,67 +469,6 @@ export function normalizeAgentResponse(response) {
     placeholders.push(projected);
   }
   return { ready: response.ready, display_name: response.display_name, placeholders };
-}
-
-export function normalizeTestMessage(raw) {
-  if (typeof raw !== "string") return null;
-  const value = raw.replace(GO_EDGE_WHITESPACE, "");
-  if (!value || [...value].length > 500 || CONTROL_CHARACTERS.test(value)) return null;
-  return value;
-}
-
-function safeAnswer(value) {
-  if (typeof value !== "string" || !value.trim() || value.length > ANSWER_LIMIT) return null;
-  if (/\u0000/u.test(value)) return null;
-  return value;
-}
-
-function normalizedIdentityText(value) {
-  if (typeof value !== "string") return "";
-  return value.normalize("NFKC").trim().replace(/\s+/gu, " ").toUpperCase();
-}
-
-export function normalizedAnswerContainsName(answer, displayName) {
-  const normalizedName = normalizedIdentityText(displayName);
-  return Boolean(normalizedName)
-    && normalizedIdentityText(answer).includes(normalizedName);
-}
-
-export function normalizeTestResponse(response, { displayName, snapshot, now }) {
-  if (!isRecord(response)) return null;
-  const normalizedSnapshot = normalizeStatus(snapshot);
-  const answer = safeAnswer(response.answer);
-  const botName = semanticString(response.bot_name);
-  const providerID = semanticString(response.provider_id);
-  const modelID = semanticString(response.model_id);
-  const position = response.position;
-  const member = Number.isSafeInteger(position) && position >= 0
-    ? normalizedSnapshot?.providers[position] : null;
-  const token = semanticString(response.test_token, { limit: OPAQUE_TOKEN_LIMIT });
-  const expiresAt = typeof response.expires_at === "string" ? Date.parse(response.expires_at) : NaN;
-  if (!answer || botName !== displayName || !normalizedAnswerContainsName(answer, displayName)
-    || normalizedSnapshot?.phase !== "test" || member?.status !== "ready"
-    || member.position !== position || providerID !== member.provider_id || modelID !== member.model_id
-    || !token || !Number.isFinite(expiresAt) || expiresAt <= now
-    || response.revision !== successorRevision(normalizedSnapshot.revision)) return null;
-  return {
-    answer,
-    botName,
-    token,
-    expiresAt,
-    revision: response.revision,
-    providerID,
-    modelID,
-    position,
-  };
-}
-
-export function normalizeCompleteResponse(response) {
-  if (!isRecord(response) || response.completed !== true || response.onboarding_version !== 1) {
-    return null;
-  }
-  const comboID = semanticString(response.combo_id);
-  return comboID ? { completed: true, onboardingVersion: 1, comboID } : null;
 }
 
 export function validDisplayName(value) {
@@ -532,42 +485,10 @@ export function terminalIdentity(terminal, expectedKind) {
   return { kind, providerID, accountID };
 }
 
-export function testResponseError(response, displayName, now) {
-  if (isRecord(response) && ((typeof response.bot_name === "string"
-    && response.bot_name !== displayName)
-    || (safeAnswer(response.answer) && !normalizedAnswerContainsName(response.answer, displayName)))) {
-    return "Bot đã phản hồi nhưng chưa áp dụng đúng Persona.";
-  }
-  const expiry = isRecord(response) && typeof response.expires_at === "string"
-    ? Date.parse(response.expires_at) : NaN;
-  return Number.isFinite(expiry) && expiry <= now
-    ? "Kết quả thử đã hết hạn. Vui lòng thử lại."
-    : "Chưa thể xác minh kết quả trò chuyện. Vui lòng thử lại.";
-}
-
-export function testChatRecovery(code) {
-  if (["ONBOARDING_REVISION_CONFLICT", "ONBOARDING_PHASE_INVALID", "ONBOARDING_TEST_BUSY"].includes(code)) {
-    return "refresh";
-  }
-  if (code === "ONBOARDING_PERSONA_CHANGED") return "persona";
-  if (["ONBOARDING_STAGING_INVALID", "ONBOARDING_NO_MODEL"].includes(code)) return "provider";
-  return "local";
-}
-
-export function safeServerFieldCount(error) {
-  if (error?.status !== 422 || error?.code !== "AGENT_PLACEHOLDERS_REMAIN"
-    || !isRecord(error.fields)) return 0;
-  let count = 0;
-  for (const key of Object.keys(error.fields)) {
-    if (semanticString(key)) count++;
-  }
-  return count;
-}
-
 export function validateOnboardingPageService(service) {
   for (const method of [
-    "status", "updateProviders", "beginProvider", "setup", "backToProviders",
-    "loadAgent", "saveAgent", "testChat", "complete",
+    "status", "bootstrapStatus", "updateProviders", "beginProvider", "setup", "backToProviders",
+    "loadAgent", "bootstrap",
   ]) {
     if (typeof service?.[method] !== "function") {
       throw new TypeError(`Onboarding page service requires ${method}()`);
@@ -602,9 +523,13 @@ export function createOnboardingService({ requestJSON = sharedRequestJSON } = {}
       return normalized;
     });
   };
+  const rawStatus = (signal) => requestJSON("/onboarding/status", { signal });
   return Object.freeze({
     status(signal) {
-      return Promise.resolve(requestJSON("/onboarding/status", { signal })).then(projectStatus);
+      return Promise.resolve(rawStatus(signal)).then(projectStatus);
+    },
+    bootstrapStatus(signal) {
+      return rawStatus(signal);
     },
     updateProviders(selectedKinds, revision, signal) {
       if (Number.isSafeInteger(selectedKinds)) {
@@ -695,22 +620,10 @@ export function createOnboardingService({ requestJSON = sharedRequestJSON } = {}
     loadAgent({ signal } = {}) {
       return requestJSON("/agent", { signal });
     },
-    saveAgent(payload, { signal } = {}) {
-      return requestJSON("/agent", { method: "PUT", body: payload, signal });
-    },
-    testChat(message, revision, { signal } = {}) {
+    bootstrap(revision, signal) {
       const currentRevision = requireRevision(revision);
-      requireSuccessor(currentRevision);
-      return requestJSON("/onboarding/test-chat", {
-        method: "POST", body: { message, revision: currentRevision }, signal,
-      });
-    },
-    complete(testToken, revision, { signal } = {}) {
-      const token = semanticString(testToken, { limit: OPAQUE_TOKEN_LIMIT });
-      const currentRevision = requireRevision(revision);
-      if (!token) throw new TypeError("Onboarding test token is invalid");
-      return requestJSON("/onboarding/complete", {
-        method: "POST", body: { test_token: token, revision: currentRevision }, signal,
+      return requestJSON("/onboarding/bootstrap", {
+        method: "POST", body: { revision: currentRevision }, signal,
       });
     },
   });

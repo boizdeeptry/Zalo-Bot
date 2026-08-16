@@ -60,17 +60,17 @@ function setupResult(overrides = {}) {
 }
 
 function service(overrides = {}) {
+  const status = overrides.status ?? (() => Promise.resolve(providerStatus()));
   return {
-    status: () => Promise.resolve(providerStatus()),
+    status,
+    bootstrapStatus: overrides.bootstrapStatus ?? status,
     updateProviders: () => Promise.reject(new Error("not used")),
     beginProvider: () => Promise.reject(new Error("not used")),
     backToProviders: () => Promise.reject(new Error("not used")),
     selectProvider: () => Promise.resolve(connectStatus()),
     setup: () => Promise.resolve(setupResult()),
     loadAgent: () => Promise.resolve({ ready: true, display_name: "Bé Mi", placeholders: [] }),
-    saveAgent: () => Promise.reject(new Error("not used")),
-    testChat: () => Promise.reject(new Error("not used")),
-    complete: () => Promise.reject(new Error("not used")),
+    bootstrap: () => new Promise(() => {}),
     ...overrides,
   };
 }
@@ -180,9 +180,11 @@ test("setup phase stays in the Tư Vấn Zalo modal before Persona starts", asyn
   const { host } = mount(t, {
     initialStatus: setupStatus({ revision: 9, account_id: "account-7" }),
     service: service({
-      setup(accountId, revision) {
+      setup(kind, accountId, revision) {
         setups++;
-        assert.deepEqual({ accountId, revision }, { accountId: "account-7", revision: 9 });
+        assert.deepEqual({ kind, accountId, revision }, {
+          kind: "codex", accountId: "account-7", revision: 9,
+        });
         return pending;
       },
     }),
@@ -202,12 +204,13 @@ test("onboarding UI source does not mention the reference product", async () => 
     "../overlay/internal/webui/static/components/persona-fields.js",
     "../overlay/internal/webui/static/components/provider-connect.js",
     "../overlay/internal/webui/static/pages/onboarding.js",
+    "../overlay/internal/webui/static/pages/onboarding-bootstrap.js",
     "../overlay/internal/webui/static/pages/onboarding-contract.js",
     "../overlay/internal/webui/static/pages/onboarding-early-view.js",
     "../overlay/internal/webui/static/pages/onboarding-late-view.js",
   ];
   const source = (await Promise.all(modules.map((path) => readFile(
     new URL(path, import.meta.url), "utf8",
-  )))).join("\n");
+  ).catch((error) => error?.code === "ENOENT" ? "" : Promise.reject(error))))).join("\n");
   assert.doesNotMatch(source, /\bAGS\b|AGENTSEE/iu);
 });

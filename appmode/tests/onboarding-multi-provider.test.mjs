@@ -39,17 +39,17 @@ const install = (root, kind) => find(row(root, kind), (node) => hasClass(node, "
 const never = () => new Promise(() => {});
 
 function pageService(overrides = {}) {
+  const status = overrides.status ?? never;
   return {
-    status: never,
+    status,
+    bootstrapStatus: overrides.bootstrapStatus ?? status,
     updateProviders: never,
     beginProvider: never,
     backToProviders: never,
     selectProvider: never,
     setup: never,
     loadAgent: never,
-    saveAgent: never,
-    testChat: never,
-    complete: never,
+    bootstrap: never,
     ...overrides,
   };
 }
@@ -163,8 +163,8 @@ const abortFenceScenarios = [
 
 test("page service validation requires the plural runtime contract, not legacy selection", () => {
   const methods = [
-    "status", "updateProviders", "beginProvider", "setup", "backToProviders",
-    "loadAgent", "saveAgent", "testChat", "complete",
+    "status", "bootstrapStatus", "updateProviders", "beginProvider", "setup", "backToProviders",
+    "loadAgent", "bootstrap",
   ];
   const valid = Object.fromEntries(methods.map((method) => [method, never]));
   const create = (service) => createOnboardingPage({
@@ -181,8 +181,8 @@ test("page service validation requires the plural runtime contract, not legacy s
   }
 
   const legacyOnly = {
-    status: never, selectProvider: never, setup: never, loadAgent: never,
-    saveAgent: never, testChat: never, complete: never,
+    status: never, bootstrapStatus: never, selectProvider: never, setup: never, loadAgent: never,
+    bootstrap: never,
   };
   assert.throws(() => create(legacyOnly), /updateProviders\(\)/u);
 });
@@ -688,47 +688,4 @@ test("begin reconciliation preserves full staged arrays and accepts only the exa
     loadStatus: async () => exact,
   }), /revision/i);
   assert.equal(begins, 0);
-});
-
-test("Test Chat response identifies the actual ready fallback member by position", () => {
-  const stages = [
-    readyProvider("codex", 0, { account_id: "account-c", model_id: "model-c" }),
-    readyProvider("claude-code", 1, { account_id: "account-a", model_id: "model-a" }),
-  ];
-  const snapshot = contract.normalizeStatus(readyStatus("test", stages, { revision: 50 }));
-  const now = Date.now();
-  const response = {
-    answer: "Xin chào, mình là Bé Mi.",
-    bot_name: "Bé Mi",
-    provider_id: "claude-code",
-    model_id: "model-a",
-    position: 1,
-    test_token: "opaque",
-    expires_at: new Date(now + 60_000).toISOString(),
-    revision: 51,
-  };
-  const normalized = contract.normalizeTestResponse(response, { displayName: "Bé Mi", snapshot, now });
-  assert.deepEqual({
-    providerID: normalized?.providerID,
-    modelID: normalized?.modelID,
-    position: normalized?.position,
-  }, { providerID: "claude-code", modelID: "model-a", position: 1 });
-
-  const { position: _omitted, ...missingPosition } = response;
-  assert.equal(contract.normalizeTestResponse(missingPosition, {
-    displayName: "Bé Mi", snapshot, now,
-  }), null);
-  const singleton = contract.normalizeStatus(readyStatus("test", [stages[0]], { revision: 50 }));
-  assert.equal(contract.normalizeTestResponse({
-    ...missingPosition, provider_id: "codex", model_id: "model-c",
-  }, { displayName: "Bé Mi", snapshot: singleton, now }), null);
-
-  for (const overrides of [
-    { position: undefined }, { position: 2 }, { position: 0 },
-    { provider_id: "codex" }, { model_id: "model-c" },
-  ]) {
-    assert.equal(contract.normalizeTestResponse({ ...response, ...overrides }, {
-      displayName: "Bé Mi", snapshot, now,
-    }), null);
-  }
 });

@@ -1,7 +1,5 @@
 import { element } from "../core/ui.js";
 
-const STEP_LABELS = Object.freeze(["Kết nối", "Cá nhân hoá", "Trò chuyện thử"]);
-
 export function providerName(kind, options = []) {
   return options.find((option) => option.kind === kind)?.display_name
     || (kind === "claude-code" ? "Claude Code" : kind === "codex" ? "Codex" : kind);
@@ -17,29 +15,6 @@ export function focusProviderControl(node, kind) {
     if (focusProviderControl(child, kind)) return true;
   }
   return false;
-}
-
-function currentStepIndex(phase) {
-  if (phase === "persona") return 1;
-  if (phase === "test" || phase === "completed") return 2;
-  return 0;
-}
-
-function rail(phase) {
-  const current = currentStepIndex(phase);
-  return element(
-    "nav",
-    { className: "onboarding-rail", attributes: { "aria-label": "Tiến trình thiết lập" } },
-    element("ol", { className: "onboarding-step-list" }, STEP_LABELS.map((label, index) => element(
-      "li",
-      {
-        className: `onboarding-step${index === current ? " is-current" : ""}`,
-        attributes: index === current ? { "aria-current": "step" } : {},
-      },
-      element("span", { className: "onboarding-step-index", text: index + 1 }),
-      element("span", { className: "onboarding-step-label", text: label }),
-    ))),
-  );
 }
 
 function decorativeDashboard() {
@@ -80,7 +55,7 @@ function decorativeDashboard() {
   );
 }
 
-export function renderOnboardingShell(root, phase, content) {
+export function renderOnboardingShell(root, _phase, content) {
   const dialog = element(
     "section",
     {
@@ -103,7 +78,6 @@ export function renderOnboardingShell(root, phase, content) {
         }),
         element("span", { className: "onboarding-dialog-lock", attributes: { "aria-hidden": "true" }, text: "◆" }),
       ),
-      rail(phase),
     ),
     element("main", { className: "onboarding-main" }, content),
   );
@@ -391,7 +365,7 @@ export function createWelcomeStage({
     confirmationHost,
     element("p", {
       className: "onboarding-provider-warning",
-      text: "Bạn cần đăng nhập. Cấu hình đang dùng chỉ thay đổi sau khi kết nối được xác minh, Chat thử đạt yêu cầu và bạn bấm Hoàn tất.",
+      text: "Bạn cần đăng nhập. Sau khi kết nối được xác minh, hệ thống tự động chuyển sang “Đang chuẩn bị trợ lý…”. Cấu hình đang dùng chỉ thay đổi khi quá trình hoàn thành an toàn.",
     }),
     message ? element("p", {
       className: "onboarding-error", attributes: { role: "alert" }, text: message,
@@ -430,14 +404,14 @@ export function createSetupStage(state, status, message, retryButton) {
     { className: "onboarding-stage onboarding-setup-stage onboarding-agent-setup-stage" },
     ...setupHeader(
       "Hàng đợi thiết lập",
-      "Nhà cung cấp đã được xác minh. Tư Vấn Zalo đang chuẩn bị cấu hình trước khi chuyển sang bước cá nhân hoá.",
+      "Nhà cung cấp đã được xác minh. Tư Vấn Zalo đang chuẩn bị cấu hình rồi tự động chuyển sang “Đang chuẩn bị trợ lý…”.",
     ),
     stagedProviderList(state, "setup"),
     setupStatusPanel({
       title: "Trạng thái",
       status: complete ? "Hoàn tất" : (error ? "Cần thử lại" : "Đang thiết lập"),
       detail: complete
-        ? "✓ Thiết lập xong. Đang mở bước cá nhân hoá Persona…"
+        ? "✓ Thiết lập xong. Đang chuẩn bị trợ lý…"
         : "Đang thiết lập… Đang chuẩn bị cấu hình, chọn model và tạo combo staging.",
       children: [element("p", {
         className: `onboarding-setup-status${complete ? " is-complete" : ""}`,

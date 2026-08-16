@@ -66,17 +66,17 @@ function connectionStatus(overrides = {}) {
   return pageStatus({ phase: "connect", provider_kind: "codex", revision: 2, ...overrides });
 }
 function pageService(overrides = {}) {
+  const status = overrides.status ?? (() => Promise.resolve(pageStatus()));
   return {
-    status: () => Promise.resolve(pageStatus()),
+    status,
+    bootstrapStatus: overrides.bootstrapStatus ?? status,
     updateProviders: () => new Promise(() => {}),
     beginProvider: () => new Promise(() => {}),
     backToProviders: () => new Promise(() => {}),
     selectProvider: () => Promise.resolve(connectionStatus()),
     setup: () => new Promise(() => {}),
     loadAgent: () => new Promise(() => {}),
-    saveAgent: () => new Promise(() => {}),
-    testChat: () => new Promise(() => {}),
-    complete: () => new Promise(() => {}),
+    bootstrap: () => new Promise(() => {}),
     ...overrides,
   };
 }
