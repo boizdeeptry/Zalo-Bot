@@ -502,12 +502,12 @@ func agentFramedSHA256(domain string, fields ...[]byte) string {
 func (a *api) handleAgentGet(w http.ResponseWriter, _ *http.Request) {
 	p, err := a.personaPath()
 	if err != nil {
-		a.writeErr(w, http.StatusPreconditionFailed, err.Error())
+		a.writeErr(w, http.StatusPreconditionFailed, "văn phong chưa sẵn sàng")
 		return
 	}
 	b, err := os.ReadFile(p)
 	if err != nil {
-		a.logger.Error("agent: đọc persona", "path", p, "err", err)
+		a.logger.Error("agent persona read failed", "error_kind", "persona_read_failed")
 		a.writeErr(w, http.StatusInternalServerError, "không đọc được văn phong")
 		return
 	}
@@ -605,7 +605,12 @@ func (runtimeContext appRuntimeContext) handleAgentPut(w http.ResponseWriter, r 
 		a.writeErr(w, http.StatusBadRequest, "không có giá trị nào")
 		return
 	}
-	a.handleAgentNormalPut(w, values, displayName)
+	defaults, defaultsErr := runtimeContext.loadPersonaMutationDefaults()
+	if defaultsErr != nil {
+		a.writePersonaDefaultsInvalid(w)
+		return
+	}
+	runtimeContext.handleAgentNormalPut(w, values, displayName, defaults)
 }
 
 type appAgentPutRequest struct {
@@ -669,23 +674,33 @@ func normalizeAgentNameValue(label, raw string) (string, error) {
 	return value, nil
 }
 
-func (a *api) handleAgentNormalPut(w http.ResponseWriter, values map[string]string, displayName string) {
+func (runtimeContext appRuntimeContext) handleAgentNormalPut(
+	w http.ResponseWriter,
+	values map[string]string,
+	displayName string,
+	defaults appPersonaDefaults,
+) {
+	a := runtimeContext.api
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
 
-	p, err := a.personaPath()
+	p, err := appPackagedPersonaWorkingPath(a)
 	if err != nil {
-		a.writeErr(w, http.StatusPreconditionFailed, err.Error())
+		a.writePersonaDefaultsInvalid(w)
 		return
 	}
 	if err := a.resolveAgentPersonaRecovery(p); err != nil {
 		a.writeAgentRollbackFailed(w, err)
 		return
 	}
+	if err := prepareImmutablePersonaBackup(p, defaults); err != nil {
+		a.writePersonaDefaultsInvalid(w)
+		return
+	}
 	if displayName == "" && a.st != nil {
 		displayName, err = a.st.AgentDisplayName()
 		if err != nil {
-			a.logger.Error("agent: đọc tên hiển thị trước khi lưu", "err", err)
+			a.logger.Error("agent persona mutation failed", "error_kind", "display_name_read_failed")
 			a.writeErr(w, http.StatusInternalServerError, "không đọc được tên bot")
 			return
 		}
@@ -720,17 +735,11 @@ func (a *api) handleAgentNormalPut(w http.ResponseWriter, values map[string]stri
 	// persona.md là thứ đắt nhất trong gói này. Điền sai một cái tên rồi muốn quay lại thì không
 	// có git ở đây, và chỗ trống đã bị thay mất nên không tìm lại được. Một tệp .goc cạnh nó là
 	// đường lùi duy nhất, và nó phải được tạo TRƯỚC lần ghi đầu.
-	backup := p + ".goc"
-	if err := writeAppBackupOnce(backup, b, 0o600); err != nil {
-		a.logger.Error("agent: ghi bản gốc persona", "path", backup, "err", err)
-		a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
-		return
-	}
 	recoveryToken := ""
 	if a.st != nil {
 		recoveryToken, err = a.prepareAgentPersonaRecovery(p, b, []byte(text))
 		if err != nil {
-			a.logger.Error("agent: chuẩn bị khôi phục persona", "err", err)
+			a.logger.Error("agent persona mutation failed", "error_kind", "recovery_prepare_failed")
 			a.writeErr(w, http.StatusInternalServerError, "không chuẩn bị được bản khôi phục, chưa ghi gì")
 			return
 		}
@@ -742,7 +751,7 @@ func (a *api) handleAgentNormalPut(w http.ResponseWriter, values map[string]stri
 				return
 			}
 		}
-		a.logger.Error("agent: ghi persona", "path", p, "err", err)
+		a.logger.Error("agent persona mutation failed", "error_kind", "persona_write_failed")
 		a.writeErr(w, http.StatusInternalServerError, "không ghi được văn phong")
 		return
 	}
@@ -781,15 +790,6 @@ func (runtimeContext appRuntimeContext) handleAgentCompletePut(
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
 
-	p, err := a.personaPath()
-	if err != nil {
-		a.writeErr(w, http.StatusPreconditionFailed, err.Error())
-		return
-	}
-	if err := a.resolveAgentPersonaRecovery(p); err != nil {
-		a.writeAgentRollbackFailed(w, err)
-		return
-	}
 	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err == nil {
 		if len(snapshot.Stages) == 0 {
@@ -811,9 +811,23 @@ func (runtimeContext appRuntimeContext) handleAgentCompletePut(
 		a.writeOnboardingStoreError(w, fmt.Errorf("complete persona from %q: %w", state.Phase, store.ErrOnboardingInvalidPhase))
 		return
 	}
-	original, err := os.ReadFile(p)
+	defaults, defaultsErr := runtimeContext.loadPersonaMutationDefaults()
+	if defaultsErr != nil {
+		a.writePersonaDefaultsInvalid(w)
+		return
+	}
+	p, err := appPackagedPersonaWorkingPath(a)
 	if err != nil {
-		a.writeErr(w, http.StatusInternalServerError, "không đọc được văn phong")
+		a.writePersonaDefaultsInvalid(w)
+		return
+	}
+	if err := a.resolveAgentPersonaRecovery(p); err != nil {
+		a.writeAgentRollbackFailed(w, err)
+		return
+	}
+	original, missing, err := runtimeContext.readPersonaWorking(p)
+	if err != nil || missing {
+		a.writePersonaDefaultsInvalid(w)
 		return
 	}
 	text, keys, ok := a.renderAgentValues(w, string(original), values)
@@ -830,16 +844,20 @@ func (runtimeContext appRuntimeContext) handleAgentCompletePut(
 
 	finalBytes := []byte(text)
 	changed := !bytes.Equal(original, finalBytes)
-	recoveryToken := ""
 	if changed {
-		if err := writeAppBackupOnce(p+".goc", original, 0o600); err != nil {
-			a.logger.Error("agent: ghi bản gốc persona", "path", p+".goc", "err", err)
-			a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
+		if err := prepareImmutablePersonaBackup(p, defaults); err != nil {
+			a.writePersonaDefaultsInvalid(w)
 			return
 		}
+	} else if err := validateExistingImmutablePersonaBackup(p, defaults.persona); err != nil {
+		a.writePersonaDefaultsInvalid(w)
+		return
+	}
+	recoveryToken := ""
+	if changed {
 		recoveryToken, err = a.prepareAgentPersonaRecovery(p, original, finalBytes)
 		if err != nil {
-			a.logger.Error("agent: chuẩn bị khôi phục persona", "err", err)
+			a.logger.Error("agent persona mutation failed", "error_kind", "recovery_prepare_failed")
 			a.writeErr(w, http.StatusInternalServerError, "không chuẩn bị được bản khôi phục, chưa ghi gì")
 			return
 		}
@@ -848,7 +866,7 @@ func (runtimeContext appRuntimeContext) handleAgentCompletePut(
 				a.writeAgentRollbackFailed(w, cleanupErr)
 				return
 			}
-			a.logger.Error("agent: ghi persona hoàn chỉnh", "path", p, "err", err)
+			a.logger.Error("agent persona mutation failed", "error_kind", "persona_write_failed")
 			a.writeErr(w, http.StatusInternalServerError, "không ghi được văn phong")
 			return
 		}

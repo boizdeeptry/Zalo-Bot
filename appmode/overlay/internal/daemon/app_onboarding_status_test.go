@@ -20,10 +20,11 @@ import (
 )
 
 type onboardingRouteTestEnv struct {
-	a       *api
-	mux     http.Handler
-	db      *sql.DB
-	dataDir string
+	a               *api
+	mux             http.Handler
+	db              *sql.DB
+	dataDir         string
+	personaDefaults *appPersonaDefaultsSource
 }
 
 func newOnboardingRouteTestEnv(t *testing.T) *onboardingRouteTestEnv {
@@ -46,15 +47,21 @@ func newOnboardingRouteTestEnv(t *testing.T) *onboardingRouteTestEnv {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		portalOpen: true,
 	}
+	defaultsFixture := newPackagedPersonaFixture(t)
+	personaDefaults := &appPersonaDefaultsSource{root: defaultsFixture.root}
+	runtimeContext := productionAppRuntimeContext(a)
+	runtimeContext.personaDefaults = personaDefaults
 	runtimeMux := http.NewServeMux()
-	a.registerAppRoutes(runtimeMux)
+	registerAppRoutesWithContext(runtimeMux, runtimeContext)
 	mux := legacyInjectedConnectRouteHandler(a, runtimeMux)
 	t.Cleanup(func() {
 		connectMgr = nil
 		_ = raw.Close()
 		_ = st.Close()
 	})
-	return &onboardingRouteTestEnv{a: a, mux: mux, db: raw, dataDir: dataDir}
+	return &onboardingRouteTestEnv{
+		a: a, mux: mux, db: raw, dataDir: dataDir, personaDefaults: personaDefaults,
+	}
 }
 
 // legacyInjectedConnectRouteHandler is fixture-only compatibility for older

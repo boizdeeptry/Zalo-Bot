@@ -200,6 +200,7 @@ public static class AgentDCAppPersonaFileReader
 
 $script:AppPersonaMaxIdentityBytes = 256
 $script:AppPersonaMaxFileBytes = 1MB
+$script:AppPersonaMaxWorkingPersonaBytes = 400KB
 $script:AppPersonaMaxTreeBytes = 4MB
 $script:AppPersonaMaxFiles = 64
 $script:AppPersonaMaxRelativePathBytes = 512
@@ -506,6 +507,22 @@ function Assert-AppPersonaRelativePaths {
     if ($pathBytes.Length -gt $script:AppPersonaMaxRelativePathBytes) {
       throw 'persona source path exceeds its bound'
     }
+    if (-not $relative.IsNormalized([Text.NormalizationForm]::FormC)) {
+      throw 'persona source path is not NFC-normalized'
+    }
+    foreach ($character in $relative.ToCharArray()) {
+      if ([char]::IsControl($character)) {
+        throw 'persona source path contains a control character'
+      }
+    }
+    foreach ($component in $relative.Split(
+        [char[]]@('/'), [StringSplitOptions]::None)) {
+      if ([string]::IsNullOrEmpty($component) -or
+          $component -ceq '.' -or $component -ceq '..' -or
+          $component -cne $component.Trim()) {
+        throw 'persona source path contains an invalid component'
+      }
+    }
     if (-not $caseFoldedPaths.Add($relative)) {
       throw 'persona source contains case-folded duplicate paths'
     }
@@ -594,6 +611,11 @@ function Assert-AppPersonaIdentityValue {
       $Value.Contains("`r") -or $Value.Contains("`n") -or
       $Value.Contains('{{') -or $Value.Contains('}}')) {
     throw 'persona identity metadata is invalid'
+  }
+  foreach ($character in $Value.ToCharArray()) {
+    if ([char]::IsControl($character)) {
+      throw 'persona identity metadata is invalid'
+    }
   }
   return $Value
 }
@@ -900,6 +922,11 @@ function Read-AppPersonaSourceSnapshot {
       }
     }
     $text = ConvertFrom-AppPersonaUTF8 -Bytes $bytes -Label $relative
+    if ($relative -ceq 'persona.md' -and
+        ($bytes.Length -gt $script:AppPersonaMaxWorkingPersonaBytes -or
+         [string]::IsNullOrWhiteSpace($text))) {
+      throw 'persona source persona.md is blank or exceeds 400 KiB'
+    }
     if ($relative -cne 'identity.json') {
       Assert-AppPersonaTextComplete -Text $text -Label $relative
       $decodedPersona.Add($text)
@@ -1039,14 +1066,49 @@ function Assert-AppPersonaPackagePrivacy {
 
   Assert-AppPersonaSnapshotType -Snapshot $Snapshot
   $outPath = [IO.Path]::GetFullPath($Out)
-  Assert-AppPathHasNoReparsePoint -Path $outPath -InspectExistingTree | Out-Null
-  $files = @(Get-AppSafePackageFiles -Root $outPath)
+  try {
+    Assert-AppPathHasNoReparsePoint -Path $outPath -InspectExistingTree | Out-Null
+    $entries = @(Get-AppSafePackageEntries -Root $outPath)
+  } catch {
+    throw 'persona package privacy policy could not inspect package entries safely'
+  }
+  $files = @($entries | Where-Object { -not $_.PSIsContainer })
+  $pathForbidden = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  foreach ($marker in $script:AppPersonaSensitiveMarkers) {
+    $pathForbidden.Add($marker) | Out-Null
+  }
+  foreach ($identity in $Snapshot.GetIdentities()) {
+    $pathForbidden.Add($identity) | Out-Null
+  }
+  foreach ($known in $script:AppPersonaKnownIdentityMarkers) {
+    $pathForbidden.Add($known) | Out-Null
+  }
+  foreach ($entry in $entries) {
+    try {
+      $relative = [IO.Path]::GetRelativePath($outPath, $entry.FullName).Replace('\', '/')
+      $normalizedRelative = $relative.Normalize([Text.NormalizationForm]::FormC)
+    } catch {
+      throw 'persona package privacy policy rejected an entry path'
+    }
+    foreach ($forbidden in $pathForbidden) {
+      if ($normalizedRelative.IndexOf($forbidden, [StringComparison]::Ordinal) -ge 0) {
+        throw 'persona package privacy policy rejected an entry path'
+      }
+    }
+  }
   $workingPrefix = 'brain/reference/persona/'
   $defaultPrefix = 'app/defaults/persona/'
+  $workingRoot = $workingPrefix.TrimEnd('/')
+  $defaultRoot = $defaultPrefix.TrimEnd('/')
   $workingBackupRelative = 'brain/reference/persona/persona.md.goc'
   $manifestRelative = 'app/defaults/persona/build-manifest.json'
   $allowedPersonaFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
   $expectedPersonaFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  $expectedPersonaDirectories = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::Ordinal)
+  $expectedPersonaDirectories.Add($workingRoot) | Out-Null
+  $expectedPersonaDirectories.Add($defaultRoot) | Out-Null
+  $expectedPersonaDirectories.Add($workingPrefix + 'overlay') | Out-Null
   foreach ($snapshotFile in $Snapshot.GetFiles()) {
     foreach ($prefix in @($workingPrefix, $defaultPrefix)) {
       $relative = $prefix + $snapshotFile.Path
@@ -1062,6 +1124,13 @@ function Assert-AppPersonaPackagePrivacy {
           [UInt64]$bytes.Length -ne $snapshotFile.Length) {
         throw "persona package verification failed for '$relative'"
       }
+    }
+    $directory = [IO.Path]::GetDirectoryName($snapshotFile.Path.Replace('/', '\'))
+    while (-not [string]::IsNullOrEmpty($directory)) {
+      $relativeDirectory = $directory.Replace('\', '/')
+      $expectedPersonaDirectories.Add($workingPrefix + $relativeDirectory) | Out-Null
+      $expectedPersonaDirectories.Add($defaultPrefix + $relativeDirectory) | Out-Null
+      $directory = [IO.Path]::GetDirectoryName($directory)
     }
   }
   $expectedPersonaFiles.Add($manifestRelative) | Out-Null
@@ -1081,8 +1150,16 @@ function Assert-AppPersonaPackagePrivacy {
     throw 'persona package manifest verification failed'
   }
 
-  foreach ($item in @(Get-ChildItem -LiteralPath $outPath -Force -Recurse -ErrorAction Stop)) {
+  foreach ($item in $entries) {
     $relative = [IO.Path]::GetRelativePath($outPath, $item.FullName).Replace('\', '/')
+    if ($item.PSIsContainer -and
+        ($relative.Equals($workingRoot, [StringComparison]::Ordinal) -or
+         $relative.StartsWith($workingPrefix, [StringComparison]::Ordinal) -or
+         $relative.Equals($defaultRoot, [StringComparison]::Ordinal) -or
+         $relative.StartsWith($defaultPrefix, [StringComparison]::Ordinal)) -and
+        -not $expectedPersonaDirectories.Contains($relative)) {
+      throw 'persona package privacy policy rejected an unexpected Persona directory'
+    }
     if ($item.Name.EndsWith('.goc', [StringComparison]::OrdinalIgnoreCase)) {
       if (-not $relative.Equals($workingBackupRelative, [StringComparison]::Ordinal) -or
           $item.PSIsContainer -or
@@ -2287,7 +2364,7 @@ function Apply-AppSeams {
   Assert-AppProviderRouteTopology -Path $daemonPath -ExpectedAnswerCallCount 1
 }
 
-function Get-AppSafePackageFiles {
+function Get-AppSafePackageEntries {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$Root)
 
@@ -2305,13 +2382,19 @@ function Get-AppSafePackageFiles {
       if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "package tree contains a reparse point: '$($child.FullName)'"
       }
+      Write-Output $child
       if ($child.PSIsContainer) {
         $pending.Push($child.FullName)
-      } else {
-        Write-Output $child
       }
     }
   }
+}
+
+function Get-AppSafePackageFiles {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Root)
+
+  Get-AppSafePackageEntries -Root $Root | Where-Object { -not $_.PSIsContainer }
 }
 
 function Assert-AppPackageSensitiveContentAbsent {

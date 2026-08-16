@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 
+	"agentdc/internal/providercatalog"
 	"agentdc/internal/store"
 )
 
@@ -37,6 +39,22 @@ func (runtimeContext appRuntimeContext) appOnboardingBootstrap(
 	expectedRevision int64,
 ) {
 	a := runtimeContext.api
+	// Persona completion must authenticate the immutable package before it
+	// enters the global mutation critical section. The core re-reads and
+	// validates this snapshot under that lock before advancing.
+	personaSnapshot, personaSnapshotErr := runtimeContext.onboardingStore().OnboardingSnapshot()
+	if personaSnapshotErr == nil &&
+		validateRuntimeOnboardingSnapshot(runtimeContext.registry, personaSnapshot) == nil &&
+		personaSnapshot.State.Revision == expectedRevision &&
+		personaSnapshot.State.Phase == store.OnboardingPhasePersona {
+		updated, err := runtimeContext.completePackagedOnboardingPersona(r.Context(), expectedRevision)
+		if err != nil {
+			runtimeContext.writePackagedPersonaBootstrapError(w, r, err)
+			return
+		}
+		runtimeContext.bootstrapOnboardingTest(w, r, updated.Revision)
+		return
+	}
 	onboardingMutationMu.Lock()
 	if r.Context().Err() != nil {
 		onboardingMutationMu.Unlock()
@@ -46,12 +64,12 @@ func (runtimeContext appRuntimeContext) appOnboardingBootstrap(
 	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err != nil {
 		onboardingMutationMu.Unlock()
-		a.writeOnboardingStateUnavailable(w, err)
+		a.writeOnboardingBootstrapStoreError(w, err)
 		return
 	}
 	if err := validateRuntimeOnboardingSnapshot(runtimeContext.registry, snapshot); err != nil {
 		onboardingMutationMu.Unlock()
-		a.writeOnboardingStateUnavailable(w, err)
+		a.writeOnboardingStoreError(w, store.ErrOnboardingConfigurationChanged)
 		return
 	}
 	if snapshot.State.Revision != expectedRevision {
@@ -72,14 +90,71 @@ func (runtimeContext appRuntimeContext) appOnboardingBootstrap(
 		a.writeJSON(w, http.StatusOK, response)
 	case store.OnboardingPhasePersona:
 		onboardingMutationMu.Unlock()
-		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_BOOTSTRAP_PERSONA_PENDING",
-			"Persona đóng gói chưa sẵn sàng để tự động hoàn tất", nil)
+		if personaSnapshotErr != nil {
+			a.writeOnboardingBootstrapStoreError(w, personaSnapshotErr)
+			return
+		}
+		a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
 	case store.OnboardingPhaseTest:
 		onboardingMutationMu.Unlock()
 		runtimeContext.bootstrapOnboardingTest(w, r, expectedRevision)
 	default:
 		onboardingMutationMu.Unlock()
 		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidPhase)
+	}
+}
+
+func (runtimeContext appRuntimeContext) writePackagedPersonaBootstrapError(
+	w http.ResponseWriter,
+	r *http.Request,
+	err error,
+) {
+	a := runtimeContext.api
+	if errors.Is(err, errAppPersonaRepairRequired) {
+		if a.logger != nil {
+			a.logger.Error("onboarding bootstrap: working Persona requires repair")
+		}
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_PERSONA_REPAIR_REQUIRED",
+			"Văn phong hiện tại cần được kiểm tra trước khi tiếp tục", nil)
+		return
+	}
+	if r.Context().Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		a.writeOnboardingTestCanceled(w)
+		return
+	}
+	if errors.Is(err, store.ErrOnboardingConflict) || errors.Is(err, store.ErrOnboardingInvalidPhase) {
+		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	if !errors.Is(err, errAppPersonaDefaultsInvalid) {
+		a.writeOnboardingBootstrapStoreError(w, err)
+		return
+	}
+	if a.logger != nil {
+		a.logger.Error("onboarding bootstrap: packaged Persona rejected", "error_kind", "persona_defaults_invalid")
+	}
+	a.writeLLMErr(w, http.StatusInternalServerError, "ONBOARDING_PERSONA_DEFAULTS_INVALID",
+		"Không thể xác thực văn phong mặc định an toàn", nil)
+}
+
+func (a *api) writeOnboardingBootstrapStoreError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, providercatalog.ErrInvalidSelection),
+		errors.Is(err, providercatalog.ErrUnsupportedKind),
+		errors.Is(err, store.ErrOnboardingConflict),
+		errors.Is(err, store.ErrOnboardingProviderUnsupported),
+		errors.Is(err, store.ErrOnboardingInvalidPhase),
+		errors.Is(err, store.ErrOnboardingInvalidStagingOwnership),
+		errors.Is(err, store.ErrOnboardingConfigurationChanged),
+		errors.Is(err, store.ErrOnboardingModelUnavailable),
+		errors.Is(err, store.ErrOnboardingPersonaMismatch):
+		a.writeOnboardingStoreError(w, err)
+	default:
+		if a.logger != nil {
+			a.logger.Error("onboarding bootstrap: state unavailable", "error_kind", "state_unavailable")
+		}
+		a.writeLLMErr(w, http.StatusInternalServerError, "ONBOARDING_STATE_UNAVAILABLE",
+			"Không đọc hoặc cập nhật được trạng thái thiết lập", nil)
 	}
 }
 
@@ -93,6 +168,11 @@ func (runtimeContext appRuntimeContext) bootstrapOnboardingTest(
 ) {
 	a := runtimeContext.api
 	onboardingMutationMu.Lock()
+	if err := runtimeContext.resolveOnboardingTestPersonaRecovery(expectedRevision); err != nil {
+		onboardingMutationMu.Unlock()
+		runtimeContext.writePackagedPersonaBootstrapError(w, r, err)
+		return
+	}
 	lease, admitted := beginAppOnboardingTest()
 	if !admitted {
 		onboardingMutationMu.Unlock()
@@ -236,6 +316,44 @@ func (runtimeContext appRuntimeContext) bootstrapOnboardingTest(
 		return
 	}
 	a.writeJSON(w, http.StatusOK, response)
+}
+
+func (runtimeContext appRuntimeContext) resolveOnboardingTestPersonaRecovery(expectedRevision int64) error {
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
+	if err != nil {
+		return err
+	}
+	if err := validateRuntimeOnboardingSnapshot(runtimeContext.registry, snapshot); err != nil {
+		return store.ErrOnboardingConfigurationChanged
+	}
+	if snapshot.State.Revision != expectedRevision {
+		return store.ErrOnboardingConflict
+	}
+	if snapshot.State.Phase != store.OnboardingPhaseTest {
+		return store.ErrOnboardingInvalidPhase
+	}
+	personaPath, err := appPackagedPersonaWorkingPath(runtimeContext.api)
+	if err != nil {
+		return errAppPersonaRepairRequired
+	}
+	if _, missing, err := runtimeContext.readPersonaWorking(personaPath); err != nil || missing {
+		return errAppPersonaRepairRequired
+	}
+	journal, err := readAgentPersonaRecovery(personaPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errAppPersonaRepairRequired
+	}
+	storedToken, err := runtimeContext.api.st.AgentPersonaRecoveryToken()
+	if err != nil || storedToken != journal.record.Token {
+		return errAppPersonaRepairRequired
+	}
+	if err := runtimeContext.api.resolveAgentPersonaRecovery(personaPath); err != nil {
+		return errAppPersonaRepairRequired
+	}
+	return nil
 }
 
 func (runtimeContext appRuntimeContext) writeBootstrapTestPostflightError(

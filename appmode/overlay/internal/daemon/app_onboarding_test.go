@@ -1233,8 +1233,9 @@ func TestAgentCompletesOnboardingWithAuthoritativeNameAndFingerprint(t *testing.
 		t.Fatalf("AgentDisplayName() = %q, %v", name, err)
 	}
 	backup, err := os.ReadFile(persona + ".goc")
-	if err != nil || string(backup) != "Tên {{TEN_BOT}} ở {{đơn vị}}.\n" {
-		t.Fatalf("backup = %q, %v", backup, err)
+	defaults, defaultsErr := env.personaDefaults.load()
+	if err != nil || defaultsErr != nil || !bytes.Equal(backup, defaults.persona) {
+		t.Fatalf("backup = %q, %v; immutable defaults = %q, %v", backup, err, defaults.persona, defaultsErr)
 	}
 }
 
@@ -1825,7 +1826,7 @@ BEGIN SELECT RAISE(ABORT, 'injected Store failure'); END`); err != nil {
 	}
 }
 
-func TestAgentStaleCompletionReconcilesCommittedRecoveryBeforeConflict(t *testing.T) {
+func TestAgentStaleCompletionLeavesCommittedRecoveryUntouchedBeforeConflict(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	original := []byte("Tên Committed.\n")
 	persona := configureAgentPersonaForOnboardingTest(t, env, string(original))
@@ -1852,8 +1853,8 @@ func TestAgentStaleCompletionReconcilesCommittedRecoveryBeforeConflict(t *testin
 	rr := env.serve(http.MethodPut, "/agent", `{
 "values":{},"display_name":"Committed","require_complete":true,"onboarding_revision":12}`)
 	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT")
-	if _, err := os.Stat(persona + ".agentdc-recovery"); !os.IsNotExist(err) {
-		t.Fatalf("stale retry left committed recovery obligation: %v", err)
+	if _, err := os.Stat(persona + ".agentdc-recovery"); err != nil {
+		t.Fatalf("stale retry changed committed recovery obligation: %v", err)
 	}
 	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
 		t.Fatalf("committed recovery changed persona to %q (%v)", got, err)

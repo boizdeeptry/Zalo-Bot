@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -944,6 +945,8 @@ type appRuntimeContext struct {
 	api             *api
 	registry        appProviderRuntimeRegistry
 	connect         *connectManager
+	personaDefaults *appPersonaDefaultsSource
+	personaReader   appPersonaWorkingReader
 	routeCheckpoint func(operation, phase string)
 }
 
@@ -954,5 +957,7 @@ func (ctx appRuntimeContext) onboardingStore() store.OnboardingStore {
 func productionAppRuntimeContext(a *api) appRuntimeContext {
 	return appRuntimeContext{
 		api: a, registry: productionAppProviderRuntimeRegistry(), connect: a.newConnectManager(),
+		personaDefaults: &appPersonaDefaultsSource{root: os.Getenv(appPersonaDefaultsEnv)},
+		personaReader:   readAppWorkingPersona,
 	}
 }

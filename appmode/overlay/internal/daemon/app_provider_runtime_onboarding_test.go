@@ -35,7 +35,11 @@ func newRuntimeOnboardingHarness(
 		t.Fatal(err)
 	}
 	env := newOnboardingRouteTestEnv(t)
-	ctx := appRuntimeContext{api: env.a, registry: registry, connect: env.a.newConnectManager()}
+	ctx := appRuntimeContext{
+		api: env.a, registry: registry, connect: env.a.newConnectManager(),
+		personaDefaults: env.personaDefaults,
+		personaReader:   readAppWorkingPersona,
+	}
 	mux := http.NewServeMux()
 	registerAppRoutesWithContext(mux, ctx)
 	env.mux = mux

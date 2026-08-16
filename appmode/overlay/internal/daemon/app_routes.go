@@ -95,7 +95,7 @@ func registerAppRoutesWithContext(mux *http.ServeMux, ctx appRuntimeContext) {
 	mux.Handle("GET /agent", a.auth(a.handleAgentGet))
 	mux.Handle("PUT /agent", a.auth(ctx.handleAgentPut))
 	mux.Handle("GET /agent/persona/{name}", a.auth(a.handlePersonaGet))
-	mux.Handle("PUT /agent/persona/{name}", a.auth(a.handlePersonaPut))
+	mux.Handle("PUT /agent/persona/{name}", a.auth(ctx.handlePersonaPut))
 	mux.Handle("GET /kb", a.auth(a.handleKBList))
 	mux.Handle("POST /kb/upload", a.auth(a.handleKBUpload))
 	mux.Handle("POST /kb/ingest", a.auth(a.handleKBIngest))

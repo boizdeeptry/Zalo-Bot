@@ -1224,7 +1224,7 @@ func TestOnboardingBootstrapStrictRequestAndCompletedNoop(t *testing.T) {
 		})
 	}
 
-	t.Run("Persona is stable conflict until packaged defaults task", func(t *testing.T) {
+	t.Run("Persona without a configured working path is a repair conflict", func(t *testing.T) {
 		harness := newRuntimeOnboardingHarness(t, nil)
 		snapshot := harness.prepareReadyRoute(
 			t,
@@ -1234,7 +1234,7 @@ func TestOnboardingBootstrapStrictRequestAndCompletedNoop(t *testing.T) {
 		rr := serveOnboardingBootstrap(
 			onboardingBootstrapHandler(t, harness, nil), context.Background(), snapshot.State.Revision,
 		)
-		requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_BOOTSTRAP_PERSONA_PENDING")
+		requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PERSONA_REPAIR_REQUIRED")
 	})
 
 	t.Run("Completed exact revision is no-op and stale conflicts", func(t *testing.T) {

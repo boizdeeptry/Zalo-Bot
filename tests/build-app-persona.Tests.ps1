@@ -521,6 +521,17 @@ $invalidIdentityCases = @(
     }
   },
   @{
+    Label = 'display-name-with-control'
+    Mutate = {
+      param($source)
+      $bad = "bot$([char]0)name"
+      $ids = @([PSCustomObject]@{ Role = 'assistant'; Value = $bad })
+      Write-TestText (Join-Path $source 'identity.json') `
+        (Get-TestIdentityJSON -DisplayName $bad -Identities $ids)
+      Write-TestText (Join-Path $source 'persona.md') "$bad`n"
+    }
+  },
+  @{
     Label = 'display-name-with-placeholder'
     Mutate = {
       param($source)
@@ -609,6 +620,9 @@ foreach ($case in $invalidIdentityCases) {
 Write-Host 'PASS: strict identity schema, normalization, cardinality and presence are fail closed.'
 
 $contentCases = @(
+  @{ Label = 'persona-blank'; Relative = 'persona.md'; Bytes = $script:Utf8.GetBytes(" `t`n") },
+  @{ Label = 'persona-over-400-kib'; Relative = 'persona.md'; Bytes = $script:Utf8.GetBytes(
+      "boizdeeptry Anh Trường " + ('x' * 400KB) + "`n") },
   @{ Label = 'persona-hole'; Relative = 'persona.md'; Bytes = $script:Utf8.GetBytes("boizdeeptry Anh Trường {{TEN_BOT}}`n") },
   @{ Label = 'roster-hole'; Relative = 'roster.md'; Bytes = $script:Utf8.GetBytes("boizdeeptry {{TEN_BOT}}`n") },
   @{ Label = 'overlay-hole'; Relative = 'overlay\README.md'; Bytes = $script:Utf8.GetBytes("Anh Trường {{TEN_BOT}}`n") },
@@ -647,6 +661,11 @@ Invoke-InvalidPersonaCase -Label 'unknown-source-sibling' -Pattern 'persona' -Mu
 Invoke-InvalidPersonaCase -Label 'unknown-source-directory' -Pattern 'persona' -Mutate {
   param($source)
   Write-TestText (Join-Path $source 'private\notes.md') "unknown`n"
+}
+Invoke-InvalidPersonaCase -Label 'non-nfc-overlay-path' -Pattern 'persona' -Mutate {
+  param($source)
+  $decomposed = "Cafe$([char]0x0301).md"
+  Write-TestText (Join-Path $source (Join-Path 'overlay' $decomposed)) "boizdeeptry Anh Trường`n"
 }
 Invoke-InvalidPersonaCase -Label 'declared-identity-in-overlay-path' -Pattern 'persona|privacy' `
   -ForbiddenDetail 'boizdeeptry' -Mutate {
@@ -689,6 +708,58 @@ Assert-Equal $relativePathValidation.Outcome 'rejected' `
   'Case-folded Persona relative paths were not rejected before snapshot reads'
 Assert-True (-not $relativePathValidation.Message.Contains('overlay/A.md')) `
   'Case-folded path rejection leaked a source-relative path'
+
+$controlPathValidation = & $script:BuildAppModule {
+  param([string[]]$Paths)
+  try {
+    Assert-AppPersonaRelativePaths -RelativePath $Paths
+    return [PSCustomObject]@{ Outcome = 'accepted'; Message = '' }
+  } catch {
+    return [PSCustomObject]@{ Outcome = 'rejected'; Message = $_.Exception.Message }
+  }
+} @("overlay/a$([char]9)b.md")
+Assert-Equal $controlPathValidation.Outcome 'rejected' `
+  'A control-character Persona path passed preflight validation'
+Assert-True (-not $controlPathValidation.Message.Contains("a$([char]9)b.md")) `
+  'Control-character path rejection leaked a source-relative path'
+
+foreach ($whitespacePath in @(
+    'overlay/ leading.md',
+    'overlay/trailing.md ',
+    "overlay/$([char]0x2003)wide.md",
+    'overlay /child.md'
+  )) {
+  $whitespacePathValidation = & $script:BuildAppModule {
+    param([string[]]$Paths)
+    try {
+      Assert-AppPersonaRelativePaths -RelativePath $Paths
+      return [PSCustomObject]@{ Outcome = 'accepted'; Message = '' }
+    } catch {
+      return [PSCustomObject]@{ Outcome = 'rejected'; Message = $_.Exception.Message }
+    }
+  } @($whitespacePath)
+  Assert-Equal $whitespacePathValidation.Outcome 'rejected' `
+    "A whitespace-padded Persona path component was accepted: '$whitespacePath'"
+  Assert-True (-not $whitespacePathValidation.Message.Contains($whitespacePath)) `
+    'Whitespace-component path rejection leaked a source-relative path'
+}
+Invoke-InvalidPersonaCase -Label 'leading-whitespace-overlay-path' -Pattern 'persona|path' `
+  -ForbiddenDetail ' leading.md' -Mutate {
+  param($source)
+  Write-TestText (Join-Path $source 'overlay\ leading.md') "safe content`n"
+}
+
+$controlIdentityValidation = & $script:BuildAppModule {
+  param([string]$Value)
+  try {
+    $null = Assert-AppPersonaIdentityValue -Value $Value
+    return 'accepted'
+  } catch {
+    return 'rejected'
+  }
+} "bot$([char]0)name"
+Assert-Equal $controlIdentityValidation 'rejected' `
+  'A control-character Persona identity passed preflight validation'
 
 $unpairedSurrogatePath = 'overlay/' + ([char]0xd800).ToString() + '.md'
 $invalidPathValidation = & $script:BuildAppModule {
@@ -875,6 +946,26 @@ try {
   $minimalManifest = [IO.File]::ReadAllText(
     (Join-Path $minimalOut 'app\defaults\persona\build-manifest.json')) | ConvertFrom-Json
   Assert-Equal @($minimalManifest.files).Count 2 'Minimal Persona manifest did not contain exactly two files'
+
+  $workingOverlayScaffold = Join-Path $minimalOut 'brain\reference\persona\overlay'
+  [IO.Directory]::CreateDirectory($workingOverlayScaffold) | Out-Null
+  Assert-AppPersonaPackagePrivacy -Out $minimalOut -Snapshot $minimalSnapshot
+
+  foreach ($unexpectedDirectory in @(
+      'brain\reference\persona\overlay\unexpected-empty',
+      'app\defaults\persona\unexpected-empty'
+    )) {
+    $unexpectedDirectoryPath = Join-Path $minimalOut $unexpectedDirectory
+    [IO.Directory]::CreateDirectory($unexpectedDirectoryPath) | Out-Null
+    try {
+      Assert-ThrowsLike -Action {
+        Assert-AppPersonaPackagePrivacy -Out $minimalOut -Snapshot $minimalSnapshot
+      } -Pattern 'persona|privacy|directory' -ForbiddenDetail 'unexpected-empty' `
+        -Message "A minimal package accepted an unexpected Persona directory: '$unexpectedDirectory'"
+    } finally {
+      Remove-Item -LiteralPath $unexpectedDirectoryPath -Force
+    }
+  }
 } finally {
   if (Test-Path -LiteralPath $minimalRoot) {
     Remove-Item -LiteralPath $minimalRoot -Recurse -Force
@@ -918,13 +1009,14 @@ try {
   New-TestPersonaSource -Path $source -WithSourceBackup | Out-Null
   Write-TestText (Join-Path $source 'overlay\Z.md') "boizdeeptry Z`n"
   Write-TestText (Join-Path $source 'overlay\a.md') "Anh Trường a`n"
+  Write-TestText (Join-Path $source 'overlay\a+`b.md') "boizdeeptry punctuation`n"
   Write-TestText (Join-Path $source 'overlay\é.md') "boizdeeptry UTF-8`n"
   $sourceBefore = Get-TestDirectoryFingerprint $source
   $snapshot = Read-AppPersonaSourceSnapshot -PersonaSource $source
   Assert-Equal $snapshot.DisplayName 'boizdeeptry' 'Snapshot display name drifted'
   Assert-Equal @($snapshot.GetIdentities()).Count 2 'Snapshot identity count drifted'
   $snapshotFiles = Get-TestSnapshotFiles $snapshot
-  Assert-Equal $snapshotFiles.Count 7 'Snapshot file count drifted'
+  Assert-Equal $snapshotFiles.Count 8 'Snapshot file count drifted'
   Assert-True (-not $snapshotFiles.ContainsKey('persona.md.goc')) `
     'Source operator backup entered the immutable snapshot'
   Assert-Equal $snapshot.TreeSHA256 (Get-TestPersonaTreeSHA256 $snapshotFiles) `
@@ -1008,6 +1100,59 @@ try {
       "Persona manifest digest drifted for '$($entry.path)'"
   }
   Assert-AppPersonaPackagePrivacy -Out $outOne -Snapshot $snapshot
+
+  $decomposedIdentity = 'Anh Trường'.Normalize([Text.NormalizationForm]::FormD)
+  foreach ($pathLeakCase in @(
+      @{
+        Relative = 'app\boizdeeptry-invalid.bin'
+        Cleanup = 'app\boizdeeptry-invalid.bin'
+        Forbidden = 'boizdeeptry'
+      },
+      @{
+        Relative = "data\$decomposedIdentity-private\invalid.bin"
+        Cleanup = "data\$decomposedIdentity-private"
+        Forbidden = $decomposedIdentity
+      },
+      @{
+        Relative = 'launcher\ACCOUNT_CONFIG_DIR_CANARY_CLEAR_A19E-private\invalid.bin'
+        Cleanup = 'launcher\ACCOUNT_CONFIG_DIR_CANARY_CLEAR_A19E-private'
+        Forbidden = 'ACCOUNT_CONFIG_DIR_CANARY_CLEAR_A19E'
+      },
+      @{
+        Relative = 'app\defaults\persona\boizdeeptry-invalid.bin'
+        Cleanup = 'app\defaults\persona\boizdeeptry-invalid.bin'
+        Forbidden = 'boizdeeptry'
+      }
+    )) {
+    $pathLeak = Join-Path $outOne $pathLeakCase.Relative
+    $pathLeakCleanup = Join-Path $outOne $pathLeakCase.Cleanup
+    Write-TestBytes $pathLeak ([byte[]](0xff, 0xfe, 0x00))
+    try {
+      Assert-ThrowsLike -Action {
+        Assert-AppPersonaPackagePrivacy -Out $outOne -Snapshot $snapshot
+      } -Pattern 'persona|privacy|identity|sensitive' `
+        -ForbiddenDetail $pathLeakCase.Forbidden `
+        -Message "A private package entry path was accepted: '$($pathLeakCase.Relative)'"
+    } finally {
+      Remove-Item -LiteralPath $pathLeakCleanup -Recurse -Force
+    }
+  }
+
+  foreach ($unexpectedDirectory in @(
+      'brain\reference\persona\unexpected-empty',
+      'app\defaults\persona\overlay\unexpected-empty'
+    )) {
+    $unexpectedDirectoryPath = Join-Path $outOne $unexpectedDirectory
+    [IO.Directory]::CreateDirectory($unexpectedDirectoryPath) | Out-Null
+    try {
+      Assert-ThrowsLike -Action {
+        Assert-AppPersonaPackagePrivacy -Out $outOne -Snapshot $snapshot
+      } -Pattern 'persona|privacy|directory' -ForbiddenDetail 'unexpected-empty' `
+        -Message "An unexpected empty Persona directory was accepted: '$unexpectedDirectory'"
+    } finally {
+      Remove-Item -LiteralPath $unexpectedDirectoryPath -Force
+    }
+  }
 
   $workingBackup = Join-Path $outOne 'brain\reference\persona\persona.md.goc'
   Copy-Item -LiteralPath (Join-Path $outOne 'app\defaults\persona\persona.md') `
