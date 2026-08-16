@@ -267,9 +267,9 @@ export function createProviderConnect({
     switch (phase) {
       case "detecting": return "Đang kiểm tra…";
       case "installing": return "Đang cài đặt gói…";
-      case "awaiting_login": return providerKind === "claude-code"
-        ? "Bấm link để đăng nhập Claude ở trình duyệt vừa mở, rồi chờ xác nhận…"
-        : "Mở trang đăng nhập, nhập mã bên dưới, rồi chờ xác nhận…";
+      case "awaiting_login": return connect.code
+        ? "Mở trang đăng nhập, nhập mã bên dưới, rồi chờ xác nhận…"
+        : "Bấm link để đăng nhập ở trình duyệt vừa mở, rồi chờ xác nhận…";
       case "polling": return "Đang xác nhận đăng nhập…";
       case "connected": return "Đã kết nối.";
       default: return message || "";

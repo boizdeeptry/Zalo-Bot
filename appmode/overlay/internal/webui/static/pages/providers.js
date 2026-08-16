@@ -1,4 +1,5 @@
 import { requestJSON } from "../core/api.js";
+import { normalizeProviderRuntimeResponse } from "../core/provider-runtime-catalog.js";
 import { isProviderConnected } from "../core/providers-status.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
 import {
@@ -8,21 +9,6 @@ import {
 } from "../components/provider-connect.js";
 
 export { INSTALL_CEILING, phaseProgress };
-
-export const PROVIDER_CATALOG = [
-  { kind: "claude-code", name: "Claude Code", group: "subscription", prefix: "cc", logoColor: "#c8613b" },
-  { kind: "codex", name: "OpenAI Codex", group: "subscription", prefix: "cx", logoColor: "#0f7a63" },
-  { kind: "openai", name: "OpenAI", group: "apikey", prefix: "oa", logoColor: "#10a37f" },
-  { kind: "anthropic", name: "Anthropic", group: "apikey", prefix: "an", logoColor: "#c8613b" },
-  { kind: "gemini", name: "Gemini", group: "apikey", prefix: "gm", logoColor: "#3f6ff5" },
-  { kind: "openrouter", name: "OpenRouter", group: "apikey", prefix: "or", logoColor: "#5b5ef0" },
-];
-// CONNECTABLE_KINDS mirrors the backend subscriptionKinds: only these can run the in-Portal login
-// flow. Two DIFFERENT login shapes: codex shows a device-auth code, claude-code shows a plain browser
-// URL (no code). (Routing differs too — codex runs via cliAdapter, claude-code via runClaude for KB
-// --add-dir access — but that's a backend concern; here we only drive the login UI.)
-const CONNECTABLE_KINDS = new Set(["codex", "claude-code"]);
-const normalizeKind = (k) => String(k ?? "").replace(/_/g, "-");
 
 function providerPath(id, suffix = "") {
   const value = String(id ?? "").trim();
@@ -99,8 +85,8 @@ function galleryStatus(entry, byKind) {
   // Gói thuê bao (codex/claude): "đã kết nối" = CÓ TÀI KHOẢN đăng nhập, KHÔNG phải credential — chúng
   // chạy proxy/CLI bằng phiên riêng của account, không có credential đi qua daemon. Nhánh này chỉ dựng
   // NHÃN (đếm số tài khoản); cls đã do isProviderConnected quyết.
-  if (entry.group === "subscription") {
-    const accounts = Array.isArray(p.accounts) ? p.accounts.filter((a) => a.enabled !== false) : [];
+  if (entry.connection_mode === "account") {
+    const accounts = Array.isArray(p.accounts) ? p.accounts.filter((a) => a.enabled === true) : [];
     if (accounts.length) {
       return { cls, label: accounts.length > 1 ? `Đã kết nối · ${accounts.length} tài khoản` : "Đã kết nối" };
     }
@@ -109,18 +95,31 @@ function galleryStatus(entry, byKind) {
     // không phải một nhãn xanh gây hiểu nhầm.
     return { cls, label: "Chưa kết nối" };
   }
-  if (p.last_check_status === "ok") return { cls, label: "Đã kết nối" };
-  if (p.system) return { cls, label: "Sẵn sàng" };
   if (!p.credential_configured) return { cls, label: "Chưa kết nối" };
   return { cls, label: "Đã thêm" };
 }
+
+function providerMark(entry, large = false) {
+  const mark = element("span", {
+    className: `pv-logo${large ? " lg" : ""} pv-logo-${entry.kind}`,
+    attributes: {
+      "aria-hidden": "true",
+      "data-provider-mark": entry.prefix,
+      title: entry.display_name,
+    },
+    text: entry.prefix.toUpperCase(),
+  });
+  mark.style.backgroundColor = entry.theme_color;
+  return mark;
+}
+
 function card(entry, byKind, onOpen) {
   const st = galleryStatus(entry, byKind);
   return element("button", { className: "pv-card",
-    attributes: { type: "button", "aria-label": `Mở ${entry.name}` }, on: { click() { onOpen(entry.kind); } } },
-    element("span", { className: `pv-logo pv-logo-${entry.kind}`, attributes: { "aria-hidden": "true" } }),
+    attributes: { type: "button", "aria-label": `Mở ${entry.display_name}` }, on: { click() { onOpen(entry.kind); } } },
+    providerMark(entry),
     element("span", { className: "pv-meta" },
-      element("span", { className: "pv-name", text: entry.name }),
+      element("span", { className: "pv-name", text: entry.display_name }),
       element("span", { className: `pv-status ${st.cls}`, text: st.label })),
   );
 }
@@ -129,17 +128,6 @@ function group(title, entries, byKind, onOpen, extraHead = null) {
     element("div", { className: "pv-group-head" }, element("h2", { text: title }), extraHead),
     element("div", { className: "pv-grid" }, entries.map((e) => card(e, byKind, onOpen))));
 }
-// PROXY_KINDS: provider chạy qua PROXY (gọi thẳng API bằng phiên đăng nhập) thay vì CLI chính chủ.
-// Proxy nhanh/nhiều tài khoản NHƯNG mang rủi ro nhà cung cấp hạn chế/khoá tài khoản — badge phải nói
-// đúng, không bán "an toàn tuyệt đối". Hôm nay chỉ codex; claude-code/gemini-cli vẫn CLI chính chủ.
-const PROXY_KINDS = new Set(["codex"]);
-
-// safeTag là nhãn CẤP NHÓM: nhóm thuê bao giờ TRỘN (Claude chính chủ + Codex proxy) nên KHÔNG dán
-// blanket "không rủi ro" ở đây — nói trung tính, để badge chi tiết từng provider mang sự thật riêng.
-const safeTag = () => element("span", { className: "pv-safe-tag" },
-  element("span", { className: "pv-dot" }),
-  element("span", { text: "Claude chính chủ · Codex proxy" }),
-);
 // testAllButton nhận service/refresh làm tham số thay vì đóng bao (closure) — group()/renderGallery
 // giữ nguyên là hàm thuần trên tham số đầu vào, không đụng trạng thái của mount(). Promise.allSettled
 // vì một Provider lỗi (mất mạng, khoá hết hạn) không được chặn phần còn lại của lượt kiểm tra chung.
@@ -163,25 +151,45 @@ function renderGallery(entries, byKind, onOpen, headFor) {
   const sub = entries.filter((e) => e.group === "subscription");
   const api = entries.filter((e) => e.group === "apikey");
   return element("div", { className: "pv-gallery" },
-    group("Gói thuê bao", sub, byKind, onOpen, headFor(sub, byKind, true)),
-    group("API Key", api, byKind, onOpen, headFor(api, byKind, false)));
+    group("Gói thuê bao", sub, byKind, onOpen, headFor(sub, byKind)),
+    group("API Key", api, byKind, onOpen, headFor(api, byKind)));
 }
 
 function detailHead(entry, byKind) {
   const p = byKind.get(entry.kind);
   const count = p && Array.isArray(p.models) ? `${p.models.length} model` : "0 kết nối";
   return element("div", { className: "pv-detail-head" },
-    element("span", { className: `pv-logo lg pv-logo-${entry.kind}`, attributes: { "aria-hidden": "true" } }),
-    element("div", {}, element("div", { className: "pv-name", text: entry.name }),
+    providerMark(entry, true),
+    element("div", {}, element("div", { className: "pv-name", text: entry.display_name }),
       element("div", { className: "pv-sub", text: count })),
   );
 }
-const safeBadge = (kind) => (PROXY_KINDS.has(kind)
-  ? element("div", { className: "pv-risk-badge" },
-    element("span", { text: "Chạy qua PROXY — gọi thẳng API bằng phiên đăng nhập của tài khoản (như 9Router). Nhanh và"
-      + " dùng được nhiều tài khoản, NHƯNG nhà cung cấp có thể hạn chế hoặc KHOÁ tài khoản. Không phải đăng nhập chính chủ." }))
-  : element("div", { className: "pv-safe-badge" },
-    element("span", { text: "Đăng nhập chính chủ qua CLI — không giả client, không proxy, không rủi ro khoá tài khoản." })));
+function executionBadge(entry) {
+  switch (entry.execution_mode) {
+    case "proxy":
+      return element("div", { className: "pv-execution-badge pv-risk-badge" },
+        element("span", { text: "Chạy qua PROXY — có rủi ro nhà cung cấp hạn chế hoặc khoá tài khoản." }));
+    case "official_cli":
+      return element("div", { className: "pv-execution-badge pv-safe-badge" },
+        element("span", { text: "Chạy qua CLI chính chủ." }));
+    case "local":
+      return element("div", { className: "pv-execution-badge pv-safe-badge" },
+        element("span", { text: "Runtime chạy cục bộ trên máy này." }));
+    case "api":
+    default:
+      return element("div", { className: "pv-execution-badge pv-safe-badge" },
+        element("span", { text: "Gọi API chính thức bằng credential đã lưu." }));
+  }
+}
+
+function connectionBadge(entry) {
+  const label = entry.connection_mode === "account"
+    ? "Kết nối bằng tài khoản"
+    : entry.connection_mode === "credential"
+      ? "Kết nối bằng API key"
+      : "Không hỗ trợ kết nối mới";
+  return element("div", { className: "pv-connection-mode", text: label });
+}
 
 function renderConnections(entry, p, ui) {
   const accounts = Array.isArray(p?.accounts) ? p.accounts : [];
@@ -201,7 +209,7 @@ function renderConnections(entry, p, ui) {
       }),
     )));
   } else if (p && p.system) {
-    body = element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.name}).` });
+    body = element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.display_name}).` });
   } else if (ui.connectable) {
     // Connectable subscription with zero accounts (codex, first visit): point at the add button
     // instead of the generic empty copy below.
@@ -255,7 +263,8 @@ function renderDetail(entry, byKind, onBack, connUI) {
   return element("div", { className: "pv-detail" },
     element("button", { className: "pv-back", attributes: { type: "button" }, text: "Về Providers", on: { click: onBack } }),
     detailHead(entry, byKind),
-    entry.group === "subscription" ? safeBadge(entry.kind) : null,
+    executionBadge(entry),
+    connectionBadge(entry),
     renderConnections(entry, p, connUI),
     renderModels(entry, p),
   );
@@ -301,8 +310,9 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       const openDetail = (kind) => { disposeProviderConnect(); view = kind; paint(); };
       const backToGallery = () => { disposeProviderConnect(); view = "gallery"; paint(); };
 
-      const byKindFrom = (providers) => new Map(providers.map((p) => [normalizeKind(p.kind), p]));
+      const byKindFrom = (providers) => new Map(providers.map((p) => [p.kind, p]));
       let lastProviders = [];
+      let runtimeOptions = [];
       // Mặc định true để KHÔNG nháy banner trước lượt fetch đầu; refresh() ghi đè bằng giá trị thật.
       // Chỉ hiện banner khi backend nói HẲN false (thiếu trường = backend cũ = không kết luận "chưa nối").
       let hasConnectedProvider = true;
@@ -320,7 +330,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       const defaultLabel = (p) => `Tài khoản ${(p?.accounts?.length ?? 0) + 1}`;
 
       function startConnect(kind) {
-        const p = byKindFrom(lastProviders).get(normalizeKind(kind));
+        const p = byKindFrom(lastProviders).get(kind);
         if (!providerConnect || providerConnectKind !== kind) return;
         providerConnectOpen = true;
         providerConnect.start({ label: defaultLabel(p) });
@@ -363,8 +373,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
 
       // headFor đóng bao service/refresh của mount() — group-head cần gọi testSaved() và refresh()
       // thật, còn renderGallery thì không nên biết tới hai thứ đó để vẫn là hàm thuần trên tham số.
-      const headFor = (groupEntries, byKind, isSubscription) => element("span", { className: "pv-head" },
-        isSubscription ? safeTag() : null,
+      const headFor = (groupEntries, byKind) => element("span", { className: "pv-head" },
         testAllButton(groupEntries, byKind, service, refresh));
 
       // noProviderBanner cảnh báo người trực: chưa nối gì thì bot IM với khách (không có Claude mặc
@@ -380,9 +389,10 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       }
 
       function galleryNode() {
+        const visible = runtimeOptions.filter((entry) => entry.visible);
         const filtered = query
-          ? PROVIDER_CATALOG.filter((e) => e.name.toLowerCase().includes(query))
-          : PROVIDER_CATALOG;
+          ? visible.filter((entry) => `${entry.display_name} ${entry.description}`.toLowerCase().includes(query))
+          : visible;
         return renderGallery(filtered, byKindFrom(lastProviders), openDetail, headFor);
       }
 
@@ -396,9 +406,9 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       // detail thay root bằng header + renderDetail. kind lạ (đã bị xoá khỏi catalogue) rơi về gallery.
       function paint() {
         if (view !== "gallery") {
-          const entry = PROVIDER_CATALOG.find((e) => e.kind === view);
+          const entry = runtimeOptions.find((option) => option.visible && option.kind === view);
           if (entry) {
-            const connectable = entry.group === "subscription" && CONNECTABLE_KINDS.has(entry.kind);
+            const connectable = entry.connectable === true;
             if (connectable) ensureProviderConnect(entry);
             const connUI = {
               connectable,
@@ -438,12 +448,12 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         // ngược về toolbar gallery rồi mới vẽ lại detail ở paint().
         if (view === "gallery") root.replaceChildren(header(), toolbar());
         try {
-          const data = await service.list();
+          const data = normalizeProviderRuntimeResponse(await service.list());
           if (disposed || revision !== listRevision) return;
-          const providers = Array.isArray(data?.providers) ? data.providers : [];
           live.textContent = "";
-          lastProviders = providers;
-          hasConnectedProvider = data?.hasConnectedProvider !== false;
+          lastProviders = data.providers;
+          runtimeOptions = data.provider_options;
+          hasConnectedProvider = data.hasConnectedProvider;
           paint();
         } catch (error) {
           if (disposed || revision !== listRevision || error?.name === "AbortError") return;

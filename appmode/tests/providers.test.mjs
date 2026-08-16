@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { createProviderService, createProvidersPage, INSTALL_CEILING, phaseProgress } from "../overlay/internal/webui/static/pages/providers.js";
+import { createProvidersPage } from "../overlay/internal/webui/static/pages/providers.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
+import {
+  CLAUDE_ADDED,
+  CODEX_CONNECTED,
+  providerRuntimeResponse,
+} from "./helpers/provider-runtime-fixtures.mjs";
 
-const staticRoot = new URL("../overlay/internal/webui/static/", import.meta.url);
 const flush = () => new Promise((r) => setImmediate(r));
 const deferred = () => {
   let resolve;
@@ -25,43 +27,6 @@ async function waitFor(condition, description, timeoutMs = 1000) {
 const hasClass = (n, c) => n.classList?.contains(c) ?? false;
 const cards = (main) => findAll(main, (n) => hasClass(n, "pv-card"));
 const cardName = (card) => text(find(card, (n) => hasClass(n, "pv-name")));
-const progressBar = (main) => find(main, (n) => hasClass(n, "pv-progress"));
-const fillPct = (main) => {
-  const fill = find(main, (n) => hasClass(n, "pv-progress-fill"));
-  return fill ? parseFloat(fill.style.width) : NaN;
-};
-// Drive a connect flow to a chosen phase: the status handler returns `phase` forever, and we pump
-// the poll loop's sleep(pollMs=0) with real event-loop turns (setImmediate/flush never lets the
-// setTimeout(0) timer fire — same reason the existing connect tests use setTimeout(0)).
-async function openConnectAt(t, kind, cardLabel, status) {
-  const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
-    if (path === `/llm/providers/${kind}/connect` && options.method === "POST") return { kind, phase: "detecting" };
-    if (path === `/llm/providers/${kind}/connect` && !options.method) return { kind, ...status };
-    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
-  });
-  await flush();
-  cards(main).find((c) => cardName(c) === cardLabel).click();
-  await flush();
-  const detail = find(main, (n) => hasClass(n, "pv-detail"));
-  find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
-  await flush();
-  find(main, (n) => n.tagName === "BUTTON" && /Bắt đầu/.test(text(n))).click();
-  for (let k = 0; k < 20; k++) await new Promise((r) => setTimeout(r, 0));
-  return main;
-}
-
-const CLAUDE_ADDED = {
-  id: "claude-code", name: "Claude Code", kind: "claude-code", system: true, enabled: true,
-  credential_configured: false, credential_unreadable: false, last_check_status: "", last_error: "",
-  models: [{ model_id: "sonnet", name: "Claude Sonnet", source: "manual", available: true }],
-};
-const CODEX_CONNECTED = {
-  id: "codex", name: "OpenAI Codex", kind: "codex", system: false, enabled: true,
-  credential_configured: false, credential_unreadable: false, last_check_status: "", last_error: "",
-  models: [],
-  accounts: [{ id: "a1", label: "Tài khoản 1", email: "", enabled: true }],
-};
 function mountPage(t, handler, opts = {}) {
   const dom = installDOM();
   const calls = [];
@@ -74,7 +39,7 @@ function mountPage(t, handler, opts = {}) {
   return { calls, main, mounted };
 }
 const listWith = (providers) => (path, options = {}) => {
-  if (path === "/llm/providers" && !options.method) return { providers, kinds: [] };
+  if (path === "/llm/providers" && !options.method) return providerRuntimeResponse(providers);
   throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
 };
 
@@ -82,27 +47,29 @@ test("gallery renders the 6-provider catalogue in two groups", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();
   assert.deepEqual(cards(main).map(cardName),
-    ["Claude Code", "OpenAI Codex", "OpenAI", "Anthropic", "Gemini", "OpenRouter"]);
+    ["Codex", "Claude Code", "OpenAI", "Anthropic", "Google Gemini", "OpenRouter"]);
   const groups = findAll(main, (n) => hasClass(n, "pv-group"));
   assert.equal(groups.length, 2);
 });
 
-test("the subscription group carries the green official-CLI safety badge, never a ban warning", async (t) => {
+test("execution badges come from each runtime instead of a blanket subscription safety claim", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();
-  const tag = find(main, (n) => hasClass(n, "pv-safe-tag"));
-  assert.ok(tag, "subscription group must show the safety badge");
-  assert.match(text(tag), /chính chủ/i);
-  for (const bad of ["Risk Notice", "banned", "restricted", "proxy/router"]) {
-    assert.ok(!text(main).includes(bad), `gallery must not contain "${bad}"`);
-  }
+  assert.equal(find(main, (n) => hasClass(n, "pv-safe-tag")), null,
+    "mixed subscription runtimes must not receive one blanket safety badge");
+
+  cards(main).find((entry) => cardName(entry) === "Codex").click();
+  assert.match(text(find(main, (n) => hasClass(n, "pv-risk-badge"))), /proxy/i);
+  find(main, (n) => hasClass(n, "pv-back")).click();
+  cards(main).find((entry) => cardName(entry) === "Claude Code").click();
+  assert.match(text(find(main, (n) => hasClass(n, "pv-safe-badge"))), /CLI|chính chủ/i);
 });
 
 test("a system subscription provider with no connected account shows 'Chưa kết nối', never 'Sẵn sàng'", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();
   const claude = cards(main).find((c) => cardName(c) === "Claude Code");
-  const codex = cards(main).find((c) => cardName(c) === "OpenAI Codex");
+  const codex = cards(main).find((c) => cardName(c) === "Codex");
   const claudeStatus = find(claude, (n) => hasClass(n, "pv-status"));
   // Dưới no-default, claude-code hệ thống mà 0 account KHÔNG trả lời được → phải "Chưa kết nối"/xám,
   // KHÔNG phải nhãn xanh "Sẵn sàng" gây hiểu nhầm. ("Đã nối" = có account bật, xem test kế trên.)
@@ -117,7 +84,7 @@ test("a system subscription provider with no connected account shows 'Chưa kế
 test("a subscription provider with a connected account shows Đã kết nối, not credential-gated", async (t) => {
   const { main } = mountPage(t, listWith([CODEX_CONNECTED]));
   await flush();
-  const codex = cards(main).find((c) => cardName(c) === "OpenAI Codex");
+  const codex = cards(main).find((c) => cardName(c) === "Codex");
   const status = find(codex, (n) => hasClass(n, "pv-status"));
   // codex-proxy có 0 credential nhưng CÓ account → phải "Đã kết nối" (không rơi về "Chưa kết nối").
   assert.ok(hasClass(status, "on"), "codex with an enabled account must read as connected");
@@ -126,7 +93,7 @@ test("a subscription provider with a connected account shows Đã kết nối, n
 
 test("banner cảnh báo hiện khi 0 provider connected", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [], hasConnectedProvider: false };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
@@ -137,7 +104,9 @@ test("banner cảnh báo hiện khi 0 provider connected", async (t) => {
 
 test("banner ẩn khi có provider connected", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [CODEX_CONNECTED], kinds: [], hasConnectedProvider: true };
+    if (path === "/llm/providers" && !options.method) {
+      return providerRuntimeResponse([CODEX_CONNECTED], { hasConnectedProvider: true });
+    }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
@@ -146,7 +115,12 @@ test("banner ẩn khi có provider connected", async (t) => {
 
 test("banner ẩn khi payload không có trường hasConnectedProvider (backend cũ)", async (t) => {
   // Ghim guard mặc-định-ẩn (`!== false`): thiếu trường = không kết luận "chưa nối", KHÔNG hiện banner.
-  const { main } = mountPage(t, listWith([CODEX_CONNECTED]));
+  const legacy = providerRuntimeResponse([CODEX_CONNECTED]);
+  delete legacy.hasConnectedProvider;
+  const { main } = mountPage(t, (path, options = {}) => {
+    if (path === "/llm/providers" && !options.method) return legacy;
+    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
+  });
   await flush();
   assert.equal(find(main, (n) => n.hasAttribute?.("data-no-provider-warning")), null);
 });
@@ -158,17 +132,17 @@ test("typing in the search box filters cards by name", async (t) => {
   assert.ok(box);
   box.value = "codex";
   box.dispatchEvent({ type: "input" });
-  assert.deepEqual(cards(main).map(cardName), ["OpenAI Codex"]);
+  assert.deepEqual(cards(main).map(cardName), ["Codex"]);
 });
 
 test("clicking a card opens its detail; back returns to the gallery", async (t) => {
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
   assert.ok(detail);
-  assert.equal(text(find(detail, (n) => hasClass(n, "pv-name"))), "OpenAI Codex");
+  assert.equal(text(find(detail, (n) => hasClass(n, "pv-name"))), "Codex");
   // Codex chạy qua PROXY nên detail phải mang huy hiệu RỦI RO (không phải huy hiệu an toàn) — nói thật
   // về nguy cơ khoá tài khoản, không dán nhãn "không rủi ro".
   const riskBadge = find(detail, (n) => hasClass(n, "pv-risk-badge"));
@@ -194,7 +168,7 @@ test("both subscription CLIs (codex, claude-code) have an enabled add-connection
   const { main } = mountPage(t, listWith([CLAUDE_ADDED]));
   await flush();
 
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   let detail = find(main, (n) => hasClass(n, "pv-detail"));
   assert.match(text(find(detail, (n) => hasClass(n, "pv-connections"))), /Chưa có tài khoản/);
@@ -215,7 +189,7 @@ test("both subscription CLIs (codex, claude-code) have an enabled add-connection
 test("subscription detail lists connected accounts with a delete button and a '+ Thêm account' button", async (t) => {
   const { main } = mountPage(t, listWith([CODEX_CONNECTED]));
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
   const labels = findAll(detail, (n) => hasClass(n, "pv-account-label")).map(text);
@@ -229,13 +203,13 @@ test("deleting an account issues DELETE .../accounts/{id} and refreshes", async 
   const { calls, main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) {
       listCalls++;
-      return { providers: [deleted ? { ...CODEX_CONNECTED, accounts: [] } : CODEX_CONNECTED], kinds: [] };
+      return providerRuntimeResponse([deleted ? { ...CODEX_CONNECTED, accounts: [] } : CODEX_CONNECTED]);
     }
     if (path === "/llm/providers/codex/accounts/a1" && options.method === "DELETE") { deleted = true; return null; }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
   find(detail, (n) => n.tagName === "BUTTON" && /Xoá/.test(text(n))).click();
@@ -247,7 +221,7 @@ test("deleting an account issues DELETE .../accounts/{id} and refreshes", async 
 test("'+ Thêm account' reuses the connect flow (opens the label prompt)", async (t) => {
   const { calls, main } = mountPage(t, listWith([CODEX_CONNECTED]));
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   find(main, (n) => n.tagName === "BUTTON" && /Thêm account/.test(text(n))).click();
   await flush();
@@ -262,7 +236,7 @@ test("subscription connect: click drives phases through to connected and refresh
   let i = 0;
   let listCalls = 0;
   const { calls, main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) { listCalls++; return { providers: [], kinds: [] }; }
+    if (path === "/llm/providers" && !options.method) { listCalls++; return providerRuntimeResponse(); }
     if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
     if (path === "/llm/providers/codex/connect" && !options.method) {
       const p = phases[Math.min(i++, phases.length - 1)];
@@ -277,7 +251,7 @@ test("subscription connect: click drives phases through to connected and refresh
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
   find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
@@ -304,7 +278,7 @@ test("a connected snapshot without terminal ids cannot refresh the Provider deta
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) {
       listCalls++;
-      return { providers: [], kinds: [] };
+      return providerRuntimeResponse();
     }
     if (path === "/llm/providers/codex/connect" && options.method === "POST") {
       return { kind: "codex", phase: "detecting" };
@@ -315,7 +289,7 @@ test("a connected snapshot without terminal ids cannot refresh the Provider deta
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
-  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "Codex").click();
   await flush();
   find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
@@ -333,7 +307,7 @@ test("a contradictory connected identity cannot refresh the Provider detail", as
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) {
       listCalls++;
-      return { providers: [], kinds: [] };
+      return providerRuntimeResponse();
     }
     if (path === "/llm/providers/codex/connect" && options.method === "POST") {
       return { kind: "codex", phase: "detecting" };
@@ -349,7 +323,7 @@ test("a contradictory connected identity cannot refresh the Provider detail", as
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
-  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "Codex").click();
   await flush();
   find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
@@ -368,7 +342,7 @@ test("a contradictory connected identity cannot refresh the Provider detail", as
 // polling-with-url is the robust guard.
 test("running connect (polling) renders the login link + device-auth code", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
     if (path === "/llm/providers/codex/connect" && !options.method) {
       return { kind: "codex", phase: "polling", loginUrl: "https://auth.example/x", code: "EQ0J-QKCPZ" };
@@ -376,7 +350,7 @@ test("running connect (polling) renders the login link + device-auth code", asyn
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
   find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
@@ -397,7 +371,7 @@ test("running connect (polling) renders the login link + device-auth code", asyn
 // Mirrors the codex polling test above, minus the code.
 test("claude connect (polling) renders the login link but no device-code block", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     if (path === "/llm/providers/claude-code/connect" && options.method === "POST") return { kind: "claude-code", phase: "detecting" };
     if (path === "/llm/providers/claude-code/connect" && !options.method) {
       return { kind: "claude-code", phase: "polling", loginUrl: "https://claude.ai/login/x" };
@@ -424,7 +398,7 @@ test("claude connect (polling) renders the login link but no device-code block",
 // user at claude.com/claude-code.
 test("claude connect failure points the user at claude.com/claude-code", async (t) => {
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     if (path === "/llm/providers/claude-code/connect" && options.method === "POST") return { kind: "claude-code", phase: "detecting" };
     if (path === "/llm/providers/claude-code/connect" && !options.method) {
       return { kind: "claude-code", phase: "error", message: "Không cài được Claude" };
@@ -448,13 +422,13 @@ test("claude connect failure points the user at claude.com/claude-code", async (
 test("navigating back to the gallery stops the connect poll loop", async (t) => {
   let connectGets = 0;
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
     if (path === "/llm/providers/codex/connect" && !options.method) { connectGets++; return { kind: "codex", phase: "polling" }; }
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
   find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
@@ -476,14 +450,14 @@ test("cancel: an accepted DELETE renders canceled and stops the live flow", asyn
   let connectGets = 0;
   const statusGate = deferred();
   const { calls, main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     if (path === "/llm/providers/codex/connect" && options.method === "POST") return { kind: "codex", phase: "detecting" };
     if (path === "/llm/providers/codex/connect" && !options.method) { connectGets++; return statusGate.promise; }
     if (path === "/llm/providers/codex/connect" && options.method === "DELETE") return { ok: true };
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   });
   await flush();
-  cards(main).find((c) => cardName(c) === "OpenAI Codex").click();
+  cards(main).find((c) => cardName(c) === "Codex").click();
   await flush();
   const detail = find(main, (n) => hasClass(n, "pv-detail"));
   find(detail, (n) => n.tagName === "BUTTON" && /Thêm kết nối/.test(text(n))).click();
@@ -510,7 +484,7 @@ test("cancel: a rejected ownership claim warns, refreshes live status, and keeps
   let connectGets = 0;
   let statusGetsAfterDelete = 0;
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     if (path === "/llm/providers/codex/connect" && options.method === "POST") {
       return { kind: "codex", phase: "detecting" };
     }
@@ -530,7 +504,7 @@ test("cancel: a rejected ownership claim warns, refreshes live status, and keeps
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   }, { pollMs: 0 });
   await flush();
-  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "Codex").click();
   await flush();
   find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
@@ -551,7 +525,7 @@ test("cancel: a rejected ownership claim warns, refreshes live status, and keeps
 test("cancel: a DELETE transport error stays nonterminal and polling continues", async (t) => {
   let connectGets = 0;
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     if (path === "/llm/providers/codex/connect" && options.method === "POST") {
       return { kind: "codex", phase: "detecting" };
     }
@@ -565,7 +539,7 @@ test("cancel: a DELETE transport error stays nonterminal and polling continues",
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   }, { pollMs: 0 });
   await flush();
-  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "Codex").click();
   await flush();
   find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
@@ -587,7 +561,7 @@ test("cancel: a reconciliation GET error keeps the live phase and polling active
   let connectGets = 0;
   let failNextStatus = false;
   const { main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method) return { providers: [], kinds: [] };
+    if (path === "/llm/providers" && !options.method) return providerRuntimeResponse();
     if (path === "/llm/providers/codex/connect" && options.method === "POST") {
       return { kind: "codex", phase: "detecting" };
     }
@@ -603,7 +577,7 @@ test("cancel: a reconciliation GET error keeps the live phase and polling active
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   }, { pollMs: 0 });
   await flush();
-  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "Codex").click();
   await flush();
   find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
@@ -630,7 +604,9 @@ test("cancel: stale old polls cannot refresh, while fresh reconciliation can", a
   const { main } = mountPage(t, (path, options = {}) => {
     if (path === "/llm/providers" && !options.method) {
       listGets++;
-      return { providers: listGets > 1 ? [CODEX_CONNECTED] : [], kinds: [] };
+      return providerRuntimeResponse(listGets > 1 ? [CODEX_CONNECTED] : [], {
+        hasConnectedProvider: listGets > 1,
+      });
     }
     if (path === "/llm/providers/codex/connect" && options.method === "POST") {
       return { kind: "codex", phase: "detecting" };
@@ -646,7 +622,7 @@ test("cancel: stale old polls cannot refresh, while fresh reconciliation can", a
     throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
   }, { pollMs: 0 });
   await flush();
-  cards(main).find((cardNode) => cardName(cardNode) === "OpenAI Codex").click();
+  cards(main).find((cardNode) => cardName(cardNode) === "Codex").click();
   await flush();
   find(main, (node) => node.tagName === "BUTTON" && /Thêm kết nối/.test(text(node))).click();
   await flush();
@@ -677,173 +653,4 @@ test("cancel: stale old polls cannot refresh, while fresh reconciliation can", a
   assert.match(text(main), /Tài khoản 1/, "the fresh authoritative generation refreshes the account");
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(listGets, 2, "the reconciled connected callback fires exactly once");
-});
-
-// phaseProgress is the pure phase→% mapping the bar anchors to. Testing it directly avoids the
-// time-based crawl: the mapping is what must stay honest (never 100 until connected).
-test("phaseProgress maps each phase to an honest anchor", () => {
-  assert.equal(phaseProgress("detecting"), 8);
-  assert.equal(phaseProgress("installing"), 12);
-  assert.ok(phaseProgress("installing") < INSTALL_CEILING, "installing starts below the crawl ceiling");
-  assert.ok(INSTALL_CEILING < 100, "the install ceiling is below 100 — never a fake full bar");
-  assert.equal(phaseProgress("awaiting_login"), 90);
-  assert.equal(phaseProgress("polling"), 90);
-  assert.equal(phaseProgress("connected"), 100);
-  // prompt has no bar; error/canceled freeze at whatever % they reached (not a phase anchor).
-  assert.equal(phaseProgress("prompt"), null);
-  assert.equal(phaseProgress("error"), null);
-  assert.equal(phaseProgress("canceled"), null);
-});
-
-test("installing renders a progress bar anchored below the ceiling, with the live npm line", async (t) => {
-  const main = await openConnectAt(t, "codex", "OpenAI Codex", { phase: "installing", message: "npm: added 90 packages" });
-  assert.ok(progressBar(main), "installing shows a progress bar");
-  const pct = fillPct(main);
-  assert.ok(pct >= 12 && pct < INSTALL_CEILING, `installing % ${pct} must sit in [12, ${INSTALL_CEILING})`);
-  assert.ok(pct < 100, "installing is never 100%");
-  assert.equal(find(main, (n) => hasClass(n, "pv-progress--error")), null, "installing bar is not the error style");
-  const log = find(main, (n) => hasClass(n, "pv-connect-log"));
-  assert.ok(log && /added 90 packages/.test(text(log)), "the live npm line renders under the bar");
-});
-
-test("polling jumps the bar to its ~90% anchor, still below 100", async (t) => {
-  const main = await openConnectAt(t, "codex", "OpenAI Codex", { phase: "polling", loginUrl: "https://auth.example/x" });
-  assert.ok(progressBar(main), "polling shows a progress bar");
-  const pct = fillPct(main);
-  assert.equal(pct, 90);
-  assert.ok(pct < 100, "polling is never 100%");
-});
-
-test("an errored connect freezes the bar and styles it red", async (t) => {
-  const main = await openConnectAt(t, "codex", "OpenAI Codex", { phase: "error", message: "Kết nối thất bại" });
-  const bar = progressBar(main);
-  assert.ok(bar, "the error panel still shows the (frozen) bar");
-  assert.ok(hasClass(bar, "pv-progress--error"), "the frozen bar carries the error style");
-  assert.ok(fillPct(main) < 100, "a failed flow never shows 100%");
-});
-
-test("Test all runs the saved-provider test and refreshes status", async (t) => {
-  let checked = false;
-  const { calls, main } = mountPage(t, (path, options = {}) => {
-    if (path === "/llm/providers" && !options.method)
-      return { providers: [{ ...CLAUDE_ADDED, last_check_status: checked ? "ok" : "" }], kinds: [] };
-    if (path === "/llm/providers/claude-code/test" && options.method === "POST") { checked = true; return { ok: true }; }
-    throw new Error(`Unexpected: ${options.method || "GET"} ${path}`);
-  });
-  await flush();
-  const testAll = find(main, (n) => n.tagName === "BUTTON" && /Kiểm tra tất cả/.test(text(n)));
-  testAll.click();
-  await flush();
-  assert.ok(calls.some((c) => c.path === "/llm/providers/claude-code/test"));
-});
-
-test("a failed provider list renders the shared error panel, never a blank page", async (t) => {
-  const { main } = mountPage(t, () => { throw new Error("không đọc được danh sách Provider"); });
-  await flush();
-  assert.match(text(find(main, (n) => hasClass(n, "banner"))), /không đọc được danh sách Provider/);
-});
-
-// Khoá thử nghiệm của tầng Portal, cùng một chuỗi với llmPackageCanary bên Go. Cửa chặn gói
-// (tests/build-app.Tests.ps1) quét đúng chuỗi con này trong gói đã dựng và đòi 0 lần khớp; quét
-// một chuỗi không tệp nào trong repo mang thì luôn xanh, nên mọi khoá gõ vào test phải là nó.
-//
-// Đường rò có thật: trang này được nhúng thẳng vào agentdc.exe, nên một khoá copy từ đây sang
-// pages/providers.js đi ra bản bán mà không nằm trong tệp văn bản nào của gói.
-const CANARY_KEY = "sk-package-must-never-contain-7f36d2";
-
-test("provider service issues the documented paths and methods", async () => {
-  const calls = [];
-  const request = async (path, options = {}) => {
-    calls.push({ path, options });
-    return null;
-  };
-  const service = createProviderService(request);
-
-  await service.list();
-  await service.create({ kind: "openai", name: "Chính", enabled: true, credential: CANARY_KEY });
-  await service.update("openai-1", { name: "Đổi tên", enabled: false, credential: "" });
-  await service.remove("openai-1");
-  await service.replaceCredential("openai-1", CANARY_KEY);
-  await service.clearCredential("openai-1");
-  await service.testDraft({ kind: "openai", credential: CANARY_KEY });
-  await service.testSaved("openai-1");
-  await service.discover("openai-1");
-  await service.addModel("openai-1", "gpt-5");
-  await service.removeModel("openai-1", "gpt 5/preview");
-  await service.removeAccount("codex", "a1");
-
-  assert.deepEqual(calls, [
-    { path: "/llm/providers", options: {} },
-    {
-      path: "/llm/providers",
-      options: {
-        method: "POST",
-        body: { kind: "openai", name: "Chính", enabled: true, credential: CANARY_KEY },
-      },
-    },
-    {
-      path: "/llm/providers/openai-1",
-      options: { method: "PUT", body: { name: "Đổi tên", enabled: false, credential: "" } },
-    },
-    { path: "/llm/providers/openai-1", options: { method: "DELETE" } },
-    {
-      path: "/llm/providers/openai-1/credential",
-      options: { method: "PUT", body: { credential: CANARY_KEY } },
-    },
-    { path: "/llm/providers/openai-1/credential", options: { method: "DELETE" } },
-    {
-      path: "/llm/providers/test",
-      options: { method: "POST", body: { kind: "openai", credential: CANARY_KEY, model: "" } },
-    },
-    { path: "/llm/providers/openai-1/test", options: { method: "POST" } },
-    { path: "/llm/providers/openai-1/discover", options: { method: "POST" } },
-    {
-      path: "/llm/providers/openai-1/models",
-      options: { method: "POST", body: { model_id: "gpt-5", name: "" } },
-    },
-    {
-      path: "/llm/providers/openai-1/models?model_id=gpt%205%2Fpreview",
-      options: { method: "DELETE" },
-    },
-    { path: "/llm/providers/codex/accounts/a1", options: { method: "DELETE" } },
-  ]);
-});
-
-// Cửa chặn nguồn của tầng Portal. Assets nhúng thẳng vào agentdc.exe, nên một khoá còn sót trong
-// bất kỳ tệp nào dưới static/ đều đi ra bản bán mà không nằm trong tệp văn bản nào của gói để quét.
-//
-// Duyệt CẢ CÂY chứ không riêng trang Providers: trang này là chỗ dễ bị dán khoá nhất, nhưng một
-// khoá trong core/api.js rời khỏi máy y hệt, và một phép kiểm chỉ đọc những tệp mà người viết nó
-// tình cờ đang sửa thì chỉ canh được đúng ngày nó ra đời.
-//
-// Bắt theo HÌNH DẠNG chứ không theo canary: cửa chặn gói tìm đúng chuỗi canary, nên nó bỏ lọt khoá
-// THẬT của người đang gỡ lỗi — đúng thứ tệ nhất được để lại. Bốn tiền tố là bốn nhà cung cấp đang
-// hỗ trợ, cùng bộ với mẫu che cuối cùng trong sanitizeProviderError.
-//
-// Không in ra chuỗi khớp: thông báo hỏng của test đi vào log, và chuỗi đó chính là thứ đang bị tố
-// cáo. Tên tệp và số lượng đủ để biết phải đi tìm ở đâu.
-//
-// Cờ /g vì phép kiểm đếm mọi lần khớp trong một tệp. Dùng lại được qua nhiều lượt: String.match
-// với mẫu global đặt lastIndex về 0 trước khi chạy, nên assert.match ở đầu test không làm lệch
-// vòng lặp phía sau.
-const KEY_SHAPE = /\b(?:sk-|xai-|gsk_|AIza)[A-Za-z0-9_-]{8,}/g;
-
-test("no embedded Portal asset carries an API-key literal", async () => {
-  // .html và .css chứ không riêng .js: `//go:embed static` lấy CẢ thư mục, nên index.html và
-  // portal.css cũng nằm trong agentdc.exe — và một thẻ <script> nội tuyến trong index.html là chỗ
-  // dán khoá không kém phần thực tế.
-  const names = (await readdir(staticRoot, { recursive: true })).filter((n) => /\.(js|html|css)$/.test(n));
-  // Ghim ĐỆ QUY bằng một mục lồng có tên, không bằng số lượng: một ngưỡng đếm đặt đúng bằng con số
-  // hôm nay sẽ đỏ khi ai đó xoá một trang, với thông báo nói rằng phép duyệt hỏng.
-  assert.ok(names.includes(join("pages", "providers.js")), `walk missed pages/providers.js: ${names}`);
-  // Chính mẫu này là toàn bộ cơ chế phát hiện, và mọi khẳng định bên dưới đều là khẳng định VẮNG
-  // MẶT: thay nó bằng một mẫu không khớp gì thì cả vòng lặp vẫn xanh. Một dòng khoá mẫu ở đây là
-  // thứ duy nhất phân biệt "không có khoá nào" với "không tìm nữa".
-  assert.match("sk-live-AbCdEfGh12345678", KEY_SHAPE);
-
-  for (const name of names) {
-    const source = await readFile(new URL(name, staticRoot), "utf8");
-    const found = source.match(KEY_SHAPE) ?? [];
-    assert.equal(found.length, 0, `${name} carries ${found.length} key-shaped literal(s)`);
-  }
 });

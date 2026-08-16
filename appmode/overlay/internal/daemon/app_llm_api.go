@@ -20,11 +20,17 @@ import (
 // --- Provider ---
 
 func (a *api) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
-	productionAppRuntimeContext(a).handleLLMProviderList(w, nil)
+	appRuntimeContext{api: a, registry: productionAppProviderRuntimeRegistry()}.
+		handleLLMProviderList(w, nil)
 }
 
 func (ctx appRuntimeContext) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
 	a := ctx.api
+	options, err := ctx.registry.validatedManagementOptions()
+	if err != nil {
+		a.writeLLMInternal(w, "không đọc được danh mục Provider", err)
+		return
+	}
 	providers, err := a.st.LLMProviders()
 	if err != nil {
 		a.writeLLMInternal(w, "không đọc được danh sách Provider", err)
@@ -32,9 +38,9 @@ func (ctx appRuntimeContext) handleLLMProviderList(w http.ResponseWriter, _ *htt
 	}
 	out := make([]llmProviderBody, 0, len(providers))
 	for _, p := range providers {
-		body, err := a.llmProviderBody(p)
+		body, err := ctx.llmProviderBody(p)
 		if err != nil {
-			a.writeLLMInternal(w, "không đọc được model của Provider", err)
+			a.writeLLMInternal(w, "không đọc được Provider", err)
 			return
 		}
 		out = append(out, body)
@@ -43,6 +49,7 @@ func (ctx appRuntimeContext) handleLLMProviderList(w http.ResponseWriter, _ *htt
 	// router dùng để quyết bot có im hay không, nên banner nói đúng thứ khách sẽ gặp: 0 nối = im lặng.
 	a.writeJSON(w, http.StatusOK, map[string]any{
 		"providers":            out,
+		"provider_options":     options,
 		"kinds":                llmProviderKinds,
 		"hasConnectedProvider": ctx.hasAnyConnectedProvider(),
 	})

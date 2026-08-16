@@ -541,6 +541,32 @@ func (registry appProviderRuntimeRegistry) managementOptions() []appProviderMana
 	return result
 }
 
+// validatedManagementOptions rebuilds the registry through its constructor before exposing
+// management metadata over HTTP. The ordinary accessors stay fail-closed for runtime use, but
+// an HTTP response must reject a forged, incomplete, or denied registry as a whole instead of
+// silently publishing a partial catalog.
+func (registry appProviderRuntimeRegistry) validatedManagementOptions() ([]appProviderManagementOption, error) {
+	if !registry.valid || len(registry.management) == 0 || len(registry.byKind) != len(registry.management) {
+		return nil, errAppProviderRuntimeRegistry
+	}
+
+	registrations := make([]appProviderRuntimeRegistration, 0, len(registry.management))
+	for _, option := range registry.management {
+		registration, exists := registry.byKind[option.Kind]
+		if !exists || appProviderProductionDenied(option.Kind) ||
+			registration.Metadata.managementOption() != option {
+			return nil, errAppProviderRuntimeRegistry
+		}
+		registrations = append(registrations, registration)
+	}
+
+	validated, err := newAppProviderRuntimeRegistry(registry.catalog.Options(), registrations)
+	if err != nil || !slices.Equal(validated.management, registry.management) {
+		return nil, errAppProviderRuntimeRegistry
+	}
+	return slices.Clone(validated.management), nil
+}
+
 func (registry appProviderRuntimeRegistry) registration(
 	kind string,
 ) (appProviderRuntimeRegistration, bool) {
