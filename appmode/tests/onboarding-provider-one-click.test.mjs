@@ -8,6 +8,7 @@ import {
 import {
   createOnboardingPage,
 } from "../overlay/internal/webui/static/pages/onboarding.js";
+import { createProviderOffDialog } from "../overlay/internal/webui/static/components/provider-off-dialog.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
 import { onboardingStatus, pendingProvider, readyProvider } from "./helpers/onboarding-fixtures.mjs";
 
@@ -20,11 +21,13 @@ const providerRow = (root, kind) => find(root, (node) =>
 const providerToggle = (root, kind) => find(root, (node) =>
   hasClass(node, "onboarding-provider-toggle") && node.dataset.providerKind === kind);
 const installButton = (root, kind) => byClass(providerRow(root, kind), "onboarding-provider-install");
-const confirmation = (root) => find(root, (node) => node.getAttribute?.("role") === "alertdialog");
+const confirmation = () => find(document.body, (node) => node.tagName === "DIALOG"
+  && node.getAttribute?.("role") === "alertdialog");
 
 function mountWelcome(t, initialSelection = "", message = "", onListen = () => {}) {
   const dom = installDOM();
   const host = document.createElement("div");
+  document.body.append(host);
   const events = [];
   const selected = new Set(initialSelection ? [initialSelection] : []);
   const listen = (node, type, listener) => {
@@ -32,6 +35,15 @@ function mountWelcome(t, initialSelection = "", message = "", onListen = () => {
     node.addEventListener(type, listener);
     return node;
   };
+  const offDialog = createProviderOffDialog({
+    listen,
+    async onConfirm(kind) {
+      events.push({ type: "toggle", kind, enabled: false });
+      selected.delete(kind);
+      render();
+      return true;
+    },
+  });
   const render = () => host.replaceChildren(createWelcomeStage({
     state: pageStatus({
       providers: [...selected].map((kind, position) => pendingProvider(kind, position)),
@@ -41,14 +53,20 @@ function mountWelcome(t, initialSelection = "", message = "", onListen = () => {
     listen,
     onToggle(kind, enabled) {
       events.push({ type: "toggle", kind, enabled });
-      if (enabled) selected.add(kind); else selected.delete(kind);
+      if (enabled) selected.add(kind);
       render();
     },
+    onRequestOff: ({ kind, label, opener }) => offDialog.open({
+      label,
+      value: kind,
+      opener,
+      description: `Nếu tắt ${label} trước khi cài, lựa chọn này sẽ bị bỏ. Bạn vẫn muốn tắt chứ?`,
+    }),
     onInstall(kind) { events.push({ type: "install", kind }); },
     onRetry() { events.push({ type: "retry" }); },
   }));
   render();
-  t.after(() => dom.restore());
+  t.after(() => { offDialog.dispose(); dom.restore(); });
   return { host, events };
 }
 
@@ -106,6 +124,7 @@ function connectFactory() {
 function mountPage(t, options = {}) {
   const dom = installDOM();
   const host = document.createElement("div");
+  document.body.append(host);
   const page = createOnboardingPage({
     initialStatus: pageStatus(), service: pageService(),
     connectService: connectService(), ...options,
@@ -148,31 +167,35 @@ test("OFF is noninteractive outside its toggle and has no install action", (t) =
   assert.deepEqual(nestedButtons, []);
 });
 
-test("turning the current provider OFF opens a named inline confirmation", (t) => {
+test("turning the current provider OFF opens one named native modal", (t) => {
   const { host, events } = mountWelcome(t, "codex");
   const origin = providerToggle(host, "codex");
 
   origin.click();
 
-  const warning = confirmation(host);
+  const warning = confirmation();
   assert.ok(warning);
-  assert.equal(warning.getAttribute("aria-labelledby"), "onboarding-provider-confirm-title");
-  assert.equal(warning.getAttribute("aria-describedby"), "onboarding-provider-confirm-description");
-  assert.equal(warning.hasAttribute("aria-modal"), false);
-  assert.equal(text(byClass(warning, "onboarding-provider-confirm-description")),
+  assert.equal(warning.tagName, "DIALOG");
+  assert.equal(warning.open, true);
+  assert.equal(warning.getAttribute("aria-labelledby"), "provider-off-dialog-title");
+  assert.equal(warning.getAttribute("aria-describedby"), "provider-off-dialog-description");
+  assert.equal(warning.getAttribute("aria-modal"), "true");
+  assert.deepEqual(findAll(document.body, (node) => node.getAttribute?.("role") === "alertdialog"), [warning]);
+  assert.equal(text(byClass(warning, "provider-off-dialog-description")),
     "Nếu tắt Codex trước khi cài, lựa chọn này sẽ bị bỏ. Bạn vẫn muốn tắt chứ?");
-  assert.equal(document.activeElement, button(warning, "Huỷ"));
+  assert.equal(document.activeElement, button(warning, "Hủy"));
+  assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
   assert.deepEqual(events, []);
 });
 
-test("Huỷ closes confirmation, keeps selection, and restores toggle focus", (t) => {
+test("Hủy closes confirmation, keeps selection, and restores toggle focus", (t) => {
   const { host, events } = mountWelcome(t, "codex");
   const origin = providerToggle(host, "codex");
   origin.click();
 
-  button(confirmation(host), "Huỷ").click();
+  button(confirmation(), "Hủy").click();
 
-  assert.equal(confirmation(host), null);
+  assert.equal(confirmation(), null);
   assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
   assert.equal(document.activeElement, origin);
   assert.deepEqual(events, []);
@@ -183,14 +206,13 @@ test("Escape cancels confirmation and restores the originating toggle", (t) => {
   const origin = providerToggle(host, "codex");
   origin.click();
 
-  const warning = confirmation(host);
-  const cancel = button(warning, "Huỷ");
+  const warning = confirmation();
+  const cancel = button(warning, "Hủy");
   assert.equal(document.activeElement, cancel);
-  const event = { type: "keydown", key: "Escape", bubbles: true };
-  cancel.dispatchEvent(event);
+  const accepted = warning.cancel();
 
-  assert.equal(event.defaultPrevented, true);
-  assert.equal(confirmation(host), null);
+  assert.equal(accepted, false);
+  assert.equal(confirmation(), null);
   assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
   assert.equal(document.activeElement, origin);
   assert.deepEqual(events, []);
@@ -201,30 +223,31 @@ test("repeated confirmation cancellation retains a bounded listener set", (t) =>
   const { host } = mountWelcome(t, "codex", "", () => { bindings++; });
   const origin = providerToggle(host, "codex");
   origin.click();
-  button(confirmation(host), "Huỷ").click();
+  button(confirmation(), "Hủy").click();
   const stableBindings = bindings;
 
   for (let cycle = 0; cycle < 5; cycle++) {
     origin.click();
-    button(confirmation(host), "Huỷ").click();
+    button(confirmation(), "Hủy").click();
   }
 
   assert.equal(bindings, stableBindings);
 });
 
-test("Vẫn tắt applies OFF only after confirmation", (t) => {
+test("Vẫn tắt applies OFF only after authoritative confirmation", async (t) => {
   const { host, events } = mountWelcome(t, "codex");
   providerToggle(host, "codex").click();
 
-  button(confirmation(host), "Vẫn tắt").click();
+  button(confirmation(), "Vẫn tắt").click();
+  await settle();
 
   assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "false");
   assert.equal(installButton(host, "codex"), null);
   assert.deepEqual(events, [{ type: "toggle", kind: "codex", enabled: false }]);
 });
 
-test("confirmation disables every background toggle and install action", (t) => {
-  const { host } = mountWelcome(t, "codex");
+test("native modal makes every background toggle and install action inert", (t) => {
+  const { host, events } = mountWelcome(t, "codex");
   providerToggle(host, "codex").click();
 
   const controls = [
@@ -232,23 +255,25 @@ test("confirmation disables every background toggle and install action", (t) => 
     ...findAll(host, (node) => hasClass(node, "onboarding-provider-install")),
   ];
   assert.ok(controls.length > 0);
-  assert.ok(controls.every((control) => control.disabled));
-  assert.equal(button(confirmation(host), "Huỷ").disabled, false);
-  assert.equal(button(confirmation(host), "Vẫn tắt").disabled, false);
+  controls.forEach((control) => control.click());
+  assert.deepEqual(events, []);
+  assert.equal(document.activeModalDialog, confirmation());
+  assert.equal(button(confirmation(), "Hủy").disabled, false);
+  assert.equal(button(confirmation(), "Vẫn tắt").disabled, false);
 });
 
-test("confirmation locks Retry until cancellation", (t) => {
+test("native modal makes Retry inert until cancellation", (t) => {
   const { host, events } = mountWelcome(t, "codex", "Không thể kết nối");
   const retry = button(host, "Thử lại");
   assert.equal(retry.disabled, false);
 
   providerToggle(host, "codex").click();
 
-  assert.equal(retry.disabled, true);
+  assert.equal(retry.disabled, false);
   retry.click();
   assert.deepEqual(events, []);
 
-  button(confirmation(host), "Huỷ").click();
+  button(confirmation(), "Hủy").click();
   assert.equal(retry.disabled, false);
   retry.click();
   assert.deepEqual(events, [{ type: "retry" }]);
@@ -328,20 +353,63 @@ test("pending OFF confirms accessibly while ready rows stay locked ON", async (t
   const origin = providerToggle(host, "claude-code");
   origin.click();
   assert.equal(calls.length, 0);
-  assert.ok(confirmation(host));
-  assert.equal(document.activeElement, button(confirmation(host), "Huỷ"));
-  confirmation(host).dispatchEvent({ type: "keydown", key: "Escape", bubbles: true });
-  assert.equal(confirmation(host), null);
+  assert.ok(confirmation());
+  assert.equal(document.activeElement, button(confirmation(), "Hủy"));
+  confirmation().cancel();
+  assert.equal(confirmation(), null);
   assert.equal(document.activeElement, origin);
   assert.equal(origin.getAttribute("aria-pressed"), "true");
 
   origin.click();
-  button(confirmation(host), "Vẫn tắt").click();
+  const activeDialog = confirmation();
+  button(activeDialog, "Vẫn tắt").click();
+  assert.equal(confirmation(), activeDialog);
   await settle();
   assert.deepEqual(calls.map(({ kinds, revision }) => ({ kinds, revision })), [
     { kinds: ["codex"], revision: 31 },
   ]);
   assert.equal(providerToggle(host, "claude-code"), null);
+});
+
+test("failed OFF reconciliation stays in the same modal and Retry remains one-flight", async (t) => {
+  const retained = pendingProvider("codex", 0);
+  let mutations = 0;
+  let loads = 0;
+  const { host } = mountPage(t, {
+    initialStatus: pageStatus({ revision: 71, providers: [retained] }),
+    service: pageService({
+      updateProviders(kinds, revision) {
+        mutations += 1;
+        assert.deepEqual({ kinds, revision }, { kinds: [], revision: 71 });
+        if (mutations === 1) return Promise.reject(new Error("private mutation detail"));
+        return Promise.resolve(pageStatus({ revision: 72, providers: [] }));
+      },
+      status() {
+        loads += 1;
+        return Promise.reject(new Error("private reconciliation detail"));
+      },
+    }),
+  });
+
+  providerToggle(host, "codex").click();
+  const modal = confirmation();
+  button(modal, "Vẫn tắt").click();
+  button(modal, "Vẫn tắt").click();
+  await settle();
+
+  assert.equal(mutations, 1);
+  assert.equal(loads, 1);
+  assert.equal(confirmation(), modal);
+  assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "true");
+  assert.doesNotMatch(text(modal), /private mutation detail|private reconciliation detail/u);
+  assert.match(text(modal), /Chưa thể tắt provider/u);
+
+  button(modal, "Thử lại").click();
+  button(modal, "Thử lại").click();
+  await settle();
+  assert.equal(mutations, 2);
+  assert.equal(confirmation(), null);
+  assert.equal(providerToggle(host, "codex").getAttribute("aria-pressed"), "false");
 });
 
 test("provider mutation is one-flight and disposal aborts its late response", async (t) => {

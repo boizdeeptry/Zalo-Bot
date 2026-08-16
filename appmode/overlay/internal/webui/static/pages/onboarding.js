@@ -1,4 +1,5 @@
 import { createProviderConnect } from "../components/provider-connect.js";
+import { createProviderOffDialog } from "../components/provider-off-dialog.js";
 import { element } from "../core/ui.js";
 import { createProviderService } from "./providers.js";
 import {
@@ -33,6 +34,7 @@ export function createOnboardingPage({
   let setupInFlight = null, doneView = null;
   let disposed = false, generation = 0, connectKey = "", agentName = "";
   let providerBusy = false, bootstrapBusy = false, bootstrapAttempted = false, handoffDone = false;
+  let providerOffDialog = null;
   const listeners = new Set();
   function listen(node, type, listener) {
     node.addEventListener(type, listener); listeners.add({ node, type, listener });
@@ -41,6 +43,18 @@ export function createOnboardingPage({
   function clearListeners() {
     for (const binding of listeners) binding.node.removeEventListener(binding.type, binding.listener);
     listeners.clear();
+  }
+  function providerOffController() {
+    if (providerOffDialog) return providerOffDialog;
+    const dialogListen = (node, type, listener) => {
+      node.addEventListener(type, listener);
+      return node;
+    };
+    providerOffDialog = createProviderOffDialog({
+      listen: dialogListen,
+      onConfirm: ({ kind }, signal) => updateProviderSet(kind, false, { preserveView: true, signal }),
+    });
+    return providerOffDialog;
   }
   function abortActive() { activeController?.abort(); activeController = null; }
   function invalidate() {
@@ -83,11 +97,17 @@ export function createOnboardingPage({
     shell("provider", createWelcomeStage({
       state, message, busy: providerBusy, listen,
       onToggle: (kind, enabled) => { void updateProviderSet(kind, enabled); },
+      onRequestOff: ({ kind, label, opener }) => providerOffController().open({
+        label,
+        value: { kind },
+        opener,
+        description: `Nếu tắt ${label} trước khi cài, lựa chọn này sẽ bị bỏ. Bạn vẫn muốn tắt chứ?`,
+      }),
       onInstall: (kind) => { void beginProviderInstall(kind); },
       onRetry: refreshStatus,
     }));
   }
-  async function updateProviderSet(kind, enabled) {
+  async function updateProviderSet(kind, enabled, { preserveView = false, signal } = {}) {
     const snapshot = normalizeStatus(state);
     if (providerBusy || snapshot?.phase !== "provider") return false;
     const current = snapshot.providers.map((stage) => stage.kind);
@@ -97,7 +117,10 @@ export function createOnboardingPage({
     agentName = "";
     providerBusy = true;
     const { run, controller } = beginOperation();
-    renderWelcome();
+    const abort = () => controller.abort();
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    if (!preserveView) renderWelcome();
     try {
       const result = await persistProviderSetWithReconciliation({
         state: snapshot, selectedKinds, signal: controller.signal,
@@ -113,9 +136,10 @@ export function createOnboardingPage({
     } catch (error) {
       if (!owns(run) || error?.name === "AbortError") return false;
       providerBusy = false;
-      renderSafeError();
+      if (!preserveView) renderSafeError();
       return false;
     } finally {
+      signal?.removeEventListener("abort", abort);
       releaseOperation(run, controller);
     }
   }
@@ -560,6 +584,8 @@ export function createOnboardingPage({
     agentName = "";
     providerBusy = false;
     bootstrapBusy = false;
+    providerOffDialog?.dispose();
+    providerOffDialog = null;
     invalidate();
     clearListeners();
     disposeConnect();

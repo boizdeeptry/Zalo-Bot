@@ -21,6 +21,12 @@ class TestNode {
     return this.children[0] ?? null;
   }
 
+  get isConnected() {
+    let node = this;
+    while (node?.parentNode) node = node.parentNode;
+    return node?.nodeType === 9;
+  }
+
   get textContent() {
     return this.childNodes.map((child) => child.textContent).join("");
   }
@@ -52,6 +58,11 @@ class TestNode {
     const index = siblings.indexOf(this);
     if (index !== -1) siblings.splice(index, 1);
     this.parentNode = null;
+  }
+
+  contains(node) {
+    if (node === this) return true;
+    return this.childNodes.some((child) => child.contains?.(node));
   }
 
   #appendValue(value) {
@@ -262,7 +273,10 @@ class TestElement extends TestNode {
   }
 
   click() {
-    if (!this.disabled) this.dispatchEvent({ type: "click" });
+    const modal = this.ownerDocument?.activeModalDialog;
+    if (!this.disabled && (!modal || modal.contains(this))) {
+      this.dispatchEvent({ type: "click" });
+    }
   }
 
   // Một nút disabled KHÔNG nhận được focus trong trình duyệt thật, y như nó không nhận click.
@@ -270,7 +284,53 @@ class TestElement extends TestNode {
   // con trỏ rơi về <body> — tức là một trạng thái bất khả thi vẫn qua được bài kiểm.
   focus() {
     if (this.disabled) return;
+    const modal = this.ownerDocument?.activeModalDialog;
+    if (modal && !modal.contains(this)) return;
     if (this.ownerDocument) this.ownerDocument.activeElement = this;
+  }
+}
+
+class TestDialogElement extends TestElement {
+  constructor(ownerDocument) {
+    super("dialog", ownerDocument);
+    this.returnValue = "";
+  }
+
+  get open() {
+    return this.hasAttribute("open");
+  }
+
+  set open(value) {
+    if (value) this.setAttribute("open", "");
+    else this.removeAttribute("open");
+  }
+
+  showModal() {
+    if (!this.isConnected) throw new Error("Dialog must be connected before showModal");
+    if (this.open) {
+      if (this.ownerDocument.modalDialogs.includes(this)) return;
+      throw new Error("A non-modal open dialog cannot be shown modally");
+    }
+    this.open = true;
+    this.ownerDocument.modalDialogs.push(this);
+    this.ownerDocument.activeModalDialog = this;
+  }
+
+  close(returnValue = "") {
+    if (!this.open) return;
+    this.returnValue = String(returnValue);
+    this.open = false;
+    const modalIndex = this.ownerDocument.modalDialogs.indexOf(this);
+    if (modalIndex !== -1) this.ownerDocument.modalDialogs.splice(modalIndex, 1);
+    this.ownerDocument.activeModalDialog = this.ownerDocument.modalDialogs.at(-1) ?? null;
+    this.dispatchEvent({ type: "close" });
+  }
+
+  cancel() {
+    if (!this.open) return false;
+    const accepted = this.dispatchEvent({ type: "cancel", cancelable: true });
+    if (accepted) this.close();
+    return accepted;
   }
 }
 
@@ -287,11 +347,14 @@ class TestDocument extends TestNode {
     this.nodeType = 9;
     this.ownerDocument = this;
     this.activeElement = null;
+    this.modalDialogs = [];
+    this.activeModalDialog = null;
     this.body = this.createElement("body");
     this.append(this.body);
   }
 
   createElement(tagName) {
+    if (String(tagName).toLowerCase() === "dialog") return new TestDialogElement(this);
     return new TestElement(tagName, this);
   }
 
@@ -353,4 +416,4 @@ export function installDOM() {
   return Object.freeze({ restore });
 }
 
-export { TestDocumentFragment, TestElement, TestNode, TestText };
+export { TestDialogElement, TestDocumentFragment, TestElement, TestNode, TestText };

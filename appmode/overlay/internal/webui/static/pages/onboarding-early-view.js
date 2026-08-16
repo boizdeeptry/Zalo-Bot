@@ -61,8 +61,6 @@ export function renderOnboardingShell(root, _phase, content) {
     {
       className: "onboarding-dialog",
       attributes: {
-        role: "dialog",
-        "aria-modal": "true",
         "aria-labelledby": "onboarding-dialog-title",
         tabindex: "-1",
       },
@@ -259,12 +257,12 @@ export function createWelcomeStage({
   busy = false,
   listen,
   onToggle,
+  onRequestOff = () => false,
   onInstall,
   onRetry,
 }) {
-  let locked = busy, confirmationOpen = false, confirmationOrigin = null, confirmationKind = "";
+  let locked = busy;
   let retry = null;
-  const confirmationHost = element("div");
   const rowViews = [];
   const stages = new Map(state.providers.map((stage) => [stage.kind, stage]));
   const providerControls = () => [
@@ -276,60 +274,20 @@ export function createWelcomeStage({
       control.disabled = disabled || control.dataset.locked === "true";
     }
   };
-  const dismissConfirmation = (restoreFocus = true) => {
-    const origin = confirmationOrigin;
-    confirmationOpen = false;
-    confirmationOrigin = null;
-    confirmationHost.replaceChildren();
-    disableProviderControls(locked);
-    if (restoreFocus) origin?.focus({ preventScroll: true });
-  };
   const run = (action) => {
-    if (locked || confirmationOpen) return;
+    if (locked) return;
     locked = true;
     disableProviderControls(true);
     action();
   };
-  const cancel = actionButton("Huỷ");
-  const confirm = actionButton("Vẫn tắt", true);
-  const confirmationDescription = element("p", {
-    className: "onboarding-provider-confirm-description",
-    attributes: { id: "onboarding-provider-confirm-description" },
-  });
-  const confirmationNode = element("section", {
-    className: "onboarding-provider-confirm",
-    attributes: {
-      role: "alertdialog", "aria-labelledby": "onboarding-provider-confirm-title",
-      "aria-describedby": "onboarding-provider-confirm-description",
-    },
-  }, element("h2", {
-    attributes: { id: "onboarding-provider-confirm-title" }, text: "Xác nhận tắt provider",
-  }), confirmationDescription, element("div", { className: "onboarding-actions" }, cancel, confirm));
-  listen(cancel, "click", () => dismissConfirmation());
-  listen(confirm, "click", () => {
-    const kind = confirmationKind;
-    dismissConfirmation(false);
-    run(() => onToggle(kind, false));
-  });
-  listen(confirmationNode, "keydown", (event) => {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    dismissConfirmation();
-  });
-  const showConfirmation = (kind, origin) => {
-    if (confirmationOpen || locked) return;
-    confirmationOpen = true;
-    confirmationOrigin = origin;
-    confirmationKind = kind;
-    confirmationDescription.textContent = `Nếu tắt ${providerName(kind, state.provider_options)} trước khi cài, lựa chọn này sẽ bị bỏ. Bạn vẫn muốn tắt chứ?`;
-    confirmationHost.replaceChildren(confirmationNode);
-    disableProviderControls(true);
-    cancel.focus({ preventScroll: true });
-  };
   const toggleProvider = (kind, origin) => {
     const stage = stages.get(kind);
     if (stage?.status === "ready") return;
-    if (stage) showConfirmation(kind, origin);
+    if (stage) onRequestOff({
+      kind,
+      label: providerName(kind, state.provider_options),
+      opener: origin,
+    });
     else run(() => onToggle(kind, true));
   };
   for (const option of state.provider_options) {
@@ -362,7 +320,6 @@ export function createWelcomeStage({
         : "Bật một hoặc nhiều provider bên dưới để chuẩn bị kết nối.",
     }),
     element("div", { className: "onboarding-provider-grid onboarding-agent-list" }, cards),
-    confirmationHost,
     element("p", {
       className: "onboarding-provider-warning",
       text: "Bạn cần đăng nhập. Sau khi kết nối được xác minh, hệ thống tự động chuyển sang “Đang chuẩn bị trợ lý…”. Cấu hình đang dùng chỉ thay đổi khi quá trình hoàn thành an toàn.",

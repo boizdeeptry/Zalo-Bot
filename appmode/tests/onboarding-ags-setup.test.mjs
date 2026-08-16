@@ -14,24 +14,24 @@ const providerCard = (root, kind) => find(root, (node) => hasClass(node, "onboar
 const providerToggle = (root, kind) => find(root, (node) => hasClass(node, "onboarding-provider-toggle")
   && node.dataset.providerKind === kind);
 
-function assertModalFrame(host) {
+function assertFullPageFrame(host) {
   const dashboards = findAll(host, (node) => hasClass(node, "onboarding-dashboard"));
   const dialogs = findAll(host, (node) => node.getAttribute?.("role") === "dialog");
   assert.equal(dashboards.length, 1);
-  assert.equal(dialogs.length, 1);
+  assert.equal(dialogs.length, 0);
   const [dashboard] = dashboards;
-  const [dialog] = dialogs;
-  assert.ok(hasClass(dialog, "onboarding-dialog"));
+  const card = byClass(host, "onboarding-dialog");
+  assert.ok(card);
   assert.equal(dashboard.getAttribute("aria-hidden"), "true");
   const decorativeElements = findAll(dashboard, (node) => Boolean(node.tagName));
   assert.ok(decorativeElements.every((node) => ["DIV", "SPAN"].includes(node.tagName)));
-  assert.equal(dialog.getAttribute("aria-modal"), "true");
-  assert.equal(dialog.getAttribute("aria-labelledby"), "onboarding-dialog-title");
-  assert.equal(document.activeElement, dialog);
-  const dismissers = findAll(dialog, (node) => node.tagName === "BUTTON"
+  assert.equal(card.getAttribute("aria-modal"), null);
+  assert.equal(card.getAttribute("aria-labelledby"), "onboarding-dialog-title");
+  assert.equal(document.activeElement, card);
+  const dismissers = findAll(card, (node) => node.tagName === "BUTTON"
     && /đóng|bỏ qua|close|skip/iu.test(`${text(node)} ${node.getAttribute("aria-label") ?? ""}`));
   assert.equal(dismissers.length, 0);
-  return { dashboard, dialog };
+  return { dashboard, card };
 }
 
 function providerStatus(overrides = {}) {
@@ -112,11 +112,11 @@ function mount(t, options = {}) {
   return { host, page };
 }
 
-test("provider phase uses a Tư Vấn Zalo modal over the retained grid canvas", (t) => {
+test("provider phase uses a non-modal Tư Vấn Zalo card over the retained grid canvas", (t) => {
   const { host } = mount(t, {
     initialStatus: providerStatus({ suggested_provider_kind: "codex" }),
   });
-  const { dialog } = assertModalFrame(host);
+  const { card } = assertFullPageFrame(host);
   const dashboard = byClass(host, "onboarding-dashboard");
   assert.match(text(dashboard), /0\/2.*chưa thiết lập.*Chưa dùng:.*Claude Code, Codex/su);
   assert.doesNotMatch(text(dashboard), /2\/2.*sẵn sàng/su);
@@ -142,20 +142,20 @@ test("provider phase uses a Tư Vấn Zalo modal over the retained grid canvas",
   const switches = findAll(host, (node) => hasClass(node, "onboarding-agent-switch"));
   assert.equal(switches.length, 2);
   assert.equal(switches.filter((node) => hasClass(node, "is-on")).length, 0);
-  dialog.dispatchEvent({ type: "keydown", key: "Escape" });
+  card.dispatchEvent({ type: "keydown", key: "Escape" });
   byClass(host, "onboarding-backdrop").click();
-  assert.equal(find(host, (node) => node.getAttribute?.("role") === "dialog"), dialog);
+  assert.equal(byClass(host, "onboarding-dialog"), card);
   providerCard(host, "claude-code").click();
   assert.equal(find(host, (node) => node.getAttribute?.("role") === "alertdialog"), null);
 });
 
-test("connect phase stays inside the same Tư Vấn Zalo modal", (t) => {
+test("connect phase stays inside the same Tư Vấn Zalo card", (t) => {
   const instances = [];
   const { host } = mount(t, {
     initialStatus: connectStatus({ revision: 6, provider_kind: "claude-code" }),
     connectFactory: connectFactory(instances),
   });
-  assertModalFrame(host);
+  assertFullPageFrame(host);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
   assert.match(text(host), /Tư Vấn Zalo/u);
   assert.match(text(host), /Đang kết nối/u);
@@ -174,7 +174,7 @@ test("connect phase stays inside the same Tư Vấn Zalo modal", (t) => {
   }]);
 });
 
-test("setup phase stays in the Tư Vấn Zalo modal before Persona starts", async (t) => {
+test("setup phase stays in the Tư Vấn Zalo card before automatic bootstrap", async (t) => {
   const pending = new Promise(() => {});
   let setups = 0;
   const { host } = mount(t, {
@@ -191,7 +191,7 @@ test("setup phase stays in the Tư Vấn Zalo modal before Persona starts", asyn
   });
   await flush();
   assert.equal(setups, 1);
-  assertModalFrame(host);
+  assertFullPageFrame(host);
   assert.ok(byClass(host, "onboarding-agent-setup-stage"));
   assert.match(text(host), /Tư Vấn Zalo/u);
   assert.match(text(host), /Hàng đợi thiết lập/u);
@@ -203,6 +203,7 @@ test("onboarding UI source does not mention the reference product", async () => 
     "../overlay/internal/webui/static/app-main.js",
     "../overlay/internal/webui/static/components/persona-fields.js",
     "../overlay/internal/webui/static/components/provider-connect.js",
+    "../overlay/internal/webui/static/components/provider-off-dialog.js",
     "../overlay/internal/webui/static/pages/onboarding.js",
     "../overlay/internal/webui/static/pages/onboarding-bootstrap.js",
     "../overlay/internal/webui/static/pages/onboarding-contract.js",

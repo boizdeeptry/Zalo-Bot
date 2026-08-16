@@ -151,6 +151,42 @@
 [data-combos-modal] .cnew-model .cchip { border:1px solid #2f2f36; border-radius:999px; padding:3px 10px; font-size:11.5px; background:#1c1c20; color:var(--ink); }
 [data-combos-modal] .cnew .none { padding:12px; color:var(--dim); font-style:italic; font-size:12px; border:1px dashed var(--line); border-radius:9px; text-align:center; }
 
+.provider-off-dialog {
+  --provider-off-focus:#54d9f4;
+  box-sizing:border-box; width:min(420px, calc(100vw - 32px)); max-width:calc(100vw - 32px);
+  max-height:calc(100dvh - 32px); margin:auto; overflow:auto; border:1px solid var(--line,#313647);
+  border-radius:12px; padding:18px; color:var(--ink,#ededee); background:var(--panel,#141a2e);
+  box-shadow:0 28px 90px rgba(0,0,0,.68); font:13px/1.55 "Cascadia Mono",SFMono-Regular,Consolas,monospace;
+}
+.provider-off-dialog::backdrop { background:rgba(5,8,16,.76); }
+.provider-off-dialog h2 { margin:0 0 8px; color:inherit; font-size:16px; }
+.provider-off-dialog .provider-off-dialog-description { margin:0; color:var(--dim,#a8acb8); overflow-wrap:anywhere; }
+.provider-off-dialog .provider-off-dialog-status,
+.provider-off-dialog .provider-off-dialog-error { min-height:20px; margin:12px 0 0; overflow-wrap:anywhere; }
+.provider-off-dialog .provider-off-dialog-status { color:var(--dim,#a8acb8); }
+.provider-off-dialog .provider-off-dialog-error { color:#f0a8a8; }
+.provider-off-dialog .provider-off-dialog-actions {
+  display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; margin-top:16px;
+}
+.provider-off-dialog .provider-off-dialog-button {
+  min-height:36px; border:1px solid var(--line,#313647); border-radius:8px; padding:7px 12px;
+  color:var(--ink,#ededee); background:var(--sunk,#101628); font:inherit; cursor:pointer;
+}
+.provider-off-dialog .provider-off-dialog-confirm { border-color:#9d4f59; color:#ffd8dc; background:#44232a; }
+.provider-off-dialog .provider-off-dialog-button:disabled { opacity:.5; cursor:default; }
+.provider-off-dialog .provider-off-dialog-button:focus-visible {
+  outline:2px solid var(--provider-off-focus); outline-offset:3px;
+}
+.provider-off-dialog [hidden] { display:none; }
+
+@media (max-width: 420px) {
+  .provider-off-dialog {
+    width:calc(100vw - 16px); max-width:calc(100vw - 16px); max-height:calc(100dvh - 16px); padding:14px;
+  }
+  .provider-off-dialog .provider-off-dialog-actions { align-items:stretch; flex-direction:column; }
+  .provider-off-dialog .provider-off-dialog-button { width:100%; }
+}
+
 /* providers:begin — Providers gallery + detail (Task 1–6). Nền tối kiểu 9Router: card #161618,
    viền #26262b, accent xanh #34d399 thay cho banner đỏ "may be banned" của bản gốc.
 
@@ -698,21 +734,9 @@
 .onboarding-shell .onboarding-provider-toggle:disabled,
 .onboarding-shell .onboarding-provider-install:disabled { opacity:.45; cursor:default; }
 .onboarding-shell .onboarding-provider-toggle:focus-visible,
-.onboarding-shell .onboarding-provider-install:focus-visible,
-.onboarding-shell .onboarding-provider-confirm .onboarding-button:focus-visible {
+.onboarding-shell .onboarding-provider-install:focus-visible {
   outline:2px solid var(--onboarding-cyan); outline-offset:3px;
 }
-.onboarding-shell .onboarding-provider-confirm {
-  box-sizing:border-box; width:min(360px,100%); max-width:100%; margin:12px auto 0;
-  border:1px solid var(--onboarding-border); border-radius:9px; padding:12px; background:#151b30;
-}
-.onboarding-shell .onboarding-provider-confirm h2 {
-  margin:0 0 7px; color:var(--onboarding-text); font-size:13px;
-}
-.onboarding-shell .onboarding-provider-confirm-description {
-  margin:0; color:var(--onboarding-muted); font-size:11px;
-}
-.onboarding-shell .onboarding-provider-confirm .onboarding-actions { margin-top:11px; }
 .onboarding-shell .onboarding-connect-provider-row {
   margin:0; padding:10px 18px; border-top:1px solid var(--onboarding-divider);
   border-bottom:1px solid var(--onboarding-divider); background:rgba(84,217,244,.035);
@@ -857,7 +881,6 @@
   .onboarding-shell .onboarding-agent-row-main { min-width:0; overflow-wrap:anywhere; }
   .onboarding-shell .onboarding-agent-row-tail { flex-shrink:0; gap:6px; }
   .onboarding-shell .onboarding-agent-badge { font-size:11px; }
-  .onboarding-shell .onboarding-provider-confirm { width:100%; }
   .onboarding-shell .onboarding-persona-form > div,
   .onboarding-shell .onboarding-chat-form,
   .onboarding-shell .pv-connect-prompt { grid-template-columns:1fr; }

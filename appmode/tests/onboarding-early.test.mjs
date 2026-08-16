@@ -510,7 +510,9 @@ test("Setup Retry renders an authoritative non-Setup phase without stale POST", 
       assert.ok(byClass(host, className));
       assert.equal(text(find(host, (node) => node.tagName === "H1")), heading);
       const dialog = byClass(host, "onboarding-dialog");
-      assert.equal(dialog?.getAttribute("aria-modal"), "true");
+      assert.equal(dialog?.getAttribute("role"), null);
+      assert.equal(dialog?.getAttribute("aria-modal"), null);
+      assert.equal(find(host, (node) => node.getAttribute?.("role") === "dialog"), null);
       assert.ok(byClass(host, "onboarding-dashboard"));
     });
   }

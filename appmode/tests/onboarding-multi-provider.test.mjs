@@ -36,6 +36,9 @@ const row = (root, kind) => find(root, (node) => hasClass(node, "onboarding-prov
   && node.dataset.providerKind === kind);
 const toggle = (root, kind) => find(row(root, kind), (node) => hasClass(node, "onboarding-provider-toggle"));
 const install = (root, kind) => find(row(root, kind), (node) => hasClass(node, "onboarding-provider-install"));
+const button = (root, label) => find(root, (node) => node.tagName === "BUTTON" && text(node).includes(label));
+const offDialog = () => find(document.body, (node) => node.tagName === "DIALOG"
+  && node.getAttribute?.("role") === "alertdialog");
 const never = () => new Promise(() => {});
 
 function pageService(overrides = {}) {
@@ -74,6 +77,7 @@ function pageConnectFactory() {
 function mountPage(t, initialStatus, service, connectFactory = pageConnectFactory()) {
   const dom = installDOM();
   const host = document.createElement("div");
+  document.body.append(host);
   const page = createOnboardingPage({ initialStatus, service, connectFactory, connectService: {} });
   page.mount(host);
   t.after(() => { page.dispose(); dom.restore(); });
@@ -254,6 +258,16 @@ test("keeps two providers on and installs only the clicked pending row", async (
   assert.equal(toggle(host, "claude-code").getAttribute("aria-pressed"), "true");
   assert.equal(install(host, "codex").getAttribute("aria-label"), "Cài Codex");
   assert.equal(install(host, "claude-code").getAttribute("aria-label"), "Cài Claude Code");
+
+  const codexToggle = toggle(host, "codex");
+  codexToggle.click();
+  assert.equal(mutations.length, 2, "OFF must not mutate before confirmation");
+  assert.equal(toggle(host, "codex").getAttribute("aria-pressed"), "true");
+  assert.equal(toggle(host, "claude-code").getAttribute("aria-pressed"), "true");
+  assert.equal(offDialog()?.open, true);
+  button(offDialog(), "Hủy").click();
+  assert.equal(offDialog(), null);
+  assert.equal(document.activeElement, codexToggle);
 
   const cta = install(host, "claude-code");
   cta.click(); cta.click(); page.mount(host); cta.click();
