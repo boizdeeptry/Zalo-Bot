@@ -16,7 +16,7 @@ Go bo = xoa thu muc.
 
 Sau khoang 4 giay, Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.
 Day la trang quan ly, khong phai trang Zalo. Lan chay dau chua co Provider,
-Combo hay route; hay lam phan THIET LAP BOT ben duoi truoc khi ket noi Zalo.
+hay route; hay lam phan THIET LAP BOT ben duoi truoc khi ket noi Zalo.
 
   Dung lai:  nhan doi "Stop.bat"
 
@@ -30,24 +30,18 @@ thi mo http://127.0.0.1:8770/
 
 Lam theo DUNG thu tu nay trong Portal:
 
-  1. Mo trang Providers. Bam Connect cho Claude Code hoac Codex.
+  1. Chon Provider. Bat ON roi bam Connect hoac Bam de cai tren dung dong do.
+     Co the bat nhieu Provider; Portal cai tung dong va bao dong nao dang cho.
 
-     Nut Connect tu dong cai Claude duoc quan ly neu can; khong can cai Claude
-     global thu cong. Lam tiep cac buoc dang nhap ma Portal hien ra.
+  2. Khi Provider cuoi cung san sang, Portal tu hien "Dang chuan bi tro ly" va tu hoan tat.
+     Khong co buoc Persona, Test Chat hay Complete de bam.
 
-     Provider API dung endpoint/API key hien chua co trong Portal (Sap co).
-     Khong nhap endpoint, key hay model API o man hinh khac.
+  3. Khi Portal bao "San sang", vao Portal de quan ly hoac mo trang Zalo de ket
+     noi bang ma QR.
 
-     Lenh claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
-
-  2. Mo trang Combos. Chon model, tao hoac sua Combo, them Provider/model can
-     dung, sau do kich hoat Combo de tao route dang hoat dong.
-
-  3. Mo trang Zalo. Bam Ket noi, roi quet ma QR bang dien thoai.
-
-Khong co Provider da ket noi va route dang hoat dong, bot co y im lang. Portal
-va Zalo van co the mo, nhung bot se khong tu y roi ve Claude global hay mot
-Provider khac. Day la hanh vi an toan cua ban V6, khong phai loi.
+Sau khi bot San sang, trang Knowledge la tuy chon; tri thuc trong do khong chan Done.
+Neu cai dat hoac chuan bi that bai, he thong khong tao route; bot co y im lang.
+Portal va Zalo van co the mo, nhung bot se khong tu y roi ve mot Provider khac.
 
 
 ────────────────────────────────────────────────────────────────────────────────
@@ -110,19 +104,12 @@ Bot doc duoc ngay khi co tep moi, KHONG can khoi dong lai.
 
 
 ────────────────────────────────────────────────────────────────────────────────
- VAN PHONG: SUA HAI CHO TRUOC KHI MO CHO KHACH THAT
+ VAN PHONG: DA DONG GOI SAN
 ────────────────────────────────────────────────────────────────────────────────
 
-Mo  brain\reference\persona\persona.md  bang Notepad. Tim va thay:
-
-  {{TEN_BOT}}           -> ten bot cua ban, viet dung cach ban muon no tu goi
-  {{TEN_CHUYEN_GIA}}    -> ten nguoi ma tri thuc thuoc ve
-
-Ca hai xuat hien nhieu lan. Dung Ctrl+H de thay het mot luot.
-
-Tep do LA tinh cach cua bot: cach xung ho, do dai cau, khi nao tach thanh nhieu
-tin, khi nao chuyen cho nguoi that, cai gi tuyet doi khong noi. Sua no la sua
-cach bot noi, co hieu luc ngay o luot tra loi sau, khong can khoi dong lai.
+Goi da co Persona hoan chinh de chay ngay; khong can dien ten hay cau hinh tri
+thuc truoc lan chay dau. Neu muon doi cach noi sau nay, dung trang Agents trong
+Portal de sua co kiem soat.
 
   reference\persona\roster.md   so tay nhan dien thanh vien. Tuy chon, de rong duoc.
   reference\persona\overlay\    luat rieng cho tung nhom. Doc README trong do.

@@ -544,13 +544,15 @@ try {
   $personaSource = Join-Path $personaRoot 'Nguồn persona'
   $personaFile = Join-Path $personaSource 'persona.md'
   $rosterFile = Join-Path $personaSource 'roster.md'
+  $identityFile = Join-Path $personaSource 'identity.json'
   Write-TestFile $personaFile "persona`n"
   Write-TestFile $rosterFile "roster`n"
+  Write-TestFile $identityFile '{"version":1,"display_name":"bot","persona_identities":[{"role":"assistant","value":"bot"}]}'
 
   $resolvedPersona = Resolve-PersonaSource -PersonaSource $personaSource
   Assert-Equal $resolvedPersona ([IO.Path]::GetFullPath($personaSource)) 'Persona source was not normalized'
 
-  Remove-Item -LiteralPath $rosterFile -Force
+  Remove-Item -LiteralPath $identityFile -Force
   Assert-ThrowsLike -Action { Resolve-PersonaSource -PersonaSource $personaSource } `
     -Pattern 'persona' -Message 'An incomplete persona source was accepted'
 
@@ -661,14 +663,13 @@ try {
 Nhan doi "Start.vbs". Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.
 
 Lam theo dung thu tu:
-1. Mo trang Providers. Bam Connect cho Claude Code hoac Codex.
-Nut Connect tu dong cai Claude duoc quan ly neu can; khong can cai Claude global thu cong.
-Provider API dung endpoint/API key hien chua co trong Portal (Sap co).
-2. Mo trang Combos. Chon model, tao Combo va kich hoat Combo de tao route dang hoat dong.
-3. Mo trang Zalo. Ket noi bang ma QR.
+1. Chon Provider. Bat ON roi bam Connect hoac Bam de cai tren dung dong do.
+2. Khi Provider cuoi cung san sang, Portal tu hien "Dang chuan bi tro ly" va tu hoan tat.
+Khong co buoc Persona, Test Chat hay Complete de bam.
+3. Khi Portal bao "San sang", vao Portal de quan ly hoac mo trang Zalo de ket noi bang ma QR.
 
-Khong co Provider da ket noi va route dang hoat dong, bot co y im lang.
-claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
+Sau khi bot San sang, trang Knowledge la tuy chon; tri thuc trong do khong chan Done.
+Neu cai dat hoac chuan bi that bai, he thong khong tao route; bot co y im lang.
 '@
   Write-TestFile $packageReadme $validOnboarding
   $packagedNode = Join-Path $packageRoot 'app\node\node.exe'
@@ -730,17 +731,16 @@ Day la buoc DUY NHAT khong the bo. Kiem tra bang claude --version.
     -Message 'A package carrying the legacy Zalo-and-global-Claude-only onboarding was accepted'
   foreach ($onboardingCase in @(
       @{ Missing = 'Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.'; Label = 'management Portal startup guidance' },
-      @{ Missing = '1. Mo trang Providers'; Label = 'Providers guidance' },
-      @{ Missing = 'Bam Connect cho Claude Code hoac Codex'; Label = 'packaged Provider Connect guidance' },
-      @{ Missing = 'Nut Connect tu dong cai Claude duoc quan ly neu can'; Label = 'managed Claude installation guidance' },
-      @{ Missing = 'khong can cai Claude global thu cong'; Label = 'no-global-Claude-install guidance' },
-      @{ Missing = 'Provider API dung endpoint/API key hien chua co trong Portal (Sap co)'; Label = 'unavailable API Provider guidance' },
-      @{ Missing = '2. Mo trang Combos'; Label = 'Combos guidance' },
-      @{ Missing = 'Chon model'; Label = 'model guidance' },
-      @{ Missing = 'route dang hoat dong'; Label = 'active-route guidance' },
-      @{ Missing = '3. Mo trang Zalo'; Label = 'Zalo-last guidance' },
-      @{ Missing = 'bot co y im lang'; Label = 'intentional-silence guidance' },
-      @{ Missing = 'claude --version chi la chan doan tuy chon, khong phai buoc thiet lap'; Label = 'optional CLI-diagnostic guidance' }
+      @{ Missing = '1. Chon Provider'; Label = 'Provider selection guidance' },
+      @{ Missing = 'Bat ON roi bam Connect hoac Bam de cai tren dung dong do'; Label = 'per-row Provider install guidance' },
+      @{ Missing = '2. Khi Provider cuoi cung san sang'; Label = 'automatic bootstrap start guidance' },
+      @{ Missing = 'Portal tu hien "Dang chuan bi tro ly" va tu hoan tat'; Label = 'automatic bootstrap progress guidance' },
+      @{ Missing = 'Khong co buoc Persona, Test Chat hay Complete de bam'; Label = 'no-manual-wizard guidance' },
+      @{ Missing = '3. Khi Portal bao "San sang"'; Label = 'ready guidance' },
+      @{ Missing = 'vao Portal de quan ly hoac mo trang Zalo'; Label = 'Portal and Zalo guidance' },
+      @{ Missing = 'trang Knowledge la tuy chon'; Label = 'optional Knowledge guidance' },
+      @{ Missing = 'tri thuc trong do khong chan Done'; Label = 'Knowledge-does-not-block guidance' },
+      @{ Missing = 'he thong khong tao route; bot co y im lang'; Label = 'failed-setup no-route silence guidance' }
     )) {
     Write-TestFile $packageReadme $validOnboarding.Replace($onboardingCase.Missing, '')
     Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
@@ -751,14 +751,13 @@ Day la buoc DUY NHAT khong the bo. Kiem tra bang claude --version.
 Nhan doi "Start.vbs". Start.vbs mo Portal quan ly tai http://127.0.0.1:8770/.
 
 Lam theo dung thu tu:
-2. Mo trang Combos. Chon model, tao Combo va kich hoat Combo de tao route dang hoat dong.
-1. Mo trang Providers. Bam Connect cho Claude Code hoac Codex.
-Nut Connect tu dong cai Claude duoc quan ly neu can; khong can cai Claude global thu cong.
-Provider API dung endpoint/API key hien chua co trong Portal (Sap co).
-3. Mo trang Zalo. Ket noi bang ma QR.
+2. Khi Provider cuoi cung san sang, Portal tu hien "Dang chuan bi tro ly" va tu hoan tat.
+Khong co buoc Persona, Test Chat hay Complete de bam.
+1. Chon Provider. Bat ON roi bam Connect hoac Bam de cai tren dung dong do.
+3. Khi Portal bao "San sang", vao Portal de quan ly hoac mo trang Zalo de ket noi bang ma QR.
 
-Khong co Provider da ket noi va route dang hoat dong, bot co y im lang.
-claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
+Sau khi bot San sang, trang Knowledge la tuy chon; tri thuc trong do khong chan Done.
+Neu cai dat hoac chuan bi that bai, he thong khong tao route; bot co y im lang.
 '@
   Write-TestFile $packageReadme $wrongOrderOnboarding
   Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
@@ -766,7 +765,9 @@ claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
     -Message 'A semantically complete package README with the wrong onboarding order was accepted'
   foreach ($misleadingGuidance in @(
       'Cai Claude Code global thu cong truoc khi mo Portal.',
-      'Voi Provider API, nhap endpoint, API key va model trong Portal.'
+      'Voi Provider API, nhap endpoint, API key va model trong Portal.',
+      'Mo trang Combos va kich hoat Combo truoc khi ket noi Zalo.',
+      'Mo persona.md va thay {{TEN_BOT}} truoc khi chay.'
     )) {
     Write-TestFile $packageReadme "$validOnboarding`n$misleadingGuidance`n"
     Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
@@ -810,6 +811,55 @@ claude --version chi la chan doan tuy chon, khong phai buoc thiet lap.
       -Message 'A corrupt packaged npm-cli.js was accepted'
   } finally {
     Write-TestFile $packagedNpmCLI $fixtureNpmCLI
+  }
+
+  $lateSmokeCanaryPath = Join-Path $packageRoot 'data\late-npm-canary.bin'
+  $lateSmokeCanaryCLI = @'
+const fs = require('fs');
+const path = require('path');
+const value = ['ONBOARDING_ANSWER', '_CANARY_CLEAR_BC43'].join('');
+const target = path.resolve(__dirname, '../../../../../data/late-npm-canary.bin');
+fs.mkdirSync(path.dirname(target), { recursive: true });
+fs.writeFileSync(target, value);
+process.stdout.write('99.88.77\n');
+'@
+  Write-TestFile $packagedNpmCLI $lateSmokeCanaryCLI
+  try {
+    Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+      -Pattern 'sensitive content' `
+      -Message 'A sensitive file created by the packaged npm smoke escaped the final package scan'
+    if (-not (Test-Path -LiteralPath $lateSmokeCanaryPath -PathType Leaf)) {
+      throw 'The late-write npm smoke fixture did not execute'
+    }
+  } finally {
+    Write-TestFile $packagedNpmCLI $fixtureNpmCLI
+    if (Test-Path -LiteralPath $lateSmokeCanaryPath) {
+      Remove-Item -LiteralPath $lateSmokeCanaryPath -Force
+    }
+  }
+
+  $lateCredentialsPath = Join-Path $packageRoot 'data\zalo\credentials.json'
+  $lateCredentialsCLI = @'
+const fs = require('fs');
+const path = require('path');
+const target = path.resolve(__dirname, '../../../../../data/zalo/credentials.json');
+fs.mkdirSync(path.dirname(target), { recursive: true });
+fs.writeFileSync(target, '{}');
+process.stdout.write('99.88.77\n');
+'@
+  Write-TestFile $packagedNpmCLI $lateCredentialsCLI
+  try {
+    Assert-ThrowsLike -Action { Assert-AppPackage -Out $packageRoot } `
+      -Pattern 'Zalo credentials' `
+      -Message 'A Zalo credential file created by the packaged npm smoke escaped the exact path gate'
+    if (-not (Test-Path -LiteralPath $lateCredentialsPath -PathType Leaf)) {
+      throw 'The late-credential npm smoke fixture did not execute'
+    }
+  } finally {
+    Write-TestFile $packagedNpmCLI $fixtureNpmCLI
+    if (Test-Path -LiteralPath $lateCredentialsPath) {
+      Remove-Item -LiteralPath $lateCredentialsPath -Force
+    }
   }
 
   Write-TestFile $packagedNpmCmd "@ECHO OFF`nECHO 99.88.77`n"

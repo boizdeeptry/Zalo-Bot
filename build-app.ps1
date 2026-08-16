@@ -79,6 +79,8 @@ $paths = Resolve-BuildPaths -Repo $Repo -Out $Out
 $Repo = $paths.Repo
 $Out = $paths.Out
 $PersonaSource = Resolve-PersonaSource -PersonaSource $PersonaSource
+Assert-CleanGitSource -Repo $Repo | Out-Null
+$personaSnapshot = Read-AppPersonaSourceSnapshot -PersonaSource $PersonaSource -Out $Out -ProtectedRoot @($Repo, $PSScriptRoot)
 
 # Repo chi de DOC. Script nay khong nam trong no nua, co chu dich: nguon dong goi
 # la thu rieng cua ban ban, va de no trong repo lam `git status` cua ban dang chay
@@ -316,20 +318,15 @@ $nodeModulesOut = Join-Path $nodeOut 'node_modules'
 Copy-Item -LiteralPath $npmModuleSrc -Destination $nodeModulesOut -Recurse -Force
 
 # ------------------------------------------------------- 6. persona chung hoa
-Write-Host '[6/7] persona: thay danh tinh bang cho trong'
-$phase = 'chuẩn hoá persona và launcher'
-$pSrc = $PersonaSource
+Write-Host '[6/7] persona: đóng gói bản hoàn chỉnh và bất biến'
+$phase = 'đóng gói persona và launcher'
 # Ten tep ASCII co chu dich: .bat doc theo codepage OEM chu khong UTF-8, nen mot
 # duong dan tieng Viet trong Chay.bat se bien dang va daemon khong doc duoc.
 # reference\persona\, KHONG brain\persona\: khop dung vi tri ban dev dung, va
 # reference\ la thu muc bo xuong danh cho thu NGUOI doc chu khong phai bot trich
 # dan. Persona phai o ngoai moi goc KB (wiki, raw) -- mot tep trong goc KB thi
 # bot trich dan duoc no, va van phong khong phai can cu.
-Copy-Item -LiteralPath (Join-Path $pSrc 'persona.md') -Destination (Join-Path $Out 'brain\reference\persona\persona.md') -Force
-Copy-Item -LiteralPath (Join-Path $pSrc 'roster.md') -Destination (Join-Path $Out 'brain\reference\persona\roster.md') -Force
-Copy-Item -LiteralPath (Join-Path $pSrc 'overlay\README.md') -Destination (Join-Path $Out 'brain\reference\persona\overlay') -Force -EA SilentlyContinue
-& python (Join-Path $PSScriptRoot 'genpersona.py') $Out
-if ($LASTEXITCODE -ne 0) { throw 'genpersona that bai' }
+Write-AppPersonaPackage -Snapshot $personaSnapshot -Out $Out
 
 # Ba tep khoi chay: giu ban trong dist\launcher, copy vao goi.
 Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'launcher') -Force | ForEach-Object {
@@ -339,16 +336,6 @@ Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'launcher') -Force | ForEach
 # --------------------------------------------------------------- 7. do goi
 Write-Host '[7/7] kiem tra goi va nguon'
 $phase = 'package gates'
-
-# Quet lai. Day la cua chan cuoi: mot chuoi sot lai o day la mot chuoi da ban ra.
-$pat = 'MIDU|MenaQ7|boizdeeptry|Anh Trường|Bé Mi'
-$scanExtensions = @('.md', '.txt', '.js', '.json', '.html', '.bat', '.vbs')
-$hits = Get-ChildItem -LiteralPath $Out -Recurse -File -EA SilentlyContinue |
-  Where-Object { $scanExtensions -contains $_.Extension } |
-  Where-Object { $_.FullName -notlike '*node_modules*' } |
-  Select-String -Pattern $pat -Encoding UTF8 -EA SilentlyContinue
-$bin = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes("$Out\app\agentdc.exe"))
-$binHits = ([regex]::Matches($bin, $pat)).Count
 
 Write-Host ''
 # Cua chan quan trong nhat trong tep nay. Phien Zalo la mot credential, khong mot
@@ -371,19 +358,10 @@ if (Test-Path -LiteralPath $cred) {
     throw 'package contains Zalo credentials'
   }
 }
-if ($hits) {
-  Write-Host 'CON DAU KHACH HANG TRONG TEP VAN BAN:' -ForegroundColor Red
-  $hits | ForEach-Object { '  ' + $_.Filename + ':' + $_.LineNumber }
-}
-if ($binHits -gt 0) { Write-Host ("CON {0} CHUOI TRONG agentdc.exe" -f $binHits) -ForegroundColor Red }
-if ($hits -or $binHits -gt 0) {
-  Write-Host '  KHONG duoc nen thu muc nay de ban.' -ForegroundColor Red
-  throw 'package contains customer identity strings'
-}
-Write-Host 'sach: khong con dau khach hang nao' -ForegroundColor Green
-
 Assert-AppPackage -Out $Out -AllowZaloCredentials:$KeepData | Out-Null
 Assert-CleanGitSource -Repo $Repo | Out-Null
+Assert-AppPersonaPackagePrivacy -Out $Out -Snapshot $personaSnapshot
+Write-Host 'sach: persona va danh tinh chi nam trong dung tep da khai bao' -ForegroundColor Green
 
 $f = Get-ChildItem -LiteralPath $Out -Recurse -File
 Write-Host ('goi: {0} tep, {1:N1} MB  ->  {2}' -f $f.Count, (($f | Measure-Object Length -Sum).Sum / 1MB), $Out)
