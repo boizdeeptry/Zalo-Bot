@@ -831,24 +831,15 @@ func appOnboardingBeginRejectsTestPhaseWithoutCancellation(t *testing.T) {
 	before := env.state(t)
 
 	cancelCalls := 0
-	onboardingTestMu.Lock()
-	oldActive := onboardingTestActive
-	oldDone := onboardingTestDone
-	oldCancel := onboardingTestCancel
-	oldCancelRequested := onboardingTestCancelRequested
-	onboardingTestActive = true
-	onboardingTestDone = make(chan struct{})
-	onboardingTestCancel = func() { cancelCalls++ }
-	onboardingTestCancelRequested = false
-	onboardingTestMu.Unlock()
-	t.Cleanup(func() {
-		onboardingTestMu.Lock()
-		onboardingTestActive = oldActive
-		onboardingTestDone = oldDone
-		onboardingTestCancel = oldCancel
-		onboardingTestCancelRequested = oldCancelRequested
-		onboardingTestMu.Unlock()
-	})
+	lease, ok := beginAppOnboardingTest()
+	if !ok {
+		t.Fatal("begin fixture Test lease = false; want true")
+	}
+	if !lease.bindCancel(func() { cancelCalls++ }) {
+		lease.finish()
+		t.Fatal("bind fixture Test cancellation = false; want true")
+	}
+	t.Cleanup(lease.finish)
 
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":37,"kind":"codex"}`)
 	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")

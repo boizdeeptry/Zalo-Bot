@@ -8,6 +8,7 @@ var appPortalRoutePatterns = []string{
 	"PUT /onboarding/provider",
 	"POST /onboarding/setup",
 	"POST /onboarding/test-chat",
+	"POST /onboarding/bootstrap",
 	"POST /onboarding/back-to-providers",
 	"POST /onboarding/complete",
 	"POST /onboarding/restart",
@@ -87,6 +88,7 @@ func registerAppRoutesWithContext(mux *http.ServeMux, ctx appRuntimeContext) {
 	mux.Handle("PUT /onboarding/provider", a.auth(ctx.handleOnboardingProvider))
 	mux.Handle("POST /onboarding/setup", a.auth(ctx.handleOnboardingSetup))
 	mux.Handle("POST /onboarding/test-chat", a.auth(ctx.handleOnboardingTestChat))
+	mux.Handle("POST /onboarding/bootstrap", a.auth(ctx.handleOnboardingBootstrap))
 	mux.Handle("POST /onboarding/back-to-providers", a.auth(ctx.handleOnboardingBackToProviders))
 	mux.Handle("POST /onboarding/complete", a.auth(ctx.handleOnboardingComplete))
 	mux.Handle("POST /onboarding/restart", a.auth(ctx.handleOnboardingRestart))

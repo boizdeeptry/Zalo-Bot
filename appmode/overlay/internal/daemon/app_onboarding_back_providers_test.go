@@ -354,7 +354,7 @@ func TestAppOnboardingBackToProvidersRejectsMalformedTestFingerprintBeforeCancel
 	default:
 	}
 	onboardingTestMu.Lock()
-	stillActive := onboardingTestActive && !onboardingTestCancelRequested
+	stillActive := onboardingTestActive != nil && !onboardingTestActive.cancelRequested
 	onboardingTestMu.Unlock()
 	if !stillActive {
 		t.Fatal("malformed Test fingerprint changed active Test runner state")
@@ -411,38 +411,25 @@ var fakeOnboardingTestCanceledForBack atomic.Pointer[chan struct{}]
 
 func installFakeActiveOnboardingTestForBack(t *testing.T) (*atomic.Int32, func()) {
 	t.Helper()
-	onboardingTestMu.Lock()
-	if onboardingTestActive || onboardingProviderTransition != nil {
-		onboardingTestMu.Unlock()
-		t.Fatal("onboarding Test/transition global is not clean")
-	}
-	done := make(chan struct{})
 	canceled := make(chan struct{})
 	var cancelOnce sync.Once
 	var cancelCalls atomic.Int32
-	onboardingTestActive = true
-	onboardingTestDone = done
-	onboardingTestCancel = func() {
+	lease, ok := beginAppOnboardingTest()
+	if !ok {
+		t.Fatal("onboarding Test/transition global is not clean")
+	}
+	if !lease.bindCancel(func() {
 		cancelCalls.Add(1)
 		cancelOnce.Do(func() { close(canceled) })
+	}) {
+		lease.finish()
+		t.Fatal("bind fake active onboarding Test cancellation = false; want true")
 	}
-	onboardingTestCancelRequested = false
-	onboardingTestMu.Unlock()
 	fakeOnboardingTestCanceledForBack.Store(&canceled)
 
 	var finishOnce sync.Once
 	finish := func() {
-		finishOnce.Do(func() {
-			onboardingTestMu.Lock()
-			if onboardingTestDone == done {
-				onboardingTestActive = false
-				onboardingTestDone = nil
-				onboardingTestCancel = nil
-				onboardingTestCancelRequested = false
-				close(done)
-			}
-			onboardingTestMu.Unlock()
-		})
+		finishOnce.Do(lease.finish)
 	}
 	t.Cleanup(func() {
 		finish()
