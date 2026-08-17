@@ -4,9 +4,12 @@ import "net/http"
 
 var appPortalRoutePatterns = []string{
 	"GET /onboarding/status",
+	"PUT /onboarding/providers",
 	"PUT /onboarding/provider",
 	"POST /onboarding/setup",
 	"POST /onboarding/test-chat",
+	"POST /onboarding/bootstrap",
+	"POST /onboarding/back-to-providers",
 	"POST /onboarding/complete",
 	"POST /onboarding/restart",
 	"GET /agent",
@@ -68,23 +71,38 @@ func init() {
 }
 
 func (a *api) registerAppRoutes(mux *http.ServeMux) {
-	mux.Handle("GET /onboarding/status", a.auth(a.handleOnboardingStatus))
-	mux.Handle("PUT /onboarding/provider", a.auth(a.handleOnboardingProvider))
-	mux.Handle("POST /onboarding/setup", a.auth(a.handleOnboardingSetup))
-	mux.Handle("POST /onboarding/test-chat", a.auth(a.handleOnboardingTestChat))
-	mux.Handle("POST /onboarding/complete", a.auth(a.handleOnboardingComplete))
-	mux.Handle("POST /onboarding/restart", a.auth(a.handleOnboardingRestart))
+	registerAppRoutesWithContext(mux, productionAppRuntimeContext(a))
+}
+
+// registerAppRoutesWithContext is the internal dependency-injected route
+// registration seam. Connect routes close over ctx so their registry and
+// manager cannot drift after registration. The package singleton assignment is
+// retained only for legacy direct-handler and non-Connect onboarding tests.
+func registerAppRoutesWithContext(mux *http.ServeMux, ctx appRuntimeContext) {
+	if mux == nil || ctx.api == nil || !ctx.registry.valid || ctx.connect == nil {
+		panic("register app routes: invalid runtime context")
+	}
+	a := ctx.api
+	mux.Handle("GET /onboarding/status", a.auth(ctx.handleOnboardingStatus))
+	mux.Handle("PUT /onboarding/providers", a.auth(ctx.handleOnboardingProviders))
+	mux.Handle("PUT /onboarding/provider", a.auth(ctx.handleOnboardingProvider))
+	mux.Handle("POST /onboarding/setup", a.auth(ctx.handleOnboardingSetup))
+	mux.Handle("POST /onboarding/test-chat", a.auth(ctx.handleOnboardingTestChat))
+	mux.Handle("POST /onboarding/bootstrap", a.auth(ctx.handleOnboardingBootstrap))
+	mux.Handle("POST /onboarding/back-to-providers", a.auth(ctx.handleOnboardingBackToProviders))
+	mux.Handle("POST /onboarding/complete", a.auth(ctx.handleOnboardingComplete))
+	mux.Handle("POST /onboarding/restart", a.auth(ctx.handleOnboardingRestart))
 	mux.Handle("GET /agent", a.auth(a.handleAgentGet))
-	mux.Handle("PUT /agent", a.auth(a.handleAgentPut))
+	mux.Handle("PUT /agent", a.auth(ctx.handleAgentPut))
 	mux.Handle("GET /agent/persona/{name}", a.auth(a.handlePersonaGet))
-	mux.Handle("PUT /agent/persona/{name}", a.auth(a.handlePersonaPut))
+	mux.Handle("PUT /agent/persona/{name}", a.auth(ctx.handlePersonaPut))
 	mux.Handle("GET /kb", a.auth(a.handleKBList))
 	mux.Handle("POST /kb/upload", a.auth(a.handleKBUpload))
 	mux.Handle("POST /kb/ingest", a.auth(a.handleKBIngest))
 	mux.Handle("DELETE /kb/ingest", a.auth(a.handleKBIngestStop))
 	mux.Handle("GET /kb/model", a.auth(a.handleKBModelGet))
 	mux.Handle("PUT /kb/model", a.auth(a.handleKBModelPut))
-	mux.Handle("GET /llm/providers", a.auth(a.handleLLMProviderList))
+	mux.Handle("GET /llm/providers", a.auth(ctx.handleLLMProviderList))
 	mux.Handle("POST /llm/providers", a.auth(a.handleLLMProviderCreate))
 	mux.Handle("PUT /llm/providers/{id}", a.auth(a.handleLLMProviderUpdate))
 	mux.Handle("DELETE /llm/providers/{id}", a.auth(a.handleLLMProviderDelete))
@@ -99,23 +117,23 @@ func (a *api) registerAppRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /llm/providers/{id}/models", a.auth(a.handleLLMModelDelete))
 	mux.Handle("DELETE /llm/providers/{id}/accounts/{accountId}", a.auth(a.handleLLMAccountDelete))
 
-	// connectMgr is refreshed on every registerAppRoutes call (not lazily nil-guarded) so it always
-	// reflects the api that registered the routes. Production registers once; tests each get their
-	// own valid manager and never inherit a prior test's closed store / nil logger.
-	connectMgr = a.newConnectManager()
+	// Legacy compatibility: old direct handlers and onboarding cleanup tests
+	// still inject this singleton. The three registered Connect handlers below
+	// never read it; they are bound to ctx.connect.
+	connectMgr = ctx.connect
 	// Gieo model tĩnh của claude-code ngay khi khởi động: nó là provider luôn có sẵn (seeded), chạy
 	// qua runClaude nên KHÔNG có adapter để discover — không gieo ở đây thì detail + combo picker
 	// trống model dù chưa ai connect. Idempotent (ReplaceLLMModels thay trọn nguồn discovered).
 	ensureCLIProviderModels(a.st, a.logger, "claude-code", "claude-code")
-	mux.Handle("POST /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectStart))
-	mux.Handle("GET /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectStatus))
-	mux.Handle("DELETE /llm/providers/{kind}/connect", a.auth(a.handleLLMConnectCancel))
+	mux.Handle("POST /llm/providers/{kind}/connect", a.auth(ctx.handleLLMConnectStart))
+	mux.Handle("GET /llm/providers/{kind}/connect", a.auth(ctx.handleLLMConnectStatus))
+	mux.Handle("DELETE /llm/providers/{kind}/connect", a.auth(ctx.handleLLMConnectCancel))
 	mux.Handle("GET /llm/route", a.auth(a.handleLLMRouteGet))
-	mux.Handle("PUT /llm/route", a.auth(a.handleLLMRoutePut))
+	mux.Handle("PUT /llm/route", a.auth(ctx.handleLLMRoutePut))
 	mux.Handle("GET /llm/combos", a.auth(a.handleLLMComboList))
 	mux.Handle("POST /llm/combos", a.auth(a.handleLLMComboCreate))
-	mux.Handle("PUT /llm/combos/{id}", a.auth(a.handleLLMComboReplace))
-	mux.Handle("POST /llm/combos/{id}/activate", a.auth(a.handleLLMComboActivate))
+	mux.Handle("PUT /llm/combos/{id}", a.auth(ctx.handleLLMComboReplace))
+	mux.Handle("POST /llm/combos/{id}/activate", a.auth(ctx.handleLLMComboActivate))
 	mux.Handle("DELETE /llm/combos/{id}", a.auth(a.handleLLMComboDelete))
 	mux.Handle("GET /llm/status", a.auth(a.handleLLMStatus))
 	mux.Handle("GET /memory", a.auth(a.handleMemoryOverview))

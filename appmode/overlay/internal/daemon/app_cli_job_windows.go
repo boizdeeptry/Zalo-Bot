@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,17 +11,34 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 var (
-	assignCLIProcessToJob = assignProcessToCLIJob
-	resumeCLIProcess      = resumeSuspendedCLIProcess
-	terminateCLIJob       = windows.TerminateJobObject
-	closeCLIJobHandle     = windows.CloseHandle
+	assignCLIProcessToJob      = assignProcessToCLIJob
+	resumeCLIProcess           = resumeSuspendedCLIProcess
+	terminateCLIJob            = windows.TerminateJobObject
+	closeCLIJobHandle          = windows.CloseHandle
+	queryCLIJobInformation     = windows.QueryInformationJobObject
+	queryCLIJobActiveProcesses = queryWindowsCLIJobActiveProcesses
+	pollCLIJobQuiescence       = waitForCLIJobQuiescencePoll
 )
+
+// cliJobBasicAccountingInformation mirrors JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+// x/sys/windows exposes the information-class constant but not this structure.
+type cliJobBasicAccountingInformation struct {
+	totalUserTime             int64
+	totalKernelTime           int64
+	thisPeriodTotalUserTime   int64
+	thisPeriodTotalKernelTime int64
+	totalPageFaultCount       uint32
+	totalProcesses            uint32
+	activeProcesses           uint32
+	totalTerminatedProcesses  uint32
+}
 
 type windowsManagedCLIProcess struct {
 	job      windows.Handle
@@ -36,6 +54,49 @@ func (p *windowsManagedCLIProcess) terminate() error {
 func (p *windowsManagedCLIProcess) close() error {
 	p.closeOne.Do(func() { p.closeErr = closeCLIJobHandle(p.job) })
 	return p.closeErr
+}
+
+func (p *windowsManagedCLIProcess) quiesce(ctx context.Context) (result error) {
+	defer func() { result = errors.Join(result, p.close()) }()
+
+	if err := terminateCLIJob(p.job, 1); err != nil {
+		return wrapCLITerminateJobError(err)
+	}
+	for {
+		active, err := queryCLIJobActiveProcesses(p.job)
+		if err != nil {
+			return fmt.Errorf("query CLI job active processes: %w", err)
+		}
+		if active == 0 {
+			return nil
+		}
+		if err := pollCLIJobQuiescence(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func queryWindowsCLIJobActiveProcesses(job windows.Handle) (uint32, error) {
+	var info cliJobBasicAccountingInformation
+	err := queryCLIJobInformation(
+		job,
+		windows.JobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+		nil,
+	)
+	return info.activeProcesses, err
+}
+
+func waitForCLIJobQuiescencePoll(ctx context.Context) error {
+	timer := time.NewTimer(10 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // startManagedCLIProcess prevents the process from executing before it belongs

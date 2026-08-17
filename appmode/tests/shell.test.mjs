@@ -80,6 +80,34 @@ test("desktop shell loads isolated Portal CSS with the legacy rail dimensions", 
   assert.match(css, /#main:focus-visible\s*\{[^}]*outline-offset:\s*-2px/s);
 });
 
+test("onboarding CSS shows a full-page card plus one responsive native OFF modal", async () => {
+  const css = await readFile(new URL("portal.css", staticRoot), "utf8");
+  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-topbar,\s*\.onboarding-shell \.onboarding-dashboard-sidebar,\s*\.onboarding-shell \.onboarding-dashboard-summary\s*\{[^}]*display:\s*none/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dashboard-canvas\s*\{[^}]*inset:\s*0[^}]*linear-gradient\(45deg/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-backdrop\s*\{[^}]*background:\s*transparent/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dialog\s*\{[^}]*width:\s*min\(560px,\s*calc\(100vw - 32px\)\)/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-dialog:focus\s*\{[^}]*outline:\s*2px solid var\(--onboarding-cyan\)/s);
+  assert.doesNotMatch(css, /\.onboarding-shell \.onboarding-dialog:focus\s*\{[^}]*outline:\s*none/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-step\s*\{[^}]*color:\s*var\(--onboarding-muted\)/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-step-label\s*\{[^}]*font-size:\s*11px/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-agent-badge\s*\{[^}]*color:\s*var\(--onboarding-muted\)[^}]*font-size:\s*11px/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-agent-switch\s*\{[^}]*width:\s*46px[^}]*height:\s*26px/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-card\s*\{[^}]*display:\s*flex[^}]*min-width:\s*0/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-toggle\s*\{[^}]*display:\s*inline-grid[^}]*background:\s*transparent/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-install\s*\{[^}]*color:\s*var\(--onboarding-cyan\)[^}]*text-decoration:\s*underline/s);
+  assert.doesNotMatch(css, /\.onboarding-shell \.onboarding-provider-confirm\b/s);
+  assert.match(css, /\.provider-off-dialog\s*\{[^}]*box-sizing:\s*border-box[^}]*width:\s*min\(420px,\s*calc\(100vw - 32px\)\)[^}]*max-height:\s*calc\(100dvh - 32px\)[^}]*overflow:\s*auto/s);
+  assert.match(css, /\.provider-off-dialog::backdrop\s*\{[^}]*background:\s*rgba\(/s);
+  assert.match(css, /\.provider-off-dialog \.provider-off-dialog-button:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--provider-off-focus\)/s);
+  assert.match(css, /@media\s*\(max-width:\s*420px\)[\s\S]*\.provider-off-dialog\s*\{[^}]*width:\s*calc\(100vw - 16px\)[^}]*max-width:\s*calc\(100vw - 16px\)/s);
+  assert.match(css, /@media\s*\(max-width:\s*600px\)[\s\S]*\.onboarding-shell \.onboarding-provider-card\s*\{[^}]*min-width:\s*0/s);
+  assert.match(css, /@media\s*\(max-width:\s*420px\)[\s\S]*\.onboarding-shell \.onboarding-backdrop\s*\{[^}]*padding:\s*8px[^}]*\}[\s\S]*\.onboarding-shell \.onboarding-dialog\s*\{[^}]*width:\s*calc\(100vw - 16px\)[^}]*max-width:\s*calc\(100vw - 16px\)/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-connect-provider-row\s*\{[^}]*margin:\s*0/s);
+  assert.match(css, /@media\s*\(max-width:\s*600px\)[\s\S]*\.onboarding-shell \.onboarding-connect-provider-row\s*\{[^}]*margin:\s*0/s);
+  assert.match(css, /\.onboarding-shell \.onboarding-provider-install-state\s*\{[^}]*overflow-wrap:\s*anywhere/s);
+  assert.doesNotMatch(css, /@media\s*\(max-width:\s*900px\)[\s\S]*\.onboarding-shell \.onboarding-dashboard-sidebar/s);
+});
+
 // regionsFor lấy phần thân giữa mỗi cặp dấu <marker>:begin/end.
 //
 // Cắt theo DẤU chứ không lọc theo chữ trong selector: một luật xổng phạm vi là một

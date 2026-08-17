@@ -7,7 +7,7 @@ import {
   installDOM,
   text,
 } from "./helpers/dom-harness.mjs";
-import { onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
+import { onboardingProviderOptions, onboardingStatus } from "./helpers/onboarding-fixtures.mjs";
 
 const {
   createSettingsController,
@@ -96,6 +96,19 @@ test("restart response validation requires an exact clean successor lifecycle", 
   for (const response of invalid) {
     assert.equal(normalizeRestartStatus(response, 11), null, JSON.stringify(response));
   }
+});
+
+test("restart accepts a suggested provider advertised only by the server catalog", () => {
+  const future = {
+    kind: "future-runtime", display_name: "Future Runtime",
+    description: "Server-advertised runtime", recommended: false,
+    beta: true, advertised: true, route_rank: 200,
+  };
+  const response = restartStatus({
+    provider_options: [...onboardingProviderOptions(), future],
+    suggested_provider_kind: future.kind,
+  });
+  assert.equal(normalizeRestartStatus(response, 11)?.suggested_provider_kind, future.kind);
 });
 
 test("the first click only opens a complete warning and Cancel keeps the Portal active", async (t) => {

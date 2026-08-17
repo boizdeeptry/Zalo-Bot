@@ -3,54 +3,53 @@ import assert from "node:assert/strict";
 
 import { isProviderConnected } from "../overlay/internal/webui/static/core/providers-status.js";
 
-// Luật "đã kết nối" dùng chung cho nhãn trang Providers và bộ lọc picker Combos — ghim từng nhánh ở
-// đây để một lượt sửa nhãn không lặng lẽ đổi bộ lọc (và ngược lại).
+// Cùng một luật cho nhãn Providers và picker Combos. Quyết định chỉ đến từ connection_mode đã được
+// server project/normalizer xác thực; kind, system và trạng thái Provider không được tự đổi domain.
 
-test("a subscription provider needs at least one enabled account", () => {
-  const base = { kind: "claude-code", system: true, credential_configured: false };
-  assert.equal(isProviderConnected({ ...base }), false, "no accounts field → not connected");
-  assert.equal(isProviderConnected({ ...base, accounts: [] }), false, "empty accounts → not connected");
-  assert.equal(
-    isProviderConnected({ ...base, accounts: [{ id: "a1", enabled: false }] }),
-    false,
-    "only disabled accounts → not connected",
-  );
-  assert.equal(
-    isProviderConnected({ ...base, accounts: [{ id: "a1", enabled: true }] }),
-    true,
-    "an enabled account → connected (system/credential irrelevant for subscription)",
-  );
-  // enabled mặc định (không có trường): coi như bật.
-  assert.equal(isProviderConnected({ ...base, accounts: [{ id: "a1" }] }), true);
+test("account mode needs at least one explicitly enabled account", () => {
+  const base = {
+    kind: "future-cli", connection_mode: "account", system: true,
+    credential_configured: true, credential_unreadable: false,
+  };
+  assert.equal(isProviderConnected(base), false, "missing accounts stays disconnected");
+  assert.equal(isProviderConnected({ ...base, accounts: [] }), false);
+  assert.equal(isProviderConnected({ ...base, accounts: [{ id: "a1", enabled: false }] }), false);
+  assert.equal(isProviderConnected({ ...base, accounts: [{ id: "a1" }] }), false,
+    "missing enabled is not silently promoted");
+  assert.equal(isProviderConnected({
+    ...base, enabled: false, accounts: [{ id: "a1", enabled: true }],
+  }), true, "Provider.enabled is a separate usability filter");
 });
 
-test("kind chuẩn hoá _ thành - trước khi tra danh sách thuê bao", () => {
-  assert.equal(isProviderConnected({ kind: "claude_code", accounts: [{ enabled: true }] }), true);
-  assert.equal(isProviderConnected({ kind: "claude_code", credential_configured: true }), false,
-    "một kind thuê bao 0 account KHÔNG được credential cứu");
+test("credential mode uses configured readable credential independent of Provider.enabled", () => {
+  const base = { kind: "future-api", connection_mode: "credential", enabled: false };
+  assert.equal(isProviderConnected(base), false);
+  assert.equal(isProviderConnected({ ...base, system: true }), false, "system is not readiness");
+  assert.equal(isProviderConnected({ ...base, last_check_status: "ok" }), false,
+    "a stale health check is not credential readiness");
+  assert.equal(isProviderConnected({ ...base, credential_configured: true }), true);
+  assert.equal(isProviderConnected({
+    ...base, credential_configured: true, credential_unreadable: true,
+  }), false);
 });
 
-test("an API provider connects via ok status, system, or a configured credential", () => {
-  assert.equal(isProviderConnected({ kind: "openai" }), false, "nothing configured → not connected");
-  assert.equal(isProviderConnected({ kind: "openai", last_check_status: "ok" }), true);
-  assert.equal(isProviderConnected({ kind: "openai", system: true }), true);
-  assert.equal(isProviderConnected({ kind: "openai", credential_configured: true }), true);
-  // enabled không tính vào "đã nối" (cùng cách hasAnyConnectedProvider bên Go).
-  assert.equal(isProviderConnected({ kind: "openai", enabled: false, credential_configured: true }), true);
-});
-
-test("credential_unreadable is never connected, whatever the kind", () => {
-  assert.equal(
-    isProviderConnected({ kind: "openai", credential_configured: true, credential_unreadable: true }),
-    false,
-  );
-  assert.equal(
-    isProviderConnected({ kind: "codex", credential_unreadable: true, accounts: [{ enabled: true }] }),
-    false,
-  );
-});
-
-test("a missing provider is not connected", () => {
+test("none, unknown, and missing connection modes always fail closed", () => {
+  const apparentlyReady = {
+    kind: "gemini-cli", enabled: true, system: true, credential_configured: true,
+    accounts: [{ id: "a1", enabled: true }],
+  };
+  assert.equal(isProviderConnected({ ...apparentlyReady, connection_mode: "none" }), false);
+  assert.equal(isProviderConnected({ ...apparentlyReady, connection_mode: "oauth" }), false);
+  assert.equal(isProviderConnected(apparentlyReady), false);
   assert.equal(isProviderConnected(null), false);
   assert.equal(isProviderConnected(undefined), false);
+});
+
+test("kind spelling cannot switch readiness modes", () => {
+  assert.equal(isProviderConnected({
+    kind: "claude_code", connection_mode: "credential", credential_configured: true,
+  }), true);
+  assert.equal(isProviderConnected({
+    kind: "openai", connection_mode: "account", accounts: [{ enabled: true }],
+  }), true);
 });

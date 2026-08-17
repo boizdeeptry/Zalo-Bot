@@ -320,20 +320,14 @@ func TestAppOnboardingProviderRemovesExactOwnedStagingData(t *testing.T) {
 		t.Fatal(err)
 	}
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	got := decodeOnboardingResponse[appOnboardingStatusResponse](t, rr)
-	if got.ProviderKind != "claude-code" || got.Phase != store.OnboardingPhaseConnect || got.Revision != 2 || got.AccountID != "" {
-		t.Fatalf("provider response=%+v", got)
-	}
-	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
-		t.Fatalf("owned dir still exists or inspect failed: %v", err)
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("rejected begin removed owned dir: %v", err)
 	}
 	if info, err := os.Stat(canary); err != nil || !info.IsDir() {
 		t.Fatalf("sibling canary was damaged: info=%v err=%v", info, err)
 	}
-	requireAccountPresent(t, env, "codex", "owned", false)
+	requireAccountPresent(t, env, "codex", "owned", true)
 }
 
 func TestAppOnboardingProviderRetriesAlreadyMissingOwnedDirectory(t *testing.T) {
@@ -343,17 +337,15 @@ func TestAppOnboardingProviderRetriesAlreadyMissingOwnedDirectory(t *testing.T) 
 		t.Fatal(err)
 	}
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	requireAccountPresent(t, env, "codex", "owned", false)
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
+	requireAccountPresent(t, env, "codex", "owned", true)
 }
 
 func TestAppOnboardingProviderPreservesEnabledAccountAndMapsInvalidStaging(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	dir := seedOnboardingStagingAccount(t, env, "codex", "enabled", true)
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_STAGING_INVALID")
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if got := env.state(t); got.Revision != 1 || got.AccountID != "enabled" {
 		t.Fatalf("state changed: %+v", got)
 	}
@@ -372,7 +364,7 @@ func TestAppOnboardingCleanupFailurePreservesStateAndDoesNotLeakDetails(t *testi
 	}
 	t.Cleanup(func() { removeAllOnboardingAccountRooted = original })
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_CLEANUP_FAILED")
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if got := env.state(t); got.Revision != 1 || got.AccountID != "owned" {
 		t.Fatalf("cleanup failure changed state: %+v", got)
 	}
@@ -388,137 +380,78 @@ func newManualConnectJob(kind string, cancel context.CancelFunc) *connectJob {
 	}
 }
 
-func TestAppOnboardingProviderAuthoritativelyCancelsAndWaitsForMatchingConnect(t *testing.T) {
+func TestAppOnboardingProviderRejectsWithoutCancelingMatchingConnect(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
 	ctx, cancel := context.WithCancel(context.Background())
 	job := newManualConnectJob("codex", cancel)
 	job.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
-	cleaned := make(chan struct{})
 	connectMgr = &connectManager{job: job, jobKind: "codex"}
-	go func() {
-		<-ctx.Done()
-		time.Sleep(20 * time.Millisecond)
-		close(cleaned)
-		close(job.done)
-	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-job.done:
+		default:
+			close(job.done)
+		}
+	})
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	select {
-	case <-cleaned:
-	default:
-		t.Fatal("handler returned before connect cleanup completed")
-	}
-	if got := job.snapshot().Phase; got != phaseCanceled {
-		t.Fatalf("job phase=%q; want canceled", got)
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
+	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
+		t.Fatal("rejected begin canceled matching Connect")
 	}
 }
 
-func TestAppLLMConnectStartWaitsForOnboardingCleanupTransition(t *testing.T) {
+func TestAppLLMConnectStartWaitsForOnboardingMutation(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
-	seedOnboardingStagingAccount(t, env, "codex", "owned", false)
-
-	oldCtx, cancelOld := context.WithCancel(context.Background())
-	oldJob := newManualConnectJob("codex", cancelOld)
-	oldJob.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
-	newStarted := make(chan struct{})
+	started := make(chan struct{})
 	connectMgr = &connectManager{
 		runner:        &fakeRunner{installed: true, loginURL: "https://x", auth: authLoggedOut},
 		ensure:        env.a.st.EnsureProviderForKind,
 		createAccount: env.a.st.CreateLLMAccount,
 		dataDir:       env.dataDir,
 		newID: func() string {
-			close(newStarted)
-			return "new-connect"
+			close(started)
+			return "serialized-connect"
 		},
 		logger:       env.a.logger,
-		job:          oldJob,
-		jobKind:      "codex",
 		loginTimeout: 5 * time.Second,
 		pollInterval: 5 * time.Millisecond,
 	}
-	go func() {
-		<-oldCtx.Done()
-		close(oldJob.done)
-	}()
 
-	cleanupEntered := make(chan struct{})
-	releaseCleanup := make(chan struct{})
-	var releaseOnce sync.Once
-	originalRemove := removeAllOnboardingAccountRooted
-	removeAllOnboardingAccountRooted = func(root *os.Root, name string) error {
-		close(cleanupEntered)
-		<-releaseCleanup
-		return root.RemoveAll(name)
-	}
-	t.Cleanup(func() {
-		releaseOnce.Do(func() { close(releaseCleanup) })
-		removeAllOnboardingAccountRooted = originalRemove
-		if connectMgr != nil && connectMgr.cancel("claude-code") {
-			connectMgr.mu.Lock()
-			job := connectMgr.job
-			connectMgr.mu.Unlock()
-			if job != nil {
-				select {
-				case <-job.done:
-				case <-time.After(2 * time.Second):
-				}
-			}
+	onboardingMutationMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			onboardingMutationMu.Unlock()
 		}
-	})
-
-	onboardingResponse := make(chan *httptest.ResponseRecorder, 1)
+	}()
+	response := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		onboardingResponse <- env.serve(http.MethodPut, "/onboarding/provider",
-			`{"revision":1,"kind":"claude-code"}`)
+		response <- env.serve(http.MethodPost, "/llm/providers/codex/connect", `{"label":"next"}`)
 	}()
 	select {
-	case <-cleanupEntered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("onboarding transition did not reach blocked cleanup")
-	}
-
-	connectResponse := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		connectResponse <- env.serve(http.MethodPost, "/llm/providers/claude-code/connect",
-			`{"label":"next"}`)
-	}()
-	startedBeforeTransition := false
-	select {
-	case <-newStarted:
-		startedBeforeTransition = true
+	case <-started:
+		t.Fatal("Connect entered manager before onboarding mutation lock was released")
 	case <-time.After(150 * time.Millisecond):
 	}
-
-	releaseOnce.Do(func() { close(releaseCleanup) })
+	onboardingMutationMu.Unlock()
+	locked = false
 	select {
-	case rr := <-onboardingResponse:
-		if rr.Code != http.StatusOK {
-			t.Fatalf("onboarding status=%d body=%s", rr.Code, rr.Body.String())
-		}
+	case <-started:
 	case <-time.After(2 * time.Second):
-		t.Fatal("onboarding transition did not finish")
-	}
-	if !startedBeforeTransition {
-		select {
-		case <-newStarted:
-		case <-time.After(2 * time.Second):
-			t.Fatal("Connect start did not enter manager after onboarding transition")
-		}
+		t.Fatal("Connect did not enter manager after onboarding mutation lock was released")
 	}
 	select {
-	case rr := <-connectResponse:
+	case rr := <-response:
 		if rr.Code != http.StatusOK {
 			t.Fatalf("connect status=%d body=%s", rr.Code, rr.Body.String())
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Connect start did not return after onboarding transition")
+		t.Fatal("Connect request did not return")
 	}
-	if startedBeforeTransition {
-		t.Fatal("Connect start entered manager while onboarding transition held the mutation lock")
-	}
+	connectMgr.cancel("codex")
+	waitConnectJobDone(t, connectMgr)
 }
 
 func TestAppLLMConnectStartCanceledRequestDoesNotEnterManager(t *testing.T) {
@@ -577,7 +510,9 @@ func TestConnectOnboardingHandlerValidatesContextBeforeStartingJob(t *testing.T)
 			kind: "codex", body: `{"onboarding_revision":1}`, status: http.StatusConflict, code: "ONBOARDING_REVISION_CONFLICT",
 		},
 		{
-			name: "wrong phase", state: store.OnboardingState{Phase: store.OnboardingPhaseSetup, ProviderKind: "codex", Revision: 2},
+			name: "wrong phase", state: store.OnboardingState{
+				Phase: store.OnboardingPhaseSetup, ProviderKind: "codex", ProviderID: "codex", AccountID: "account", Revision: 2,
+			},
 			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusConflict, code: "ONBOARDING_PHASE_INVALID",
 		},
 		{
@@ -588,7 +523,7 @@ func TestConnectOnboardingHandlerValidatesContextBeforeStartingJob(t *testing.T)
 			name: "dirty connect staging", state: store.OnboardingState{
 				Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", ProviderID: "old", Revision: 2,
 			},
-			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusConflict, code: "ONBOARDING_STAGING_INVALID",
+			kind: "codex", body: `{"onboarding_revision":2}`, status: http.StatusInternalServerError, code: "ONBOARDING_STATE_UNAVAILABLE",
 		},
 		{
 			name: "correct context", state: store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 2},
@@ -600,6 +535,11 @@ func TestConnectOnboardingHandlerValidatesContextBeforeStartingJob(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			env := newOnboardingRouteTestEnv(t)
 			env.setState(t, tt.state)
+			if tt.state.Phase == store.OnboardingPhaseConnect || tt.state.Phase == store.OnboardingPhaseSetup {
+				env.replaceProviderStages(t, appOnboardingProviderWire{
+					Kind: "codex", Status: "pending", Position: 0,
+				})
+			}
 			starts := 0
 			connectMgr = &connectManager{
 				runner:        &fakeRunner{installed: true, auth: authLoggedOut},
@@ -640,9 +580,13 @@ func TestConnectOnboardingHandlerValidatesContextBeforeStartingJob(t *testing.T)
 
 func TestConnectOnboardingRouteStagesDisabledAccountAndAdvancesState(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
-	selected := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"codex"}`)
+	selected := env.serve(http.MethodPut, "/onboarding/providers", `{"revision":1,"selected_kinds":["codex"]}`)
 	if selected.Code != http.StatusOK {
 		t.Fatalf("select provider status=%d body=%s", selected.Code, selected.Body.String())
+	}
+	begun := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":2,"kind":"codex"}`)
+	if begun.Code != http.StatusOK {
+		t.Fatalf("begin provider status=%d body=%s", begun.Code, begun.Body.String())
 	}
 	state := env.state(t)
 	createCalls := 0
@@ -711,9 +655,13 @@ func TestConnectOnboardingRouteStagesDisabledAccountAndAdvancesState(t *testing.
 
 func TestConnectOnboardingStateChangeDuringLoginFailsClosed(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
-	selected := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"codex"}`)
+	selected := env.serve(http.MethodPut, "/onboarding/providers", `{"revision":1,"selected_kinds":["codex"]}`)
 	if selected.Code != http.StatusOK {
 		t.Fatalf("select provider status=%d body=%s", selected.Code, selected.Body.String())
+	}
+	begun := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":2,"kind":"codex"}`)
+	if begun.Code != http.StatusOK {
+		t.Fatalf("begin provider status=%d body=%s", begun.Code, begun.Body.String())
 	}
 	state := env.state(t)
 	runner := &gatedAccountLabelRunner{
@@ -772,9 +720,7 @@ func TestAppOnboardingProviderDoesNotCancelUnrelatedConnect(t *testing.T) {
 	connectMgr = &connectManager{job: job, jobKind: "claude-code"}
 	t.Cleanup(func() { cancel(); close(job.done) })
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
 		t.Fatal("unrelated connect job was canceled")
 	}
@@ -791,9 +737,7 @@ func TestAppOnboardingProviderDoesNotCancelSameKindNormalConnect(t *testing.T) {
 	t.Cleanup(func() { cancel(); close(job.done) })
 
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
 		t.Fatal("onboarding mutation canceled a normal same-kind Connect")
 	}
@@ -812,7 +756,7 @@ func TestAppOnboardingProviderRejectsMismatchedConnectContextWithoutCancel(t *te
 	before := env.state(t)
 
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":4,"kind":"claude-code"}`)
-	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT")
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
 		t.Fatal("mismatched onboarding Connect was canceled")
 	}
@@ -821,90 +765,28 @@ func TestAppOnboardingProviderRejectsMismatchedConnectContextWithoutCancel(t *te
 	}
 }
 
-func TestAppOnboardingCanceledConnectCannotCompleteLate(t *testing.T) {
-	env := newOnboardingRouteTestEnv(t)
-	env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
-	ctx, cancel := context.WithCancel(context.Background())
-	job := newManualConnectJob("codex", cancel)
-	job.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
-	lateAdvanced := make(chan bool, 1)
-	connectMgr = &connectManager{job: job, jobKind: "codex"}
-	go func() {
-		<-ctx.Done()
-		lateAdvanced <- job.transitionActive(ctx, phaseDetecting, phasePolling, nil)
-		close(job.done)
-	}()
-	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	if <-lateAdvanced {
-		t.Fatal("late completion advanced canceled job")
-	}
-	if got := job.snapshot().Phase; got != phaseCanceled {
-		t.Fatalf("job phase=%q; want canceled", got)
-	}
-}
-
-func TestAppOnboardingConnectCleanupTimeoutAndRequestCancelPreserveState(t *testing.T) {
-	tests := []struct {
-		name          string
-		cancelRequest bool
-	}{
-		{"timeout", false},
-		{"request canceled", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			env := newOnboardingRouteTestEnv(t)
-			env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
-			jobCtx, cancelJob := context.WithCancel(context.Background())
-			job := newManualConnectJob("codex", cancelJob)
-			job.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
-			connectMgr = &connectManager{job: job, jobKind: "codex"}
-			originalWait := appOnboardingConnectCancelWait
-			appOnboardingConnectCancelWait = 40 * time.Millisecond
-			t.Cleanup(func() {
-				appOnboardingConnectCancelWait = originalWait
-				select {
-				case <-job.done:
-				default:
-					close(job.done)
-				}
-			})
-			req := httptest.NewRequest(http.MethodPut, "/onboarding/provider", strings.NewReader(`{"revision":1,"kind":"claude-code"}`))
-			if tt.cancelRequest {
-				requestCtx, cancelRequest := context.WithCancel(req.Context())
-				req = req.WithContext(requestCtx)
-				go func() {
-					<-jobCtx.Done()
-					cancelRequest()
-				}()
-			}
-			rr := env.serveRequest(req)
-			requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_CLEANUP_FAILED")
-			if got := env.state(t); got.Revision != 1 || got.ProviderKind != "codex" {
-				t.Fatalf("failed cancellation changed state: %+v", got)
-			}
-		})
-	}
-}
-
-func TestAppOnboardingProviderRechecksRevisionAfterConnectCleanup(t *testing.T) {
+func TestAppOnboardingRejectedBeginLeavesConnectActive(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
 	env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
 	ctx, cancel := context.WithCancel(context.Background())
 	job := newManualConnectJob("codex", cancel)
 	job.onboarding = &connectOnboardingContext{Revision: 1, Kind: "codex"}
 	connectMgr = &connectManager{job: job, jobKind: "codex"}
-	go func() {
-		<-ctx.Done()
-		_, _ = env.db.Exec(`UPDATE app_onboarding_state SET revision = 2 WHERE id = 1`)
-		close(job.done)
-	}()
+	t.Cleanup(func() { cancel(); close(job.done) })
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
-	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT")
-	if got := env.state(t); got.ProviderKind != "codex" || got.Revision != 2 {
-		t.Fatalf("late old flow was overwritten: %+v", got)
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
+	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
+		t.Fatal("rejected begin canceled Connect")
+	}
+}
+
+func TestAppOnboardingProviderPhaseRejectionPreservesState(t *testing.T) {
+	env := newOnboardingRouteTestEnv(t)
+	env.setState(t, store.OnboardingState{Phase: store.OnboardingPhaseConnect, ProviderKind: "codex", Revision: 1})
+	before := env.state(t)
+	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"claude-code"}`)
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
+	if got := env.state(t); got != before {
+		t.Fatalf("rejected begin changed state: before=%+v after=%+v", before, got)
 	}
 }

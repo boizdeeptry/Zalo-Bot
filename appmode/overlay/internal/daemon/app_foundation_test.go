@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,9 +37,12 @@ type appRouteTestCase struct {
 func appRouteTestCases() []appRouteTestCase {
 	return []appRouteTestCase{
 		{"GET /onboarding/status", "/onboarding/status"},
+		{"PUT /onboarding/providers", "/onboarding/providers"},
 		{"PUT /onboarding/provider", "/onboarding/provider"},
 		{"POST /onboarding/setup", "/onboarding/setup"},
 		{"POST /onboarding/test-chat", "/onboarding/test-chat"},
+		{"POST /onboarding/bootstrap", "/onboarding/bootstrap"},
+		{"POST /onboarding/back-to-providers", "/onboarding/back-to-providers"},
 		{"POST /onboarding/complete", "/onboarding/complete"},
 		{"POST /onboarding/restart", "/onboarding/restart"},
 		{"GET /agent", "/agent"},
@@ -286,17 +290,49 @@ func (*appRouteConnectRunner) login(context.Context, string, string) (string, st
 func (*appRouteConnectRunner) pollAuth(string, string) authState  { return authUnknown }
 func (*appRouteConnectRunner) accountLabel(string, string) string { return "" }
 
+func appRouteInjectedConnectRegistry(
+	t *testing.T,
+	runner connectRunner,
+	ensure func(string) error,
+) appProviderRuntimeRegistry {
+	t.Helper()
+	registrations := appProductionProviderRuntimeRegistrations()
+	index := appRuntimeRegistrationIndex(t, registrations, "codex")
+	registrations[index].Connect = func(*slog.Logger) appConnectDriver {
+		return appBoundConnectDriver{kind: "codex", runner: runner}
+	}
+	registrations[index].EnsureAccountProvider = func(st *store.Store) error {
+		if ensure != nil {
+			if err := ensure("codex"); err != nil {
+				return err
+			}
+		}
+		return st.EnsureProviderForKind("codex")
+	}
+	registrations[index].SeedConnectedModels = func(*store.Store, string) error { return nil }
+	registry, err := newAppProviderRuntimeRegistry(
+		productionAppProviderRuntimeRegistry().Catalog().Options(),
+		registrations,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry
+}
+
 func TestAppRoutesDispatchEveryConnectHandler(t *testing.T) {
 	a := newAppRouteAPI(t)
 	a.portalOpen = true
-	mux := http.NewServeMux()
-	a.registerAppRoutes(mux)
 
 	runner := &appRouteConnectRunner{
 		entered: make(chan struct{}), release: make(chan struct{}), returned: make(chan struct{}),
 	}
 	manager := newTestManager(t, runner, func(string) error { return nil }, func(store.LLMAccount) error { return nil })
-	connectMgr = manager
+	mux := http.NewServeMux()
+	registerAppRoutesWithContext(mux, appRuntimeContext{
+		api: a, registry: appRouteInjectedConnectRegistry(t, runner, func(string) error { return nil }),
+		connect: manager,
+	})
 	t.Cleanup(func() {
 		manager.cancel("codex")
 		connectMgr = nil
@@ -366,8 +402,6 @@ func TestAppRoutesDispatchEveryConnectHandler(t *testing.T) {
 func TestAppRouteConnectCancelReportsFalseAfterSuccessClaim(t *testing.T) {
 	a := newAppRouteAPI(t)
 	a.portalOpen = true
-	mux := http.NewServeMux()
-	a.registerAppRoutes(mux)
 
 	ensureEntered := make(chan struct{})
 	ensureRelease := make(chan struct{})
@@ -382,7 +416,15 @@ func TestAppRouteConnectCancelReportsFalseAfterSuccessClaim(t *testing.T) {
 		},
 		func(store.LLMAccount) error { return nil },
 	)
-	connectMgr = manager
+	mux := http.NewServeMux()
+	registerAppRoutesWithContext(mux, appRuntimeContext{
+		api: a, registry: appRouteInjectedConnectRegistry(t, runner, func(string) error {
+			close(ensureEntered)
+			<-ensureRelease
+			return nil
+		}),
+		connect: manager,
+	})
 	t.Cleanup(func() {
 		release()
 		manager.cancel("codex")

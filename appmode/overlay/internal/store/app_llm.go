@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"agentdc/internal/providercatalog"
 )
 
 // ErrLLMRouteConflict nói rằng có người đã ghi route giữa lúc người này đang sửa.
@@ -20,6 +22,16 @@ var ErrLLMRouteConflict = errors.New("llm route revision conflict")
 // trong schema chỉ là tài liệu quan hệ. Xoá lọt sẽ để lại một chuỗi fallback trỏ vào hư không
 // và lượt trả lời tiếp theo chết giữa chừng.
 var ErrLLMProviderInUse = errors.New("llm provider is referenced by the route")
+
+// ErrLLMOnboardingStageInUse prevents ordinary Provider management from
+// invalidating an in-progress onboarding stage. It is deliberately distinct
+// from the live-route sentinel because the Portal resolves the two conflicts
+// through different flows.
+var ErrLLMOnboardingStageInUse = errors.New("llm resource is referenced by onboarding")
+
+// ErrLLMProviderSingletonConflict reports that an account-mode runtime cannot
+// own the required exact Provider singleton without changing existing rows.
+var ErrLLMProviderSingletonConflict = errors.New("llm account-runtime provider singleton conflict")
 
 // Nguồn của một model: do khám phá từ API Provider, hay do người dùng tự nhập.
 const (
@@ -173,35 +185,109 @@ VALUES(?,?,?,?,0,x'')`, p.ID, p.Name, p.Kind, boolInt(p.Enabled)); err != nil {
 	return nil
 }
 
-// subscriptionDisplayName ánh xạ kind sang tên hiển thị cho các Provider subscription
-// (CLI tự giữ phiên đăng nhập, không qua credential_cipher).
-var subscriptionDisplayName = map[string]string{
-	"claude-code": "Claude Code",
-	"codex":       "OpenAI Codex",
-}
-
 // EnsureProviderForKind đảm bảo có ĐÚNG một hàng Provider cho một kind subscription.
 //
 // Idempotent: đã có thì không làm gì. Provider subscription không mang credential (CLI tự giữ
 // phiên riêng), nên hàng này chỉ tồn tại để lên danh sách / route trỏ tới. id = kind vì #2 mới
 // chỉ có một tài khoản; #3 (multi-account) dùng riêng bảng llm_accounts cho danh tính từng tài khoản.
 func (s *Store) EnsureProviderForKind(kind string) error {
-	name, ok := subscriptionDisplayName[kind]
-	if !ok {
+	option, supported := providercatalog.Default().Option(kind)
+	if !supported || !option.Advertised {
 		return fmt.Errorf("ensure provider %s: không phải kind subscription", kind)
 	}
-	// ponytail: check-then-insert is not atomic; safe because connect runs one job at a time
-	// from a single goroutine. Wrap in inLLMTx if this is ever called concurrently.
-	providers, err := s.LLMProviders()
-	if err != nil {
+	return s.EnsureAccountRuntimeProvider(option.Kind, option.DisplayName)
+}
+
+// EnsureAccountRuntimeProvider creates the exact Provider singleton trusted
+// account-runtime registry metadata describes. Existing exact rows are
+// immutable through this operation, including their enabled and health fields.
+func (s *Store) EnsureAccountRuntimeProvider(kind, displayName string) error {
+	return s.ensureAccountRuntimeProvider(kind, displayName, true)
+}
+
+func (s *Store) ensureAccountRuntimeProvider(kind, displayName string, enabled bool) error {
+	if err := validateAccountRuntimeProviderMetadata(kind, displayName); err != nil {
 		return err
 	}
-	for _, p := range providers {
-		if p.Kind == kind {
-			return nil
+	return s.inLLMTx("ensure account-runtime Provider "+kind, func(tx *sql.Tx) error {
+		return ensureAccountRuntimeProviderInTx(tx, kind, displayName, enabled)
+	})
+}
+
+func ensureAccountRuntimeProviderInTx(
+	tx *sql.Tx,
+	kind string,
+	displayName string,
+	enabled bool,
+) error {
+	rows, err := tx.Query(`SELECT id, kind
+FROM llm_providers
+WHERE id = ? OR kind = ?
+ORDER BY id`, kind, kind)
+	if err != nil {
+		return fmt.Errorf("inspect account-runtime Provider %q: %w", kind, err)
+	}
+	exact := false
+	for rows.Next() {
+		var providerID, providerKind string
+		if err := rows.Scan(&providerID, &providerKind); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan account-runtime Provider %q: %w", kind, err)
+		}
+		switch {
+		case providerID == kind && providerKind == kind:
+			exact = true
+		case providerID == kind:
+			_ = rows.Close()
+			return fmt.Errorf(
+				"%w: exact Provider ID %q has kind %q",
+				ErrLLMProviderSingletonConflict,
+				kind,
+				providerKind,
+			)
+		case providerKind == kind:
+			_ = rows.Close()
+			return fmt.Errorf(
+				"%w: sibling Provider %q also has kind %q",
+				ErrLLMProviderSingletonConflict,
+				providerID,
+				kind,
+			)
 		}
 	}
-	return s.CreateLLMProvider(LLMProvider{ID: kind, Name: name, Kind: kind, Enabled: true})
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate account-runtime Provider %q: %w", kind, err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close account-runtime Provider inspection %q: %w", kind, err)
+	}
+	if exact {
+		return nil
+	}
+	result, err := tx.Exec(`INSERT INTO llm_providers(id, name, kind, enabled)
+VALUES (?, ?, ?, ?)`, kind, displayName, kind, boolInt(enabled))
+	if err != nil {
+		return fmt.Errorf("insert account-runtime Provider %q: %w", kind, err)
+	}
+	return assertOneRow(result, "insert account-runtime Provider "+kind)
+}
+
+func validateAccountRuntimeProviderMetadata(kind, displayName string) error {
+	if !providercatalog.ValidKind(kind) {
+		return fmt.Errorf("ensure account-runtime Provider: invalid kind %q", kind)
+	}
+	_, err := providercatalog.New([]providercatalog.Option{{
+		Kind:        kind,
+		DisplayName: displayName,
+		Description: "Account runtime Provider",
+		Advertised:  true,
+		RouteRank:   0,
+	}})
+	if err != nil {
+		return fmt.Errorf("ensure account-runtime Provider %q: invalid display metadata: %w", kind, err)
+	}
+	return nil
 }
 
 // UpdateLLMProvider sửa phần hiển thị và trạng thái kiểm tra.
@@ -213,15 +299,33 @@ func (s *Store) UpdateLLMProvider(p LLMProvider) error {
 	if p.ID == "" || p.Name == "" {
 		return fmt.Errorf("update llm provider: cần id và tên")
 	}
-	res, err := s.db.Exec(`
+	return s.inLLMTx(fmt.Sprintf("update llm provider %s", p.ID), func(tx *sql.Tx) error {
+		staged, err := llmOnboardingStageReferencesProviderInTx(tx, p.ID)
+		if err != nil {
+			return err
+		}
+		if staged {
+			current, err := llmProviderMutableFieldsInTx(tx, p.ID)
+			if err != nil {
+				return err
+			}
+			// Name and health metadata do not affect staged execution ownership.
+			// Enabled does, so it is the only mutable field fenced here; Kind and
+			// credential are owned by separate APIs and are not updated below.
+			if current.Enabled != p.Enabled {
+				return ErrLLMOnboardingStageInUse
+			}
+		}
+		res, err := tx.Exec(`
 UPDATE llm_providers
 SET name = ?, enabled = ?, last_check_status = ?, last_error = ?, last_checked_at = ?
 WHERE id = ?`, p.Name, boolInt(p.Enabled), p.LastCheckStatus, p.LastError,
-		formatNullableTS(p.LastCheckedAt), p.ID)
-	if err != nil {
-		return fmt.Errorf("update llm provider %s: %w", p.ID, err)
-	}
-	return assertOneRow(res, fmt.Sprintf("update llm provider %s", p.ID))
+			formatNullableTS(p.LastCheckedAt), p.ID)
+		if err != nil {
+			return err
+		}
+		return assertOneRow(res, fmt.Sprintf("update llm provider %s", p.ID))
+	})
 }
 
 func (s *Store) DeleteLLMProvider(id string) error {
@@ -232,7 +336,11 @@ func (s *Store) DeleteLLMProvider(id string) error {
 		res, err := tx.Exec(`
 DELETE FROM llm_providers
 WHERE id = ?
-  AND NOT EXISTS (SELECT 1 FROM llm_combo_members WHERE provider_id = ?)`, id, id)
+  AND NOT EXISTS (SELECT 1 FROM llm_combo_members WHERE provider_id = ?)
+  AND NOT EXISTS (
+    SELECT 1 FROM app_onboarding_provider_stages
+    WHERE kind = ? OR provider_id = ?
+  )`, id, id, id, id)
 		if err != nil {
 			return err
 		}
@@ -246,6 +354,15 @@ WHERE id = ?
 			// Cold path: phân biệt id không tồn tại với Provider đang được combo giữ để giữ nguyên
 			// sentinel của API. Lần đọc này nằm sau conditional DELETE trong cùng transaction; nó
 			// chỉ giải thích kết quả, không quyết định việc xoá nên không mở lại khe đua.
+			var staged int
+			if err := tx.QueryRow(`SELECT EXISTS(
+SELECT 1 FROM app_onboarding_provider_stages WHERE kind = ? OR provider_id = ?
+)`, id, id).Scan(&staged); err != nil {
+				return fmt.Errorf("check onboarding stage references: %w", err)
+			}
+			if staged == 1 {
+				return ErrLLMOnboardingStageInUse
+			}
 			var referenced int
 			if err := tx.QueryRow(
 				`SELECT EXISTS(SELECT 1 FROM llm_combo_members WHERE provider_id = ?)`, id).
@@ -346,11 +463,25 @@ func (s *Store) AddLLMModel(m LLMModel) error {
 		return fmt.Errorf("add llm model %s/%s: nguồn phải là %q hoặc %q, không phải %q",
 			m.ProviderID, m.ModelID, LLMModelManual, LLMModelDiscovered, m.Source)
 	}
-	if _, err := s.db.Exec(llmModelUpsert,
-		m.ProviderID, m.ModelID, m.Name, m.Source, boolInt(m.Available)); err != nil {
-		return fmt.Errorf("add llm model %s/%s: %w", m.ProviderID, m.ModelID, err)
-	}
-	return nil
+	return s.inLLMTx(fmt.Sprintf("add llm model %s/%s", m.ProviderID, m.ModelID), func(tx *sql.Tx) error {
+		staged, err := llmOnboardingStageReferencesModelInTx(tx, m.ProviderID, m.ModelID)
+		if err != nil {
+			return err
+		}
+		if staged {
+			current, err := llmModelInTx(tx, m.ProviderID, m.ModelID)
+			if err != nil {
+				return ErrLLMOnboardingStageInUse
+			}
+			if current != m {
+				return ErrLLMOnboardingStageInUse
+			}
+			return nil
+		}
+		_, err = tx.Exec(llmModelUpsert,
+			m.ProviderID, m.ModelID, m.Name, m.Source, boolInt(m.Available))
+		return err
+	})
 }
 
 // ReplaceLLMModels thay TOÀN BỘ model của một Provider thuộc đúng một nguồn.
@@ -370,6 +501,9 @@ func (s *Store) ReplaceLLMModels(providerID, source string, models []LLMModel) e
 			providerID, LLMModelManual, LLMModelDiscovered, source)
 	}
 	return s.inLLMTx(fmt.Sprintf("replace llm models of %s", providerID), func(tx *sql.Tx) error {
+		if err := validateLLMOnboardingModelReplacementInTx(tx, providerID, source, models); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(
 			`DELETE FROM llm_models WHERE provider_id = ? AND source = ?`, providerID, source); err != nil {
 			return err
@@ -388,12 +522,32 @@ func (s *Store) ReplaceLLMModels(providerID, source string, models []LLMModel) e
 }
 
 func (s *Store) DeleteLLMModel(providerID, modelID string) error {
-	res, err := s.db.Exec(
-		`DELETE FROM llm_models WHERE provider_id = ? AND model_id = ?`, providerID, modelID)
-	if err != nil {
-		return fmt.Errorf("delete llm model %s/%s: %w", providerID, modelID, err)
-	}
-	return assertOneRow(res, fmt.Sprintf("delete llm model %s/%s", providerID, modelID))
+	return s.inLLMTx(fmt.Sprintf("delete llm model %s/%s", providerID, modelID), func(tx *sql.Tx) error {
+		res, err := tx.Exec(`DELETE FROM llm_models
+WHERE provider_id = ? AND model_id = ?
+  AND NOT EXISTS (
+    SELECT 1 FROM app_onboarding_provider_stages
+    WHERE status = 'ready' AND provider_id = ? AND model_id = ?
+  )`, providerID, modelID, providerID, modelID)
+		if err != nil {
+			return err
+		}
+		changed, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 1 {
+			return nil
+		}
+		staged, err := llmOnboardingStageReferencesModelInTx(tx, providerID, modelID)
+		if err != nil {
+			return err
+		}
+		if staged {
+			return ErrLLMOnboardingStageInUse
+		}
+		return ErrNotFound
+	})
 }
 
 const llmModelUpsert = `
@@ -445,11 +599,40 @@ VALUES(?,?,?,?,?,?,?)`, a.ID, a.ProviderID, a.Label, a.Email, a.ConfigDir,
 }
 
 func (s *Store) DeleteLLMAccount(id string) error {
-	res, err := s.db.Exec(`DELETE FROM llm_accounts WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete llm account %s: %w", id, err)
-	}
-	return assertOneRow(res, fmt.Sprintf("delete llm account %s", id))
+	return s.inLLMTx(fmt.Sprintf("delete llm account %s", id), func(tx *sql.Tx) error {
+		res, err := tx.Exec(`DELETE FROM llm_accounts
+WHERE id = ?
+  AND NOT EXISTS (
+    SELECT 1 FROM app_onboarding_provider_stages
+    WHERE status = 'ready' AND account_id = ?
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM app_onboarding_state
+    WHERE id = 1 AND phase = 'setup' AND account_id = ?
+  )`, id, id, id)
+		if err != nil {
+			return err
+		}
+		changed, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 1 {
+			return nil
+		}
+		var staged int
+		if err := tx.QueryRow(`SELECT EXISTS(
+SELECT 1 FROM app_onboarding_provider_stages WHERE status = 'ready' AND account_id = ?
+UNION ALL
+SELECT 1 FROM app_onboarding_state WHERE id = 1 AND phase = 'setup' AND account_id = ?
+)`, id, id).Scan(&staged); err != nil {
+			return err
+		}
+		if staged == 1 {
+			return ErrLLMOnboardingStageInUse
+		}
+		return ErrNotFound
+	})
 }
 
 // --- route ---
@@ -597,6 +780,127 @@ WHERE outcome = ? ORDER BY id DESC LIMIT 1`, LLMAttemptOK).
 }
 
 // --- helpers ---
+
+func llmOnboardingStageReferencesProviderInTx(tx *sql.Tx, providerID string) (bool, error) {
+	var referenced int
+	if err := tx.QueryRow(`SELECT EXISTS(
+SELECT 1 FROM app_onboarding_provider_stages WHERE kind = ? OR provider_id = ?
+)`, providerID, providerID).Scan(&referenced); err != nil {
+		return false, fmt.Errorf("check onboarding Provider stage reference: %w", err)
+	}
+	return referenced == 1, nil
+}
+
+func llmOnboardingStageReferencesModelInTx(
+	tx *sql.Tx,
+	providerID string,
+	modelID string,
+) (bool, error) {
+	var referenced int
+	if err := tx.QueryRow(`SELECT EXISTS(
+SELECT 1 FROM app_onboarding_provider_stages
+WHERE status = 'ready' AND provider_id = ? AND model_id = ?
+)`, providerID, modelID).Scan(&referenced); err != nil {
+		return false, fmt.Errorf("check onboarding model stage reference: %w", err)
+	}
+	return referenced == 1, nil
+}
+
+func llmProviderMutableFieldsInTx(tx *sql.Tx, providerID string) (LLMProvider, error) {
+	var provider LLMProvider
+	var enabled int
+	var checkedAt string
+	err := tx.QueryRow(`SELECT id, name, enabled, last_check_status, last_error, last_checked_at
+FROM llm_providers WHERE id = ?`, providerID).Scan(
+		&provider.ID,
+		&provider.Name,
+		&enabled,
+		&provider.LastCheckStatus,
+		&provider.LastError,
+		&checkedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return LLMProvider{}, ErrNotFound
+	}
+	if err != nil {
+		return LLMProvider{}, err
+	}
+	provider.Enabled = enabled == 1
+	provider.LastCheckedAt, err = parseNullableTS(checkedAt)
+	if err != nil {
+		return LLMProvider{}, err
+	}
+	return provider, nil
+}
+
+func llmModelInTx(tx *sql.Tx, providerID, modelID string) (LLMModel, error) {
+	var model LLMModel
+	var available int
+	err := tx.QueryRow(`SELECT provider_id, model_id, name, source, available
+FROM llm_models WHERE provider_id = ? AND model_id = ?`, providerID, modelID).Scan(
+		&model.ProviderID,
+		&model.ModelID,
+		&model.Name,
+		&model.Source,
+		&available,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return LLMModel{}, ErrNotFound
+	}
+	if err != nil {
+		return LLMModel{}, err
+	}
+	model.Available = available == 1
+	return model, nil
+}
+
+func validateLLMOnboardingModelReplacementInTx(
+	tx *sql.Tx,
+	providerID string,
+	source string,
+	models []LLMModel,
+) error {
+	incoming := make(map[string]LLMModel, len(models))
+	for _, model := range models {
+		incoming[model.ModelID] = model
+	}
+	rows, err := tx.Query(`SELECT s.model_id, m.source, m.available
+FROM app_onboarding_provider_stages s
+LEFT JOIN llm_models m
+  ON m.provider_id = s.provider_id AND m.model_id = s.model_id
+WHERE s.status = 'ready' AND s.provider_id = ?`, providerID)
+	if err != nil {
+		return fmt.Errorf("read onboarding staged models: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var modelID string
+		var currentSource sql.NullString
+		var available sql.NullInt64
+		if err := rows.Scan(&modelID, &currentSource, &available); err != nil {
+			return fmt.Errorf("scan onboarding staged model: %w", err)
+		}
+		if !currentSource.Valid || !available.Valid || available.Int64 != 1 {
+			return ErrLLMOnboardingStageInUse
+		}
+		candidate, supplied := incoming[modelID]
+		if currentSource.String == source {
+			if !supplied || !candidate.Available {
+				return ErrLLMOnboardingStageInUse
+			}
+			continue
+		}
+		// llmModelUpsert would otherwise move a staged model from the other
+		// source into this replacement set even though the scoped DELETE did not.
+		if supplied {
+			return ErrLLMOnboardingStageInUse
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate onboarding staged models: %w", err)
+	}
+	return nil
+}
 
 // inLLMTx chạy fn trong một transaction và trả nguyên trạng khi fn lỗi.
 //

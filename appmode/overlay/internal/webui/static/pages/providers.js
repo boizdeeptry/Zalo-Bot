@@ -1,6 +1,8 @@
 import { requestJSON } from "../core/api.js";
+import { normalizeProviderRuntimeResponse } from "../core/provider-runtime-catalog.js";
 import { isProviderConnected } from "../core/providers-status.js";
 import { element, errorPanel, pageHeader } from "../core/ui.js";
+import { createProviderOffDialog } from "../components/provider-off-dialog.js";
 import {
   createProviderConnect,
   INSTALL_CEILING,
@@ -9,26 +11,33 @@ import {
 
 export { INSTALL_CEILING, phaseProgress };
 
-export const PROVIDER_CATALOG = [
-  { kind: "claude-code", name: "Claude Code", group: "subscription", prefix: "cc", logoColor: "#c8613b" },
-  { kind: "codex", name: "OpenAI Codex", group: "subscription", prefix: "cx", logoColor: "#0f7a63" },
-  { kind: "openai", name: "OpenAI", group: "apikey", prefix: "oa", logoColor: "#10a37f" },
-  { kind: "anthropic", name: "Anthropic", group: "apikey", prefix: "an", logoColor: "#c8613b" },
-  { kind: "gemini", name: "Gemini", group: "apikey", prefix: "gm", logoColor: "#3f6ff5" },
-  { kind: "openrouter", name: "OpenRouter", group: "apikey", prefix: "or", logoColor: "#5b5ef0" },
-];
-// CONNECTABLE_KINDS mirrors the backend subscriptionKinds: only these can run the in-Portal login
-// flow. Two DIFFERENT login shapes: codex shows a device-auth code, claude-code shows a plain browser
-// URL (no code). (Routing differs too — codex runs via cliAdapter, claude-code via runClaude for KB
-// --add-dir access — but that's a backend concern; here we only drive the login UI.)
-const CONNECTABLE_KINDS = new Set(["codex", "claude-code"]);
-const normalizeKind = (k) => String(k ?? "").replace(/_/g, "-");
-
 function providerPath(id, suffix = "") {
   const value = String(id ?? "").trim();
   if (!value) throw new TypeError("Provider id is required");
   return `/llm/providers/${encodeURIComponent(value)}${suffix}`;
 }
+
+const providerMutationHandoff = (() => {
+  const listeners = new Set();
+  let settlementEpoch = 0;
+  return Object.freeze({
+    currentEpoch: () => settlementEpoch,
+    subscribe(owner, listener) {
+      const subscription = { owner, listener };
+      listeners.add(subscription);
+      return () => listeners.delete(subscription);
+    },
+    async run(owner, operation) {
+      try { await operation(); } catch { /* The authoritative read decides ambiguous writes. */ }
+      const epoch = ++settlementEpoch;
+      for (const subscription of [...listeners]) {
+        if (subscription.owner === owner) continue;
+        try { subscription.listener(epoch); } catch { /* A page refresh owns its own safe failure UI. */ }
+      }
+      return epoch;
+    },
+  });
+})();
 
 // createProviderService dựng THÂN của mọi lượt gọi tại đây thay vì chuyển tiếp thẳng đối tượng
 // người gọi đưa: /llm từ chối trường lạ, nên một phím gõ thừa ở tầng trên sẽ thành 400 chứ không
@@ -99,8 +108,8 @@ function galleryStatus(entry, byKind) {
   // Gói thuê bao (codex/claude): "đã kết nối" = CÓ TÀI KHOẢN đăng nhập, KHÔNG phải credential — chúng
   // chạy proxy/CLI bằng phiên riêng của account, không có credential đi qua daemon. Nhánh này chỉ dựng
   // NHÃN (đếm số tài khoản); cls đã do isProviderConnected quyết.
-  if (entry.group === "subscription") {
-    const accounts = Array.isArray(p.accounts) ? p.accounts.filter((a) => a.enabled !== false) : [];
+  if (entry.connection_mode === "account") {
+    const accounts = Array.isArray(p.accounts) ? p.accounts.filter((a) => a.enabled === true) : [];
     if (accounts.length) {
       return { cls, label: accounts.length > 1 ? `Đã kết nối · ${accounts.length} tài khoản` : "Đã kết nối" };
     }
@@ -109,18 +118,31 @@ function galleryStatus(entry, byKind) {
     // không phải một nhãn xanh gây hiểu nhầm.
     return { cls, label: "Chưa kết nối" };
   }
-  if (p.last_check_status === "ok") return { cls, label: "Đã kết nối" };
-  if (p.system) return { cls, label: "Sẵn sàng" };
   if (!p.credential_configured) return { cls, label: "Chưa kết nối" };
   return { cls, label: "Đã thêm" };
 }
-function card(entry, byKind, onOpen) {
-  const st = galleryStatus(entry, byKind);
+
+function providerMark(entry, large = false) {
+  const mark = element("span", {
+    className: `pv-logo${large ? " lg" : ""} pv-logo-${entry.kind}`,
+    attributes: {
+      "aria-hidden": "true",
+      "data-provider-mark": entry.prefix,
+      title: entry.display_name,
+    },
+    text: entry.prefix.toUpperCase(),
+  });
+  mark.style.backgroundColor = entry.theme_color;
+  return mark;
+}
+
+function card(entry, byKind, onOpen, status = null) {
+  const st = status ?? galleryStatus(entry, byKind);
   return element("button", { className: "pv-card",
-    attributes: { type: "button", "aria-label": `Mở ${entry.name}` }, on: { click() { onOpen(entry.kind); } } },
-    element("span", { className: `pv-logo pv-logo-${entry.kind}`, attributes: { "aria-hidden": "true" } }),
+    attributes: { type: "button", "aria-label": `Mở ${entry.display_name}` }, on: { click() { onOpen(entry.kind); } } },
+    providerMark(entry),
     element("span", { className: "pv-meta" },
-      element("span", { className: "pv-name", text: entry.name }),
+      element("span", { className: "pv-name", text: entry.display_name }),
       element("span", { className: `pv-status ${st.cls}`, text: st.label })),
   );
 }
@@ -129,17 +151,6 @@ function group(title, entries, byKind, onOpen, extraHead = null) {
     element("div", { className: "pv-group-head" }, element("h2", { text: title }), extraHead),
     element("div", { className: "pv-grid" }, entries.map((e) => card(e, byKind, onOpen))));
 }
-// PROXY_KINDS: provider chạy qua PROXY (gọi thẳng API bằng phiên đăng nhập) thay vì CLI chính chủ.
-// Proxy nhanh/nhiều tài khoản NHƯNG mang rủi ro nhà cung cấp hạn chế/khoá tài khoản — badge phải nói
-// đúng, không bán "an toàn tuyệt đối". Hôm nay chỉ codex; claude-code/gemini-cli vẫn CLI chính chủ.
-const PROXY_KINDS = new Set(["codex"]);
-
-// safeTag là nhãn CẤP NHÓM: nhóm thuê bao giờ TRỘN (Claude chính chủ + Codex proxy) nên KHÔNG dán
-// blanket "không rủi ro" ở đây — nói trung tính, để badge chi tiết từng provider mang sự thật riêng.
-const safeTag = () => element("span", { className: "pv-safe-tag" },
-  element("span", { className: "pv-dot" }),
-  element("span", { text: "Claude chính chủ · Codex proxy" }),
-);
 // testAllButton nhận service/refresh làm tham số thay vì đóng bao (closure) — group()/renderGallery
 // giữ nguyên là hàm thuần trên tham số đầu vào, không đụng trạng thái của mount(). Promise.allSettled
 // vì một Provider lỗi (mất mạng, khoá hết hạn) không được chặn phần còn lại của lượt kiểm tra chung.
@@ -163,25 +174,100 @@ function renderGallery(entries, byKind, onOpen, headFor) {
   const sub = entries.filter((e) => e.group === "subscription");
   const api = entries.filter((e) => e.group === "apikey");
   return element("div", { className: "pv-gallery" },
-    group("Gói thuê bao", sub, byKind, onOpen, headFor(sub, byKind, true)),
-    group("API Key", api, byKind, onOpen, headFor(api, byKind, false)));
+    group("Gói thuê bao", sub, byKind, onOpen, headFor(sub, byKind)),
+    group("API Key", api, byKind, onOpen, headFor(api, byKind)));
+}
+
+function renderPersistedHidden(entries, byKind, onOpen) {
+  if (!entries.length) return null;
+  return element("section", { className: "pv-managed-hidden" },
+    element("div", { className: "pv-group-head" },
+      element("h2", { text: "Runtime đã lưu (chỉ đọc)" })),
+    element("div", { className: "pv-grid" }, entries.map((entry) => card(entry, byKind, onOpen, { cls: "off", label: "Runtime ẩn · Chỉ đọc" }))));
 }
 
 function detailHead(entry, byKind) {
   const p = byKind.get(entry.kind);
   const count = p && Array.isArray(p.models) ? `${p.models.length} model` : "0 kết nối";
   return element("div", { className: "pv-detail-head" },
-    element("span", { className: `pv-logo lg pv-logo-${entry.kind}`, attributes: { "aria-hidden": "true" } }),
-    element("div", {}, element("div", { className: "pv-name", text: entry.name }),
+    providerMark(entry, true),
+    element("div", {}, element("div", { className: "pv-name", text: entry.display_name }),
       element("div", { className: "pv-sub", text: count })),
   );
 }
-const safeBadge = (kind) => (PROXY_KINDS.has(kind)
-  ? element("div", { className: "pv-risk-badge" },
-    element("span", { text: "Chạy qua PROXY — gọi thẳng API bằng phiên đăng nhập của tài khoản (như 9Router). Nhanh và"
-      + " dùng được nhiều tài khoản, NHƯNG nhà cung cấp có thể hạn chế hoặc KHOÁ tài khoản. Không phải đăng nhập chính chủ." }))
-  : element("div", { className: "pv-safe-badge" },
-    element("span", { text: "Đăng nhập chính chủ qua CLI — không giả client, không proxy, không rủi ro khoá tài khoản." })));
+function executionBadge(entry) {
+  switch (entry.execution_mode) {
+    case "proxy":
+      return element("div", { className: "pv-execution-badge pv-risk-badge" },
+        element("span", { text: "Chạy qua PROXY — có rủi ro nhà cung cấp hạn chế hoặc khoá tài khoản." }));
+    case "official_cli":
+      return element("div", { className: "pv-execution-badge pv-safe-badge" },
+        element("span", { text: "Chạy qua CLI chính chủ." }));
+    case "local":
+      return element("div", { className: "pv-execution-badge pv-safe-badge" },
+        element("span", { text: "Runtime chạy cục bộ trên máy này." }));
+    case "api":
+    default:
+      return element("div", { className: "pv-execution-badge pv-safe-badge" },
+        element("span", { text: "Gọi API chính thức bằng credential đã lưu." }));
+  }
+}
+
+function connectionBadge(entry) {
+  const label = entry.connection_mode === "account"
+    ? "Kết nối bằng tài khoản"
+    : entry.connection_mode === "credential"
+      ? "Kết nối bằng API key"
+      : "Không hỗ trợ kết nối mới";
+  return element("div", { className: "pv-connection-mode", text: label });
+}
+
+function enabledExplanation(entry, provider) {
+  if (!provider) return "Chưa có Provider đã lưu; hãy kết nối trước khi quản lý trạng thái.";
+  if (entry.visible !== true) return "Runtime ẩn chỉ đọc; không thể bật hoặc tắt tại đây.";
+  if (provider.system === true) return "Provider hệ thống là chế độ chỉ đọc; không thể bật hoặc tắt tại đây.";
+  return provider.enabled ? "Provider đang được sử dụng." : "Provider hiện không được sử dụng.";
+}
+
+function syncEnabledPanel(panel, entry, provider, { busy = false } = {}) {
+  const enabled = provider?.enabled === true;
+  const editable = Boolean(provider && entry.visible === true && provider.system === false);
+  panel.control.checked = enabled;
+  panel.control.setAttribute("aria-checked", String(enabled));
+  panel.control.disabled = busy || !editable;
+  panel.explanation.textContent = busy ? "Đang đối soát trạng thái Provider…" : enabledExplanation(entry, provider);
+}
+
+function createEnabledPanel(entry, provider, onChange) {
+  const explanation = element("p", { className: "pv-enabled-explanation" });
+  const feedback = element("p", {
+    className: "pv-enabled-error",
+    attributes: { role: "alert", "aria-live": "assertive", hidden: true },
+  });
+  const control = element("input", {
+    className: "pv-enabled-switch",
+    attributes: {
+      type: "checkbox",
+      role: "switch",
+      "data-provider-enabled-switch": "true",
+      "aria-label": `Bật hoặc tắt ${entry.display_name}`,
+    },
+    on: { change(event) { onChange(panel, event.currentTarget.checked); } },
+  });
+  const panel = {
+    control,
+    explanation,
+    feedback,
+    providerId: provider?.id ?? "",
+    kind: entry.kind,
+    node: element("section", { className: "pv-panel pv-enabled" },
+      element("div", { className: "pv-panel-head" }, element("h3", { text: "Trạng thái sử dụng" }), control),
+      explanation,
+      feedback),
+  };
+  syncEnabledPanel(panel, entry, provider);
+  return panel;
+}
 
 function renderConnections(entry, p, ui) {
   const accounts = Array.isArray(p?.accounts) ? p.accounts : [];
@@ -201,7 +287,7 @@ function renderConnections(entry, p, ui) {
       }),
     )));
   } else if (p && p.system) {
-    body = element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.name}).` });
+    body = element("div", { className: "pv-conn-row", text: `Chạy cục bộ trên máy này (${entry.display_name}).` });
   } else if (ui.connectable) {
     // Connectable subscription with zero accounts (codex, first visit): point at the add button
     // instead of the generic empty copy below.
@@ -250,13 +336,15 @@ function renderModels(entry, p) {
   );
 }
 
-function renderDetail(entry, byKind, onBack, connUI) {
+function renderDetail(entry, byKind, backControl, connUI, enabledPanel) {
   const p = byKind.get(entry.kind);
   return element("div", { className: "pv-detail" },
-    element("button", { className: "pv-back", attributes: { type: "button" }, text: "Về Providers", on: { click: onBack } }),
+    backControl,
     detailHead(entry, byKind),
-    entry.group === "subscription" ? safeBadge(entry.kind) : null,
-    renderConnections(entry, p, connUI),
+    executionBadge(entry),
+    connectionBadge(entry),
+    enabledPanel.node,
+    entry.visible ? renderConnections(entry, p, connUI) : null,
     renderModels(entry, p),
   );
 }
@@ -269,9 +357,19 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         ...options,
         signal: controller.signal,
       }));
+      const durableMutationService = createProviderService(request);
+      const handoffOwner = Object.freeze({});
       const root = element("div", { className: "providers-page" });
       let disposed = false;
-      let listRevision = 0;
+      let providerRequestEpoch = 0;
+      let adoptedProviderKey = { settlementEpoch: -1, requestEpoch: -1 };
+      let issuedProviderKey = adoptedProviderKey;
+      const pendingProviderReads = new Map();
+      let releaseProviderReads;
+      const providerReadsDisposed = new Promise((resolve) => { releaseProviderReads = resolve; });
+      let enabledRevision = 0;
+      let enabledBusy = false;
+      let currentEnabledPanel = null, currentDetailBack = null;
       container.append(root);
 
       const header = () => pageHeader(
@@ -280,13 +378,24 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       );
       const live = element("span", { className: "note", attributes: { "aria-live": "polite" } });
 
-      // view cầm trạng thái điều hướng: "gallery" hoặc kind của Provider đang xem chi tiết.
-      // paint() là điểm vẽ DUY NHẤT đọc view này để quyết định vẽ gì vào root.
       let view = "gallery";
       let providerConnect = null;
       let providerConnectKind = "";
       let providerConnectSlot = null;
       let providerConnectOpen = false;
+      const providerOffDialog = createProviderOffDialog({
+        listen(node, type, listener) {
+          node.addEventListener(type, listener);
+          return node;
+        },
+        onConfirm: ({ providerId, panel }, signal) => updateProviderEnabled(providerId, false, panel, {
+          signal,
+          showInlineError: false,
+        }),
+      });
+      const unsubscribeHandoff = providerMutationHandoff.subscribe(handoffOwner, (settlementEpoch) => {
+        if (!disposed) void refresh(settlementEpoch, { background: true }).catch(() => {});
+      });
 
       function disposeProviderConnect() {
         providerConnect?.dispose();
@@ -296,15 +405,14 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         providerConnectOpen = false;
       }
 
-      // Một detail sở hữu đúng một component Connect. Rời detail huỷ component để poll/timer/listener
-      // không sống qua điều hướng; paint lại cùng detail chỉ dùng lại controller hiện có.
       const openDetail = (kind) => { disposeProviderConnect(); view = kind; paint(); };
       const backToGallery = () => { disposeProviderConnect(); view = "gallery"; paint(); };
 
-      const byKindFrom = (providers) => new Map(providers.map((p) => [normalizeKind(p.kind), p]));
+      const byKindFrom = (providers) => new Map(providers.map((p) => [p.kind, p]));
+      const byIDFrom = (providers) => new Map(providers.map((p) => [p.id, p]));
       let lastProviders = [];
-      // Mặc định true để KHÔNG nháy banner trước lượt fetch đầu; refresh() ghi đè bằng giá trị thật.
-      // Chỉ hiện banner khi backend nói HẲN false (thiếu trường = backend cũ = không kết luận "chưa nối").
+      let runtimeOptions = [];
+      // Chỉ hiện banner khi backend nói HẲN false; thiếu trường backend cũ không kết luận "chưa nối".
       let hasConnectedProvider = true;
       let query = "";
       const searchBox = element("input", { className: "pv-search-input",
@@ -312,16 +420,15 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         on: { input(e) { query = e.currentTarget.value.trim().toLowerCase(); paintGallery(); } },
       });
       const searchBar = () => element("div", { className: "pv-search" }, searchBox);
-      // gallerySlot là một node ổn định giữ nguyên vị trí trong root; paintGallery chỉ thay NỘI
-      // DUNG của nó (replaceChildren), không đụng tới root hay các anh em header/toolbar/searchBar —
-      // nên gõ vào ô search không làm mất focus hay dựng lại nút "Tải lại".
       const gallerySlot = element("div", {});
 
       const defaultLabel = (p) => `Tài khoản ${(p?.accounts?.length ?? 0) + 1}`;
 
       function startConnect(kind) {
-        const p = byKindFrom(lastProviders).get(normalizeKind(kind));
-        if (!providerConnect || providerConnectKind !== kind) return;
+        const p = byKindFrom(lastProviders).get(kind);
+        const entry = runtimeOptions.find((option) => option.kind === kind);
+        if (!providerConnect || providerConnectKind !== kind
+          || entry?.visible !== true || entry.connectable !== true) return;
         providerConnectOpen = true;
         providerConnect.start({ label: defaultLabel(p) });
         paint();
@@ -361,10 +468,7 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         component.mount(slot);
       }
 
-      // headFor đóng bao service/refresh của mount() — group-head cần gọi testSaved() và refresh()
-      // thật, còn renderGallery thì không nên biết tới hai thứ đó để vẫn là hàm thuần trên tham số.
-      const headFor = (groupEntries, byKind, isSubscription) => element("span", { className: "pv-head" },
-        isSubscription ? safeTag() : null,
+      const headFor = (groupEntries, byKind) => element("span", { className: "pv-head" },
         testAllButton(groupEntries, byKind, service, refresh));
 
       // noProviderBanner cảnh báo người trực: chưa nối gì thì bot IM với khách (không có Claude mặc
@@ -380,25 +484,239 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       }
 
       function galleryNode() {
+        const byKind = byKindFrom(lastProviders);
+        const visible = runtimeOptions.filter((entry) => entry.visible);
+        const hidden = runtimeOptions.filter((entry) => !entry.visible && byKind.has(entry.kind));
         const filtered = query
-          ? PROVIDER_CATALOG.filter((e) => e.name.toLowerCase().includes(query))
-          : PROVIDER_CATALOG;
-        return renderGallery(filtered, byKindFrom(lastProviders), openDetail, headFor);
+          ? visible.filter((entry) => `${entry.display_name} ${entry.description}`.toLowerCase().includes(query))
+          : visible;
+        const filteredHidden = query
+          ? hidden.filter((entry) => `${entry.display_name} ${entry.description}`.toLowerCase().includes(query))
+          : hidden;
+        return element("div", { className: "pv-provider-browser" },
+          renderGallery(filtered, byKind, openDetail, headFor),
+          renderPersistedHidden(filteredHidden, byKind, openDetail));
       }
 
-      // paintGallery chỉ vẽ lại gallerySlot — KHÔNG đụng header/toolbar, KHÔNG refetch.
+      function setEnabledError(panel, visible) {
+        panel.feedback.textContent = visible
+          ? "Chưa thể đổi trạng thái Provider. Trạng thái hiện tại vẫn được giữ nguyên."
+          : "";
+        panel.feedback.hidden = !visible;
+      }
+
+      function mountedEnabledPanel(providerId, fallback) {
+        if (currentEnabledPanel?.providerId === providerId && currentEnabledPanel.control.isConnected) {
+          return currentEnabledPanel;
+        }
+        return fallback?.providerId === providerId && fallback.control.isConnected ? fallback : null;
+      }
+
+      function providerKeyIsOlder(candidate, reference) {
+        return candidate.settlementEpoch < reference.settlementEpoch
+          || (candidate.settlementEpoch === reference.settlementEpoch
+            && candidate.requestEpoch < reference.requestEpoch);
+      }
+
+      function beginProviderRead(settlementEpoch) {
+        const key = { settlementEpoch, requestEpoch: ++providerRequestEpoch };
+        let finish;
+        const done = new Promise((resolve) => { finish = resolve; });
+        const read = { key, done, finish };
+        pendingProviderReads.set(key.requestEpoch, read);
+        if (!providerKeyIsOlder(key, issuedProviderKey)) issuedProviderKey = key;
+        return read;
+      }
+
+      const providerKeyIsStale = (key) => providerKeyIsOlder(key, adoptedProviderKey)
+        || providerKeyIsOlder(key, issuedProviderKey);
+
+      function finishProviderRead(read) {
+        pendingProviderReads.delete(read.key.requestEpoch);
+        read.finish();
+      }
+
+      async function afterDominatingReads(ownerKey, signal, decide) {
+        for (;;) {
+          const watermark = issuedProviderKey;
+          const pending = [...pendingProviderReads.values()].filter(({ key }) =>
+            providerKeyIsOlder(ownerKey, key) && !providerKeyIsOlder(watermark, key));
+          if (pending.length) {
+            await Promise.race([Promise.all(pending.map(({ done }) => done)), providerReadsDisposed]);
+          }
+          if (disposed || signal?.aborted) return false;
+          if (!providerKeyIsOlder(watermark, issuedProviderKey)) return decide(watermark);
+        }
+      }
+
+      function adoptProviderData(data, key) {
+        if (providerKeyIsStale(key)) return null;
+        const previous = { providers: lastProviders, options: runtimeOptions };
+        lastProviders = data.providers;
+        runtimeOptions = data.provider_options;
+        hasConnectedProvider = data.hasConnectedProvider;
+        adoptedProviderKey = key;
+        live.textContent = "";
+        return previous;
+      }
+
+      function detailProjection(entry, provider) {
+        return JSON.stringify([
+          entry && [entry.kind, entry.display_name, entry.visible, entry.connectable,
+            entry.connection_mode, entry.execution_mode, entry.prefix, entry.theme_color],
+          provider && [provider.id, provider.kind, provider.system,
+            (provider.accounts ?? []).map((account) => [account.id, account.label, account.email, account.enabled]),
+            (provider.models ?? []).map((model) => [model.model_id, model.name])],
+        ]);
+      }
+      function reconcileCurrentView(previous) {
+        if (view === "gallery") { paint(); return; }
+        if (currentEnabledPanel?.control.isConnected) setEnabledError(currentEnabledPanel, false);
+        const before = byKindFrom(previous.providers).get(view);
+        const current = byKindFrom(lastProviders).get(view);
+        const beforeEntry = previous.options.find((option) => option.kind === view);
+        const currentEntry = runtimeOptions.find((option) => option.kind === view);
+        const structural = !beforeEntry || !currentEntry || before?.id !== current?.id
+          || beforeEntry.visible !== currentEntry.visible
+          || beforeEntry.connectable !== currentEntry.connectable
+          || beforeEntry.connection_mode !== currentEntry.connection_mode;
+        if (structural) {
+          disposeProviderConnect();
+          paint();
+          return;
+        }
+        if (detailProjection(beforeEntry, before) !== detailProjection(currentEntry, current)) {
+          const reusable = currentEnabledPanel?.providerId === current?.id ? currentEnabledPanel : null;
+          disposeProviderConnect();
+          paint(reusable);
+          return;
+        }
+        if (currentEnabledPanel?.kind === view && currentEnabledPanel.control.isConnected) {
+          currentEnabledPanel.providerId = current?.id ?? "";
+          syncEnabledPanel(currentEnabledPanel, currentEntry, current, { busy: enabledBusy });
+        } else {
+          paint();
+        }
+      }
+
+      function renderEnabledReconciliation(before, entry, current, currentEntry, panel, failed, showInlineError) {
+        if (!current || current.kind !== before.kind) {
+          if (view === before.kind) {
+            disposeProviderConnect();
+            view = "gallery";
+            paint();
+          } else if (view === "gallery") {
+            paint();
+          }
+          return;
+        }
+        if (view === "gallery") {
+          paint();
+        }
+        const target = mountedEnabledPanel(current.id, panel);
+        if (!target) return;
+        target.providerId = current.id;
+        target.kind = current.kind;
+        syncEnabledPanel(target, currentEntry, current);
+        setEnabledError(target, failed && showInlineError);
+      }
+
+      async function updateProviderEnabled(providerId, desired, panel, {
+        signal,
+        showInlineError = true,
+      } = {}) {
+        const before = byIDFrom(lastProviders).get(providerId);
+        const entry = before && runtimeOptions.find((option) => option.kind === before.kind);
+        const editable = Boolean(before && entry?.visible === true && before.system === false);
+        if (disposed || enabledBusy || signal?.aborted || !editable || panel.providerId !== providerId) return false;
+
+        const startingPanel = mountedEnabledPanel(providerId, panel);
+        if (!startingPanel) return false;
+        enabledBusy = true;
+        const revision = ++enabledRevision;
+        setEnabledError(startingPanel, false);
+        syncEnabledPanel(startingPanel, entry, before, { busy: true });
+        try {
+          const settlementEpoch = await providerMutationHandoff.run(
+            handoffOwner,
+            () => durableMutationService.update(providerId, {
+              name: before.name, enabled: desired, credential: "",
+            }),
+          );
+          if (disposed || revision !== enabledRevision || signal?.aborted) return false;
+
+          const read = beginProviderRead(settlementEpoch);
+          try {
+            const data = normalizeProviderRuntimeResponse(await service.list());
+            if (!disposed && revision === enabledRevision && !signal?.aborted) {
+              const previous = adoptProviderData(data, read.key);
+              if (previous) reconcileCurrentView(previous);
+            }
+          } catch {
+            // The stable highest-causal snapshot below decides an ambiguous read or write.
+          } finally {
+            finishProviderRead(read);
+          }
+          if (disposed || revision !== enabledRevision || signal?.aborted) return false;
+          return await afterDominatingReads(read.key, signal, (frontier) => {
+            const authoritative = !providerKeyIsOlder(adoptedProviderKey, frontier),
+              current = lastProviders.find((provider) => provider.id === providerId);
+            const exact = Boolean(current && current.kind === before.kind);
+            const currentEntry = exact
+              ? runtimeOptions.find((option) => option.kind === current.kind)
+              : null;
+            const succeeded = authoritative && exact && current.enabled === desired;
+            renderEnabledReconciliation(before, entry, current, currentEntry, panel,
+              !succeeded, showInlineError);
+            return succeeded || !exact;
+          });
+        } finally {
+          if (revision === enabledRevision) {
+            enabledBusy = false;
+            const current = byIDFrom(lastProviders).get(currentEnabledPanel?.providerId);
+            const currentEntry = runtimeOptions.find((option) => option.kind === currentEnabledPanel?.kind);
+            if (currentEntry && currentEnabledPanel?.control.isConnected) {
+              syncEnabledPanel(currentEnabledPanel, currentEntry, current);
+            }
+          }
+        }
+      }
+
+      function changeProviderEnabled(panel, desired) {
+        const provider = byIDFrom(lastProviders).get(panel.providerId);
+        const entry = provider && runtimeOptions.find((option) => option.kind === provider.kind);
+        const editable = Boolean(provider && entry?.visible === true && provider.system === false);
+        if (!editable || enabledBusy || desired === provider.enabled) {
+          if (entry) syncEnabledPanel(panel, entry, provider);
+          return;
+        }
+        syncEnabledPanel(panel, entry, provider);
+        if (desired) {
+          void updateProviderEnabled(provider.id, true, panel);
+          return;
+        }
+        providerOffDialog.open({
+          label: provider.name,
+          value: { providerId: provider.id, panel },
+          opener: panel.control,
+          resolveFocusFallback: () => currentEnabledPanel?.control.isConnected && !currentEnabledPanel.control.disabled
+            ? currentEnabledPanel.control : currentDetailBack?.isConnected ? currentDetailBack : searchBox.isConnected ? searchBox : null,
+          description: `Nếu tắt ${provider.name}, Provider này sẽ không còn được dùng để trả lời. Bạn vẫn muốn tắt chứ?`,
+        });
+      }
+
       function paintGallery() {
         gallerySlot.replaceChildren(galleryNode());
       }
 
-      // paint là điểm vẽ toàn cục duy nhất, rẽ theo view. Gallery giữ nguyên cấu trúc
-      // header+toolbar+searchBar+gallerySlot của Task 3 (search vẫn hoạt động, không mất focus);
-      // detail thay root bằng header + renderDetail. kind lạ (đã bị xoá khỏi catalogue) rơi về gallery.
-      function paint() {
+      function paint(reusableEnabledPanel = null) {
         if (view !== "gallery") {
-          const entry = PROVIDER_CATALOG.find((e) => e.kind === view);
+          const byKind = byKindFrom(lastProviders);
+          const entry = runtimeOptions.find((option) => option.kind === view
+            && (option.visible || byKind.has(option.kind)));
           if (entry) {
-            const connectable = entry.group === "subscription" && CONNECTABLE_KINDS.has(entry.kind);
+            const provider = byKind.get(entry.kind);
+            const connectable = entry.visible === true && entry.connectable === true;
             if (connectable) ensureProviderConnect(entry);
             const connUI = {
               connectable,
@@ -407,15 +725,21 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
               onAdd: startConnect,
               onRemoveAccount: removeAccount,
             };
-            root.replaceChildren(header(), renderDetail(entry, byKindFrom(lastProviders), backToGallery, connUI));
+            const enabledPanel = reusableEnabledPanel?.providerId === (provider?.id ?? "")
+              && reusableEnabledPanel.kind === entry.kind
+              ? reusableEnabledPanel : createEnabledPanel(entry, provider, changeProviderEnabled);
+            const backControl = element("button", { className: "pv-back", attributes: { type: "button" }, text: "Về Providers", on: { click: backToGallery } });
+            enabledPanel.control.setAttribute("aria-label", `Bật hoặc tắt ${entry.display_name}`);
+            syncEnabledPanel(enabledPanel, entry, provider, { busy: enabledBusy });
+            root.replaceChildren(header(), live, renderDetail(entry, byKind, backControl, connUI, enabledPanel));
+            currentEnabledPanel = enabledPanel; currentDetailBack = backControl;
             return;
           }
           disposeProviderConnect();
           view = "gallery";
         }
+        currentEnabledPanel = null; currentDetailBack = null;
         paintGallery();
-        // filter(Boolean) vì root là DOM element THẬT: native replaceChildren ép null → chuỗi "null"
-        // (một text node lạ ở đầu lưới cho mọi máy đã cấu hình đúng), khác element() tự bỏ null.
         root.replaceChildren(...[header(), noProviderBanner(), toolbar(), searchBar(), gallerySlot].filter(Boolean));
       }
 
@@ -429,26 +753,27 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
         live,
       );
 
-      // refresh chỉ chạy lúc mount, sau mỗi lượt ghi, và khi người dùng bấm Tải lại. KHÔNG hẹn giờ:
-      // mỗi lượt GET /llm/providers giải mã một lần cho từng Provider để biết khoá còn mở được không.
-      async function refresh() {
-        const revision = ++listRevision;
-        live.textContent = "Đang đọc danh sách Provider…";
-        // Chỉ vẽ toolbar gallery khi đang ở gallery — reload lúc đang xem detail không được nháy
-        // ngược về toolbar gallery rồi mới vẽ lại detail ở paint().
-        if (view === "gallery") root.replaceChildren(header(), toolbar());
+      async function refresh(settlementEpoch = providerMutationHandoff.currentEpoch(), {
+        background = false,
+      } = {}) {
+        const read = beginProviderRead(settlementEpoch);
+        if (!background) live.textContent = "Đang đọc danh sách Provider…";
+        if (!background && view === "gallery") root.replaceChildren(header(), toolbar());
         try {
-          const data = await service.list();
-          if (disposed || revision !== listRevision) return;
-          const providers = Array.isArray(data?.providers) ? data.providers : [];
-          live.textContent = "";
-          lastProviders = providers;
-          hasConnectedProvider = data?.hasConnectedProvider !== false;
-          paint();
+          const data = normalizeProviderRuntimeResponse(await service.list());
+          if (disposed) return;
+          const previous = adoptProviderData(data, read.key);
+          if (previous) reconcileCurrentView(previous);
         } catch (error) {
-          if (disposed || revision !== listRevision || error?.name === "AbortError") return;
+          if (disposed || providerKeyIsStale(read.key) || error?.name === "AbortError") return;
+          if (background) {
+            live.textContent = "Chưa thể cập nhật danh sách Provider. Dữ liệu hiện tại vẫn được giữ nguyên.";
+            return;
+          }
           live.textContent = "";
           root.replaceChildren(header(), toolbar(), errorPanel(error));
+        } finally {
+          finishProviderRead(read);
         }
       }
 
@@ -456,7 +781,11 @@ export function createProvidersPage({ request = requestJSON, pollMs = 1500, craw
       return {
         dispose() {
           disposed = true;
-          listRevision++;
+          enabledRevision++;
+          pendingProviderReads.clear();
+          releaseProviderReads();
+          unsubscribeHandoff();
+          providerOffDialog.dispose();
           disposeProviderConnect();
           controller.abort();
         },

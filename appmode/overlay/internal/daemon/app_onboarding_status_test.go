@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"io"
@@ -19,10 +20,11 @@ import (
 )
 
 type onboardingRouteTestEnv struct {
-	a       *api
-	mux     *http.ServeMux
-	db      *sql.DB
-	dataDir string
+	a               *api
+	mux             http.Handler
+	db              *sql.DB
+	dataDir         string
+	personaDefaults *appPersonaDefaultsSource
 }
 
 func newOnboardingRouteTestEnv(t *testing.T) *onboardingRouteTestEnv {
@@ -45,14 +47,57 @@ func newOnboardingRouteTestEnv(t *testing.T) *onboardingRouteTestEnv {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		portalOpen: true,
 	}
-	mux := http.NewServeMux()
-	a.registerAppRoutes(mux)
+	defaultsFixture := newPackagedPersonaFixture(t)
+	personaDefaults := &appPersonaDefaultsSource{root: defaultsFixture.root}
+	runtimeContext := productionAppRuntimeContext(a)
+	runtimeContext.personaDefaults = personaDefaults
+	runtimeMux := http.NewServeMux()
+	registerAppRoutesWithContext(runtimeMux, runtimeContext)
+	mux := legacyInjectedConnectRouteHandler(a, runtimeMux)
 	t.Cleanup(func() {
 		connectMgr = nil
 		_ = raw.Close()
 		_ = st.Close()
 	})
-	return &onboardingRouteTestEnv{a: a, mux: mux, db: raw, dataDir: dataDir}
+	return &onboardingRouteTestEnv{
+		a: a, mux: mux, db: raw, dataDir: dataDir, personaDefaults: personaDefaults,
+	}
+}
+
+// legacyInjectedConnectRouteHandler is fixture-only compatibility for older
+// onboarding concurrency tests that replace connectMgr after constructing the
+// shared environment. Production/context route registration is intentionally
+// stricter and closes over its manager; these tests exercise the retained
+// direct-handler/global seam explicitly instead.
+func legacyInjectedConnectRouteHandler(a *api, next http.Handler) http.Handler {
+	start := a.auth(a.handleLLMConnectStart)
+	status := a.auth(a.handleLLMConnectStatus)
+	cancel := a.auth(a.handleLLMConnectCancel)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "/llm/providers/"
+		const suffix = "/connect"
+		if strings.HasPrefix(r.URL.Path, prefix) && strings.HasSuffix(r.URL.Path, suffix) {
+			kind := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, prefix), suffix)
+			if kind != "" && !strings.Contains(kind, "/") {
+				r.SetPathValue("kind", kind)
+				switch r.Method {
+				case http.MethodPost:
+					r.Pattern = "POST /llm/providers/{kind}/connect"
+					start.ServeHTTP(w, r)
+					return
+				case http.MethodGet:
+					r.Pattern = "GET /llm/providers/{kind}/connect"
+					status.ServeHTTP(w, r)
+					return
+				case http.MethodDelete:
+					r.Pattern = "DELETE /llm/providers/{kind}/connect"
+					cancel.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (e *onboardingRouteTestEnv) serve(method, path, body string) *httptest.ResponseRecorder {
@@ -274,11 +319,15 @@ func TestAppOnboardingStatusSuggestsOnlySupportedFirstEnabledRouteKind(t *testin
 
 func TestAppOnboardingStatusNeverSerializesInternalOrSecretFields(t *testing.T) {
 	env := newOnboardingRouteTestEnv(t)
+	hiddenFingerprint := strings.Repeat("e", sha256.Size*2)
 	env.setState(t, store.OnboardingState{
-		Phase: store.OnboardingPhaseTest, ProviderKind: "codex", ProviderID: "provider-public",
-		AccountID: "account-public", ModelID: "model-public", StagedComboID: "HIDDEN-COMBO",
-		PersonaFingerprint: "HIDDEN-FINGERPRINT", TestNonceHash: "HIDDEN-NONCE-HASH",
+		Phase: store.OnboardingPhaseTest, StagedComboID: "HIDDEN-COMBO",
+		PersonaFingerprint: hiddenFingerprint, TestNonceHash: "HIDDEN-NONCE-HASH",
 		TestExpiresAt: "HIDDEN-EXPIRY", Revision: 4,
+	})
+	env.replaceProviderStages(t, appOnboardingProviderWire{
+		Kind: "codex", Status: "ready", ProviderID: "provider-public",
+		AccountID: "account-public", ModelID: "model-public", Position: 0,
 	})
 	rr := env.serve(http.MethodGet, "/onboarding/status", "")
 	if rr.Code != http.StatusOK {
@@ -297,7 +346,7 @@ func TestAppOnboardingStatusNeverSerializesInternalOrSecretFields(t *testing.T) 
 		}
 	}
 	body := rr.Body.String()
-	for _, hidden := range []string{"HIDDEN-COMBO", "HIDDEN-FINGERPRINT", "HIDDEN-NONCE-HASH", "HIDDEN-EXPIRY"} {
+	for _, hidden := range []string{"HIDDEN-COMBO", hiddenFingerprint, "HIDDEN-NONCE-HASH", "HIDDEN-EXPIRY"} {
 		if strings.Contains(body, hidden) {
 			t.Fatalf("response leaked %q: %s", hidden, body)
 		}
@@ -317,6 +366,8 @@ func TestAppOnboardingStatusRejectsSemanticallyCorruptState(t *testing.T) {
 		{"setup without provider", store.OnboardingState{Phase: store.OnboardingPhaseSetup, Revision: 1}},
 		{"persona without provider", store.OnboardingState{Phase: store.OnboardingPhasePersona, Revision: 1}},
 		{"test without provider", store.OnboardingState{Phase: store.OnboardingPhaseTest, Revision: 1}},
+		{"completed unsupported provider", store.OnboardingState{CompletedVersion: 1, Phase: store.OnboardingPhaseCompleted, ProviderKind: "private-provider", Revision: 1}},
+		{"completed orphan identity", store.OnboardingState{CompletedVersion: 1, Phase: store.OnboardingPhaseCompleted, ProviderID: "HIDDEN-PROVIDER", Revision: 1}},
 		{"completed phase restarting", store.OnboardingState{CompletedVersion: 1, Phase: store.OnboardingPhaseCompleted, RestartInProgress: true, Revision: 1}},
 		{"completed version in unfinished phase", store.OnboardingState{CompletedVersion: 1, Phase: store.OnboardingPhaseProvider, Revision: 1}},
 		{"restart before completed version", store.OnboardingState{CompletedVersion: 0, Phase: store.OnboardingPhaseProvider, RestartInProgress: true, Revision: 1}},
@@ -328,7 +379,7 @@ func TestAppOnboardingStatusRejectsSemanticallyCorruptState(t *testing.T) {
 			rr := env.serve(http.MethodGet, "/onboarding/status", "")
 			requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_STATE_UNAVAILABLE")
 			body := strings.ToLower(rr.Body.String())
-			for _, forbidden := range []string{"sql", "database", "app_onboarding_state", env.dataDir, "broken-phase", "openai"} {
+			for _, forbidden := range []string{"sql", "database", "app_onboarding_state", env.dataDir, "broken-phase", "openai", "private-provider", "HIDDEN-PROVIDER"} {
 				if strings.Contains(body, strings.ToLower(forbidden)) {
 					t.Fatalf("response leaked %q: %s", forbidden, rr.Body.String())
 				}
@@ -396,14 +447,7 @@ func TestAppOnboardingUpgradeProviderPreservesLiveAccountDirectoryAndConnect(t *
 	})
 
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":4,"kind":"claude-code"}`)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	got := decodeOnboardingResponse[appOnboardingStatusResponse](t, rr)
-	if got.CompletedVersion != store.CurrentOnboardingVersion-1 || got.Phase != store.OnboardingPhaseConnect ||
-		got.ProviderKind != "claude-code" || got.AccountID != "" || got.Revision != 5 {
-		t.Fatalf("upgrade response=%+v", got)
-	}
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
 		t.Fatal("upgrade selection canceled the prior completed flow's Connect job")
 	}
@@ -426,7 +470,7 @@ func TestAppOnboardingProviderRejectsCorruptStateBeforeConnectCleanup(t *testing
 		close(job.done)
 	})
 	rr := env.serve(http.MethodPut, "/onboarding/provider", `{"revision":1,"kind":"codex"}`)
-	requireOnboardingCode(t, rr, http.StatusInternalServerError, "ONBOARDING_STATE_UNAVAILABLE")
+	requireOnboardingCode(t, rr, http.StatusConflict, "ONBOARDING_PHASE_INVALID")
 	if ctx.Err() != nil || job.snapshot().Phase == phaseCanceled {
 		t.Fatal("handler canceled Connect before rejecting corrupt onboarding state")
 	}

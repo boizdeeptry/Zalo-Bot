@@ -3,11 +3,13 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // startManagedCLIProcess creates a new process group in the child before exec.
@@ -24,8 +26,10 @@ func startManagedCLIProcess(cmd *exec.Cmd, _ *slog.Logger) (managedCLIProcessLif
 		return nil, err
 	}
 	return &processGroupManagedCLIProcess{
-		pgid: cmd.Process.Pid,
-		kill: killCLIProcessGroup,
+		pgid:   cmd.Process.Pid,
+		kill:   killCLIProcessGroup,
+		active: cliProcessGroupActive,
+		poll:   pollCLIProcessGroup,
 	}, nil
 }
 
@@ -38,4 +42,29 @@ func killCLIProcessGroup(pgid int) error {
 		return nil
 	}
 	return fmt.Errorf("kill CLI process group %d: %w", pgid, err)
+}
+
+func cliProcessGroupActive(pgid int) (bool, error) {
+	if pgid <= 0 {
+		return false, fmt.Errorf("inspect CLI process group: invalid pgid %d", pgid)
+	}
+	err := syscall.Kill(-pgid, 0)
+	if err == nil || errors.Is(err, syscall.EPERM) {
+		return true, nil
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return false, nil
+	}
+	return false, fmt.Errorf("inspect CLI process group %d: %w", pgid, err)
+}
+
+func pollCLIProcessGroup(ctx context.Context) error {
+	timer := time.NewTimer(10 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

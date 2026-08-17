@@ -185,6 +185,18 @@ func (f *fakeRunner) login(ctx context.Context, _, configDir string) (string, st
 func (f *fakeRunner) pollAuth(_, configDir string) authState { f.lastCfgDir = configDir; return f.auth }
 func (f *fakeRunner) accountLabel(_, _ string) string        { return f.acctLabel }
 
+type blockingLegacyCaptureRunner struct {
+	*fakeRunner
+	detectEntered chan struct{}
+	detectRelease chan struct{}
+}
+
+func (runner *blockingLegacyCaptureRunner) detect(string) (bool, error) {
+	close(runner.detectEntered)
+	<-runner.detectRelease
+	return runner.installed, nil
+}
+
 func newTestManager(t *testing.T, r connectRunner, ensure func(string) error, create func(store.LLMAccount) error) *connectManager {
 	t.Helper()
 	return &connectManager{
@@ -193,6 +205,45 @@ func newTestManager(t *testing.T, r connectRunner, ensure func(string) error, cr
 		logger:       slog.New(slog.DiscardHandler),
 		loginTimeout: 200 * time.Millisecond,
 		pollInterval: 5 * time.Millisecond,
+	}
+}
+
+func TestAppLLMConnectLegacyStartCapturesRunnerPerJob(t *testing.T) {
+	first := &blockingLegacyCaptureRunner{
+		fakeRunner:    &fakeRunner{installed: true, auth: authLoggedIn},
+		detectEntered: make(chan struct{}),
+		detectRelease: make(chan struct{}),
+	}
+	replacement := &fakeRunner{
+		installed: true,
+		auth:      authLoggedIn,
+		loginErr:  errors.New("replacement runner must not enter an in-flight job"),
+	}
+	m := newTestManager(
+		t,
+		first,
+		func(string) error { return nil },
+		func(store.LLMAccount) error { return nil },
+	)
+	m.ensureModels = func(string) error { return nil }
+	if _, err := m.start("codex", "legacy capture"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-first.detectEntered:
+	case <-time.After(time.Second):
+		t.Fatal("legacy runner did not enter Detect")
+	}
+	// Old tests are allowed to keep injecting m.runner. Once start has admitted
+	// a job, however, later fixture/global changes must not alter that job.
+	m.runner = replacement
+	close(first.detectRelease)
+	state := waitPhase(t, m, "codex", phaseConnected)
+	if state.Phase != phaseConnected {
+		t.Fatalf("in-flight legacy job reread replacement runner: %+v", state)
+	}
+	if replacement.lastCfgDir != "" {
+		t.Fatalf("replacement runner entered in-flight job with config dir %q", replacement.lastCfgDir)
 	}
 }
 
@@ -208,17 +259,17 @@ func TestConnectOnboardingSuccessStagesDisabledAccountAndPublishesIDsAfterBind(t
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseBind) }) })
 	bindCalls := 0
-	m.bindOnboarding = func(revision int64, kind string, account store.LLMAccount) (store.OnboardingState, error) {
+	m.bindOnboarding = func(revision int64, kind string, account store.LLMAccount) (store.OnboardingSnapshot, error) {
 		bindCalls++
 		if revision != 7 || kind != "codex" {
 			t.Errorf("bind context = revision:%d kind:%q", revision, kind)
 		}
 		bindEntered <- account
 		<-releaseBind
-		return store.OnboardingState{
+		return store.OnboardingSnapshot{State: store.OnboardingState{
 			Phase: store.OnboardingPhaseSetup, ProviderKind: kind,
 			ProviderID: kind, AccountID: account.ID, Revision: revision + 1,
-		}, nil
+		}}, nil
 	}
 
 	if _, err := m.start("codex", "Onboarding", &connectOnboardingContext{Revision: 7, Kind: "codex"}); err != nil {
@@ -252,9 +303,9 @@ func TestConnectNormalSuccessCreatesEnabledAccountWithoutOnboardingBind(t *testi
 		return nil
 	})
 	m.ensureModels = func(string) error { return nil }
-	m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+	m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingSnapshot, error) {
 		bindCalls++
-		return store.OnboardingState{}, nil
+		return store.OnboardingSnapshot{}, nil
 	}
 
 	if _, err := m.start("codex", "Normal"); err != nil {
@@ -320,9 +371,9 @@ func TestConnectOnboardingPersistenceFailuresLeaveNoIDsOrConfigDirectory(t *test
 				modelCalls++
 				return tt.modelsErr
 			}
-			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingSnapshot, error) {
 				bindCalls++
-				return store.OnboardingState{}, tt.bindErr
+				return store.OnboardingSnapshot{}, tt.bindErr
 			}
 			if _, err := m.start("codex", "Onboarding", &connectOnboardingContext{Revision: 3, Kind: "codex"}); err != nil {
 				t.Fatal(err)
@@ -369,9 +420,9 @@ func TestConnectOnboardingFailureCleanupRetriesWithoutLeakingPaths(t *testing.T)
 			m.logger = slog.New(slog.NewTextHandler(&logs, nil))
 			m.ensureOnboarding = func(string) error { return nil }
 			m.ensureModels = func(string) error { return tt.modelErr }
-			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingState, error) {
+			m.bindOnboarding = func(int64, string, store.LLMAccount) (store.OnboardingSnapshot, error) {
 				bindCalls++
-				return store.OnboardingState{}, tt.bindErr
+				return store.OnboardingSnapshot{}, tt.bindErr
 			}
 			m.newID = func() string {
 				idCalls++

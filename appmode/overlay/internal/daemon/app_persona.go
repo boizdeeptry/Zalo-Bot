@@ -64,7 +64,7 @@ func (a *api) handlePersonaGet(w http.ResponseWriter, r *http.Request) {
 			a.writeJSON(w, http.StatusOK, map[string]any{"text": "", "path": p, "label": label})
 			return
 		}
-		a.logger.Error("persona: đọc tệp", "path", p, "err", err)
+		a.logger.Error("persona read failed", "error_kind", "persona_read_failed")
 		a.writeErr(w, http.StatusInternalServerError, "không đọc được tệp "+label)
 		return
 	}
@@ -75,6 +75,18 @@ func (a *api) handlePersonaGet(w http.ResponseWriter, r *http.Request) {
 
 // handlePersonaPut ghi lại toàn văn.
 func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
+	productionAppRuntimeContext(a).handlePersonaPut(w, r)
+}
+
+func (runtimeContext appRuntimeContext) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
+	runtimeContext.api.handlePersonaPutWithDefaults(w, r, runtimeContext.personaDefaults)
+}
+
+func (a *api) handlePersonaPutWithDefaults(
+	w http.ResponseWriter,
+	r *http.Request,
+	defaultsSource *appPersonaDefaultsSource,
+) {
 	p, label, err := a.editableFile(r.PathValue("name"))
 	if err != nil {
 		a.writeErr(w, http.StatusBadRequest, err.Error())
@@ -108,12 +120,41 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 		a.writeErr(w, http.StatusBadRequest, "nội dung không phải UTF-8 hợp lệ")
 		return
 	}
+	var immutableDefaults *appPersonaDefaults
+	if p == a.zalo.cfg.PersonaPath {
+		if a.st == nil {
+			a.writePersonaDefaultsInvalid(w)
+			return
+		}
+		validatedPath, pathErr := appPackagedPersonaWorkingPath(a)
+		if pathErr != nil || validatedPath != p {
+			a.writePersonaDefaultsInvalid(w)
+			return
+		}
+		p = validatedPath
+		if defaultsSource == nil {
+			a.writePersonaDefaultsInvalid(w)
+			return
+		}
+		loaded, loadErr := defaultsSource.load()
+		if loadErr != nil {
+			a.writePersonaDefaultsInvalid(w)
+			return
+		}
+		immutableDefaults = &loaded
+	}
 	if p == a.zalo.cfg.PersonaPath && a.st != nil {
 		onboardingMutationMu.Lock()
 		defer onboardingMutationMu.Unlock()
 		if err := a.resolveAgentPersonaRecovery(p); err != nil {
 			a.writeAgentRollbackFailed(w, err)
 			return
+		}
+		if immutableDefaults != nil {
+			if err := prepareImmutablePersonaBackup(p, *immutableDefaults); err != nil {
+				a.writePersonaDefaultsInvalid(w)
+				return
+			}
 		}
 	}
 
@@ -122,13 +163,13 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 	old, readErr := os.ReadFile(p)
 	backup := p + ".goc"
 	if readErr != nil && !(r.PathValue("name") == "roster" && errors.Is(readErr, os.ErrNotExist)) {
-		a.logger.Error("persona: đọc tệp trước khi lưu", "path", p, "err", readErr)
+		a.logger.Error("persona mutation failed", "error_kind", "persona_read_failed")
 		a.writeErr(w, http.StatusInternalServerError, "không đọc được tệp "+label+", chưa ghi gì")
 		return
 	}
-	if readErr == nil {
+	if readErr == nil && (p != a.zalo.cfg.PersonaPath || immutableDefaults == nil) {
 		if err := writeAppBackupOnce(backup, old, 0o600); err != nil {
-			a.logger.Error("persona: ghi bản gốc", "path", backup, "err", err)
+			a.logger.Error("persona mutation failed", "error_kind", "backup_publish_failed")
 			a.writeErr(w, http.StatusInternalServerError, "không tạo được bản lưu gốc, chưa ghi gì")
 			return
 		}
@@ -142,13 +183,13 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 	if p == a.zalo.cfg.PersonaPath && a.st != nil {
 		displayName, err = a.st.AgentDisplayName()
 		if err != nil {
-			a.logger.Error("persona: đọc tên hiển thị trước khi lưu", "err", err)
+			a.logger.Error("persona mutation failed", "error_kind", "display_name_read_failed")
 			a.writeErr(w, http.StatusInternalServerError, "không đọc được tên bot")
 			return
 		}
 		recoveryToken, err = a.prepareAgentPersonaRecovery(p, old, []byte(text))
 		if err != nil {
-			a.logger.Error("persona: chuẩn bị khôi phục", "err", err)
+			a.logger.Error("persona mutation failed", "error_kind", "recovery_prepare_failed")
 			a.writeErr(w, http.StatusInternalServerError, "không chuẩn bị được bản khôi phục, chưa ghi gì")
 			return
 		}
@@ -164,7 +205,7 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		a.logger.Error("persona: ghi tệp", "path", p, "err", err)
+		a.logger.Error("persona mutation failed", "error_kind", "persona_write_failed")
 		a.writeErr(w, http.StatusInternalServerError, "không ghi được tệp "+label)
 		return
 	}
@@ -193,4 +234,12 @@ func (a *api) handlePersonaPut(w http.ResponseWriter, r *http.Request) {
 		"bytes": len(text), "placeholders": analysis.Placeholders,
 		"ready": len(analysis.Placeholders) == 0 && validationError == "", "validation_error": validationError,
 	})
+}
+
+func (a *api) writePersonaDefaultsInvalid(w http.ResponseWriter) {
+	if a.logger != nil {
+		a.logger.Error("persona: immutable defaults rejected")
+	}
+	a.writeLLMErr(w, http.StatusInternalServerError, "PERSONA_DEFAULTS_INVALID",
+		"Không thể xác thực bản lưu văn phong mặc định an toàn", nil)
 }

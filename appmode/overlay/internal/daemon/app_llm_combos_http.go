@@ -74,6 +74,11 @@ type comboReplaceRequest struct {
 }
 
 func (a *api) handleLLMComboReplace(w http.ResponseWriter, r *http.Request) {
+	productionAppRuntimeContext(a).handleLLMComboReplace(w, r)
+}
+
+func (ctx appRuntimeContext) handleLLMComboReplace(w http.ResponseWriter, r *http.Request) {
+	a := ctx.api
 	id := r.PathValue("id")
 	var req comboReplaceRequest
 	if !a.decodeLLMBody(w, r, &req) {
@@ -87,7 +92,33 @@ func (a *api) handleLLMComboReplace(w http.ResponseWriter, r *http.Request) {
 			Enabled:    e.Enabled,
 		})
 	}
-	c, err := a.st.ReplaceLLMComboMembers(id, req.Revision, strings.TrimSpace(req.Type), entries)
+	entries = appCanonicalRouteEntries(entries)
+	ctx.appLLMRouteCheckpoint(appLLMRouteOperationReplace, appLLMRoutePhaseBeforeLock)
+	appLLMRouteMutationMu.Lock()
+	ctx.appLLMRouteCheckpoint(appLLMRouteOperationReplace, appLLMRoutePhaseLocked)
+	var c store.LLMCombo
+	current, err := ctx.comboForActivation(id)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		err = store.ErrLLMComboConflict
+	case err == nil && current.Revision != req.Revision:
+		err = store.ErrLLMComboConflict
+	}
+	if err == nil {
+		if validationErr := ctx.validateRouteMutation(entries); validationErr != nil {
+			appLLMRouteMutationMu.Unlock()
+			a.logger.Warn("llm api: rejected combo runtime", "error_kind", "runtime_invalid")
+			a.writeLLMErr(w, http.StatusUnprocessableEntity, "COMBO_RUNTIME_INVALID",
+				"Combo dùng một Provider runtime không khả dụng", nil)
+			return
+		}
+		ctx.appLLMRouteCheckpoint(appLLMRouteOperationReplace, appLLMRoutePhaseValidated)
+		c, err = a.st.ReplaceLLMComboMembers(id, req.Revision, strings.TrimSpace(req.Type), entries)
+		if err == nil {
+			ctx.appLLMRouteCheckpoint(appLLMRouteOperationReplace, appLLMRoutePhaseWritten)
+		}
+	}
+	appLLMRouteMutationMu.Unlock()
 	switch {
 	case errors.Is(err, store.ErrLLMComboConflict):
 		// CAS trả ErrLLMComboConflict cho cả revision cũ LẪN combo không tồn tại (xem store): bản
@@ -106,8 +137,33 @@ func (a *api) handleLLMComboReplace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) handleLLMComboActivate(w http.ResponseWriter, r *http.Request) {
+	productionAppRuntimeContext(a).handleLLMComboActivate(w, r)
+}
+
+func (ctx appRuntimeContext) handleLLMComboActivate(w http.ResponseWriter, r *http.Request) {
+	a := ctx.api
 	id := r.PathValue("id")
-	switch err := a.st.SetActiveLLMCombo(id); {
+	ctx.appLLMRouteCheckpoint(appLLMRouteOperationActivate, appLLMRoutePhaseBeforeLock)
+	appLLMRouteMutationMu.Lock()
+	ctx.appLLMRouteCheckpoint(appLLMRouteOperationActivate, appLLMRoutePhaseLocked)
+	combo, readErr := ctx.comboForActivation(id)
+	if readErr == nil {
+		readErr = ctx.validateRouteMutation(combo.Members)
+		if readErr != nil {
+			appLLMRouteMutationMu.Unlock()
+			a.logger.Warn("llm api: rejected combo activation runtime", "error_kind", "runtime_invalid")
+			a.writeLLMErr(w, http.StatusUnprocessableEntity, "COMBO_RUNTIME_INVALID",
+				"Combo dùng một Provider runtime không khả dụng", nil)
+			return
+		}
+		ctx.appLLMRouteCheckpoint(appLLMRouteOperationActivate, appLLMRoutePhaseValidated)
+		readErr = a.st.SetActiveLLMCombo(id)
+		if readErr == nil {
+			ctx.appLLMRouteCheckpoint(appLLMRouteOperationActivate, appLLMRoutePhaseWritten)
+		}
+	}
+	appLLMRouteMutationMu.Unlock()
+	switch err := readErr; {
 	case errors.Is(err, store.ErrNotFound):
 		a.writeLLMErr(w, http.StatusNotFound, "COMBO_NOT_FOUND",
 			fmt.Sprintf("Không tìm thấy combo %q", id), nil)

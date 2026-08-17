@@ -76,19 +76,20 @@ func llmEndpointFor(kind string) (string, bool) {
 // thứ duy nhất được marshal ra ngoài, nên "không khai báo" là bảo đảm mạnh hơn "nhớ đừng gán".
 // Hai cờ dưới đây thay cho khoá: đã nhập chưa, và nhập rồi mà máy này còn mở ra được không.
 type llmProviderBody struct {
-	ID                   string           `json:"id"`
-	Name                 string           `json:"name"`
-	Kind                 string           `json:"kind"`
-	Endpoint             string           `json:"endpoint"`
-	Enabled              bool             `json:"enabled"`
-	System               bool             `json:"system"`
-	CredentialConfigured bool             `json:"credential_configured"`
-	CredentialUnreadable bool             `json:"credential_unreadable"`
-	LastCheckStatus      string           `json:"last_check_status"`
-	LastError            string           `json:"last_error"`
-	LastCheckedAt        string           `json:"last_checked_at"`
-	Models               []llmModelBody   `json:"models"`
-	Accounts             []llmAccountBody `json:"accounts,omitempty"`
+	ID                   string                    `json:"id"`
+	Name                 string                    `json:"name"`
+	Kind                 string                    `json:"kind"`
+	ConnectionMode       appProviderConnectionMode `json:"connection_mode"`
+	Endpoint             string                    `json:"endpoint"`
+	Enabled              bool                      `json:"enabled"`
+	System               bool                      `json:"system"`
+	CredentialConfigured bool                      `json:"credential_configured"`
+	CredentialUnreadable bool                      `json:"credential_unreadable"`
+	LastCheckStatus      string                    `json:"last_check_status"`
+	LastError            string                    `json:"last_error"`
+	LastCheckedAt        string                    `json:"last_checked_at"`
+	Models               []llmModelBody            `json:"models"`
+	Accounts             []llmAccountBody          `json:"accounts,omitempty"`
 }
 
 type llmModelBody struct {
@@ -350,6 +351,21 @@ func (a *api) llmCredentialUnreadable(providerID string) bool {
 // --- dựng phản hồi ---
 
 func (a *api) llmProviderBody(p store.LLMProvider) (llmProviderBody, error) {
+	return appRuntimeContext{api: a, registry: productionAppProviderRuntimeRegistry()}.llmProviderBody(p)
+}
+
+func (ctx appRuntimeContext) llmProviderBody(p store.LLMProvider) (llmProviderBody, error) {
+	option, exists := ctx.registry.managementOption(p.Kind)
+	if ctx.api == nil || !exists {
+		return llmProviderBody{}, fmt.Errorf("%w: Provider %q has no management option", errAppProviderRuntimeRegistry, p.Kind)
+	}
+	return ctx.api.llmProviderBodyWithConnectionMode(p, option.ConnectionMode)
+}
+
+func (a *api) llmProviderBodyWithConnectionMode(
+	p store.LLMProvider,
+	connectionMode appProviderConnectionMode,
+) (llmProviderBody, error) {
 	models, err := a.st.LLMModels(p.ID)
 	if err != nil {
 		return llmProviderBody{}, err
@@ -357,7 +373,7 @@ func (a *api) llmProviderBody(p store.LLMProvider) (llmProviderBody, error) {
 	// Endpoint rỗng cho claude-code là đúng: nó chạy một tiến trình cục bộ, không gọi HTTP đi đâu.
 	endpoint, _ := llmEndpointFor(p.Kind)
 	body := llmProviderBody{
-		ID: p.ID, Name: p.Name, Kind: p.Kind, Endpoint: endpoint,
+		ID: p.ID, Name: p.Name, Kind: p.Kind, ConnectionMode: connectionMode, Endpoint: endpoint,
 		Enabled: p.Enabled, System: p.System,
 		CredentialConfigured: p.CredentialConfigured,
 		LastCheckStatus:      p.LastCheckStatus, LastError: p.LastError,

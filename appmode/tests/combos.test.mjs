@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { AppAPIError } from "../overlay/internal/webui/static/core/api.js";
 import { createCombosPage, createComboService } from "../overlay/internal/webui/static/pages/combos.js";
 import { find, findAll, installDOM, text } from "./helpers/dom-harness.mjs";
-
+import { COMBO_PROVIDER_RESPONSE, providerRuntimeResponse } from "./helpers/provider-runtime-fixtures.mjs";
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const settle = async () => { await flush(); await flush(); };
 const hasClass = (node, className) => node.classList?.contains(className) ?? false;
@@ -60,36 +60,7 @@ function openEdit(main, index) {
   return comboModal();
 }
 
-const PROVIDERS = {
-  kinds: [],
-  providers: [
-    {
-      id: "openai-1", name: "OpenAI chính", kind: "openai", enabled: true, system: false,
-      credential_configured: true, credential_unreadable: false,
-      models: [
-        { model_id: "gpt-5", name: "GPT-5", source: "discovered", available: true },
-        { model_id: "gpt-5-mini", name: "GPT-5 mini", source: "discovered", available: true },
-      ],
-    },
-    {
-      id: "gemini", name: "Gemini", kind: "gemini", enabled: true, system: false,
-      credential_configured: true, credential_unreadable: false,
-      models: [{ model_id: "gemini-2", name: "Gemini 2", source: "discovered", available: true }],
-    },
-    {
-      id: "claude-code", name: "Claude Code", kind: "claude-code", enabled: true, system: true,
-      credential_configured: false, credential_unreadable: false,
-      models: [{ model_id: "haiku", name: "Haiku", source: "manual", available: true }],
-    },
-    {
-      // Chưa nối (API, chưa có credential) + đã tắt → bị loại khỏi picker và KHÔNG nằm trong ghi chú
-      // (hàng đã tắt thì không nhắc). Chứng minh bộ lọc mới xét "đã nối", không phải "enabled".
-      id: "anthropic-off", name: "Anthropic nghỉ", kind: "anthropic", enabled: false, system: false,
-      credential_configured: false, credential_unreadable: false,
-      models: [{ model_id: "claude-4", name: "Claude 4", source: "discovered", available: true }],
-    },
-  ],
-};
+const PROVIDERS = COMBO_PROVIDER_RESPONSE;
 
 // Một combo fallback đang chạy và một combo round_robin nghỉ — đủ để kiểm huy hiệu kiểu, chấm radio,
 // và modal Sửa model đổi theo combo được mở.
@@ -433,15 +404,12 @@ test("the picker offers only connected providers' models and names the unconnect
 test("the picker offers a connected subscription provider's models and drops the note when all are connected", async (t) => {
   // Thuê bao codex CÓ account đang bật (0 credential) → ĐÃ nối → model của nó chọn được. Không có
   // provider bật-mà-chưa-nối nào khác → không hiện ghi chú.
-  const providers = {
-    kinds: [],
-    providers: [{
+  const providers = providerRuntimeResponse([{
       id: "codex", name: "OpenAI Codex", kind: "codex", enabled: true, system: false,
       credential_configured: false, credential_unreadable: false,
       accounts: [{ id: "a1", label: "Tài khoản 1", email: "", enabled: true }],
       models: [{ model_id: "gpt-5-codex", name: "GPT-5 Codex", source: "manual", available: true }],
-    }],
-  };
+    }], { hasConnectedProvider: true });
   const { main } = await mounted(t, comboAPI({ providers }));
   const modal = openEdit(main, 0);
   button(modal, "Thêm model").click();
@@ -453,14 +421,11 @@ test("the picker offers a connected subscription provider's models and drops the
 });
 
 test("the picker excludes a disabled but connected API provider", async (t) => {
-  const providers = {
-    kinds: [],
-    providers: [{
+  const providers = providerRuntimeResponse([{
       id: "openai-off", name: "OpenAI nghỉ", kind: "openai", enabled: false, system: false,
       credential_configured: true, credential_unreadable: false,
       models: [{ model_id: "gpt-5", name: "GPT-5", source: "discovered", available: true }],
-    }],
-  };
+    }], { hasConnectedProvider: true });
   const { main } = await mounted(t, comboAPI({ providers }));
   const modal = openEdit(main, 0);
   button(modal, "Thêm model").click();
@@ -472,15 +437,12 @@ test("the picker excludes a disabled but connected API provider", async (t) => {
 });
 
 test("the picker excludes a disabled but connected subscription provider", async (t) => {
-  const providers = {
-    kinds: [],
-    providers: [{
+  const providers = providerRuntimeResponse([{
       id: "codex-off", name: "Codex nghỉ", kind: "codex", enabled: false, system: false,
       credential_configured: false, credential_unreadable: false,
       accounts: [{ id: "a1", label: "Tài khoản 1", email: "", enabled: true }],
       models: [{ model_id: "gpt-5-codex", name: "GPT-5 Codex", source: "manual", available: true }],
-    }],
-  };
+    }], { hasConnectedProvider: true });
   const { main } = await mounted(t, comboAPI({ providers }));
   const modal = openEdit(main, 0);
   button(modal, "Thêm model").click();
@@ -491,6 +453,22 @@ test("the picker excludes a disabled but connected subscription provider", async
   assert.equal(pickNote(picker), null, "a disabled provider is omitted without a connection warning");
 });
 
+test("a persisted hidden none-mode runtime renders existing members but cannot be added again", async (t) => {
+  const providers = providerRuntimeResponse([{
+    id: "gemini-cli", name: "Gemini CLI", kind: "gemini-cli", enabled: true, system: true,
+    credential_configured: true, credential_unreadable: false, accounts: [{ id: "hidden-a1", label: "Hidden account", enabled: true }],
+    models: [{ model_id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", source: "manual", available: true }],
+  }], { hasConnectedProvider: false });
+  const combos = { combos: [{ id: "hidden-combo", name: "Legacy Gemini", type: "fallback", active: true,
+    revision: 3, entries: [{ position: 0, provider_id: "gemini-cli", model_id: "gemini-2.5-pro", enabled: true }] }] };
+  const { main } = await mounted(t, comboAPI({ providers, combos }));
+  assert.deepEqual(cardChips(cards(main)[0]), ["Gemini CLI · Gemini 2.5 Pro"]);
+  const modal = openEdit(main, 0);
+  assert.match(memberLabels(modal)[0], /Gemini CLI · Gemini 2.5 Pro/);
+  button(modal, "Thêm model").click(); const picker = overlay();
+  assert.equal(pickRow(picker, "Gemini 2.5 Pro"), null, "hidden runtime is never selectable");
+  assert.match(text(pickNote(picker)), /Gemini CLI/, "existing hidden runtime may remain explanatory");
+});
 test("typing in the picker search filters the visible models", async (t) => {
   const { main } = await mounted(t);
   const modal = openEdit(main, 0);

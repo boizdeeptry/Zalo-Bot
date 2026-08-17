@@ -38,6 +38,7 @@ rem trong goc KB thi bot trich dan duoc no, va van phong khong phai can cu.
 set "AGENTDC_ZALO_PERSONA=%ROOT%\brain\reference\persona\persona.md"
 set "AGENTDC_ZALO_ROSTER=%ROOT%\brain\reference\persona\roster.md"
 set "AGENTDC_ZALO_OVERLAY_DIR=%ROOT%\brain\reference\persona\overlay"
+set "AGENTDC_ZALO_PERSONA_DEFAULT_DIR=%ROOT%\app\defaults\persona"
 
 rem Thu muc brain, cho trang Knowledge biet no upload vao dau va bien soan o dau.
 rem Tuong minh chu khong suy ra tu KB_DIRS: suy ra cha chung cua hai duong dan thi

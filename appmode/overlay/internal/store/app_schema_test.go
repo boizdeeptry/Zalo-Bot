@@ -157,6 +157,122 @@ func openMigratedAppTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+type onboardingProviderStageFixture struct {
+	Kind       string
+	Status     string
+	Position   int
+	ProviderID string
+	AccountID  string
+	ModelID    string
+	UpdatedAt  string
+}
+
+func openV7Fixture(t *testing.T, state OnboardingState) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	for _, statement := range []string{
+		appFoundationSchema,
+		appLLMSchema,
+		appOnboardingV7Schema,
+		`INSERT INTO app_meta(key, value) VALUES ('schema_version', '7')`,
+		`INSERT INTO llm_providers(id, name, kind, enabled)
+VALUES ('custom-live', 'Custom live', 'openai-compatible', 1)`,
+		`INSERT INTO llm_models(provider_id, model_id, name, source, available)
+VALUES ('custom-live', 'live-model', 'Live model', 'manual', 1)`,
+		`INSERT INTO llm_accounts(id, provider_id, label, config_dir, enabled, added_at)
+VALUES ('live-account', 'custom-live', 'Live account', 'D:/live', 1, '2026-08-14T00:00:00Z')`,
+		`INSERT INTO llm_combos(id, name, type, active, revision)
+VALUES ('live-combo', 'Live combo', 'fallback', 1, 17)`,
+		`INSERT INTO llm_combo_members(combo_id, position, provider_id, model_id, enabled)
+VALUES ('live-combo', 0, 'custom-live', 'live-model', 1)`,
+		`INSERT INTO llm_route_entries(position, provider_id, model_id, enabled)
+VALUES (0, 'custom-live', 'live-model', 1)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("create V7 fixture: %v", err)
+		}
+	}
+	if state.UpdatedAt == "" {
+		state.UpdatedAt = "2026-08-14T01:02:03Z"
+	}
+	restartInProgress := 0
+	if state.RestartInProgress {
+		restartInProgress = 1
+	}
+	if _, err := db.Exec(`UPDATE app_onboarding_state SET
+completed_version = ?, phase = ?, provider_kind = ?, provider_id = ?, account_id = ?,
+model_id = ?, staged_combo_id = ?, persona_fingerprint = ?, test_nonce_hash = ?,
+test_expires_at = ?, restart_in_progress = ?, revision = ?, updated_at = ?
+WHERE id = 1`,
+		state.CompletedVersion, state.Phase, state.ProviderKind, state.ProviderID, state.AccountID,
+		state.ModelID, state.StagedComboID, state.PersonaFingerprint, state.TestNonceHash,
+		state.TestExpiresAt, restartInProgress, state.Revision, state.UpdatedAt,
+	); err != nil {
+		t.Fatalf("seed V7 onboarding state: %v", err)
+	}
+	return db
+}
+
+func openMigratedV7Fixture(t *testing.T, state OnboardingState) *sql.DB {
+	t.Helper()
+	db := openV7Fixture(t, state)
+	if err := migrateApp(db); err != nil {
+		t.Fatalf("migrate V7 fixture: %v", err)
+	}
+	return db
+}
+
+func onboardingProviderStagesForTest(t *testing.T, db *sql.DB) []onboardingProviderStageFixture {
+	t.Helper()
+	rows, err := db.Query(`SELECT
+kind, status, position, provider_id, account_id, model_id, updated_at
+FROM app_onboarding_provider_stages ORDER BY position`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var stages []onboardingProviderStageFixture
+	for rows.Next() {
+		var stage onboardingProviderStageFixture
+		if err := rows.Scan(
+			&stage.Kind, &stage.Status, &stage.Position, &stage.ProviderID,
+			&stage.AccountID, &stage.ModelID, &stage.UpdatedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+		stages = append(stages, stage)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return stages
+}
+
+func onboardingLiveProjectionForTest(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var got string
+	if err := db.QueryRow(`SELECT
+p.id || '|' || p.name || '|' || p.kind || '|' || p.enabled || '|' ||
+m.model_id || '|' || a.id || '|' || a.config_dir || '|' || a.enabled || '|' ||
+c.id || '|' || c.type || '|' || c.active || '|' || c.revision || '|' ||
+cm.position || '|' || r.position
+FROM llm_providers p
+JOIN llm_models m ON m.provider_id = p.id
+JOIN llm_accounts a ON a.provider_id = p.id
+JOIN llm_combos c ON c.id = 'live-combo'
+JOIN llm_combo_members cm ON cm.combo_id = c.id AND cm.provider_id = p.id
+JOIN llm_route_entries r ON r.provider_id = p.id
+WHERE p.id = 'custom-live'`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
 func createFeatureV4Fixture(t *testing.T, db *sql.DB) {
 	t.Helper()
 	execAppFixture(t, db,
@@ -637,7 +753,7 @@ func productionV5DataSnapshot(t *testing.T, db *sql.DB) map[string]string {
 	return snapshot
 }
 
-func TestMigrateAppFeatureV4ToV7PreservesMemoryAndAddsLLM(t *testing.T) {
+func TestMigrateAppFeatureV4ToV8PreservesMemoryAndAddsLLM(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -648,8 +764,8 @@ func TestMigrateAppFeatureV4ToV7PreservesMemoryAndAddsLLM(t *testing.T) {
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "7" {
-		t.Fatalf("schema_version = %q; want 7", got)
+	if got := appSchemaVersionForTest(t, db); got != "8" {
+		t.Fatalf("schema_version = %q; want 8", got)
 	}
 	for _, table := range []string{
 		"llm_providers", "llm_models", "llm_route_entries", "llm_attempts",
@@ -753,10 +869,10 @@ WHERE id = 'claude-code'`).Scan(&kind, &systemProvider); err != nil {
 	}
 }
 
-func TestMigrateAppV7SeedsRequiredOnboarding(t *testing.T) {
+func TestMigrateAppV8SeedsRequiredOnboarding(t *testing.T) {
 	db := openMigratedAppTestDB(t)
-	if got := appSchemaVersionForTest(t, db); got != "7" {
-		t.Fatalf("schema_version = %q; want 7", got)
+	if got := appSchemaVersionForTest(t, db); got != "8" {
+		t.Fatalf("schema_version = %q; want 8", got)
 	}
 	if CurrentOnboardingVersion != 1 {
 		t.Fatalf("CurrentOnboardingVersion = %d; want 1", CurrentOnboardingVersion)
@@ -772,9 +888,285 @@ func TestMigrateAppV7SeedsRequiredOnboarding(t *testing.T) {
 	if got.UpdatedAt == "" {
 		t.Fatal("initial onboarding updated_at is empty")
 	}
+	if stages := onboardingProviderStagesForTest(t, db); len(stages) != 0 {
+		t.Fatalf("fresh onboarding stages = %+v; want none", stages)
+	}
 }
 
-func TestMigrateAppV7PreservesV6Data(t *testing.T) {
+func TestMigrateAppV7ToV8BackfillsOnboardingProviderStages(t *testing.T) {
+	const updatedAt = "2026-08-14T01:02:03Z"
+	const liveProjection = "custom-live|Custom live|openai-compatible|1|live-model|live-account|D:/live|1|live-combo|fallback|1|17|0|0"
+	tests := []struct {
+		name       string
+		before     OnboardingState
+		wantState  OnboardingState
+		wantStages []onboardingProviderStageFixture
+	}{
+		{
+			name: "provider keeps no stages",
+			before: OnboardingState{
+				Phase: OnboardingPhaseProvider, Revision: 31, UpdatedAt: updatedAt,
+			},
+			wantState: OnboardingState{
+				Phase: OnboardingPhaseProvider, Revision: 31, UpdatedAt: updatedAt,
+			},
+		},
+		{
+			name: "connect becomes pending and invalidates V7 tabs",
+			before: OnboardingState{
+				Phase: OnboardingPhaseConnect, ProviderKind: "codex",
+				Revision: 32, UpdatedAt: updatedAt,
+			},
+			wantState: OnboardingState{
+				Phase: OnboardingPhaseConnect, ProviderKind: "codex",
+				Revision: 33, UpdatedAt: updatedAt,
+			},
+			wantStages: []onboardingProviderStageFixture{{
+				Kind: "codex", Status: "pending", Position: 0, UpdatedAt: updatedAt,
+			}},
+		},
+		{
+			name: "setup pending stage stays clean while singleton retains active identity",
+			before: OnboardingState{
+				Phase: OnboardingPhaseSetup, ProviderKind: "claude-code",
+				ProviderID: "claude-code", AccountID: "account-v7", ModelID: "model-v7-active",
+				Revision: 33, UpdatedAt: updatedAt,
+			},
+			wantState: OnboardingState{
+				Phase: OnboardingPhaseSetup, ProviderKind: "claude-code",
+				ProviderID: "claude-code", AccountID: "account-v7", ModelID: "model-v7-active",
+				Revision: 34, UpdatedAt: updatedAt,
+			},
+			wantStages: []onboardingProviderStageFixture{{
+				Kind: "claude-code", Status: "pending", Position: 0, UpdatedAt: updatedAt,
+			}},
+		},
+		{
+			name: "persona becomes ready and clears active identity",
+			before: OnboardingState{
+				Phase: OnboardingPhasePersona, ProviderKind: "codex", ProviderID: "codex",
+				AccountID: "account-v7", ModelID: "gpt-v7", StagedComboID: "combo-v7",
+				PersonaFingerprint: "persona-v7", Revision: 34, UpdatedAt: updatedAt,
+			},
+			wantState: OnboardingState{
+				Phase: OnboardingPhasePersona, StagedComboID: "combo-v7",
+				PersonaFingerprint: "persona-v7", Revision: 35, UpdatedAt: updatedAt,
+			},
+			wantStages: []onboardingProviderStageFixture{{
+				Kind: "codex", Status: "ready", Position: 0, ProviderID: "codex",
+				AccountID: "account-v7", ModelID: "gpt-v7", UpdatedAt: updatedAt,
+			}},
+		},
+		{
+			name: "test becomes ready and preserves receipt",
+			before: OnboardingState{
+				Phase: OnboardingPhaseTest, ProviderKind: "claude-code", ProviderID: "claude-code",
+				AccountID: "account-v7", ModelID: "sonnet-v7", StagedComboID: "combo-v7",
+				PersonaFingerprint: "persona-v7", TestNonceHash: "nonce-v7",
+				TestExpiresAt: "2026-08-14T02:00:00Z", RestartInProgress: true,
+				Revision: 35, UpdatedAt: updatedAt,
+			},
+			wantState: OnboardingState{
+				Phase: OnboardingPhaseTest, StagedComboID: "combo-v7",
+				PersonaFingerprint: "persona-v7", TestNonceHash: "nonce-v7",
+				TestExpiresAt: "2026-08-14T02:00:00Z", RestartInProgress: true,
+				Revision: 36, UpdatedAt: updatedAt,
+			},
+			wantStages: []onboardingProviderStageFixture{{
+				Kind: "claude-code", Status: "ready", Position: 0, ProviderID: "claude-code",
+				AccountID: "account-v7", ModelID: "sonnet-v7", UpdatedAt: updatedAt,
+			}},
+		},
+		{
+			name: "completed lifecycle remains untouched",
+			before: OnboardingState{
+				CompletedVersion: CurrentOnboardingVersion, Phase: OnboardingPhaseCompleted,
+				ProviderKind: "codex", ProviderID: "codex", AccountID: "live-account-v7",
+				ModelID: "gpt-v7", Revision: 36, UpdatedAt: updatedAt,
+			},
+			wantState: OnboardingState{
+				CompletedVersion: CurrentOnboardingVersion, Phase: OnboardingPhaseCompleted,
+				ProviderKind: "codex", ProviderID: "codex", AccountID: "live-account-v7",
+				ModelID: "gpt-v7", Revision: 36, UpdatedAt: updatedAt,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := openMigratedV7Fixture(t, tt.before)
+			if got := appSchemaVersionForTest(t, db); got != "8" {
+				t.Fatalf("schema_version = %q; want 8", got)
+			}
+			if CurrentOnboardingVersion != 1 {
+				t.Fatalf("CurrentOnboardingVersion = %d; want 1", CurrentOnboardingVersion)
+			}
+			gotState, err := (&Store{db: db}).OnboardingState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotState != tt.wantState {
+				t.Fatalf("migrated state = %+v; want %+v", gotState, tt.wantState)
+			}
+			gotStages := onboardingProviderStagesForTest(t, db)
+			if !slices.Equal(gotStages, tt.wantStages) {
+				t.Fatalf("migrated stages = %+v; want %+v", gotStages, tt.wantStages)
+			}
+			if got := onboardingLiveProjectionForTest(t, db); got != liveProjection {
+				t.Fatalf("live projection changed = %q; want %q", got, liveProjection)
+			}
+
+			if err := migrateApp(db); err != nil {
+				t.Fatalf("second migration: %v", err)
+			}
+			secondState, err := (&Store{db: db}).OnboardingState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondStages := onboardingProviderStagesForTest(t, db)
+			if secondState != gotState || !slices.Equal(secondStages, gotStages) {
+				t.Fatalf("second migration changed snapshot: state %+v -> %+v, stages %+v -> %+v",
+					gotState, secondState, gotStages, secondStages)
+			}
+		})
+	}
+}
+
+func TestMigrateAppV7ToV8RollsBackStageAndStateOnLateFailure(t *testing.T) {
+	beforeState := OnboardingState{
+		Phase: OnboardingPhaseSetup, ProviderKind: "claude-code",
+		ProviderID: "claude-code", AccountID: "account-v7", ModelID: "model-v7-active",
+		StagedComboID: "combo-v7", PersonaFingerprint: "persona-v7",
+		Revision: 43, UpdatedAt: "2026-08-14T01:02:03Z",
+	}
+	db := openV7Fixture(t, beforeState)
+	beforeLive := onboardingLiveProjectionForTest(t, db)
+	if _, err := db.Exec(`CREATE TRIGGER fail_onboarding_v8_singleton_transform
+BEFORE UPDATE ON app_onboarding_state
+WHEN OLD.id = 1 AND NEW.revision = OLD.revision + 1
+BEGIN
+  SELECT RAISE(ABORT, 'forced V8 singleton transform failure');
+END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := migrateApp(db)
+	if err == nil || !strings.Contains(err.Error(), "forced V8 singleton transform failure") {
+		t.Fatalf("migrateApp() error = %v; want forced late V8 failure", err)
+	}
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version after rollback = %q; want 7", got)
+	}
+	gotState, err := scanOnboardingState(db.QueryRow(onboardingStateSelect))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotState != beforeState {
+		t.Fatalf("singleton changed after rollback = %+v; want %+v", gotState, beforeState)
+	}
+	if appTableExistsForTest(t, db, "app_onboarding_provider_stages") {
+		t.Fatal("rolled-back migration left app_onboarding_provider_stages behind")
+	}
+	if got := onboardingLiveProjectionForTest(t, db); got != beforeLive {
+		t.Fatalf("live route changed after rollback = %q; want %q", got, beforeLive)
+	}
+}
+
+func TestMigrateAppV7RejectsUnknownOnboardingKind(t *testing.T) {
+	beforeState := OnboardingState{
+		Phase:        OnboardingPhaseSetup,
+		ProviderKind: syntheticOnboardingProviderKind,
+		ProviderID:   syntheticOnboardingProviderKind,
+		AccountID:    "future-account-v7",
+		Revision:     47,
+		UpdatedAt:    "2026-08-16T01:02:03Z",
+	}
+	db := openV7Fixture(t, beforeState)
+	beforeLive := onboardingLiveProjectionForTest(t, db)
+
+	if err := migrateApp(db); err == nil {
+		t.Fatal("migrateApp() accepted unknown V7 onboarding kind")
+	}
+	if got := appSchemaVersionForTest(t, db); got != "7" {
+		t.Fatalf("schema_version after rollback = %q; want 7", got)
+	}
+	gotState, err := scanOnboardingState(db.QueryRow(onboardingStateSelect))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotState != beforeState {
+		t.Fatalf("singleton changed after rollback = %+v; want %+v", gotState, beforeState)
+	}
+	if appTableExistsForTest(t, db, "app_onboarding_provider_stages") {
+		t.Fatal("rejected migration left app_onboarding_provider_stages behind")
+	}
+	if got := onboardingLiveProjectionForTest(t, db); got != beforeLive {
+		t.Fatalf("live route changed after rollback = %q; want %q", got, beforeLive)
+	}
+}
+
+func TestMigrateAppV8ProviderStageContract(t *testing.T) {
+	db := openMigratedAppTestDB(t)
+	wantColumns := []string{
+		"kind", "status", "position", "provider_id", "account_id", "model_id", "updated_at",
+	}
+	if got := appTableColumns(t, db, "app_onboarding_provider_stages"); !slices.Equal(got, wantColumns) {
+		t.Fatalf("stage columns = %v; want %v", got, wantColumns)
+	}
+	rows, err := db.Query(`PRAGMA index_info(app_onboarding_provider_position)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var indexColumns []string
+	for rows.Next() {
+		var sequence, cid int
+		var name string
+		if err := rows.Scan(&sequence, &cid, &name); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		indexColumns = append(indexColumns, name)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(indexColumns, []string{"position"}) {
+		t.Fatalf("position index columns = %v; want [position]", indexColumns)
+	}
+	if _, err := db.Exec(`INSERT INTO app_onboarding_provider_stages(
+kind, status, position, updated_at
+) VALUES ('codex', 'pending', 0, '2026-08-14T00:00:00Z')`); err != nil {
+		t.Fatalf("insert valid stage: %v", err)
+	}
+	var providerID, accountID, modelID string
+	if err := db.QueryRow(`SELECT provider_id, account_id, model_id
+FROM app_onboarding_provider_stages WHERE kind = 'codex'`).Scan(
+		&providerID, &accountID, &modelID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if providerID != "" || accountID != "" || modelID != "" {
+		t.Fatalf("stage identity defaults = %q/%q/%q; want empty", providerID, accountID, modelID)
+	}
+	invalidStatements := []string{
+		`INSERT INTO app_onboarding_provider_stages(kind, status, position, updated_at)
+VALUES ('bad-status', 'installing', 1, '2026-08-14T00:00:00Z')`,
+		`INSERT INTO app_onboarding_provider_stages(kind, status, position, updated_at)
+VALUES ('bad-position', 'pending', -1, '2026-08-14T00:00:00Z')`,
+		`INSERT INTO app_onboarding_provider_stages(kind, status, position, updated_at)
+VALUES ('duplicate-position', 'pending', 0, '2026-08-14T00:00:00Z')`,
+		`INSERT INTO app_onboarding_provider_stages(kind, status, position, updated_at)
+VALUES ('codex', 'ready', 1, '2026-08-14T00:00:00Z')`,
+		`INSERT INTO app_onboarding_provider_stages(kind, status, position)
+VALUES ('missing-updated-at', 'pending', 2)`,
+	}
+	for _, statement := range invalidStatements {
+		if _, err := db.Exec(statement); err == nil {
+			t.Fatalf("invalid stage statement succeeded: %s", statement)
+		}
+	}
+}
+
+func TestMigrateAppV8PreservesV6Data(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -793,8 +1185,8 @@ FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "7" {
-		t.Fatalf("schema_version = %q; want 7", got)
+	if got := appSchemaVersionForTest(t, db); got != "8" {
+		t.Fatalf("schema_version = %q; want 8", got)
 	}
 	gotData := productionV5DataSnapshot(t, db)
 	for table, want := range wantData {
@@ -815,7 +1207,7 @@ FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
 	}
 }
 
-func TestMigrateAppV7EnforcesOnboardingSingleton(t *testing.T) {
+func TestMigrateAppV8EnforcesOnboardingSingleton(t *testing.T) {
 	db := openMigratedAppTestDB(t)
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM app_onboarding_state`).Scan(&count); err != nil {
@@ -830,14 +1222,14 @@ VALUES (2, 'provider', '2026-08-11T00:00:00Z')`); err == nil {
 	}
 }
 
-func TestMigrateAppV7RejectsUnknownOnboardingPhase(t *testing.T) {
+func TestMigrateAppV8RejectsUnknownOnboardingPhase(t *testing.T) {
 	db := openMigratedAppTestDB(t)
 	if _, err := db.Exec(`UPDATE app_onboarding_state SET phase = 'unknown' WHERE id = 1`); err == nil {
 		t.Fatal("setting an unknown onboarding phase succeeded; want CHECK failure")
 	}
 }
 
-func TestMigrateAppMainV4ToV7PreservesRoutingAndAddsMemory(t *testing.T) {
+func TestMigrateAppMainV4ToV8PreservesRoutingAndAddsMemory(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -848,8 +1240,8 @@ func TestMigrateAppMainV4ToV7PreservesRoutingAndAddsMemory(t *testing.T) {
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "7" {
-		t.Fatalf("schema_version = %q; want 7", got)
+	if got := appSchemaVersionForTest(t, db); got != "8" {
+		t.Fatalf("schema_version = %q; want 8", got)
 	}
 	for _, table := range []string{
 		"app_zalo_cli_sessions", "app_memory_revisions", "app_memory_subject_revisions",
@@ -1035,7 +1427,7 @@ END;`,
 	}
 }
 
-func TestMigrateAppV7IsIdempotent(t *testing.T) {
+func TestMigrateAppV8IsIdempotent(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -1109,14 +1501,14 @@ WHERE thread_id = 'feature-user' AND uid = 'feature-user'`).Scan(&secondSubjectR
 	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'llm_route_revision'`).Scan(&routeRevision); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "7" {
-		t.Fatalf("schema_version = %q; want 7", got)
+	if got := appSchemaVersionForTest(t, db); got != "8" {
+		t.Fatalf("schema_version = %q; want 8", got)
 	}
 	if secondSQLiteSchemaVersion != firstSQLiteSchemaVersion || secondObjectCount != firstObjectCount ||
 		secondMemoryCount != firstMemoryCount || secondThreadRevision != firstThreadRevision ||
 		secondSubjectRevision != firstSubjectRevision || secondExpiry != firstExpiry ||
 		providerName != "Claude Code edited" || routeRevision != "23" {
-		t.Fatalf("second migration changed V7 state: SQLite %d->%d objects %d->%d memory %d->%d thread revision %d->%d subject revision %d->%d expiry %q->%q provider %q route revision %q",
+		t.Fatalf("second migration changed V8 state: SQLite %d->%d objects %d->%d memory %d->%d thread revision %d->%d subject revision %d->%d expiry %q->%q provider %q route revision %q",
 			firstSQLiteSchemaVersion, secondSQLiteSchemaVersion, firstObjectCount, secondObjectCount,
 			firstMemoryCount, secondMemoryCount, firstThreadRevision, secondThreadRevision,
 			firstSubjectRevision, secondSubjectRevision, firstExpiry, secondExpiry,
@@ -1124,7 +1516,7 @@ WHERE thread_id = 'feature-user' AND uid = 'feature-user'`).Scan(&secondSubjectR
 	}
 }
 
-func TestMigrateAppV5ToV7AddsClaudeBindingWithoutChangingSession(t *testing.T) {
+func TestMigrateAppV5ToV8AddsClaudeBindingWithoutChangingSession(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -1136,8 +1528,8 @@ func TestMigrateAppV5ToV7AddsClaudeBindingWithoutChangingSession(t *testing.T) {
 	if err := migrateApp(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "7" {
-		t.Fatalf("schema_version = %q; want 7", got)
+	if got := appSchemaVersionForTest(t, db); got != "8" {
+		t.Fatalf("schema_version = %q; want 8", got)
 	}
 	columns := appTableColumns(t, db, "app_zalo_cli_sessions")
 	for _, column := range []string{"claude_account_id", "claude_config_dir"} {
@@ -1176,8 +1568,8 @@ FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
 	if err := migrateApp(db); err != nil {
 		t.Fatalf("second migrateApp: %v", err)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "7" {
-		t.Fatalf("schema_version after second migration = %q; want 7", got)
+	if got := appSchemaVersionForTest(t, db); got != "8" {
+		t.Fatalf("schema_version after second migration = %q; want 8", got)
 	}
 	var secondSQLiteSchemaVersion, secondObjectCount int
 	if err := db.QueryRow(`PRAGMA schema_version`).Scan(&secondSQLiteSchemaVersion); err != nil {
@@ -1193,7 +1585,7 @@ FROM app_zalo_cli_sessions WHERE thread_id = 'feature-user'`).Scan(
 	secondData := productionV5DataSnapshot(t, db)
 	for table, want := range gotData {
 		if got := secondData[table]; got != want {
-			t.Errorf("%s changed during second V7 migration:\n got %q\nwant %q", table, got, want)
+			t.Errorf("%s changed during second V8 migration:\n got %q\nwant %q", table, got, want)
 		}
 	}
 	assertBlankBinding("second migration")
@@ -1207,12 +1599,13 @@ func TestMigrateAppAdvancesSchemaVersionMonotonically(t *testing.T) {
 		want       string
 		wantErr    bool
 	}{
-		{name: "missing metadata", want: "7"},
-		{name: "V1 metadata", seed: "1", insertSeed: true, want: "7"},
-		{name: "older metadata", seed: "2", insertSeed: true, want: "7"},
-		{name: "previous metadata", seed: "6", insertSeed: true, want: "7"},
-		{name: "current metadata", seed: "7", insertSeed: true, want: "7"},
-		{name: "newer metadata", seed: "8", insertSeed: true, want: "8"},
+		{name: "missing metadata", want: "8"},
+		{name: "V1 metadata", seed: "1", insertSeed: true, want: "8"},
+		{name: "older metadata", seed: "2", insertSeed: true, want: "8"},
+		{name: "V6 metadata", seed: "6", insertSeed: true, want: "8"},
+		{name: "previous metadata", seed: "7", insertSeed: true, want: "8"},
+		{name: "current metadata", seed: "8", insertSeed: true, want: "8"},
+		{name: "newer metadata", seed: "9", insertSeed: true, want: "9"},
 		{name: "malformed metadata", seed: "future", insertSeed: true, want: "future", wantErr: true},
 		{name: "negative metadata", seed: "-1", insertSeed: true, want: "-1", wantErr: true},
 	}
@@ -1534,7 +1927,7 @@ func TestMigrateAppFutureVersionIsUntouched(t *testing.T) {
 	}
 	defer db.Close()
 	if _, err := db.Exec(`CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO app_meta(key, value) VALUES ('schema_version', '8')`); err != nil {
+INSERT INTO app_meta(key, value) VALUES ('schema_version', '9')`); err != nil {
 		t.Fatal(err)
 	}
 	var firstSQLiteSchemaVersion, firstObjectCount int64
@@ -1551,8 +1944,8 @@ INSERT INTO app_meta(key, value) VALUES ('schema_version', '8')`); err != nil {
 	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'schema_version'`).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
-	if got != "8" {
-		t.Fatalf("future schema_version = %q; want 8", got)
+	if got != "9" {
+		t.Fatalf("future schema_version = %q; want 9", got)
 	}
 	var secondSQLiteSchemaVersion, secondObjectCount int64
 	if err := db.QueryRow(`PRAGMA schema_version`).Scan(&secondSQLiteSchemaVersion); err != nil {
@@ -1640,7 +2033,7 @@ func TestMigrateAppSeedsNoDefaultCombo(t *testing.T) {
 	if combos != 0 {
 		t.Errorf("combos after migration = %d; want 0", combos)
 	}
-	if got := appSchemaVersionForTest(t, db); got != "7" {
-		t.Errorf("schema_version = %q; want 7", got)
+	if got := appSchemaVersionForTest(t, db); got != "8" {
+		t.Errorf("schema_version = %q; want 8", got)
 	}
 }

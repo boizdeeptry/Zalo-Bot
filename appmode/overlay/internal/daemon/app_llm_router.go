@@ -57,6 +57,13 @@ type appLLMRunnerConfig struct {
 	Route    store.LLMRouteSnapshot
 	Store    llmRouteTelemetryStore
 	Adapters map[string]providerAdapter
+	// Runtime callbacks are captured from the immutable Provider registry while
+	// the route mutation fence is held. Provider ids, rather than concrete
+	// adapter types or built-in kind literals, select every live execution path.
+	TerminalRoutes      map[string]appTerminalRouteRunner
+	LocalAttachmentRuns map[string]appLocalAttachmentRun
+	StructuredSessions  map[string]appStructuredSessionRunner
+	ResolvedStructured  map[string]zaloRunner
 	// Claude dựng mắt xích cuối cho ĐÚNG model mà snapshot của lượt này nêu tên.
 	//
 	// Là hàm chứ không phải một runner dựng sẵn vì model của mắt xích cuối nằm TRONG snapshot, và
@@ -139,6 +146,21 @@ func newAppLLMRunner(cfg appLLMRunnerConfig) *appLLMRunner {
 	// Entries là slice do store sở hữu. Clone tại ranh giới constructor để mọi
 	// thay đổi/lần lưu sau chỉ áp dụng cho runner của lượt kế tiếp.
 	cfg.Route.Entries = slices.Clone(cfg.Route.Entries)
+	cfg.Adapters = cloneProviderAdapters(cfg.Adapters)
+	cfg.TerminalRoutes = cloneTerminalRoutes(cfg.TerminalRoutes)
+	cfg.LocalAttachmentRuns = cloneLocalAttachmentRuns(cfg.LocalAttachmentRuns)
+	cfg.StructuredSessions = cloneStructuredSessions(cfg.StructuredSessions)
+	cfg.ResolvedStructured = cloneResolvedStructured(cfg.ResolvedStructured)
+	// Compatibility for focused management/router fixtures which still provide
+	// the pre-registry structured seam. Live construction always supplies the
+	// typed StructuredSessions map directly from the registry.
+	if cfg.ClaudeForSession != nil {
+		for providerID := range cfg.TerminalRoutes {
+			if _, exists := cfg.StructuredSessions[providerID]; !exists {
+				cfg.StructuredSessions[providerID] = cfg.ClaudeForSession
+			}
+		}
+	}
 	if cfg.PerProviderTimeout <= 0 {
 		cfg.PerProviderTimeout = defaultLLMProviderTimeout
 	}
@@ -151,82 +173,72 @@ func newAppLLMRunner(cfg appLLMRunnerConfig) *appLLMRunner {
 	return &appLLMRunner{cfg: cfg}
 }
 
+// newAppLLMRunnerWithLocalFactories publishes a fully wired runner. Local
+// factories need the runner for shared telemetry helpers, so their one
+// self-referential bind happens here before the pointer can escape.
+func newAppLLMRunnerWithLocalFactories(
+	cfg appLLMRunnerConfig,
+	factories map[string]appLocalAttachmentRunnerFactory,
+) (*appLLMRunner, bool) {
+	runner := newAppLLMRunner(cfg)
+	local := make(map[string]appLocalAttachmentRun, len(factories))
+	for providerID, factory := range factories {
+		callback := factory(runner)
+		if callback == nil {
+			return nil, false
+		}
+		local[providerID] = callback
+	}
+	runner.cfg.LocalAttachmentRuns = local
+	return runner, true
+}
+
+func cloneProviderAdapters(source map[string]providerAdapter) map[string]providerAdapter {
+	result := make(map[string]providerAdapter, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneTerminalRoutes(source map[string]appTerminalRouteRunner) map[string]appTerminalRouteRunner {
+	result := make(map[string]appTerminalRouteRunner, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneLocalAttachmentRuns(source map[string]appLocalAttachmentRun) map[string]appLocalAttachmentRun {
+	result := make(map[string]appLocalAttachmentRun, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneStructuredSessions(source map[string]appStructuredSessionRunner) map[string]appStructuredSessionRunner {
+	result := make(map[string]appStructuredSessionRunner, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneResolvedStructured(source map[string]zaloRunner) map[string]zaloRunner {
+	result := make(map[string]zaloRunner, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
 // appOnboardingNoopAttemptStore keeps Test Chat outside production telemetry.
 // The router still follows its normal attempt-recording semantics, but this
 // isolated sink deliberately commits nothing.
 type appOnboardingNoopAttemptStore struct{}
 
 func (appOnboardingNoopAttemptStore) RecordLLMAttempt(store.LLMAttempt) error { return nil }
-
-// newAppOnboardingTestRunner constructs a real router over a synthetic snapshot
-// containing exactly the disabled staging Account/model selected by onboarding.
-// It never reads the live route or live Account selector.
-func newAppOnboardingTestRunner(
-	ctx context.Context,
-	a *api,
-	state store.OnboardingState,
-	staged store.OnboardingStagingAccount,
-) (*appLLMRunner, error) {
-	if state.ProviderID == "" || state.ProviderID != state.ProviderKind ||
-		state.ProviderID != staged.ProviderID || state.ProviderKind != staged.ProviderKind ||
-		state.AccountID == "" || state.AccountID != staged.AccountID ||
-		state.ModelID == "" || state.StagedComboID == "" || staged.ConfigDir == "" {
-		return nil, store.ErrOnboardingInvalidStagingOwnership
-	}
-	logger := a.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	cfg := appLLMRunnerConfig{
-		Route: store.LLMRouteSnapshot{
-			Type:    "fallback",
-			ComboID: state.StagedComboID,
-			Entries: []store.LLMRouteEntry{{
-				Position: 0, ProviderID: state.ProviderID, ModelID: state.ModelID, Enabled: true,
-			}},
-		},
-		Store:          appOnboardingNoopAttemptStore{},
-		Adapters:       map[string]providerAdapter{},
-		Disabled:       map[string]bool{},
-		Credential:     func(string) ([]byte, error) { return nil, nil },
-		Claude:         func(string) zaloRunner { return silentZaloRunner{} },
-		HasAttachments: false,
-		Logger:         logger,
-	}
-
-	switch state.ProviderKind {
-	case "codex":
-		adapter, ok := newLLMAdapter(state.ProviderKind, state.ProviderID,
-			&http.Client{Timeout: defaultLLMProviderTimeout}, logger)
-		if !ok {
-			return nil, fmt.Errorf("onboarding test: staged Provider has no adapter")
-		}
-		switch pinned := adapter.(type) {
-		case *codexProxyAdapter:
-			pinned.pickConfigDir = makeOnboardingPinnedConfigDir(staged)
-		case *cliAdapter:
-			pinned.accountEnv = makeOnboardingPinnedAccountEnv(staged)
-		default:
-			return nil, fmt.Errorf("onboarding test: staged Codex adapter has unexpected type")
-		}
-		cfg.Adapters[state.ProviderID] = adapter
-	case "claude-code":
-		if a.zalo == nil {
-			return nil, fmt.Errorf("onboarding test: persona runtime is unavailable")
-		}
-		program, prefixArgs, err := resolveCLIProgramContext(ctx, cliDescriptors["claude-code"])
-		if err != nil {
-			return nil, fmt.Errorf("onboarding test: resolve staged Claude program: %w", err)
-		}
-		claude := appOnboardingPinnedClaudeRunner(
-			a.zalo.cfg, staged, state.ModelID, program, prefixArgs, logger,
-		)
-		cfg.Claude = func(string) zaloRunner { return claude }
-	default:
-		return nil, store.ErrOnboardingProviderUnsupported
-	}
-	return newAppLLMRunner(cfg), nil
-}
 
 type appOnboardingCLIProcess func(
 	context.Context,
@@ -429,16 +441,17 @@ func (r *appLLMRunner) appResolveZaloSessionRoute(
 	ctx context.Context,
 	current *store.ZaloCLISession,
 ) (zaloRunner, appZaloClaudeBinding) {
-	entry, ok := findClaudeEntry(r.cfg.Route.Entries)
-	if !ok || r.cfg.ClaudeForSession == nil {
+	entry, resolver, ok := r.firstStructuredSessionEntry(r.cfg.Route.Entries)
+	if !ok {
 		return r, appZaloClaudeBinding{}
 	}
-	claude, binding := r.cfg.ClaudeForSession(ctx, entry.ModelID, current)
-	if binding.Model == "" {
+	resolved, binding := resolver(ctx, entry.ModelID, current)
+	if binding.State != appZaloClaudeBindingUnresolved && binding.Model == "" {
 		binding.Model = entry.ModelID
 	}
 	cloned := *r
-	cloned.cfg.Claude = func(string) zaloRunner { return claude }
+	cloned.cfg.ResolvedStructured = cloneResolvedStructured(r.cfg.ResolvedStructured)
+	cloned.cfg.ResolvedStructured[entry.ProviderID] = resolved
 	cloned.cfg.ClaudeForSession = nil
 	return &cloned, binding
 }
@@ -462,30 +475,24 @@ func (r *appLLMRunner) run(
 	// cannot advance its cursor, so trying either would rediscover the same row on
 	// every future turn. Select one enabled Claude entry directly or fail closed.
 	if in.structured != nil && r.cfg.RequiresStructuredClaude {
-		e, ok := findClaudeEntry(entries)
+		e, _, ok := r.firstStructuredSessionEntry(entries)
 		if !ok {
 			return appZaloRunResult{}, newLLMError(llmErrorRequest, nil,
-				"llm route: pending session attachment requires an enabled Claude Code entry")
+				"llm route: pending session attachment requires an enabled structured terminal entry")
 		}
-		return r.runClaude(ctx, e, in, step)
+		return r.runTerminal(ctx, e, in, step)
 	}
 	// Lượt có tệp chỉ đi tới một mắt xích local_cli — nơi tệp nằm im trên đĩa máy này (codex,
 	// gemini-cli đều chạy chỉ-đọc, và claude-code). Chọn cái ĐẦU TIÊN đủ điều kiện ở bất kỳ vị trí
 	// nào; không có thì lượt này không phục vụ được — KHÔNG để đường dẫn/nội dung tệp của khách chạm
 	// một adapter HTTP. Đó là ranh giới an toàn mà cả thiết kế bảo vệ.
 	if r.cfg.HasAttachments {
-		e, ok := r.firstEligibleCLIEntry(entries)
+		e, local, ok := r.firstLocalAttachmentEntry(entries)
 		if !ok {
 			return appZaloRunResult{}, newLLMError(llmErrorRequest, nil,
-				"llm route: lượt có tệp nhưng chuỗi không có mắt xích local_cli")
+				"llm route: lượt có tệp nhưng chuỗi không có runtime tệp cục bộ")
 		}
-		// claude-code giữ NGUYÊN đường runClaude (mang step gốc, ngân sách lượt dài) — Task 11 sở hữu
-		// path đó. codex/gemini-cli chạy qua adapter, cũng dưới ctx CHA: một lượt CLI đọc tệp là một
-		// lượt thật, KHÔNG phải một API treo 25s. Cả hai đều terminal — một mắt xích, không fallback.
-		if e.ProviderID == claudeCodeProviderID {
-			return r.runClaude(ctx, e, in, step)
-		}
-		return r.runCLIAttachment(ctx, r.cfg.Adapters[e.ProviderID], e, in.statelessPrompt)
+		return local(r, ctx, e, in, step)
 	}
 
 	// Round-robin: xoay để lượt này bắt đầu ở mắt xích đủ điều kiện kế con trỏ combo, rồi vẫn
@@ -493,7 +500,7 @@ func (r *appLLMRunner) run(
 	// một primary định kỳ (xem rrRotate). Nhánh HasAttachments ở trên đã trả về, nên định tuyến tệp
 	// giữ NGUYÊN thứ tự (firstEligibleCLIEntry là ranh giới ổn định, không round-robin).
 	if snapshot.Type == "round_robin" {
-		entries = rrRotate(entries, snapshot.ComboID)
+		entries = r.rrRotate(entries, snapshot.ComboID)
 	}
 
 	apiCtx, cancel := context.WithTimeout(ctx, r.cfg.APIChainTimeout)
@@ -510,8 +517,8 @@ func (r *appLLMRunner) run(
 		// Claude Code là mắt xích ĐẦU CUỐI: chạy dưới ctx CHA (ngân sách lượt dài — một lượt Claude
 		// Code đo được 42–114s — không phải 25s của một API treo) và mang step gốc, rồi trả kết quả.
 		// Mắt xích sau nó trong lượt này KHÔNG chạy; Task 11 cho Claude Code fallthrough như mọi cái.
-		if e.ProviderID == claudeCodeProviderID {
-			return r.runClaude(ctx, e, in, step)
+		if _, terminal := r.cfg.TerminalRoutes[e.ProviderID]; terminal {
+			return r.runTerminal(ctx, e, in, step)
 		}
 		// Ngân sách chuỗi API đã cạn: mọi mắt xích API còn lại chạy bằng một apiCtx đã chết chỉ sinh
 		// thêm một hàng telemetry đổ tội cho Provider sau. Bỏ qua chúng — vòng lặp đi tiếp để tới
@@ -563,8 +570,8 @@ func (r *appLLMRunner) run(
 		next := r.nextProvider(entries, i+1)
 		if apiCtx.Err() != nil {
 			next = ""
-			if claude, ok := findClaudeEntry(entries[i+1:]); ok {
-				next = claude.ProviderID
+			if terminal, ok := r.firstTerminalEntry(entries[i+1:]); ok {
+				next = terminal.ProviderID
 			}
 		}
 		r.record(llmErrorAttempt(e, started, elapsed, kind, next))
@@ -575,46 +582,44 @@ func (r *appLLMRunner) run(
 		"llm route: cạn chuỗi fallback, không mắt xích nào trả lời được")
 }
 
-// findClaudeEntry tìm mắt xích Claude Code ĐANG BẬT trong chuỗi, ở bất kỳ vị trí nào.
-//
-// Là hàm riêng vì hai chỗ cần nó: cửa chặn lượt có tệp (phải đi Claude Code) và telemetry lúc
-// ngân sách chuỗi API cạn (đích thật là mắt xích claude-code kế). Chỉ xét Enabled — Claude Code
-// không bao giờ nằm trong Disabled (tập đó chỉ chứa Provider gọi được qua HTTP, xem appLLMAdapters).
-func findClaudeEntry(entries []store.LLMRouteEntry) (store.LLMRouteEntry, bool) {
+func (r *appLLMRunner) firstTerminalEntry(entries []store.LLMRouteEntry) (store.LLMRouteEntry, bool) {
 	for _, e := range entries {
-		if e.Enabled && e.ProviderID == claudeCodeProviderID {
+		if !e.Enabled || r.cfg.Disabled[e.ProviderID] {
+			continue
+		}
+		if _, exists := r.cfg.TerminalRoutes[e.ProviderID]; exists {
 			return e, true
 		}
 	}
 	return store.LLMRouteEntry{}, false
 }
 
-// firstEligibleCLIEntry tìm mắt xích local_cli ĐẦU TIÊN đủ điều kiện phục vụ một lượt có tệp.
-//
-// "Đủ điều kiện" = đang bật, KHÔNG nằm trong Disabled, VÀ thuộc họ local_cli. Ba nơi tệp đọc được
-// ngay trên đĩa máy này: codex, gemini-cli (đều chỉ-đọc) và claude-code. Bốn Provider HTTP thì
-// KHÔNG — chúng không có ổ đĩa, và gửi đường dẫn/nội dung tệp của khách sang đó là phá ranh giới an
-// toàn. Cùng HAI cửa tắt như vòng lặp trong Run: mắt xích tắt là lựa chọn người dựng chuỗi, Provider
-// tắt là lệnh ngắt của người trực (tới SAU lúc lưu chuỗi).
-//
-// Nhận diện kind theo cấu trúc sẵn có, không cần một map kind riêng: claude-code CHƯA có adapter
-// (Task 11) nên nhận bằng ProviderID; codex/gemini-cli nhận bằng type-assert *cliAdapter — đúng type
-// mà newLLMAdapter dựng cho hai kind local_cli đó. Một adapter vắng mặt hoặc là adapter HTTP đều
-// trả về ok=false ở phép assert này, nên bốn Provider HTTP tự động rớt. "Đầu tiên" = vị trí thấp
-// nhất trong chuỗi, nên trả về ngay mục khớp đầu tiên.
-func (r *appLLMRunner) firstEligibleCLIEntry(entries []store.LLMRouteEntry) (store.LLMRouteEntry, bool) {
+func (r *appLLMRunner) firstLocalAttachmentEntry(
+	entries []store.LLMRouteEntry,
+) (store.LLMRouteEntry, appLocalAttachmentRun, bool) {
 	for _, e := range entries {
 		if !e.Enabled || r.cfg.Disabled[e.ProviderID] {
 			continue
 		}
-		if e.ProviderID == claudeCodeProviderID {
-			return e, true
-		}
-		if _, ok := r.cfg.Adapters[e.ProviderID].(*cliAdapter); ok {
-			return e, true
+		if local, exists := r.cfg.LocalAttachmentRuns[e.ProviderID]; exists && local != nil {
+			return e, local, true
 		}
 	}
-	return store.LLMRouteEntry{}, false
+	return store.LLMRouteEntry{}, nil, false
+}
+
+func (r *appLLMRunner) firstStructuredSessionEntry(
+	entries []store.LLMRouteEntry,
+) (store.LLMRouteEntry, appStructuredSessionRunner, bool) {
+	for _, e := range entries {
+		if !e.Enabled || r.cfg.Disabled[e.ProviderID] {
+			continue
+		}
+		if resolver, exists := r.cfg.StructuredSessions[e.ProviderID]; exists && resolver != nil {
+			return e, resolver, true
+		}
+	}
+	return store.LLMRouteEntry{}, nil, false
 }
 
 // generate giữ bản rõ sống đúng bằng một lượt gọi.
@@ -628,6 +633,21 @@ func (r *appLLMRunner) generate(ctx context.Context, adapter providerAdapter,
 	callCtx, cancel := context.WithTimeout(ctx, r.cfg.PerProviderTimeout)
 	defer cancel()
 	return adapter.Generate(callCtx, llmRequest{Model: e.ModelID, Prompt: prompt}, credential)
+}
+
+func (r *appLLMRunner) runTerminal(
+	ctx context.Context,
+	e store.LLMRouteEntry,
+	in appLLMRouteInput,
+	step func(string),
+) (appZaloRunResult, error) {
+	terminal := r.cfg.TerminalRoutes[e.ProviderID]
+	if terminal == nil {
+		return appZaloRunResult{}, newLLMError(
+			llmErrorRequest, nil, "llm route: terminal runtime is unavailable",
+		)
+	}
+	return terminal(r, ctx, e, in, step)
 }
 
 // runClaude giao lượt cho mắt xích cuối, bằng ctx GỐC chứ không phải ctx của chuỗi API.
@@ -644,7 +664,18 @@ func (r *appLLMRunner) runClaude(ctx context.Context, e store.LLMRouteEntry,
 		return appZaloRunResult{}, fmt.Errorf("llm route: lượt bị huỷ trước khi tới %s: %w", e.ProviderID, err)
 	}
 	started := time.Now()
-	claude := r.cfg.Claude(e.ModelID)
+	claude := r.cfg.ResolvedStructured[e.ProviderID]
+	if claude == nil {
+		if resolver := r.cfg.StructuredSessions[e.ProviderID]; resolver != nil {
+			claude, _ = resolver(ctx, e.ModelID, nil)
+		}
+	}
+	if claude == nil && r.cfg.Claude != nil {
+		claude = r.cfg.Claude(e.ModelID)
+	}
+	if claude == nil {
+		return appZaloRunResult{}, errors.New("llm route: terminal runner is unavailable")
+	}
 	var result appZaloRunResult
 	var err error
 	if in.structured == nil {
@@ -801,14 +832,15 @@ func rotate(entries []store.LLMRouteEntry, k int) []store.LLMRouteEntry {
 // Con trỏ đẩy theo SỐ mắt xích đủ điều kiện (len(lead)), không theo cả chuỗi, nên mỗi lượt đúng
 // một mắt xích API khác nhau dẫn đầu. Không mắt xích đủ điều kiện nào (toàn tắt hoặc chỉ có
 // claude-code) → không xoay, giữ nguyên chuỗi. Một mắt xích đủ điều kiện → rotate về identity.
-func rrRotate(entries []store.LLMRouteEntry, comboID string) []store.LLMRouteEntry {
+func (r *appLLMRunner) rrRotate(entries []store.LLMRouteEntry, comboID string) []store.LLMRouteEntry {
 	// lead cấp sẵn đủ chỗ cho CẢ chuỗi: ở nhánh identity (rotate trả lại chính lead khi k%n==0),
 	// append(lead, tail...) ghi tail vào phần đuôi backing array của lead — an toàn vì lead là mảng
 	// mới toanh ở đây, không dùng lại sau lời gọi này, và cap đủ nên không cấp phát lại đè ai.
 	lead := make([]store.LLMRouteEntry, 0, len(entries))
 	tail := make([]store.LLMRouteEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.Enabled && e.ProviderID != claudeCodeProviderID {
+		_, terminal := r.cfg.TerminalRoutes[e.ProviderID]
+		if e.Enabled && !r.cfg.Disabled[e.ProviderID] && !terminal {
 			lead = append(lead, e)
 		} else {
 			tail = append(tail, e)
@@ -894,81 +926,7 @@ func (silentZaloRunner) Run(context.Context, string, func(string)) (string, erro
 // Đọc hỏng ở nhánh nào thì coi nhánh đó "không có": bot im là mặc định an toàn, và một lỗi đọc
 // store không được biến thành "đã nối" để rồi gửi tin của khách đi khi chưa cấu hình gì.
 func (a *api) hasAnyConnectedProvider() bool {
-	for kind := range subscriptionKinds {
-		if accs, err := a.st.LLMAccounts(kind); err == nil {
-			for _, ac := range accs {
-				if ac.Enabled {
-					return true
-				}
-			}
-		}
-	}
-	if provs, err := a.st.LLMProviders(); err == nil {
-		for _, p := range provs {
-			if p.CredentialConfigured {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// appZaloRunner dựng runner cho ĐÚNG một lượt Zalo.
-//
-// Dựng mới mỗi lượt chứ không cất vào api: đó là toàn bộ lý do một lần lưu route có hiệu lực ngay
-// mà không phải mở lại phần mềm. Danh sách Provider cũng đọc lại ở đây, nên một Provider vừa thêm
-// gọi được từ tin nhắn kế tiếp.
-//
-// Không trả về lỗi vì chỗ gọi nó là một tham số của answerZalo. KHÔNG có Claude mặc định: chưa
-// nối Provider nào, hay đọc route hỏng, thì lượt này IM (silentZaloRunner → ErrZaloSilent, mà
-// answerZalo nuốt) chứ không rơi về base. Đảo ngược cố ý của "thà trả lời còn hơn im".
-//
-// hasNewFiles là tệp của TIN NÀY. Tệp của cả luồng mới là thứ quyết định — xem HasAttachments.
-func (a *api) appZaloRunner(zc zaloConfig, base zaloRunner, threadID string, hasNewFiles bool) zaloRunner {
-	// Chưa nối Provider nào → im, TRƯỚC cả khi đọc route: không có Claude mặc định để rơi về, nên
-	// một bot chưa cấu hình phải lặng thay vì trả lời bằng một login sẵn nào đó của máy này.
-	if !a.hasAnyConnectedProvider() {
-		return silentZaloRunner{}
-	}
-	// Chuỗi rỗng nghĩa là chưa có định tuyến, KHÔNG phải "không còn gì để gọi": router coi rỗng
-	// là lỗi và lượt sẽ chết, nên cửa này phải ở đây chứ không ở trong router. Xảy ra khi lần
-	// gieo lúc khởi động hỏng, và ở đó vẫn im — có Provider nối nhưng chưa có chuỗi để đi.
-	//
-	// Đây là lần đọc route DUY NHẤT của lượt. Cùng snapshot vừa qua cửa cấu hình được chuyển vào
-	// runner; một lần lưu xảy ra sau đây chỉ có hiệu lực với runner/lượt kế tiếp.
-	snapshot, err := a.st.LLMRoute()
-	if err != nil {
-		a.logger.Error("llm route: không đọc được chuỗi, chưa cấu hình, bot im", "err", err)
-		return silentZaloRunner{}
-	}
-	if len(snapshot.Entries) == 0 {
-		return silentZaloRunner{}
-	}
-	adapters, disabled, err := a.appLLMAdapters()
-	if err != nil {
-		a.logger.Error("llm route: không dựng được adapter, lỗi, bot im", "err", err)
-		return silentZaloRunner{}
-	}
-	return newAppLLMRunner(appLLMRunnerConfig{
-		Route:    snapshot,
-		Store:    a.st,
-		Adapters: adapters,
-		Disabled: disabled,
-		Claude:   func(model string) zaloRunner { return a.appClaudeRunner(zc, base, model) },
-		ClaudeForSession: func(
-			ctx context.Context,
-			model string,
-			current *store.ZaloCLISession,
-		) (zaloRunner, appZaloClaudeBinding) {
-			return a.appClaudeRunnerForSession(ctx, zc, model, current)
-		},
-		Credential: a.appLLMCredential,
-		// Tệp của tin hiện tại đã biết trước khi dựng runner. Tệp lịch sử được chụp đúng một lần
-		// ngay sau đó trong appAnswerZalo và áp qua appWithZaloAttachments; cùng snapshot ấy dựng
-		// prompt, nên không có cửa một tệp lọt vào prompt sau quyết định an toàn này.
-		HasAttachments: hasNewFiles,
-		Logger:         a.logger,
-	})
+	return productionAppRuntimeContext(a).hasAnyConnectedProvider()
 }
 
 // appClaudeRunner là mắt xích cuối chạy đúng model mà route nêu tên, dưới đăng nhập của một account.
@@ -1052,22 +1010,15 @@ func (a *api) appLLMAdapters() (map[string]providerAdapter, map[string]bool, err
 	client := &http.Client{Timeout: defaultLLMProviderTimeout}
 	adapters := make(map[string]providerAdapter, len(providers))
 	disabled := map[string]bool{}
+	registry := productionAppProviderRuntimeRegistry()
 	for _, p := range providers {
-		adapter, ok := newLLMAdapter(p.Kind, p.ID, client, a.logger)
+		factory, ok := registry.providerAdapterFactory(p.Kind)
 		if !ok {
 			continue
 		}
-		// Multi-account: chỉ kind subscription (envVarFor true) chạy qua cliAdapter mới cần chọn
-		// account + set env config-dir mỗi lượt. Hôm nay chỉ codex khớp (claude-code còn qua
-		// runClaude tới Task 11; gemini-cli là cliAdapter nhưng không subscription → bỏ qua).
-		if ca, isCLI := adapter.(*cliAdapter); isCLI {
-			if _, isSub := envVarFor(p.Kind); isSub {
-				ca.accountEnv = makeAccountEnv(a.st, accountSel, p.ID, p.Kind)
-			}
-		}
-		// codex chạy qua proxy: cần CODEX_HOME của account đã chọn để đọc token OAuth (auth.json).
-		if pa, isProxy := adapter.(*codexProxyAdapter); isProxy {
-			pa.pickConfigDir = makeAccountConfigDir(a.st, accountSel, p.ID, p.Kind)
+		adapter, factoryErr := factory(p.ID, a.st, client, a.logger)
+		if factoryErr != nil || adapter == nil {
+			return nil, nil, errors.New("llm route: Provider adapter is unavailable")
 		}
 		adapters[p.ID] = adapter
 		// Chỉ Provider GỌI ĐƯỢC mới vào tập tắt. Claude Code không có adapter nên nó không bao giờ

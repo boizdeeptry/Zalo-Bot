@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -26,5 +27,52 @@ func TestProcessGroupLifetimeKillsExactlyOnceAndPreservesError(t *testing.T) {
 	}
 	if calls != 1 || gotPGID != 42 {
 		t.Fatalf("kill calls/pgid = %d/%d; want 1/42", calls, gotPGID)
+	}
+}
+
+func TestManagedCLIProcessQuiesceWaitsForProcessGroupZero(t *testing.T) {
+	kills := 0
+	probes := 0
+	process := &processGroupManagedCLIProcess{
+		pgid: 42,
+		kill: func(int) error {
+			kills++
+			return nil
+		},
+		active: func(int) (bool, error) {
+			probes++
+			return probes < 3, nil
+		},
+		poll: func(context.Context) error { return nil },
+	}
+
+	if err := process.quiesce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if kills != 1 || probes != 3 {
+		t.Fatalf("kill/probe calls = %d/%d; want 1/3", kills, probes)
+	}
+	if err := process.close(); err != nil {
+		t.Fatalf("close after quiesce = %v", err)
+	}
+	if kills != 1 {
+		t.Fatalf("kill calls after close = %d; want 1", kills)
+	}
+}
+
+func TestManagedCLIProcessQuiesceHonorsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	process := &processGroupManagedCLIProcess{
+		pgid:   42,
+		kill:   func(int) error { return nil },
+		active: func(int) (bool, error) { return true, nil },
+		poll: func(ctx context.Context) error {
+			return ctx.Err()
+		},
+	}
+
+	if err := process.quiesce(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("quiesce error = %v; want context.Canceled", err)
 	}
 }

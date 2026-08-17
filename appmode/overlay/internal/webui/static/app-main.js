@@ -2,7 +2,6 @@ import { NAVIGATION, ROUTES, createRouteHost, routeFromHash } from "./core/route
 import { createRailNavigation, renderNavigation } from "./core/shell.js";
 import { errorPanel } from "./core/ui.js";
 import {
-  SUPPORTED_PROVIDERS,
   createOnboardingService,
   normalizeStatus,
   projectStatus,
@@ -193,8 +192,7 @@ function normalizedHostRestart(response) {
     || projected.provider_id !== ""
     || projected.account_id !== ""
     || projected.model_id !== ""
-    || (projected.suggested_provider_kind !== ""
-      && !SUPPORTED_PROVIDERS.has(projected.suggested_provider_kind))) return null;
+    || status.providers.length !== 0) return null;
   return status;
 }
 
@@ -231,6 +229,7 @@ export function startApp({
   }
   const content = documentRef.querySelector("[data-portal-content]");
   const shellNodes = [
+    documentRef.querySelector(".skip-link"),
     documentRef.querySelector("#rail-toggle"),
     documentRef.querySelector("#rail"),
     documentRef.querySelector("[data-portal-nav]"),

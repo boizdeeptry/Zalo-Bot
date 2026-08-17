@@ -20,6 +20,17 @@ import (
 // --- Provider ---
 
 func (a *api) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
+	appRuntimeContext{api: a, registry: productionAppProviderRuntimeRegistry()}.
+		handleLLMProviderList(w, nil)
+}
+
+func (ctx appRuntimeContext) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
+	a := ctx.api
+	options, err := ctx.registry.validatedManagementOptions()
+	if err != nil {
+		a.writeLLMInternal(w, "không đọc được danh mục Provider", err)
+		return
+	}
 	providers, err := a.st.LLMProviders()
 	if err != nil {
 		a.writeLLMInternal(w, "không đọc được danh sách Provider", err)
@@ -27,9 +38,9 @@ func (a *api) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
 	}
 	out := make([]llmProviderBody, 0, len(providers))
 	for _, p := range providers {
-		body, err := a.llmProviderBody(p)
+		body, err := ctx.llmProviderBody(p)
 		if err != nil {
-			a.writeLLMInternal(w, "không đọc được model của Provider", err)
+			a.writeLLMInternal(w, "không đọc được Provider", err)
 			return
 		}
 		out = append(out, body)
@@ -38,8 +49,9 @@ func (a *api) handleLLMProviderList(w http.ResponseWriter, _ *http.Request) {
 	// router dùng để quyết bot có im hay không, nên banner nói đúng thứ khách sẽ gặp: 0 nối = im lặng.
 	a.writeJSON(w, http.StatusOK, map[string]any{
 		"providers":            out,
+		"provider_options":     options,
 		"kinds":                llmProviderKinds,
-		"hasConnectedProvider": a.hasAnyConnectedProvider(),
+		"hasConnectedProvider": ctx.hasAnyConnectedProvider(),
 	})
 }
 
@@ -152,6 +164,9 @@ func (a *api) handleLLMProviderUpdate(w http.ResponseWriter, r *http.Request) {
 	// nên dựng một struct mới chỉ có tên và trạng thái sẽ lặng lẽ xoá "đã kiểm, chạy tốt".
 	p.Name, p.Enabled = name, req.Enabled
 	if err := a.st.UpdateLLMProvider(p); err != nil {
+		if a.writeLLMOnboardingStageInUse(w, err) {
+			return
+		}
 		a.writeLLMInternal(w, "không lưu được Provider", err)
 		return
 	}
@@ -170,6 +185,8 @@ func (a *api) handleLLMProviderDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch err := a.st.DeleteLLMProvider(p.ID); {
+	case errors.Is(err, store.ErrLLMOnboardingStageInUse):
+		a.writeLLMOnboardingStageInUse(w, err)
 	case errors.Is(err, store.ErrLLMProviderInUse):
 		a.writeLLMErr(w, http.StatusConflict, "PROVIDER_IN_USE",
 			"Chuỗi fallback còn dùng "+p.Name+"; bỏ nó khỏi chuỗi trước đã", nil)
@@ -328,6 +345,9 @@ func (a *api) handleLLMProviderDiscover(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if err := a.st.ReplaceLLMModels(p.ID, store.LLMModelDiscovered, models); err != nil {
+			if a.writeLLMOnboardingStageInUse(w, err) {
+				return
+			}
 			a.writeLLMInternal(w, "không lưu được danh sách model", err)
 			return
 		}
@@ -359,6 +379,9 @@ func (a *api) handleLLMProviderDiscover(w http.ResponseWriter, r *http.Request) 
 	// endpoint /models) không được biến mất theo một lần đồng bộ. Đây là một transaction, nên
 	// không có khoảnh khắc nào danh sách trống.
 	if err := a.st.ReplaceLLMModels(p.ID, store.LLMModelDiscovered, discovered); err != nil {
+		if a.writeLLMOnboardingStageInUse(w, err) {
+			return
+		}
 		a.writeLLMInternal(w, "không lưu được danh sách model", err)
 		return
 	}
@@ -431,6 +454,9 @@ func (a *api) handleLLMModelAdd(w http.ResponseWriter, r *http.Request) {
 		ProviderID: p.ID, ModelID: modelID, Name: name,
 		Source: store.LLMModelManual, Available: true,
 	}); err != nil {
+		if a.writeLLMOnboardingStageInUse(w, err) {
+			return
+		}
 		a.writeLLMInternal(w, "không thêm được model", err)
 		return
 	}
@@ -449,6 +475,8 @@ func (a *api) handleLLMModelDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch err := a.st.DeleteLLMModel(p.ID, modelID); {
+	case errors.Is(err, store.ErrLLMOnboardingStageInUse):
+		a.writeLLMOnboardingStageInUse(w, err)
 	case errors.Is(err, store.ErrNotFound):
 		a.writeLLMErr(w, http.StatusNotFound, "MODEL_NOT_FOUND",
 			fmt.Sprintf("%s không có model %q", p.Name, modelID), nil)
@@ -478,6 +506,9 @@ func (a *api) handleLLMAccountDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.st.DeleteLLMAccount(accountID); err != nil {
+		if a.writeLLMOnboardingStageInUse(w, err) {
+			return
+		}
 		a.writeLLMInternal(w, "không xoá được account", err)
 		return
 	}
@@ -498,6 +529,15 @@ func findLLMAccountDir(accounts []store.LLMAccount, id string) (string, bool) {
 	return "", false
 }
 
+func (a *api) writeLLMOnboardingStageInUse(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, store.ErrLLMOnboardingStageInUse) {
+		return false
+	}
+	a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_STAGE_IN_USE",
+		"Onboarding đang dùng cấu hình này; hãy hoàn tất hoặc quay lại bước Nhà cung cấp trước", nil)
+	return true
+}
+
 // --- route ---
 
 func (a *api) handleLLMRouteGet(w http.ResponseWriter, _ *http.Request) {
@@ -515,6 +555,11 @@ type llmRouteRequest struct {
 }
 
 func (a *api) handleLLMRoutePut(w http.ResponseWriter, r *http.Request) {
+	productionAppRuntimeContext(a).handleLLMRoutePut(w, r)
+}
+
+func (ctx appRuntimeContext) handleLLMRoutePut(w http.ResponseWriter, r *http.Request) {
+	a := ctx.api
 	var req llmRouteRequest
 	if !a.decodeLLMBody(w, r, &req) {
 		return
@@ -527,7 +572,30 @@ func (a *api) handleLLMRoutePut(w http.ResponseWriter, r *http.Request) {
 			Enabled:    e.Enabled,
 		})
 	}
-	snapshot, err := a.st.ReplaceLLMRoute(req.Revision, entries)
+	entries = appCanonicalRouteEntries(entries)
+	ctx.appLLMRouteCheckpoint(appLLMRouteOperationPut, appLLMRoutePhaseBeforeLock)
+	appLLMRouteMutationMu.Lock()
+	ctx.appLLMRouteCheckpoint(appLLMRouteOperationPut, appLLMRoutePhaseLocked)
+	var snapshot store.LLMRouteSnapshot
+	current, err := a.st.LLMRoute()
+	if err == nil && current.Revision != req.Revision {
+		err = store.ErrLLMRouteConflict
+	}
+	if err == nil {
+		if validationErr := ctx.validateRouteMutation(entries); validationErr != nil {
+			appLLMRouteMutationMu.Unlock()
+			a.logger.Warn("llm api: rejected route runtime", "error_kind", "runtime_invalid")
+			a.writeLLMErr(w, http.StatusUnprocessableEntity, "ROUTE_RUNTIME_INVALID",
+				"Chuỗi dùng một Provider runtime không khả dụng", nil)
+			return
+		}
+		ctx.appLLMRouteCheckpoint(appLLMRouteOperationPut, appLLMRoutePhaseValidated)
+		snapshot, err = a.st.ReplaceLLMRoute(req.Revision, entries)
+		if err == nil {
+			ctx.appLLMRouteCheckpoint(appLLMRouteOperationPut, appLLMRoutePhaseWritten)
+		}
+	}
+	appLLMRouteMutationMu.Unlock()
 	switch {
 	case errors.Is(err, store.ErrLLMRouteConflict):
 		// Bản nháp của người dùng vẫn ĐÚNG, chỉ là nó dựa trên một bản cũ. Mã riêng để Portal

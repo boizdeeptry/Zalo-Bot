@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"strconv"
 	"time"
+
+	"agentdc/internal/providercatalog"
 )
 
-const appSchemaVersion int64 = 7
+const appSchemaVersion int64 = 8
 
 const appFoundationSchema = `
 CREATE TABLE IF NOT EXISTS app_meta (
@@ -151,6 +153,20 @@ INSERT OR IGNORE INTO app_onboarding_state(
 ) VALUES (
   1, 0, 'provider', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 );
+`
+
+const appOnboardingV8Schema = `
+CREATE TABLE app_onboarding_provider_stages(
+  kind        TEXT PRIMARY KEY,
+  status      TEXT NOT NULL CHECK(status IN ('pending','ready')),
+  position    INTEGER NOT NULL CHECK(position>=0),
+  provider_id TEXT NOT NULL DEFAULT '',
+  account_id  TEXT NOT NULL DEFAULT '',
+  model_id    TEXT NOT NULL DEFAULT '',
+  updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX app_onboarding_provider_position
+  ON app_onboarding_provider_stages(position);
 `
 
 type appColumnMigration struct {
@@ -308,6 +324,9 @@ func migrateApp(db *sql.DB) error {
 	if _, err := tx.Exec(appOnboardingV7Schema); err != nil {
 		return fmt.Errorf("migrate Portal onboarding V7 capability: %w", err)
 	}
+	if err := appMigrateOnboardingV8(tx, versionExists, version); err != nil {
+		return fmt.Errorf("migrate Portal onboarding V8 capability: %w", err)
+	}
 	if !versionExists {
 		if _, err := tx.Exec(
 			`INSERT INTO app_meta(key, value) VALUES ('schema_version', ?)`,
@@ -325,6 +344,52 @@ func migrateApp(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit Portal foundation migration: %w", err)
+	}
+	return nil
+}
+
+func appMigrateOnboardingV8(tx *sql.Tx, versionExists bool, version int64) error {
+	if _, err := tx.Exec(appOnboardingV8Schema); err != nil {
+		return fmt.Errorf("create onboarding Provider stages: %w", err)
+	}
+	if !versionExists || version != 7 {
+		return nil
+	}
+	var providerKind string
+	err := tx.QueryRow(`SELECT provider_kind
+FROM app_onboarding_state
+WHERE id = 1 AND phase IN ('connect', 'setup', 'persona', 'test')`).Scan(&providerKind)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read V7 onboarding Provider kind: %w", err)
+	}
+	if err == nil {
+		if _, err := providercatalog.Default().CanonicalSelectedKinds([]string{providerKind}); err != nil {
+			return fmt.Errorf("validate V7 onboarding Provider kind %q: %w", providerKind, err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO app_onboarding_provider_stages(
+kind, status, position, provider_id, account_id, model_id, updated_at
+)
+SELECT
+  provider_kind,
+  CASE WHEN phase IN ('persona', 'test') THEN 'ready' ELSE 'pending' END,
+  0,
+  CASE WHEN phase IN ('persona', 'test') THEN provider_id ELSE '' END,
+  CASE WHEN phase IN ('persona', 'test') THEN account_id ELSE '' END,
+  CASE WHEN phase IN ('persona', 'test') THEN model_id ELSE '' END,
+  updated_at
+FROM app_onboarding_state
+WHERE id = 1 AND phase IN ('connect', 'setup', 'persona', 'test')`); err != nil {
+		return fmt.Errorf("backfill onboarding Provider stage: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE app_onboarding_state SET
+provider_kind = CASE WHEN phase IN ('persona', 'test') THEN '' ELSE provider_kind END,
+provider_id = CASE WHEN phase IN ('persona', 'test') THEN '' ELSE provider_id END,
+account_id = CASE WHEN phase IN ('persona', 'test') THEN '' ELSE account_id END,
+model_id = CASE WHEN phase IN ('persona', 'test') THEN '' ELSE model_id END,
+revision = revision + 1
+WHERE id = 1 AND phase IN ('connect', 'setup', 'persona', 'test')`); err != nil {
+		return fmt.Errorf("transform onboarding V8 singleton: %w", err)
 	}
 	return nil
 }

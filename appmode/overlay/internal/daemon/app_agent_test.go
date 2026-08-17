@@ -69,6 +69,8 @@ func appAgentRequest(t *testing.T, a *api, method, target string, body any) *htt
 
 func TestAppAgentReportsSortedPlaceholdersAndFillsThem(t *testing.T) {
 	dir := t.TempDir()
+	fixture := newPackagedPersonaFixture(t)
+	t.Setenv(appPersonaDefaultsEnv, fixture.root)
 	persona := filepath.Join(dir, "persona.md")
 	original := "Xin chào {{TEN_BOT}}.\nĐơn vị {{CONG_TY}} gọi {{TEN_BOT}}.\n"
 	if err := os.WriteFile(persona, []byte(original), 0o600); err != nil {
@@ -114,8 +116,8 @@ func TestAppAgentReportsSortedPlaceholdersAndFillsThem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read original backup: %v", err)
 	}
-	if string(backup) != original {
-		t.Fatalf("original backup changed: got %q", backup)
+	if !bytes.Equal(backup, fixture.persona) {
+		t.Fatalf("immutable backup changed: got %q; want %q", backup, fixture.persona)
 	}
 }
 
@@ -272,6 +274,8 @@ func TestAppAgentRejectsInvalidValuesWithoutWrites(t *testing.T) {
 
 func TestAppAgentTENBOTIsAuthoritativeDisplayName(t *testing.T) {
 	dir := t.TempDir()
+	fixture := newPackagedPersonaFixture(t)
+	t.Setenv(appPersonaDefaultsEnv, fixture.root)
 	persona := filepath.Join(dir, "persona.md")
 	if err := os.WriteFile(persona, []byte("Tên bot: {{TEN_BOT}}\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -437,6 +441,8 @@ func TestAppAgentBackupIsPublishedOnlyAfterCompleteWrite(t *testing.T) {
 
 func TestAppPersonaWritesUTF8WithoutBOMAndRefreshesReadiness(t *testing.T) {
 	dir := t.TempDir()
+	fixture := newPackagedPersonaFixture(t)
+	t.Setenv(appPersonaDefaultsEnv, fixture.root)
 	persona := filepath.Join(dir, "persona.md")
 	original := "Tên bot: {{TEN_BOT}}\n"
 	if err := os.WriteFile(persona, []byte(original), 0o600); err != nil {
@@ -480,13 +486,15 @@ func TestAppPersonaWritesUTF8WithoutBOMAndRefreshesReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read persona backup: %v", err)
 	}
-	if string(backup) != original {
-		t.Fatalf("persona backup = %q; want original %q", backup, original)
+	if !bytes.Equal(backup, fixture.persona) {
+		t.Fatalf("persona backup = %q; want immutable default %q", backup, fixture.persona)
 	}
 }
 
 func TestAppPersonaDoesNotCreateMissingPersonaWithoutBackup(t *testing.T) {
 	dir := t.TempDir()
+	fixture := newPackagedPersonaFixture(t)
+	t.Setenv(appPersonaDefaultsEnv, fixture.root)
 	persona := filepath.Join(dir, "missing-persona.md")
 	a := newAppAgentTestAPI(persona, filepath.Join(dir, "roster.md"))
 	req := httptest.NewRequest(http.MethodPut, "/agent/persona/persona", strings.NewReader(`{"text":"Giọng mới"}`))
@@ -501,6 +509,42 @@ func TestAppPersonaDoesNotCreateMissingPersonaWithoutBackup(t *testing.T) {
 	}
 	if _, err := os.Stat(persona); !os.IsNotExist(err) {
 		t.Fatalf("missing persona was created without a backup: %v", err)
+	}
+}
+
+func TestAppAgentPersonaFullPutFailsClosedWithoutStoreBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	fixture := newPackagedPersonaFixture(t)
+	t.Setenv(appPersonaDefaultsEnv, fixture.root)
+	persona := filepath.Join(dir, "persona.md")
+	original := []byte("Nội dung người dùng hoàn chỉnh.\n")
+	if err := os.WriteFile(persona, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newAppAgentTestAPI(persona, filepath.Join(dir, "roster.md"))
+	if a.st != nil {
+		t.Fatal("nil-Store regression requires an API without a Store")
+	}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/agent/persona/persona",
+		strings.NewReader(`{"text":"Nội dung mới hoàn chỉnh.\n"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("name", "persona")
+	recorder := httptest.NewRecorder()
+
+	a.handlePersonaPut(recorder, req)
+
+	requireOnboardingCode(t, recorder, http.StatusInternalServerError, "PERSONA_DEFAULTS_INVALID")
+	if got, err := os.ReadFile(persona); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("nil Store changed Persona: %q, %v", got, err)
+	}
+	if _, err := os.Lstat(persona + ".goc"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("nil Store published a backup: %v", err)
+	}
+	if _, err := os.Lstat(agentPersonaRecoveryPath(persona)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("nil Store created recovery state: %v", err)
 	}
 }
 

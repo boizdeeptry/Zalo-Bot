@@ -16,25 +16,26 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"agentdc/internal/providercatalog"
 	"agentdc/internal/store"
+
+	"github.com/google/uuid"
 )
 
 const appOnboardingRequestCap int64 = 64 << 10
 
 var (
-	onboardingMutationMu          sync.Mutex
-	onboardingTestMu              sync.Mutex
-	onboardingTestActive          bool
-	onboardingTestDone            chan struct{}
-	onboardingTestCancel          context.CancelFunc
-	onboardingTestCancelRequested bool
-	onboardingProviderTransition  *appOnboardingProviderTransitionLease
+	onboardingMutationMu         sync.Mutex
+	onboardingTestMu             sync.Mutex
+	onboardingTestActive         *appOnboardingTestLease
+	onboardingProviderTransition *appOnboardingProviderTransitionLease
 
 	errOnboardingUnsafeAccountPath = errors.New("unsafe onboarding account path")
 
@@ -49,6 +50,7 @@ var (
 	appOnboardingTestRandom                                            = defaultAppOnboardingTestRandom
 	appOnboardingTestTimeout                                           = 120 * time.Second
 	appOnboardingTestExecute                 appOnboardingTestExecutor = defaultAppOnboardingTestExecute
+	appOnboardingTestBeforePostflight                                  = func(context.Context) {}
 	appOnboardingTestAfterCommit                                       = func() {}
 	appOnboardingProviderAfterTestWait                                 = func() {}
 	appOnboardingCompleteNow                                           = time.Now
@@ -59,20 +61,66 @@ const appOnboardingReceiptCompensationTimeout = 5 * time.Second
 
 type appOnboardingTestExecutor func(
 	context.Context,
-	*api,
-	store.OnboardingState,
-	store.OnboardingStagingAccount,
+	appRuntimeContext,
+	store.OnboardingTestRoute,
 	string,
-) (string, error)
+) (appOnboardingTestResult, error)
+
+type appOnboardingTestResult struct {
+	Answer     string
+	ProviderID string
+	ModelID    string
+	Position   int
+}
+
+type appOnboardingPreparedTest struct {
+	route       store.OnboardingTestRoute
+	persona     []byte
+	displayName string
+	prompt      string
+}
+
+type appOnboardingSavedTestReceipt struct {
+	route     store.OnboardingTestRoute
+	state     store.OnboardingState
+	token     string
+	nonceHash string
+	policy    store.OnboardingTestReceiptPolicy
+}
+
+var (
+	errAppOnboardingTestAnswerInvalid = errors.New("onboarding Test answer is invalid")
+	errAppOnboardingPersonaNotApplied = errors.New("onboarding Test persona is not applied")
+	errAppOnboardingTestTokenFailed   = errors.New("onboarding Test token generation failed")
+)
 
 type appOnboardingTestRandomFunc func(context.Context, []byte) error
 
-// appOnboardingProviderTransitionLease closes Test Chat admission across the
-// provider transition's intentional mutation-lock gap. cancel and done are an
-// atomic snapshot of the previously active test, captured under onboardingTestMu.
+type appOnboardingTestLeaseState uint8
+
+const (
+	appOnboardingTestLeaseActive appOnboardingTestLeaseState = iota + 1
+	appOnboardingTestLeasePromoted
+	appOnboardingTestLeaseFinished
+)
+
+// appOnboardingTestLease is the opaque pointer identity for exactly one Test
+// operation. Its fields are protected by onboardingTestMu.
+type appOnboardingTestLease struct {
+	done            chan struct{}
+	cancel          context.CancelFunc
+	cancelRequested bool
+	state           appOnboardingTestLeaseState
+}
+
+// appOnboardingProviderTransitionLease closes Test Chat admission across a
+// provider transition. A foreign transition snapshots and cancels an active
+// Test; a promoted transition owns the exact bootstrap lease's final close.
 type appOnboardingProviderTransitionLease struct {
-	cancel context.CancelFunc
-	done   <-chan struct{}
+	owner    *appOnboardingTestLease
+	cancel   context.CancelFunc
+	done     <-chan struct{}
+	promoted bool
 }
 
 func defaultAppOnboardingTestRandom(ctx context.Context, dst []byte) error {
@@ -90,6 +138,11 @@ type appOnboardingProviderRequest struct {
 	Kind     string `json:"kind"`
 }
 
+type appOnboardingProvidersRequest struct {
+	Revision      int64           `json:"revision"`
+	SelectedKinds json.RawMessage `json:"selected_kinds"`
+}
+
 type appOnboardingRestartRequest struct {
 	Revision  int64 `json:"revision"`
 	Confirmed bool  `json:"confirmed"`
@@ -97,17 +150,8 @@ type appOnboardingRestartRequest struct {
 
 type appOnboardingSetupRequest struct {
 	Revision  int64  `json:"revision"`
+	Kind      string `json:"kind"`
 	AccountID string `json:"account_id"`
-}
-
-type appOnboardingSetupResponse struct {
-	Revision      int64  `json:"revision"`
-	ProviderKind  string `json:"provider_kind"`
-	ProviderID    string `json:"provider_id"`
-	AccountID     string `json:"account_id"`
-	ModelID       string `json:"model_id"`
-	StagedComboID string `json:"staged_combo_id"`
-	ComboName     string `json:"combo_name"`
 }
 
 type appOnboardingTestChatRequest struct {
@@ -115,11 +159,16 @@ type appOnboardingTestChatRequest struct {
 	Message  string `json:"message"`
 }
 
+type appOnboardingBackRequest struct {
+	Revision int64 `json:"revision"`
+}
+
 type appOnboardingTestChatResponse struct {
 	Answer     string `json:"answer"`
 	BotName    string `json:"bot_name"`
 	ProviderID string `json:"provider_id"`
 	ModelID    string `json:"model_id"`
+	Position   int    `json:"position"`
 	TestToken  string `json:"test_token"`
 	ExpiresAt  string `json:"expires_at"`
 	Revision   int64  `json:"revision"`
@@ -140,34 +189,87 @@ type appOnboardingCompleteResponse struct {
 // state. Internal paths, staging ids, persona fingerprints and test receipts therefore cannot be
 // exposed by accidentally adding a json tag to the persistence struct later.
 type appOnboardingStatusResponse struct {
-	Required              bool   `json:"required"`
-	CurrentVersion        int64  `json:"current_version"`
-	CompletedVersion      int64  `json:"completed_version"`
-	Phase                 string `json:"phase"`
-	ProviderKind          string `json:"provider_kind"`
-	SuggestedProviderKind string `json:"suggested_provider_kind"`
-	ProviderID            string `json:"provider_id"`
-	AccountID             string `json:"account_id"`
-	ModelID               string `json:"model_id"`
-	RestartInProgress     bool   `json:"restart_in_progress"`
-	Revision              int64  `json:"revision"`
+	Required              bool                            `json:"required"`
+	CurrentVersion        int64                           `json:"current_version"`
+	CompletedVersion      int64                           `json:"completed_version"`
+	Phase                 string                          `json:"phase"`
+	ProviderKind          string                          `json:"provider_kind"`
+	SuggestedProviderKind string                          `json:"suggested_provider_kind"`
+	ProviderID            string                          `json:"provider_id"`
+	AccountID             string                          `json:"account_id"`
+	ModelID               string                          `json:"model_id"`
+	RestartInProgress     bool                            `json:"restart_in_progress"`
+	Revision              int64                           `json:"revision"`
+	Providers             []appOnboardingProviderResponse `json:"providers"`
+	ProviderOptions       []appProviderOption             `json:"provider_options"`
 }
 
-func (a *api) handleOnboardingStatus(w http.ResponseWriter, _ *http.Request) {
-	state, err := a.st.OnboardingState()
+type appOnboardingProviderResponse struct {
+	Kind       string `json:"kind"`
+	Status     string `json:"status"`
+	ProviderID string `json:"provider_id"`
+	AccountID  string `json:"account_id"`
+	ModelID    string `json:"model_id"`
+	Position   int    `json:"position"`
+}
+
+func (runtimeContext appRuntimeContext) handleOnboardingStatus(w http.ResponseWriter, _ *http.Request) {
+	a := runtimeContext.api
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	response, err := a.onboardingStatusResponse(state)
+	response, err := runtimeOnboardingStatusResponse(runtimeContext.registry, snapshot, "")
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
+	}
+	if response.ProviderKind == "" {
+		suggested, err := runtimeContext.suggestedOnboardingProviderKind()
+		if err != nil {
+			a.writeOnboardingStateUnavailable(w, err)
+			return
+		}
+		response, err = runtimeOnboardingStatusResponse(runtimeContext.registry, snapshot, suggested)
+		if err != nil {
+			a.writeOnboardingStateUnavailable(w, err)
+			return
+		}
 	}
 	a.writeJSON(w, http.StatusOK, response)
 }
 
-func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingProviders(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
+	var request appOnboardingProvidersRequest
+	if !a.decodeOnboardingBody(w, r, &request) {
+		return
+	}
+	if !a.requireOnboardingRevision(w, request.Revision) {
+		return
+	}
+	kinds, ok := runtimeContext.decodeOnboardingSelectedKinds(w, request.SelectedKinds)
+	if !ok {
+		return
+	}
+
+	onboardingMutationMu.Lock()
+	defer onboardingMutationMu.Unlock()
+	if r.Context().Err() != nil {
+		a.writeOnboardingCleanupFailed(w, r.Context().Err())
+		return
+	}
+	snapshot, err := runtimeContext.onboardingStore().ReplaceOnboardingProviderSelection(request.Revision, kinds)
+	if err != nil {
+		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	runtimeContext.writeOnboardingSnapshot(w, snapshot)
+}
+
+func (runtimeContext appRuntimeContext) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingProviderRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -175,99 +277,28 @@ func (a *api) handleOnboardingProvider(w http.ResponseWriter, r *http.Request) {
 	if !a.requireOnboardingRevision(w, request.Revision) {
 		return
 	}
-	// Validate before cancellation/cleanup: an unsupported request must not
-	// disturb a valid Test Chat already in flight.
-	if !store.IsOnboardingProviderKind(request.Kind) {
+	if !runtimeContext.registry.supportsOnboarding(request.Kind) {
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_PROVIDER_UNSUPPORTED",
 			"Nhà cung cấp này chưa được hỗ trợ trong bước thiết lập", nil)
 		return
 	}
 
-	// Reject stale or otherwise invalid transitions before they can disturb a
-	// valid Test Chat. Do not wait for the external runner while holding the
-	// mutation lock: the runner's handler must reacquire it to finish.
-	onboardingMutationMu.Lock()
-	if r.Context().Err() != nil {
-		onboardingMutationMu.Unlock()
-		a.writeOnboardingCleanupFailed(w, r.Context().Err())
-		return
-	}
-	if _, _, _, ok := a.preflightOnboardingProviderMutation(w, request.Revision); !ok {
-		onboardingMutationMu.Unlock()
-		return
-	}
-	if r.Context().Err() != nil {
-		onboardingMutationMu.Unlock()
-		a.writeOnboardingCleanupFailed(w, r.Context().Err())
-		return
-	}
-	transition, ok := acquireAppOnboardingProviderTransitionLease()
-	if !ok {
-		onboardingMutationMu.Unlock()
-		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_TEST_BUSY",
-			"Một lượt kiểm tra hoặc chuyển nhà cung cấp khác đang chạy; hãy đợi thao tác đó hoàn tất", nil)
-		return
-	}
-	defer transition.release()
-	onboardingMutationMu.Unlock()
-
-	if !transition.cancelAndWait(r.Context()) {
-		a.writeOnboardingCleanupFailed(w, r.Context().Err())
-		return
-	}
-	appOnboardingProviderAfterTestWait()
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
 	if r.Context().Err() != nil {
 		a.writeOnboardingCleanupFailed(w, r.Context().Err())
 		return
 	}
-
-	state, upgrade, owned, ok := a.preflightOnboardingProviderMutation(w, request.Revision)
-	if !ok {
-		return
-	}
-	if r.Context().Err() != nil {
-		a.writeOnboardingCleanupFailed(w, r.Context().Err())
-		return
-	}
-	if upgrade {
-		updated, err := a.st.SelectOnboardingProvider(request.Revision, request.Kind, "")
-		if err != nil {
-			a.writeOnboardingStoreError(w, err)
-			return
-		}
-		a.writeOnboardingStatus(w, updated)
-		return
-	}
-	if !a.cancelOnboardingConnect(w, r.Context(), state) {
-		return
-	}
-	if r.Context().Err() != nil {
-		a.writeOnboardingCleanupFailed(w, r.Context().Err())
-		return
-	}
-	_, _, owned, ok = a.preflightOnboardingProviderMutation(w, request.Revision)
-	if !ok {
-		return
-	}
-	if r.Context().Err() != nil {
-		a.writeOnboardingCleanupFailed(w, r.Context().Err())
-		return
-	}
-	if err := removeOwnedOnboardingAccount(a.cfg.Dir, owned); err != nil {
-		a.writeOnboardingCleanupFailed(w, err)
-		return
-	}
-	updated, err := a.st.SelectOnboardingProvider(request.Revision, request.Kind, owned.AccountID)
+	snapshot, err := runtimeContext.onboardingStore().BeginOnboardingProvider(request.Revision, request.Kind)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingStatus(w, updated)
+	runtimeContext.writeOnboardingSnapshot(w, snapshot)
 }
 
-func (a *api) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingRestartRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -288,7 +319,7 @@ func (a *api) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, ok := a.onboardingMutationState(w, request.Revision)
+	state, ok := runtimeContext.onboardingMutationState(w, request.Revision)
 	if !ok {
 		return
 	}
@@ -308,15 +339,20 @@ func (a *api) handleOnboardingRestart(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingStatus(w, updated)
+	runtimeContext.writeOnboardingStatus(w, updated)
 }
 
-func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingSetupRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
 	}
 	if !a.requireOnboardingRevision(w, request.Revision) {
+		return
+	}
+	if !runtimeContext.registry.supportsOnboarding(request.Kind) {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingProviderUnsupported)
 		return
 	}
 	if request.AccountID == "" {
@@ -332,30 +368,33 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := a.st.OnboardingState()
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	if err := validateOnboardingState(state); err != nil {
+	if err := validateRuntimeOnboardingSnapshot(runtimeContext.registry, snapshot); err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	if state.Revision == request.Revision+1 {
-		if state.Phase != store.OnboardingPhasePersona || state.AccountID != request.AccountID {
+	state := snapshot.State
+	if onboardingRevisionIsOneAheadForDaemon(request.Revision, state.Revision) {
+		stage, selected := onboardingStageForKind(snapshot.Stages, request.Kind)
+		if !selected || stage.Status != "ready" || stage.AccountID != request.AccountID || stage.ModelID == "" {
 			a.writeOnboardingStoreError(w, store.ErrOnboardingConflict)
 			return
 		}
-		staged, err := a.st.StageOnboardingSetup(
+		staged, err := runtimeContext.onboardingStore().StageOnboardingSetup(
 			request.Revision,
+			request.Kind,
 			request.AccountID,
-			state.ModelID,
+			stage.ModelID,
 		)
 		if err != nil {
 			a.writeOnboardingStoreError(w, err)
 			return
 		}
-		a.writeOnboardingSetup(w, staged)
+		runtimeContext.writeOnboardingSnapshot(w, staged)
 		return
 	}
 	if state.Revision != request.Revision {
@@ -366,15 +405,21 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidPhase)
 		return
 	}
-	if state.AccountID != request.AccountID {
+	if state.ProviderKind != request.Kind || state.AccountID != request.AccountID {
 		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
 		return
 	}
-	if _, err := a.st.OnboardingStagingAccount(request.Revision); err != nil {
-		a.writeOnboardingStoreError(w, err)
+	stage, selected := onboardingStageForKind(snapshot.Stages, request.Kind)
+	if !selected || stage.Status != "pending" {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingInvalidStagingOwnership)
 		return
 	}
-	modelID, err := selectOnboardingModel(a.st, state.ProviderKind, state.ProviderID)
+	selector, ok := runtimeContext.registry.onboardingModelSelector(request.Kind)
+	if !ok {
+		a.writeOnboardingStoreError(w, store.ErrOnboardingProviderUnsupported)
+		return
+	}
+	modelID, err := selector(a.st, state.ProviderID)
 	if err != nil {
 		if errors.Is(err, store.ErrOnboardingModelUnavailable) {
 			a.writeOnboardingStoreError(w, err)
@@ -383,15 +428,18 @@ func (a *api) handleOnboardingSetup(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
 	}
-	staged, err := a.st.StageOnboardingSetup(request.Revision, request.AccountID, modelID)
+	staged, err := runtimeContext.onboardingStore().StageOnboardingSetup(
+		request.Revision, request.Kind, request.AccountID, modelID,
+	)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	a.writeOnboardingSetup(w, staged)
+	runtimeContext.writeOnboardingSnapshot(w, staged)
 }
 
-func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingTestChatRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -405,39 +453,39 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 			"Tin nhắn kiểm tra phải có từ 1 đến 500 ký tự và không chứa ký tự điều khiển", nil)
 		return
 	}
-	if !beginAppOnboardingTest() {
+	onboardingMutationMu.Lock()
+	lease, admitted := beginAppOnboardingTest()
+	if !admitted {
+		onboardingMutationMu.Unlock()
 		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_TEST_BUSY",
 			"Một lượt kiểm tra khác đang chạy; hãy đợi lượt đó hoàn tất", nil)
 		return
 	}
-	defer endAppOnboardingTest()
+	defer lease.finish()
 
-	onboardingMutationMu.Lock()
 	if r.Context().Err() != nil {
 		onboardingMutationMu.Unlock()
 		a.writeOnboardingTestCanceled(w)
 		return
 	}
-	state, ok := a.onboardingMutationState(w, request.Revision)
-	if !ok {
-		onboardingMutationMu.Unlock()
-		return
-	}
-	staged, persona, displayName, err := a.preflightOnboardingTestChat(state)
+	prepared, err := runtimeContext.prepareOnboardingTest(r.Context(), request.Revision, message)
 	if err != nil {
 		onboardingMutationMu.Unlock()
 		a.writeOnboardingStoreError(w, err)
 		return
 	}
-	prompt := buildOnboardingTestPrompt(persona, displayName, message)
 	testCtx, cancel := context.WithTimeout(r.Context(), appOnboardingTestTimeout)
 	defer cancel()
-	bindAppOnboardingTestCancel(cancel)
+	if !lease.bindCancel(cancel) {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingTestCanceled(w)
+		return
+	}
 	// External provider I/O runs without the global mutation mutex. Mutations
 	// can proceed (or cancel a destructive provider switch); exact postflight
 	// validation below prevents a stale receipt from being committed.
 	onboardingMutationMu.Unlock()
-	answer, err := appOnboardingTestExecute(testCtx, a, state, staged, prompt)
+	result, err := runtimeContext.executeOnboardingTest(testCtx, prepared)
 	if err != nil || testCtx.Err() != nil {
 		if !a.writeOnboardingTestContextError(w, r, testCtx) {
 			a.writeLLMErr(w, http.StatusBadGateway, "ONBOARDING_TEST_FAILED",
@@ -445,32 +493,32 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	answer = strings.TrimSpace(answer)
+	result.Answer = strings.TrimSpace(result.Answer)
 
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
 	if a.writeOnboardingTestContextError(w, r, testCtx) {
 		return
 	}
-	if err := a.postflightOnboardingTestChat(state, staged, persona, displayName); err != nil {
-		a.writeOnboardingStoreError(w, err)
-		return
-	}
-	if answer == "" {
+	result, err = runtimeContext.postflightPreparedOnboardingTest(testCtx, prepared, result)
+	switch {
+	case errors.Is(err, errAppOnboardingTestAnswerInvalid):
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_TEST_ANSWER_INVALID",
 			"Câu trả lời kiểm tra không hợp lệ", nil)
 		return
-	}
-	if !normalizedOnboardingAnswerContainsName(answer, displayName) {
+	case errors.Is(err, errAppOnboardingPersonaNotApplied):
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_PERSONA_NOT_APPLIED",
 			"Câu trả lời kiểm tra chưa áp dụng đúng tên hiển thị của bot", nil)
+		return
+	case err != nil:
+		a.writeOnboardingStoreError(w, err)
 		return
 	}
 	if a.writeOnboardingTestContextError(w, r, testCtx) {
 		return
 	}
-	nonce := make([]byte, 32)
-	if err := appOnboardingTestRandom(testCtx, nonce); err != nil {
+	saved, err := runtimeContext.savePreparedOnboardingTestReceipt(testCtx, prepared)
+	if errors.Is(err, errAppOnboardingTestTokenFailed) {
 		if a.writeOnboardingTestContextError(w, r, testCtx) {
 			return
 		}
@@ -478,22 +526,6 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 			"Không thể tạo biên nhận kiểm tra an toàn", nil)
 		return
 	}
-	if a.writeOnboardingTestContextError(w, r, testCtx) {
-		return
-	}
-	token := base64.RawURLEncoding.EncodeToString(nonce)
-	digest := sha256.Sum256([]byte(token))
-	policy := store.NewOnboardingTestReceiptPolicy(appOnboardingTestNow().UTC())
-	if a.writeOnboardingTestContextError(w, r, testCtx) {
-		return
-	}
-	updated, err := a.st.SaveOnboardingTestReceipt(
-		testCtx,
-		state.Revision,
-		state.PersonaFingerprint,
-		fmt.Sprintf("%x", digest[:]),
-		policy,
-	)
 	if err != nil {
 		if a.writeOnboardingTestContextError(w, r, testCtx) {
 			return
@@ -506,31 +538,147 @@ func (a *api) handleOnboardingTestChat(w http.ResponseWriter, r *http.Request) {
 	// client must not receive a response body.
 	appOnboardingTestAfterCommit()
 	if r.Context().Err() != nil {
-		compensationCtx, compensationCancel := context.WithTimeout(
-			context.Background(), appOnboardingReceiptCompensationTimeout,
-		)
-		_, compensationErr := a.st.ClearOnboardingTestReceipt(
-			compensationCtx,
-			updated.Revision,
-			state.PersonaFingerprint,
-			fmt.Sprintf("%x", digest[:]),
-			policy,
-		)
-		compensationCancel()
-		if compensationErr != nil && a.logger != nil {
-			a.logger.Error("onboarding test: compensate canceled receipt", "err", compensationErr)
+		if compensationErr := runtimeContext.compensateOnboardingTestReceipt(saved); compensationErr != nil &&
+			a.logger != nil {
+			a.logger.Error("onboarding test: compensate canceled receipt", "error_kind", "compensation_failed")
 		}
 		return
 	}
 	a.writeJSON(w, http.StatusOK, appOnboardingTestChatResponse{
-		Answer: answer, BotName: displayName, ProviderID: state.ProviderID,
-		ModelID: state.ModelID, TestToken: token,
-		ExpiresAt: policy.ExpiresAt.Format(time.RFC3339Nano), Revision: updated.Revision,
+		Answer: result.Answer, BotName: prepared.displayName, ProviderID: result.ProviderID,
+		ModelID: result.ModelID, Position: result.Position, TestToken: saved.token,
+		ExpiresAt: saved.policy.ExpiresAt.Format(time.RFC3339Nano), Revision: saved.state.Revision,
 	})
 }
 
+// handleOnboardingBackToProviders fences Test Chat across the intentional
+// mutation-lock gap, then delegates the exact CAS and lost-response proof to
+// Store. It never cancels Connect or removes Account configuration.
+func (runtimeContext appRuntimeContext) handleOnboardingBackToProviders(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
+	var request appOnboardingBackRequest
+	if !a.decodeOnboardingBody(w, r, &request) {
+		return
+	}
+	if !a.requireOnboardingRevision(w, request.Revision) {
+		return
+	}
+
+	onboardingMutationMu.Lock()
+	if r.Context().Err() != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingBackCanceled(w)
+		return
+	}
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
+	if err != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	if err := validateRuntimeOnboardingSnapshot(runtimeContext.registry, snapshot); err != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	if onboardingRevisionIsOneAheadForDaemon(request.Revision, snapshot.State.Revision) {
+		updated, err := runtimeContext.onboardingStore().BackOnboardingToProviders(request.Revision)
+		onboardingMutationMu.Unlock()
+		if err != nil {
+			a.writeOnboardingStoreError(w, err)
+			return
+		}
+		runtimeContext.writeOnboardingSnapshot(w, updated)
+		return
+	}
+	if err := preflightOnboardingBackSnapshot(snapshot, request.Revision); err != nil {
+		onboardingMutationMu.Unlock()
+		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	transition, ok := acquireAppOnboardingProviderTransitionLease()
+	if !ok {
+		onboardingMutationMu.Unlock()
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_TRANSITION_BUSY",
+			"Một thay đổi thiết lập khác đang chạy; hãy đợi rồi thử lại", nil)
+		return
+	}
+	defer transition.release()
+	onboardingMutationMu.Unlock()
+
+	if !transition.cancelAndWait(r.Context()) {
+		a.writeOnboardingBackCanceled(w)
+		return
+	}
+	appOnboardingProviderAfterTestWait()
+
+	onboardingMutationMu.Lock()
+	defer onboardingMutationMu.Unlock()
+	if r.Context().Err() != nil {
+		a.writeOnboardingBackCanceled(w)
+		return
+	}
+	refreshed, err := runtimeContext.onboardingStore().OnboardingSnapshot()
+	if err != nil {
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	if err := validateRuntimeOnboardingSnapshot(runtimeContext.registry, refreshed); err != nil {
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	updated, err := runtimeContext.onboardingStore().BackOnboardingToProviders(request.Revision)
+	if err != nil {
+		a.writeOnboardingStoreError(w, err)
+		return
+	}
+	runtimeContext.writeOnboardingSnapshot(w, updated)
+}
+
+func preflightOnboardingBackSnapshot(snapshot store.OnboardingSnapshot, expectedRevision int64) error {
+	state := snapshot.State
+	if state.Revision != expectedRevision {
+		return store.ErrOnboardingConflict
+	}
+	if state.Phase != store.OnboardingPhasePersona && state.Phase != store.OnboardingPhaseTest {
+		return store.ErrOnboardingInvalidPhase
+	}
+	comboID, err := uuid.Parse(state.StagedComboID)
+	if err != nil || comboID.String() != state.StagedComboID {
+		return store.ErrOnboardingConfigurationChanged
+	}
+	if state.Phase == store.OnboardingPhaseTest {
+		if !validOnboardingSHA256Text(state.PersonaFingerprint) ||
+			!validOnboardingSHA256Text(state.TestNonceHash) {
+			return store.ErrOnboardingConfigurationChanged
+		}
+		expiresAt, err := time.Parse(time.RFC3339Nano, state.TestExpiresAt)
+		if err != nil || expiresAt.Format(time.RFC3339Nano) != state.TestExpiresAt {
+			return store.ErrOnboardingConfigurationChanged
+		}
+		_, offset := expiresAt.Zone()
+		if offset != 0 {
+			return store.ErrOnboardingConfigurationChanged
+		}
+	}
+	return nil
+}
+
+func validOnboardingSHA256Text(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func (a *api) writeOnboardingBackCanceled(w http.ResponseWriter) {
+	a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_BACK_CANCELED",
+		"Đã dừng thao tác quay lại; cấu hình thiết lập chưa thay đổi", nil)
+}
+
 type appOnboardingCompleteSnapshot struct {
-	staged      store.OnboardingStagingAccount
+	route       store.OnboardingTestRoute
 	nonceHash   string
 	comboID     string
 	fingerprint string
@@ -540,7 +688,8 @@ type appOnboardingCompleteSnapshot struct {
 // one-time proof; it never activates routing on its own. The transition lease closes Test Chat
 // admission while an already-running test is canceled and reaped, then Store performs the only
 // validation-and-activation transaction.
-func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
+func (runtimeContext appRuntimeContext) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
+	a := runtimeContext.api
 	var request appOnboardingCompleteRequest
 	if !a.decodeOnboardingBody(w, r, &request) {
 		return
@@ -556,7 +705,7 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := appOnboardingCompleteNow().UTC()
-	if _, ok := a.preflightOnboardingComplete(w, request.Revision, request.TestToken, now); !ok {
+	if _, ok := runtimeContext.preflightOnboardingComplete(r.Context(), w, request.Revision, request.TestToken, now); !ok {
 		onboardingMutationMu.Unlock()
 		return
 	}
@@ -574,33 +723,27 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
 		return
 	}
+	appOnboardingProviderAfterTestWait()
 	onboardingMutationMu.Lock()
 	defer onboardingMutationMu.Unlock()
+	runtimeContext.appLLMRouteCheckpoint(appLLMRouteOperationComplete, appLLMRoutePhaseBeforeLock)
+	appLLMRouteMutationMu.Lock()
+	runtimeContext.appLLMRouteCheckpoint(appLLMRouteOperationComplete, appLLMRoutePhaseLocked)
 	if r.Context().Err() != nil {
+		appLLMRouteMutationMu.Unlock()
 		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
 		return
 	}
 	now = appOnboardingCompleteNow().UTC()
-	snapshot, ok := a.preflightOnboardingComplete(w, request.Revision, request.TestToken, now)
-	if !ok {
-		return
-	}
-	updated, err := a.st.CompleteOnboarding(r.Context(), store.CompleteOnboardingInput{
-		Revision:           request.Revision,
-		TestNonceHash:      snapshot.nonceHash,
-		PersonaFingerprint: snapshot.fingerprint,
-		StagingConfigDir:   snapshot.staged.ConfigDir,
-		Now:                now,
-	})
+	_, snapshot, err := runtimeContext.completeOnboardingLocked(
+		r.Context(), request.Revision, request.TestToken, now,
+	)
 	if err != nil {
+		appLLMRouteMutationMu.Unlock()
 		a.writeOnboardingCompleteError(w, err)
 		return
 	}
-	if updated.Phase != store.OnboardingPhaseCompleted ||
-		updated.CompletedVersion != store.CurrentOnboardingVersion || updated.Revision != request.Revision+1 {
-		a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
-		return
-	}
+	appLLMRouteMutationMu.Unlock()
 	a.writeJSON(w, http.StatusOK, appOnboardingCompleteResponse{
 		Completed:         true,
 		OnboardingVersion: store.CurrentOnboardingVersion,
@@ -608,109 +751,177 @@ func (a *api) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *api) preflightOnboardingComplete(
+func (runtimeContext appRuntimeContext) preflightOnboardingComplete(
+	ctx context.Context,
 	w http.ResponseWriter,
 	expectedRevision int64,
 	testToken string,
 	now time.Time,
 ) (appOnboardingCompleteSnapshot, bool) {
-	state, ok := a.onboardingMutationState(w, expectedRevision)
-	if !ok {
+	snapshot, err := runtimeContext.onboardingCompleteSnapshot(
+		ctx, expectedRevision, testToken, now,
+	)
+	if err != nil {
+		runtimeContext.api.writeOnboardingCompleteError(w, err)
 		return appOnboardingCompleteSnapshot{}, false
 	}
-	if state.Phase != store.OnboardingPhaseTest || state.TestNonceHash == "" ||
-		state.TestExpiresAt == "" ||
-		(state.CompletedVersion >= store.CurrentOnboardingVersion && !state.RestartInProgress) {
-		a.writeOnboardingCompleteError(w, store.ErrOnboardingTestRequired)
-		return appOnboardingCompleteSnapshot{}, false
+	return snapshot, true
+}
+
+func (runtimeContext appRuntimeContext) onboardingCompleteSnapshot(
+	ctx context.Context,
+	expectedRevision int64,
+	testToken string,
+	now time.Time,
+) (appOnboardingCompleteSnapshot, error) {
+	route, _, err := runtimeContext.preflightOnboardingTestChat(ctx, expectedRevision)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrOnboardingConflict):
+			return appOnboardingCompleteSnapshot{}, err
+		case errors.Is(err, store.ErrOnboardingInvalidPhase),
+			errors.Is(err, store.ErrOnboardingInvalidTestReceipt):
+			return appOnboardingCompleteSnapshot{}, store.ErrOnboardingTestRequired
+		case errors.Is(err, store.ErrOnboardingInvalidStagingOwnership),
+			errors.Is(err, store.ErrOnboardingModelUnavailable),
+			errors.Is(err, store.ErrOnboardingPersonaMismatch),
+			errors.Is(err, store.ErrOnboardingConfigurationChanged),
+			errors.Is(err, store.ErrOnboardingProviderUnsupported):
+			return appOnboardingCompleteSnapshot{}, store.ErrOnboardingConfigurationChanged
+		default:
+			return appOnboardingCompleteSnapshot{}, err
+		}
+	}
+	if err := runtimeContext.registry.validateOnboardingLiveRoute(route.Entries); err != nil {
+		return appOnboardingCompleteSnapshot{}, store.ErrOnboardingConfigurationChanged
+	}
+	state := route.State
+	if state.TestNonceHash == "" || state.TestExpiresAt == "" {
+		return appOnboardingCompleteSnapshot{}, store.ErrOnboardingTestRequired
 	}
 	decodedToken, err := base64.RawURLEncoding.DecodeString(testToken)
 	if err != nil || len(testToken) != 43 || len(decodedToken) != sha256.Size ||
 		base64.RawURLEncoding.EncodeToString(decodedToken) != testToken {
-		a.writeOnboardingCompleteError(w, store.ErrOnboardingTestRequired)
-		return appOnboardingCompleteSnapshot{}, false
+		return appOnboardingCompleteSnapshot{}, store.ErrOnboardingTestRequired
 	}
 	computedHash := sha256.Sum256([]byte(testToken))
+	nonceHash := hex.EncodeToString(computedHash[:])
+	boundHash, err := store.OnboardingTestReceiptHash(nonceHash, route.Fingerprint)
+	if err != nil {
+		return appOnboardingCompleteSnapshot{}, store.ErrOnboardingTestRequired
+	}
 	storedHash, err := hex.DecodeString(state.TestNonceHash)
+	boundHashBytes, _ := hex.DecodeString(boundHash)
 	if err != nil || len(storedHash) != sha256.Size ||
-		appOnboardingCompleteConstantTimeCompare(storedHash, computedHash[:]) != 1 {
-		a.writeOnboardingCompleteError(w, store.ErrOnboardingTestRequired)
-		return appOnboardingCompleteSnapshot{}, false
+		appOnboardingCompleteConstantTimeCompare(storedHash, boundHashBytes) != 1 {
+		return appOnboardingCompleteSnapshot{}, store.ErrOnboardingTestRequired
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, state.TestExpiresAt)
 	if err != nil || expiresAt.Location() != time.UTC {
-		a.writeOnboardingCompleteError(w, store.ErrOnboardingConfigurationChanged)
-		return appOnboardingCompleteSnapshot{}, false
+		return appOnboardingCompleteSnapshot{}, store.ErrOnboardingConfigurationChanged
 	}
 	if !expiresAt.After(now) {
-		a.writeOnboardingCompleteError(w, store.ErrOnboardingTestExpired)
-		return appOnboardingCompleteSnapshot{}, false
+		return appOnboardingCompleteSnapshot{}, store.ErrOnboardingTestExpired
 	}
-	staged, _, displayName, err := a.preflightOnboardingTestChat(state)
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrOnboardingInvalidPhase):
-			a.writeOnboardingCompleteError(w, store.ErrOnboardingTestRequired)
-		case errors.Is(err, store.ErrOnboardingInvalidStagingOwnership),
-			errors.Is(err, store.ErrOnboardingModelUnavailable),
-			errors.Is(err, store.ErrOnboardingPersonaMismatch):
-			a.writeOnboardingCompleteError(w, store.ErrOnboardingConfigurationChanged)
-		default:
-			a.writeOnboardingCompleteError(w, store.ErrOnboardingCommitFailed)
-		}
-		return appOnboardingCompleteSnapshot{}, false
-	}
-	if strings.TrimSpace(displayName) == "" || state.PersonaFingerprint == "" {
-		a.writeOnboardingCompleteError(w, store.ErrOnboardingConfigurationChanged)
-		return appOnboardingCompleteSnapshot{}, false
+	if strings.TrimSpace(route.DisplayName) == "" || state.PersonaFingerprint == "" {
+		return appOnboardingCompleteSnapshot{}, store.ErrOnboardingConfigurationChanged
 	}
 	return appOnboardingCompleteSnapshot{
-		staged:      staged,
-		nonceHash:   hex.EncodeToString(computedHash[:]),
+		route:       route,
+		nonceHash:   nonceHash,
 		comboID:     state.StagedComboID,
 		fingerprint: state.PersonaFingerprint,
-	}, true
+	}, nil
 }
 
-func beginAppOnboardingTest() bool {
+// completeOnboardingLocked performs the mandatory final daemon preflight and
+// the Store activation while callers hold onboardingMutationMu and
+// appLLMRouteMutationMu in that order.
+func (runtimeContext appRuntimeContext) completeOnboardingLocked(
+	ctx context.Context,
+	expectedRevision int64,
+	testToken string,
+	now time.Time,
+) (store.OnboardingState, appOnboardingCompleteSnapshot, error) {
+	snapshot, err := runtimeContext.onboardingCompleteSnapshot(
+		ctx, expectedRevision, testToken, now,
+	)
+	if err != nil {
+		return store.OnboardingState{}, appOnboardingCompleteSnapshot{}, err
+	}
+	configBindings := make([]store.OnboardingConfigBinding, len(snapshot.route.Entries))
+	for index, entry := range snapshot.route.Entries {
+		configBindings[index] = store.OnboardingConfigBinding{
+			Kind: entry.Kind, AccountID: entry.AccountID, ConfigDir: entry.ConfigDir,
+		}
+	}
+	runtimeContext.appLLMRouteCheckpoint(
+		appLLMRouteOperationComplete, appLLMRoutePhaseValidated,
+	)
+	updated, err := runtimeContext.onboardingStore().CompleteOnboarding(
+		ctx,
+		store.CompleteOnboardingInput{
+			Revision:           expectedRevision,
+			TestNonceHash:      snapshot.nonceHash,
+			PersonaFingerprint: snapshot.fingerprint,
+			ConfigBindings:     configBindings,
+			Now:                now,
+		},
+	)
+	if err != nil {
+		return store.OnboardingState{}, appOnboardingCompleteSnapshot{}, err
+	}
+	runtimeContext.appLLMRouteCheckpoint(appLLMRouteOperationComplete, appLLMRoutePhaseWritten)
+	return updated, snapshot, nil
+}
+
+func beginAppOnboardingTest() (*appOnboardingTestLease, bool) {
 	onboardingTestMu.Lock()
 	defer onboardingTestMu.Unlock()
-	if onboardingTestActive || onboardingProviderTransition != nil {
-		return false
+	if onboardingTestActive != nil || onboardingProviderTransition != nil {
+		return nil, false
 	}
-	onboardingTestActive = true
-	onboardingTestDone = make(chan struct{})
-	onboardingTestCancel = nil
-	onboardingTestCancelRequested = false
-	return true
+	lease := &appOnboardingTestLease{
+		done: make(chan struct{}), state: appOnboardingTestLeaseActive,
+	}
+	onboardingTestActive = lease
+	return lease, true
 }
 
-func endAppOnboardingTest() {
+func (lease *appOnboardingTestLease) finish() {
+	if lease == nil {
+		return
+	}
 	onboardingTestMu.Lock()
-	done := onboardingTestDone
-	onboardingTestActive = false
-	onboardingTestDone = nil
-	onboardingTestCancel = nil
-	onboardingTestCancelRequested = false
-	if done != nil {
-		close(done)
+	if onboardingTestActive == lease && lease.state == appOnboardingTestLeaseActive {
+		onboardingTestActive = nil
+		lease.cancel = nil
+		lease.state = appOnboardingTestLeaseFinished
+		close(lease.done)
 	}
 	onboardingTestMu.Unlock()
 }
 
-func bindAppOnboardingTestCancel(cancel context.CancelFunc) {
+func (lease *appOnboardingTestLease) bindCancel(cancel context.CancelFunc) bool {
+	if lease == nil || cancel == nil {
+		if cancel != nil {
+			cancel()
+		}
+		return false
+	}
 	onboardingTestMu.Lock()
-	if !onboardingTestActive {
+	if onboardingTestActive != lease || lease.state != appOnboardingTestLeaseActive {
 		onboardingTestMu.Unlock()
 		cancel()
-		return
+		return false
 	}
-	onboardingTestCancel = cancel
-	cancelRequested := onboardingTestCancelRequested
+	lease.cancel = cancel
+	cancelRequested := lease.cancelRequested
 	onboardingTestMu.Unlock()
 	if cancelRequested {
 		cancel()
 	}
+	return !cancelRequested
 }
 
 // acquireAppOnboardingProviderTransitionLease is called while holding
@@ -724,11 +935,39 @@ func acquireAppOnboardingProviderTransitionLease() (*appOnboardingProviderTransi
 	}
 	transition := &appOnboardingProviderTransitionLease{}
 	onboardingProviderTransition = transition
-	if onboardingTestActive {
-		onboardingTestCancelRequested = true
-		transition.cancel = onboardingTestCancel
-		transition.done = onboardingTestDone
+	if onboardingTestActive != nil {
+		owner := onboardingTestActive
+		owner.cancelRequested = true
+		transition.owner = owner
+		transition.cancel = owner.cancel
+		transition.done = owner.done
 	}
+	return transition, true
+}
+
+// promoteAppOnboardingTest atomically moves the exact active owner into the
+// transition slot. Callers hold onboardingMutationMu before entering this
+// function, preserving mutation -> Test -> route lock order.
+func promoteAppOnboardingTest(
+	ctx context.Context,
+	owner *appOnboardingTestLease,
+) (*appOnboardingProviderTransitionLease, bool) {
+	if owner == nil || ctx == nil || ctx.Err() != nil {
+		return nil, false
+	}
+	onboardingTestMu.Lock()
+	defer onboardingTestMu.Unlock()
+	if ctx.Err() != nil || onboardingTestActive != owner ||
+		owner.state != appOnboardingTestLeaseActive || owner.cancelRequested ||
+		onboardingProviderTransition != nil {
+		return nil, false
+	}
+	transition := &appOnboardingProviderTransitionLease{
+		owner: owner, done: owner.done, promoted: true,
+	}
+	owner.state = appOnboardingTestLeasePromoted
+	onboardingTestActive = nil
+	onboardingProviderTransition = transition
 	return transition, true
 }
 
@@ -748,9 +987,18 @@ func (transition *appOnboardingProviderTransitionLease) cancelAndWait(ctx contex
 }
 
 func (transition *appOnboardingProviderTransitionLease) release() {
+	if transition == nil {
+		return
+	}
 	onboardingTestMu.Lock()
 	if onboardingProviderTransition == transition {
 		onboardingProviderTransition = nil
+		if transition.promoted && transition.owner != nil &&
+			transition.owner.state == appOnboardingTestLeasePromoted {
+			transition.owner.cancel = nil
+			transition.owner.state = appOnboardingTestLeaseFinished
+			close(transition.owner.done)
+		}
 	}
 	onboardingTestMu.Unlock()
 }
@@ -771,94 +1019,173 @@ func normalizeOnboardingTestMessage(raw string) (string, bool) {
 	return message, true
 }
 
-func (a *api) preflightOnboardingTestChat(
-	state store.OnboardingState,
-) (store.OnboardingStagingAccount, []byte, string, error) {
-	if state.CompletedVersion >= store.CurrentOnboardingVersion && !state.RestartInProgress {
-		return store.OnboardingStagingAccount{}, nil, "", store.ErrOnboardingInvalidPhase
-	}
-	if state.Phase != store.OnboardingPhaseTest {
-		return store.OnboardingStagingAccount{}, nil, "", store.ErrOnboardingInvalidPhase
-	}
-	if !store.IsOnboardingProviderKind(state.ProviderKind) ||
-		state.ProviderID == "" || state.ProviderID != state.ProviderKind ||
-		state.AccountID == "" || state.ModelID == "" || state.StagedComboID == "" ||
-		state.PersonaFingerprint == "" {
-		return store.OnboardingStagingAccount{}, nil, "", store.ErrOnboardingInvalidStagingOwnership
-	}
-	staged, err := a.st.OnboardingStagingAccount(state.Revision)
+func (runtimeContext appRuntimeContext) preflightOnboardingTestChat(
+	ctx context.Context,
+	expectedRevision int64,
+) (store.OnboardingTestRoute, []byte, error) {
+	a := runtimeContext.api
+	route, err := runtimeContext.onboardingStore().OnboardingTestRoute(ctx, expectedRevision)
 	if err != nil {
-		return store.OnboardingStagingAccount{}, nil, "", err
+		return store.OnboardingTestRoute{}, nil, err
 	}
-	if err := validateOnboardingStagingConfigDir(a.cfg.Dir, staged); err != nil {
-		return store.OnboardingStagingAccount{}, nil, "", err
+	if err := validateRuntimeOnboardingRouteRegistrations(runtimeContext.registry, route); err != nil {
+		return store.OnboardingTestRoute{}, nil, err
 	}
-	models, err := a.st.LLMModels(state.ProviderID)
-	if err != nil {
-		return store.OnboardingStagingAccount{}, nil, "", err
-	}
-	modelAvailable := false
-	for _, model := range models {
-		if model.ProviderID == state.ProviderID && model.ModelID == state.ModelID && model.Available {
-			modelAvailable = true
-			break
+	for _, entry := range route.Entries {
+		staged := store.OnboardingStagingAccount{
+			AccountID: entry.AccountID, ProviderID: entry.ProviderID,
+			ProviderKind: entry.Kind, ConfigDir: entry.ConfigDir,
+		}
+		if err := validateRuntimeOnboardingStagingConfigDir(
+			runtimeContext.registry, a.cfg.Dir, staged,
+		); err != nil {
+			return store.OnboardingTestRoute{}, nil, err
 		}
 	}
-	if !modelAvailable {
-		return store.OnboardingStagingAccount{}, nil, "", store.ErrOnboardingModelUnavailable
-	}
-	displayName, err := a.st.AgentDisplayName()
-	if err != nil {
-		return store.OnboardingStagingAccount{}, nil, "", err
-	}
-	normalizedName, err := normalizeAgentNameValue("tên hiển thị", displayName)
-	if err != nil || normalizedName != displayName {
-		return store.OnboardingStagingAccount{}, nil, "", store.ErrOnboardingPersonaMismatch
+	normalizedName, err := normalizeAgentNameValue("tên hiển thị", route.DisplayName)
+	if err != nil || normalizedName != route.DisplayName {
+		return store.OnboardingTestRoute{}, nil, store.ErrOnboardingPersonaMismatch
 	}
 	personaPath, err := a.personaPath()
 	if err != nil {
-		return store.OnboardingStagingAccount{}, nil, "", store.ErrOnboardingPersonaMismatch
+		return store.OnboardingTestRoute{}, nil, store.ErrOnboardingPersonaMismatch
 	}
 	persona, err := os.ReadFile(personaPath)
 	if err != nil || len(persona) > maxPersonaBytes || !utf8.Valid(persona) ||
 		strings.TrimSpace(string(persona)) == "" || personaValidationError(string(persona)) != "" ||
 		len(scanPlaceholders(string(persona))) != 0 {
-		return store.OnboardingStagingAccount{}, nil, "", store.ErrOnboardingPersonaMismatch
+		return store.OnboardingTestRoute{}, nil, store.ErrOnboardingPersonaMismatch
 	}
-	if agentPersonaFingerprint(persona, displayName) != state.PersonaFingerprint {
-		return store.OnboardingStagingAccount{}, nil, "", store.ErrOnboardingPersonaMismatch
+	if agentPersonaFingerprint(persona, route.DisplayName) != route.State.PersonaFingerprint {
+		return store.OnboardingTestRoute{}, nil, store.ErrOnboardingPersonaMismatch
 	}
-	return staged, persona, displayName, nil
+	return route, persona, nil
 }
 
-func (a *api) postflightOnboardingTestChat(
-	expectedState store.OnboardingState,
-	expectedStaged store.OnboardingStagingAccount,
+func (runtimeContext appRuntimeContext) postflightOnboardingTestChat(
+	ctx context.Context,
+	expectedRoute store.OnboardingTestRoute,
 	expectedPersona []byte,
-	expectedDisplayName string,
 ) error {
-	current, err := a.st.OnboardingState()
+	current, persona, err := runtimeContext.preflightOnboardingTestChat(ctx, expectedRoute.State.Revision)
 	if err != nil {
 		return err
 	}
-	if current != expectedState {
+	if !sameOnboardingTestRoute(current, expectedRoute) {
 		return store.ErrOnboardingInvalidStagingOwnership
 	}
-	staged, persona, displayName, err := a.preflightOnboardingTestChat(current)
-	if err != nil {
-		return err
-	}
-	if staged != expectedStaged {
-		return store.ErrOnboardingInvalidStagingOwnership
-	}
-	if displayName != expectedDisplayName || !bytes.Equal(persona, expectedPersona) {
+	if !bytes.Equal(persona, expectedPersona) {
 		return store.ErrOnboardingPersonaMismatch
 	}
-	fingerprint := agentPersonaFingerprint(persona, displayName)
-	if fingerprint != expectedState.PersonaFingerprint || fingerprint != current.PersonaFingerprint {
+	fingerprint := agentPersonaFingerprint(persona, current.DisplayName)
+	if fingerprint != expectedRoute.State.PersonaFingerprint ||
+		fingerprint != current.State.PersonaFingerprint {
 		return store.ErrOnboardingPersonaMismatch
 	}
 	return nil
+}
+
+func (runtimeContext appRuntimeContext) prepareOnboardingTest(
+	ctx context.Context,
+	expectedRevision int64,
+	message string,
+) (appOnboardingPreparedTest, error) {
+	route, persona, err := runtimeContext.preflightOnboardingTestChat(ctx, expectedRevision)
+	if err != nil {
+		return appOnboardingPreparedTest{}, err
+	}
+	return appOnboardingPreparedTest{
+		route:       route,
+		persona:     persona,
+		displayName: route.DisplayName,
+		prompt:      buildOnboardingTestPrompt(persona, route.DisplayName, message),
+	}, nil
+}
+
+func (runtimeContext appRuntimeContext) executeOnboardingTest(
+	ctx context.Context,
+	prepared appOnboardingPreparedTest,
+) (appOnboardingTestResult, error) {
+	return appOnboardingTestExecute(ctx, runtimeContext, prepared.route, prepared.prompt)
+}
+
+func (runtimeContext appRuntimeContext) postflightPreparedOnboardingTest(
+	ctx context.Context,
+	prepared appOnboardingPreparedTest,
+	result appOnboardingTestResult,
+) (appOnboardingTestResult, error) {
+	appOnboardingTestBeforePostflight(ctx)
+	if err := runtimeContext.postflightOnboardingTestChat(
+		ctx, prepared.route, prepared.persona,
+	); err != nil {
+		return appOnboardingTestResult{}, err
+	}
+	if !onboardingTestResultMatchesRoute(result, prepared.route) {
+		return appOnboardingTestResult{}, store.ErrOnboardingInvalidStagingOwnership
+	}
+	result.Answer = strings.TrimSpace(result.Answer)
+	if result.Answer == "" {
+		return appOnboardingTestResult{}, errAppOnboardingTestAnswerInvalid
+	}
+	if !normalizedOnboardingAnswerContainsName(result.Answer, prepared.displayName) {
+		return appOnboardingTestResult{}, errAppOnboardingPersonaNotApplied
+	}
+	return result, nil
+}
+
+func (runtimeContext appRuntimeContext) savePreparedOnboardingTestReceipt(
+	ctx context.Context,
+	prepared appOnboardingPreparedTest,
+) (appOnboardingSavedTestReceipt, error) {
+	nonce := make([]byte, sha256.Size)
+	if err := appOnboardingTestRandom(ctx, nonce); err != nil {
+		return appOnboardingSavedTestReceipt{}, errAppOnboardingTestTokenFailed
+	}
+	token := base64.RawURLEncoding.EncodeToString(nonce)
+	digest := sha256.Sum256([]byte(token))
+	nonceHash := hex.EncodeToString(digest[:])
+	policy := store.NewOnboardingTestReceiptPolicy(appOnboardingTestNow().UTC())
+	updated, err := runtimeContext.onboardingStore().SaveOnboardingTestReceipt(
+		ctx, prepared.route, nonceHash, policy,
+	)
+	if err != nil {
+		return appOnboardingSavedTestReceipt{}, err
+	}
+	savedRoute := prepared.route
+	savedRoute.State = updated
+	return appOnboardingSavedTestReceipt{
+		route: savedRoute, state: updated, token: token, nonceHash: nonceHash, policy: policy,
+	}, nil
+}
+
+func (runtimeContext appRuntimeContext) compensateOnboardingTestReceipt(
+	saved appOnboardingSavedTestReceipt,
+) error {
+	compensationCtx, cancel := context.WithTimeout(
+		context.Background(), appOnboardingReceiptCompensationTimeout,
+	)
+	defer cancel()
+	_, err := runtimeContext.onboardingStore().ClearOnboardingTestReceipt(
+		compensationCtx, saved.route, saved.nonceHash, saved.policy,
+	)
+	return err
+}
+
+func sameOnboardingTestRoute(left, right store.OnboardingTestRoute) bool {
+	return left.State == right.State && left.DisplayName == right.DisplayName &&
+		left.Fingerprint == right.Fingerprint && slices.Equal(left.Entries, right.Entries)
+}
+
+func onboardingTestResultMatchesRoute(
+	result appOnboardingTestResult,
+	route store.OnboardingTestRoute,
+) bool {
+	if result.Position < 0 || result.Position >= len(route.Entries) {
+		return false
+	}
+	entry := route.Entries[result.Position]
+	return entry.Position == result.Position && entry.ProviderID == result.ProviderID &&
+		entry.ModelID == result.ModelID
 }
 
 func buildOnboardingTestPrompt(persona []byte, displayName, message string) string {
@@ -893,14 +1220,13 @@ func canonicalOnboardingFoldRune(value rune) rune {
 
 func defaultAppOnboardingTestExecute(
 	ctx context.Context,
-	a *api,
-	state store.OnboardingState,
-	staged store.OnboardingStagingAccount,
+	runtimeContext appRuntimeContext,
+	route store.OnboardingTestRoute,
 	prompt string,
-) (string, error) {
-	runner, err := newAppOnboardingTestRunner(ctx, a, state, staged)
+) (appOnboardingTestResult, error) {
+	runner, err := newAppOnboardingTestRunner(ctx, runtimeContext, route)
 	if err != nil {
-		return "", err
+		return appOnboardingTestResult{}, err
 	}
 	return runner.Run(ctx, prompt, func(string) {})
 }
@@ -954,16 +1280,21 @@ func selectOnboardingModel(st *store.Store, kind, providerID string) (string, er
 	return "", store.ErrOnboardingModelUnavailable
 }
 
-func (a *api) writeOnboardingSetup(w http.ResponseWriter, staged store.OnboardingSetup) {
-	a.writeJSON(w, http.StatusOK, appOnboardingSetupResponse{
-		Revision:      staged.Revision,
-		ProviderKind:  staged.ProviderKind,
-		ProviderID:    staged.ProviderID,
-		AccountID:     staged.AccountID,
-		ModelID:       staged.ModelID,
-		StagedComboID: staged.StagedComboID,
-		ComboName:     staged.ComboName,
-	})
+func onboardingStageForKind(
+	stages []store.OnboardingProviderStage,
+	kind string,
+) (store.OnboardingProviderStage, bool) {
+	for _, stage := range stages {
+		if stage.Kind == kind {
+			return stage, true
+		}
+	}
+	return store.OnboardingProviderStage{}, false
+}
+
+func onboardingRevisionIsOneAheadForDaemon(expectedRevision, currentRevision int64) bool {
+	return expectedRevision > 0 && currentRevision > expectedRevision &&
+		currentRevision-expectedRevision == 1
 }
 
 // decodeOnboardingBody accepts exactly one bounded JSON object. Error details are intentionally
@@ -1018,6 +1349,11 @@ func (a *api) decodeOnboardingBody(w http.ResponseWriter, r *http.Request, desti
 			"Dữ liệu thiết lập phải là một đối tượng JSON", nil)
 		return false
 	}
+	if !onboardingTopLevelJSONKeysUnique(trimmed) {
+		a.writeLLMErr(w, http.StatusBadRequest, "ONBOARDING_REQUEST_INVALID",
+			"Dữ liệu thiết lập không hợp lệ", nil)
+		return false
+	}
 	strict := json.NewDecoder(bytes.NewReader(trimmed))
 	strict.DisallowUnknownFields()
 	if err := strict.Decode(destination); err != nil {
@@ -1026,6 +1362,78 @@ func (a *api) decodeOnboardingBody(w http.ResponseWriter, r *http.Request, desti
 		return false
 	}
 	return true
+}
+
+// onboardingTopLevelJSONKeysUnique scans the bounded original object rather
+// than round-tripping it through a map. Decoder.Token normalizes escaped key
+// spellings; EqualFold mirrors encoding/json's Unicode struct-field matching.
+// Thus "revision", "\u0072evision", and "Revision" cannot target one field
+// more than once, including Unicode folds such as long-s and the Kelvin sign.
+// Nested objects remain owned by their typed decoders; onboarding mutation
+// ambiguity is only at the request's top level.
+func onboardingTopLevelJSONKeysUnique(raw []byte) bool {
+	const maxTopLevelKeys = 64
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return false
+	}
+	seen := make([]string, 0, 8)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := token.(string)
+		if !ok {
+			return false
+		}
+		if len(seen) >= maxTopLevelKeys {
+			return false
+		}
+		for _, previous := range seen {
+			if strings.EqualFold(previous, key) {
+				return false
+			}
+		}
+		seen = append(seen, key)
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return false
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return false
+	}
+	var trailing json.RawMessage
+	return errors.Is(decoder.Decode(&trailing), io.EOF)
+}
+
+func (runtimeContext appRuntimeContext) decodeOnboardingSelectedKinds(
+	w http.ResponseWriter,
+	raw json.RawMessage,
+) ([]string, bool) {
+	a := runtimeContext.api
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 2 || trimmed[0] != '[' || trimmed[len(trimmed)-1] != ']' {
+		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_PROVIDER_SELECTION_INVALID",
+			"Danh sách nhà cung cấp không hợp lệ", nil)
+		return nil, false
+	}
+	var kinds []string
+	if err := json.Unmarshal(trimmed, &kinds); err != nil || kinds == nil {
+		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_PROVIDER_SELECTION_INVALID",
+			"Danh sách nhà cung cấp không hợp lệ", nil)
+		return nil, false
+	}
+	canonical, err := runtimeContext.registry.canonicalOnboardingKinds(kinds)
+	if err != nil {
+		a.writeOnboardingStoreError(w, err)
+		return nil, false
+	}
+	return canonical, true
 }
 
 func (a *api) requireOnboardingRevision(w http.ResponseWriter, revision int64) bool {
@@ -1037,13 +1445,17 @@ func (a *api) requireOnboardingRevision(w http.ResponseWriter, revision int64) b
 	return false
 }
 
-func (a *api) onboardingMutationState(w http.ResponseWriter, expectedRevision int64) (store.OnboardingState, bool) {
-	state, err := a.st.OnboardingState()
+func (runtimeContext appRuntimeContext) onboardingMutationState(
+	w http.ResponseWriter,
+	expectedRevision int64,
+) (store.OnboardingState, bool) {
+	a := runtimeContext.api
+	state, err := runtimeContext.onboardingStore().OnboardingState()
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return store.OnboardingState{}, false
 	}
-	if err := validateOnboardingState(state); err != nil {
+	if err := validateRuntimeOnboardingState(runtimeContext.registry, state); err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return store.OnboardingState{}, false
 	}
@@ -1074,11 +1486,12 @@ func preflightOnboardingProvider(state store.OnboardingState) (upgrade bool, err
 // preflightOnboardingProviderMutation performs every side-effect-free check
 // needed before a provider transition. Callers hold onboardingMutationMu so
 // the state snapshot remains authoritative until they deliberately release it.
-func (a *api) preflightOnboardingProviderMutation(
+func (runtimeContext appRuntimeContext) preflightOnboardingProviderMutation(
 	w http.ResponseWriter,
 	expectedRevision int64,
 ) (store.OnboardingState, bool, store.OnboardingStagingAccount, bool) {
-	state, ok := a.onboardingMutationState(w, expectedRevision)
+	a := runtimeContext.api
+	state, ok := runtimeContext.onboardingMutationState(w, expectedRevision)
 	if !ok {
 		return store.OnboardingState{}, false, store.OnboardingStagingAccount{}, false
 	}
@@ -1090,7 +1503,7 @@ func (a *api) preflightOnboardingProviderMutation(
 	if upgrade {
 		return state, true, store.OnboardingStagingAccount{}, true
 	}
-	owned, err := a.st.OnboardingStagingAccount(expectedRevision)
+	owned, err := runtimeContext.onboardingStore().OnboardingStagingAccount(expectedRevision)
 	if err != nil {
 		a.writeOnboardingStoreError(w, err)
 		return store.OnboardingState{}, false, store.OnboardingStagingAccount{}, false
@@ -1109,11 +1522,16 @@ func preflightOnboardingRestart(state store.OnboardingState) error {
 // cancelOnboardingConnect cancels only the live job owned by the exact selected kind/revision.
 // Normal Connect and other onboarding contexts are unrelated. Waiting for done is essential:
 // connectJob closes it only after child/process/config cleanup.
-func (a *api) cancelOnboardingConnect(w http.ResponseWriter, ctx context.Context, state store.OnboardingState) bool {
-	if state.ProviderKind == "" || connectMgr == nil {
+func (runtimeContext appRuntimeContext) cancelOnboardingConnect(
+	w http.ResponseWriter,
+	ctx context.Context,
+	state store.OnboardingState,
+) bool {
+	a := runtimeContext.api
+	if state.ProviderKind == "" || runtimeContext.connect == nil {
 		return true
 	}
-	manager := connectMgr
+	manager := runtimeContext.connect
 	manager.mu.Lock()
 	job := manager.job
 	if job == nil || manager.jobKind != state.ProviderKind {
@@ -1176,10 +1594,24 @@ func (a *api) cancelOnboardingConnect(w http.ResponseWriter, ctx context.Context
 	}
 }
 
-func (a *api) onboardingStatusResponse(state store.OnboardingState) (appOnboardingStatusResponse, error) {
-	if err := validateOnboardingState(state); err != nil {
+func onboardingStatusResponse(
+	snapshot store.OnboardingSnapshot,
+	suggested string,
+) (appOnboardingStatusResponse, error) {
+	return runtimeOnboardingStatusResponse(
+		productionAppProviderRuntimeRegistry(), snapshot, suggested,
+	)
+}
+
+func runtimeOnboardingStatusResponse(
+	registry appProviderRuntimeRegistry,
+	snapshot store.OnboardingSnapshot,
+	suggested string,
+) (appOnboardingStatusResponse, error) {
+	if err := validateRuntimeOnboardingSnapshot(registry, snapshot); err != nil {
 		return appOnboardingStatusResponse{}, err
 	}
+	state := snapshot.State
 	projected := state
 	if onboardingUpgradeRequired(state) {
 		projected.Phase = store.OnboardingPhaseProvider
@@ -1187,13 +1619,25 @@ func (a *api) onboardingStatusResponse(state store.OnboardingState) (appOnboardi
 		projected.ProviderID = ""
 		projected.AccountID = ""
 		projected.ModelID = ""
+	} else if (state.Phase == store.OnboardingPhasePersona || state.Phase == store.OnboardingPhaseTest) &&
+		len(snapshot.Stages) > 0 {
+		projected.ProviderKind = snapshot.Stages[0].Kind
+		projected.ProviderID = snapshot.Stages[0].ProviderID
+		projected.AccountID = snapshot.Stages[0].AccountID
+		projected.ModelID = snapshot.Stages[0].ModelID
 	}
-	suggested := ""
-	if projected.ProviderKind == "" {
-		var err error
-		suggested, err = a.suggestedOnboardingProviderKind()
-		if err != nil {
-			return appOnboardingStatusResponse{}, err
+	if projected.ProviderKind != "" || !registry.supportsOnboarding(suggested) {
+		suggested = ""
+	}
+	providers := make([]appOnboardingProviderResponse, len(snapshot.Stages))
+	for index, stage := range snapshot.Stages {
+		providers[index] = appOnboardingProviderResponse{
+			Kind:       stage.Kind,
+			Status:     stage.Status,
+			ProviderID: stage.ProviderID,
+			AccountID:  stage.AccountID,
+			ModelID:    stage.ModelID,
+			Position:   stage.Position,
 		}
 	}
 	return appOnboardingStatusResponse{
@@ -1208,6 +1652,8 @@ func (a *api) onboardingStatusResponse(state store.OnboardingState) (appOnboardi
 		ModelID:               projected.ModelID,
 		RestartInProgress:     state.RestartInProgress,
 		Revision:              state.Revision,
+		Providers:             providers,
+		ProviderOptions:       registry.onboardingOptions(),
 	}, nil
 }
 
@@ -1221,13 +1667,20 @@ func onboardingUpgradeRequired(state store.OnboardingState) bool {
 // build, so handlers must fail closed before suggesting a route, canceling Connect, or touching a
 // staging directory. Later tasks intentionally own the finer provider/account/model relationships.
 func validateOnboardingState(state store.OnboardingState) error {
+	return validateRuntimeOnboardingState(productionAppProviderRuntimeRegistry(), state)
+}
+
+func validateRuntimeOnboardingState(
+	registry appProviderRuntimeRegistry,
+	state store.OnboardingState,
+) error {
 	if state.Revision <= 0 {
 		return errors.New("onboarding state has a nonpositive revision")
 	}
 	if state.CompletedVersion < 0 {
 		return errors.New("onboarding state has a negative completed version")
 	}
-	if state.ProviderKind != "" && !store.IsOnboardingProviderKind(state.ProviderKind) {
+	if state.ProviderKind != "" && !registry.supportsOnboarding(state.ProviderKind) {
 		return errors.New("onboarding state has an unsupported selected provider")
 	}
 
@@ -1237,7 +1690,7 @@ func validateOnboardingState(state store.OnboardingState) error {
 		store.OnboardingPhaseSetup,
 		store.OnboardingPhasePersona,
 		store.OnboardingPhaseTest:
-		if !store.IsOnboardingProviderKind(state.ProviderKind) {
+		if !registry.supportsOnboarding(state.ProviderKind) {
 			return errors.New("onboarding phase requires a selected provider")
 		}
 	case store.OnboardingPhaseCompleted:
@@ -1259,7 +1712,130 @@ func validateOnboardingState(state store.OnboardingState) error {
 	return nil
 }
 
-func (a *api) suggestedOnboardingProviderKind() (string, error) {
+func validateOnboardingSnapshot(snapshot store.OnboardingSnapshot) error {
+	return validateRuntimeOnboardingSnapshot(productionAppProviderRuntimeRegistry(), snapshot)
+}
+
+func validateRuntimeOnboardingSnapshot(
+	registry appProviderRuntimeRegistry,
+	snapshot store.OnboardingSnapshot,
+) error {
+	state := snapshot.State
+	if state.Revision <= 0 {
+		return errors.New("onboarding snapshot has a nonpositive revision")
+	}
+	if state.CompletedVersion < 0 {
+		return errors.New("onboarding snapshot has a negative completed version")
+	}
+	if state.ProviderKind != "" && !registry.supportsOnboarding(state.ProviderKind) {
+		return errors.New("onboarding snapshot has an unsupported active Provider")
+	}
+	if state.ProviderKind == "" &&
+		(state.ProviderID != "" || state.AccountID != "" || state.ModelID != "") {
+		return errors.New("onboarding snapshot has orphan active Provider identity")
+	}
+	kinds := make([]string, len(snapshot.Stages))
+	for index, stage := range snapshot.Stages {
+		kinds[index] = stage.Kind
+		if stage.Position != index {
+			return errors.New("onboarding Provider positions are not contiguous")
+		}
+		switch stage.Status {
+		case "pending":
+			if stage.ProviderID != "" || stage.AccountID != "" || stage.ModelID != "" {
+				return errors.New("pending onboarding Provider owns ready identity")
+			}
+		case "ready":
+			if stage.ProviderID == "" || stage.AccountID == "" || stage.ModelID == "" {
+				return errors.New("ready onboarding Provider has incomplete identity")
+			}
+		default:
+			return errors.New("onboarding Provider has an unknown status")
+		}
+	}
+	canonical, err := registry.canonicalOnboardingKinds(kinds)
+	if err != nil || !slicesEqualStrings(canonical, kinds) {
+		return errors.New("onboarding Provider stages are not canonical")
+	}
+
+	activeIdentityClean := state.ProviderKind == "" && state.ProviderID == "" &&
+		state.AccountID == "" && state.ModelID == ""
+	activeReceiptClean := state.StagedComboID == "" &&
+		state.TestNonceHash == "" && state.TestExpiresAt == ""
+	stageForKind := func(kind string) (store.OnboardingProviderStage, bool) {
+		for _, stage := range snapshot.Stages {
+			if stage.Kind == kind {
+				return stage, true
+			}
+		}
+		return store.OnboardingProviderStage{}, false
+	}
+	allReady := len(snapshot.Stages) > 0
+	for _, stage := range snapshot.Stages {
+		allReady = allReady && stage.Status == "ready"
+	}
+
+	switch state.Phase {
+	case store.OnboardingPhaseProvider:
+		if !activeIdentityClean || !activeReceiptClean {
+			return errors.New("Provider phase owns active identity or receipt state")
+		}
+	case store.OnboardingPhaseConnect:
+		stage, selected := stageForKind(state.ProviderKind)
+		if !registry.supportsOnboarding(state.ProviderKind) || !selected || stage.Status != "pending" ||
+			state.ProviderID != "" || state.AccountID != "" || state.ModelID != "" || !activeReceiptClean {
+			return errors.New("Connect phase does not own one selected pending Provider")
+		}
+	case store.OnboardingPhaseSetup:
+		stage, selected := stageForKind(state.ProviderKind)
+		if !registry.supportsOnboarding(state.ProviderKind) || !selected || stage.Status != "pending" ||
+			state.ProviderID == "" || state.AccountID == "" || state.ModelID != "" || !activeReceiptClean {
+			return errors.New("Setup phase has inconsistent active Provider identity")
+		}
+	case store.OnboardingPhasePersona:
+		if !activeIdentityClean || !allReady || state.StagedComboID == "" ||
+			(state.PersonaFingerprint != "" && !validOnboardingSHA256Text(state.PersonaFingerprint)) ||
+			state.TestNonceHash != "" || state.TestExpiresAt != "" {
+			return errors.New("Persona phase has inconsistent staged Provider ownership")
+		}
+	case store.OnboardingPhaseTest:
+		if !activeIdentityClean || !allReady || state.StagedComboID == "" ||
+			!validOnboardingSHA256Text(state.PersonaFingerprint) {
+			return errors.New("Test phase has inconsistent staged Provider ownership")
+		}
+	case store.OnboardingPhaseCompleted:
+		if state.RestartInProgress || len(snapshot.Stages) != 0 {
+			return errors.New("completed onboarding snapshot has restart or staging markers")
+		}
+	default:
+		return errors.New("onboarding snapshot has an unknown phase")
+	}
+
+	if state.CompletedVersion >= store.CurrentOnboardingVersion &&
+		!state.RestartInProgress && state.Phase != store.OnboardingPhaseCompleted {
+		return errors.New("completed onboarding version is in an unfinished phase")
+	}
+	if state.RestartInProgress &&
+		(state.CompletedVersion < store.CurrentOnboardingVersion || state.Phase == store.OnboardingPhaseCompleted) {
+		return errors.New("onboarding restart markers are inconsistent")
+	}
+	return nil
+}
+
+func slicesEqualStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func (runtimeContext appRuntimeContext) suggestedOnboardingProviderKind() (string, error) {
+	a := runtimeContext.api
 	route, err := a.st.LLMRoute()
 	if err != nil {
 		return "", err
@@ -1279,15 +1855,32 @@ func (a *api) suggestedOnboardingProviderKind() (string, error) {
 		return "", err
 	}
 	for _, provider := range providers {
-		if provider.ID == providerID && store.IsOnboardingProviderKind(provider.Kind) {
+		if provider.ID == providerID && runtimeContext.registry.supportsOnboarding(provider.Kind) {
 			return provider.Kind, nil
 		}
 	}
 	return "", nil
 }
 
-func (a *api) writeOnboardingStatus(w http.ResponseWriter, state store.OnboardingState) {
-	response, err := a.onboardingStatusResponse(state)
+func (runtimeContext appRuntimeContext) writeOnboardingStatus(
+	w http.ResponseWriter,
+	_ store.OnboardingState,
+) {
+	a := runtimeContext.api
+	snapshot, err := runtimeContext.onboardingStore().OnboardingSnapshot()
+	if err != nil {
+		a.writeOnboardingStateUnavailable(w, err)
+		return
+	}
+	runtimeContext.writeOnboardingSnapshot(w, snapshot)
+}
+
+func (runtimeContext appRuntimeContext) writeOnboardingSnapshot(
+	w http.ResponseWriter,
+	snapshot store.OnboardingSnapshot,
+) {
+	a := runtimeContext.api
+	response, err := runtimeOnboardingStatusResponse(runtimeContext.registry, snapshot, "")
 	if err != nil {
 		a.writeOnboardingStateUnavailable(w, err)
 		return
@@ -1297,6 +1890,12 @@ func (a *api) writeOnboardingStatus(w http.ResponseWriter, state store.Onboardin
 
 func (a *api) writeOnboardingStoreError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, providercatalog.ErrInvalidSelection):
+		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_PROVIDER_SELECTION_INVALID",
+			"Danh sách nhà cung cấp không hợp lệ", nil)
+	case errors.Is(err, providercatalog.ErrUnsupportedKind):
+		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_PROVIDER_UNSUPPORTED",
+			"Nhà cung cấp này chưa được hỗ trợ trong bước thiết lập", nil)
 	case errors.Is(err, store.ErrOnboardingConflict):
 		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_REVISION_CONFLICT",
 			"Trạng thái thiết lập đã thay đổi; hãy tải lại rồi thử tiếp", nil)
@@ -1309,6 +1908,9 @@ func (a *api) writeOnboardingStoreError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrOnboardingInvalidStagingOwnership):
 		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_STAGING_INVALID",
 			"Dữ liệu kết nối tạm đã thay đổi; hãy tải lại rồi thử tiếp", nil)
+	case errors.Is(err, store.ErrOnboardingConfigurationChanged):
+		a.writeLLMErr(w, http.StatusConflict, "ONBOARDING_CONFIGURATION_CHANGED",
+			"Cấu hình thiết lập đã thay đổi; hãy tải lại rồi thử tiếp", nil)
 	case errors.Is(err, store.ErrOnboardingModelUnavailable):
 		a.writeLLMErr(w, http.StatusUnprocessableEntity, "ONBOARDING_NO_MODEL",
 			"Không có model khả dụng cho nhà cung cấp đã kết nối", nil)
@@ -1336,7 +1938,7 @@ func (a *api) writeOnboardingCompleteError(w http.ResponseWriter, err error) {
 			"Cấu hình thiết lập đã thay đổi; hãy kiểm tra lại trước khi hoàn tất", nil)
 	default:
 		if a.logger != nil {
-			a.logger.Error("onboarding complete: atomic commit failed", "err", err)
+			a.logger.Error("onboarding complete: atomic commit failed", "error_kind", "commit_failed")
 		}
 		a.writeLLMErr(w, http.StatusInternalServerError, "ONBOARDING_COMMIT_FAILED",
 			"Không thể hoàn tất thiết lập an toàn; cấu hình cũ vẫn được giữ nguyên", nil)
@@ -1366,10 +1968,20 @@ func validateOnboardingStagingConfigDir(
 	dataDir string,
 	staged store.OnboardingStagingAccount,
 ) error {
+	return validateRuntimeOnboardingStagingConfigDir(
+		productionAppProviderRuntimeRegistry(), dataDir, staged,
+	)
+}
+
+func validateRuntimeOnboardingStagingConfigDir(
+	registry appProviderRuntimeRegistry,
+	dataDir string,
+	staged store.OnboardingStagingAccount,
+) error {
 	unsafe := func(reason string) error {
 		return fmt.Errorf("%w: %s", store.ErrOnboardingInvalidStagingOwnership, reason)
 	}
-	if !store.IsOnboardingProviderKind(staged.ProviderKind) ||
+	if !registry.supportsOnboarding(staged.ProviderKind) ||
 		!validOnboardingAccountID(staged.AccountID) || staged.ProviderID != staged.ProviderKind ||
 		staged.ConfigDir == "" || filepath.Clean(staged.ConfigDir) != staged.ConfigDir {
 		return unsafe("unsafe staging account identity or config path")
@@ -1416,10 +2028,20 @@ func validateOnboardingStagingConfigDir(
 // cannot redirect it to another pathname. Every owned path component must be a real directory;
 // links and Windows junctions are rejected even when they resolve inside the data directory.
 func removeOwnedOnboardingAccount(dataDir string, owned store.OnboardingStagingAccount) error {
+	return removeRuntimeOwnedOnboardingAccount(
+		productionAppProviderRuntimeRegistry(), dataDir, owned,
+	)
+}
+
+func removeRuntimeOwnedOnboardingAccount(
+	registry appProviderRuntimeRegistry,
+	dataDir string,
+	owned store.OnboardingStagingAccount,
+) error {
 	if owned == (store.OnboardingStagingAccount{}) {
 		return nil
 	}
-	if !store.IsOnboardingProviderKind(owned.ProviderKind) ||
+	if !registry.supportsOnboarding(owned.ProviderKind) ||
 		!validOnboardingAccountID(owned.AccountID) || owned.ConfigDir == "" {
 		return errOnboardingUnsafeAccountPath
 	}
