@@ -246,7 +246,7 @@ func TestReplyEndpointKeepsSendingWhenLessonInsertFails(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	reg := NewRegistry(st, cfg, logger)
 	t.Cleanup(reg.StopAll)
-	srv := New(cfg, st, reg, nil, logger, "test", nil)
+	srv := New(context.Background(), cfg, st, reg, nil, logger, "test", nil)
 	ts := httptest.NewServer(srv.Handler)
 	t.Cleanup(ts.Close)
 	if err := st.UpsertZaloThread("t1", "Khách"); err != nil {
