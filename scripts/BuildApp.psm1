@@ -2150,14 +2150,29 @@ function Apply-AppSeams {
   Assert-SignatureAbsent -Text $duty `
     -Signature 'a.appRunZalo(ctx, run, pz, threadID, question, appZaloCurrentMsgID(reply.ReplyQuote), history, found, files, step)' `
     -Label 'session runner seam'
-  Assert-SignatureAbsent -Text $duty -Signature 'ProgramPrefixArgs []string' `
-    -Label 'managed Claude program seam'
-  Assert-SignatureAbsent -Text $duty -Signature 'var ErrZaloSilent = errors.New(' `
-    -Label 'no-provider sentinel seam'
-  Assert-SignatureAbsent -Text $duty -Signature 'errors.Is(err, ErrZaloSilent)' `
-    -Label 'no-provider answer seam'
-  Assert-SignatureAbsent -Text $duty -Signature 'CLAUDE_CONFIG_DIR=' `
-    -Label 'Claude account isolation seam'
+  # GO NGUOC LEN THUONG NGUON 18/08/2026 -- seam nay da khong con viec de lam.
+  #
+  # agentdc/internal/daemon/duty.go:92-96 nay da khai bao Program/ProgramPrefixArgs, va
+  # resolveRunProgram (:1836) + execZaloRunner.Run (:1854) da lam dung viec seam nay tung
+  # lam. Ban thuong nguon con TOT HON: no noi prefix vao argv bang mot slice moi
+  # (append(append([]string{}, prefix...), args...)) thay vi ghi de len mang nen, va no co
+  # test rieng o duty_test.go:25. Chu thich cua no tro thang ve day: "See appClaudeRunner".
+  #
+  # De lai thi Assert-SignatureAbsent bao dung: chu ky DA co, nen no dung ca build. Cua chan
+  # lam dung phan su -- thu can go la seam, khong phai cua chan.
+  #
+  # Assert-SignatureAbsent -Text $duty -Signature 'ProgramPrefixArgs []string' `
+  #   -Label 'managed Claude program seam'
+  # Hai seam duoi day cung da di nguoc len thuong nguon 18/08/2026, cung mot ly do voi
+  # 'managed Claude program' o tren: main cua agentdc da nhan ca ErrZaloSilent lan
+  # CLAUDE_CONFIG_DIR theo tung tai khoan vao duty.go.
+  #
+  # Assert-SignatureAbsent -Text $duty -Signature 'var ErrZaloSilent = errors.New(' `
+  #   -Label 'no-provider sentinel seam'
+  # Assert-SignatureAbsent -Text $duty -Signature 'errors.Is(err, ErrZaloSilent)' `
+  #   -Label 'no-provider answer seam'
+  # Assert-SignatureAbsent -Text $duty -Signature 'CLAUDE_CONFIG_DIR=' `
+  #   -Label 'Claude account isolation seam'
   Assert-SignatureAbsent -Text $lesson `
     -Signature 'a.st.CreateAppLesson(lesson)' `
     -Label 'operator lesson seam'
@@ -2201,79 +2216,26 @@ function Apply-AppSeams {
     "`tProgram string"
     "`tProgramPrefixArgs []string"
   ) -join $dutyNewline
-  $dutyUpdated = Replace-ExactlyOnce -Text $duty -Needle $configNeedle `
-    -Replacement $configReplacement -Label 'managed Claude config seam'
-
-  $answerErrorNeedle = @(
-    "`tif err != nil {"
-    "`t`treturn escalate(`"the agent did not finish`", `"err`", err)"
-    "`t}"
-  ) -join $dutyNewline
-  $answerErrorReplacement = @(
-    "`tif errors.Is(err, ErrZaloSilent) {"
-    "`t`treturn nil"
-    "`t}"
-    "`tif err != nil {"
-    "`t`treturn escalate(`"the agent did not finish`", `"err`", err)"
-    "`t}"
-  ) -join $dutyNewline
-  $dutyUpdated = Replace-ExactlyOnce -Text $dutyUpdated -Needle $answerErrorNeedle `
-    -Replacement $answerErrorReplacement -Label 'no-provider answer seam'
-
-  $silentNeedle = 'const maxZaloAnswers = 6'
-  $silentReplacement = @(
-    '// ErrZaloSilent means a deliberately unconfigured Provider route; answerZalo must stay quiet.'
-    'var ErrZaloSilent = errors.New("zalo: im lặng — chưa cấu hình provider")'
-    ''
-    $silentNeedle
-  ) -join $dutyNewline
-  $dutyUpdated = Replace-ExactlyOnce -Text $dutyUpdated -Needle $silentNeedle `
-    -Replacement $silentReplacement -Label 'no-provider sentinel seam'
-
-  $programNeedle = @(
-    "`tprof := agent.ConsultReadOnly()"
-    "`tbin, err := exec.LookPath(prof.Binary)"
-    "`tif err != nil {"
-    "`t`treturn `"`", fmt.Errorf(`"locate %s: %w`", prof.Binary, err)"
-    "`t}"
-    "`targs, err := consultArgv(e.cfg, uuid.NewString())"
-    "`tif err != nil {"
-    "`t`treturn `"`", err"
-    "`t}"
-    "`tcmd := exec.CommandContext(ctx, bin, args...)"
-  ) -join $dutyNewline
-  $programReplacement = @(
-    "`tprof := agent.ConsultReadOnly()"
-    "`tbin := e.cfg.Program"
-    "`tprefixArgs := slices.Clone(e.cfg.ProgramPrefixArgs)"
-    "`tif bin == `"`" {"
-    "`t`tvar err error"
-    "`t`tbin, err = exec.LookPath(prof.Binary)"
-    "`t`tif err != nil {"
-    "`t`t`treturn `"`", fmt.Errorf(`"locate %s: %w`", prof.Binary, err)"
-    "`t`t}"
-    "`t}"
-    "`targs, err := consultArgv(e.cfg, uuid.NewString())"
-    "`tif err != nil {"
-    "`t`treturn `"`", err"
-    "`t}"
-    "`targs = append(prefixArgs, args...)"
-    "`tcmd := exec.CommandContext(ctx, bin, args...)"
-  ) -join $dutyNewline
-  $dutyUpdated = Replace-ExactlyOnce -Text $dutyUpdated -Needle $programNeedle `
-    -Replacement $programReplacement -Label 'managed Claude program seam'
-
-  $envNeedle = "`tcmd.Env = prof.Env(os.Environ())" + $dutyNewline +
-    "`tif e.cfg.ThinkingTokens > 0 {"
-  $envReplacement = @(
-    "`tcmd.Env = prof.Env(os.Environ())"
-    "`tif e.cfg.ConfigDir != `"`" {"
-    "`t`tcmd.Env = append(cmd.Env, `"CLAUDE_CONFIG_DIR=`"+e.cfg.ConfigDir)"
-    "`t}"
-    "`tif e.cfg.ThinkingTokens > 0 {"
-  ) -join $dutyNewline
-  $dutyUpdated = Replace-ExactlyOnce -Text $dutyUpdated -Needle $envNeedle `
-    -Replacement $envReplacement -Label 'Claude account isolation seam'
+  # NAM SEAM DA DI NGUOC LEN THUONG NGUON 18/08/2026 -- go cung mot luc.
+  #
+  # agentdc/main nay da mang san ca nam thu chung tung chen vao duty.go:
+  #   managed Claude config    -> :95-96  Program / ProgramPrefixArgs tren zaloConfig
+  #   managed Claude program   -> :1836   resolveRunProgram, va :1854 noi prefix vao argv
+  #   no-provider sentinel     ->         var ErrZaloSilent
+  #   no-provider answer       ->         errors.Is(err, ErrZaloSilent)
+  #   Claude account isolation ->         CLAUDE_CONFIG_DIR theo tung tai khoan
+  #
+  # Phai go CA HAI NUA cua moi seam. Giu cua chan thi Assert-SignatureAbsent dung build vi
+  # chu ky DA co; go cua chan ma giu Replace thi Replace-ExactlyOnce lai nem "khong tim
+  # thay" vi needle ma no di tim da bien mat khoi duty.go.
+  #
+  # Nam nay khong con viec, nhung 23 chu ky seam CON LAI van sach -- da doi chieu tung cai
+  # voi nguon agentdc. Tuc la lop gop khong hong, chi la nam tinh nang da len thuong nguon.
+  #
+  # CANH BAO: tests/build-app.Tests.ps1:912 va :1413 VAN ghim nam seam nay, nen suite Pester
+  # do se do cho toi khi duoc cap nhat theo. Day la sua TAM de tra loi cau hoi "lop gop con
+  # bien dich duoc khong", chua phai ban va chinh thuc.
+  $dutyUpdated = $duty
 
   $answerNeedle = @(
     "`t`tctx, cancel := context.WithTimeout(context.Background(), deps.cfg.Timeout)"
@@ -2281,7 +2243,23 @@ function Apply-AppSeams {
     "`t`t// Bước của lượt đi vào log dùng chung, không phải một danh sách riêng của lượt:"
     "`t`t// terminal là một dòng thời gian, và một lượt đã xong vẫn nằm đó để đọc."
     "`t`tstep := func(text string) { a.zlog.add(ipc.ZaloLogStep, threadID, text) }"
-    "`t`terr := a.answerZalo(ctx, deps.cfg, deps.run, threadID, question, step, reply, files...)"
+    # Bon dong duoi day den tu agentdc 2ac027f (18/08/2026): thuong nguon chen mot buoc CHON
+    # RUNNER truoc khi goi answerZalo. Neo cu chi co dong `err :=` nen no khong con khop, va
+    # Replace-ExactlyOnce nem "expected exactly 1 match, found 0".
+    #
+    # CANH BAO -- day moi la sua NEO, chua phai sua THIET KE. $answerReplacement ben duoi van
+    # nuot ca khoi nay, nghia la trong ban dong goi `zaloRunnerFor` bi bo qua va session PTY
+    # song KHONG duoc dung. Tuc la bo chon session van vo hinh voi san pham.
+    #
+    # Cho cam dung cua session song la mot provider co dang ky Terminal (appTerminalRouteRunner,
+    # app_provider_runtime.go:129), vi appZaloRunner vut bo tham so `base` -- xem `_ = base` o
+    # app_provider_runtime_live.go:244. Doi neo o day CHI de do duoc cau hoi "lop gop con bien
+    # dich khong"; viec cam that nam o dang ky provider.
+    "`t`t// Chon runner MOI LUOT. deps.run van la runner mot-luot va tro thanh duong du phong;"
+    "`t`t// xem zaloRunnerFor. Khong dat zalo.session thi day tra ve dung deps.run, nen prompt"
+    "`t`t// va hanh vi khong doi mot chut nao."
+    "`t`trun := a.zaloRunnerFor(threadID, deps.run)"
+    "`t`terr := a.answerZalo(ctx, deps.cfg, run, threadID, question, step, reply, files...)"
   ) -join $dutyNewline
   $answerReplacement = "`t`terr := a.appAnswerZalo(deps, threadID, question, reply, files)"
   $dutyUpdated = Replace-ExactlyOnce -Text $dutyUpdated -Needle $answerNeedle `
