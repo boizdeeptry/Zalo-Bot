@@ -3,6 +3,17 @@
 Repo này **không phải** mã nguồn của bot. Mã nguồn nằm trong repo AgentDC; repo này chứa lớp
 overlay, launcher, brain skeleton và script đóng gói để dựng ra bản giao cho người mua.
 
+> **Clone repo này về thì CHƯA chạy được daemon.** Ở đây không có `go.mod`, không có
+> `cmd/agentdc`, không có một dòng mã daemon nào — nên không có gì để `go build`. Bạn cần
+> checkout AgentDC trước, rồi trỏ `ZALOBOT_REPO` vào đó (xem "Chuẩn bị máy" ngay dưới).
+>
+> Muốn chạy daemon để nghịch thử, làm trong repo AgentDC — mục "From a fresh clone" trong
+> README của nó. Tóm tắt: `go build -o agentdc.exe ./cmd/agentdc` rồi `agentdc doctor`,
+> `agentdc ls` (daemon TỰ lên, không có bước "start daemon" riêng), `agentdc portal`.
+>
+> Repo này chỉ dùng khi bạn muốn dựng ra **bản đóng gói** — thư mục có `Start.vbs`, `app\`,
+> `brain\`, node kèm sẵn — chứ không phải để phát triển.
+
 Nguyên tắc của `build-app.ps1`: **không sửa repo nguồn một byte nào.** Nó copy repo sang thư mục
 tạm, áp overlay và seam ở đó, build ở đó, rồi xoá. Chạy xong `git status` của repo nguồn phải sạch
 y như trước.
