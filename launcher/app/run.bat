@@ -88,4 +88,16 @@ rem Do duoc: cmd bao 'agentdc.exe' is not recognized du tep nam ngay canh va da 
 rem vao thu muc do. Nguyen nhan la viec cmd tim lenh trong thu muc hien tai co the
 rem bi tat bang bien NoDefaultCurrentDirectoryInExePath, va mot so moi truong dat
 rem no. Dua ca duong dan thi khong phu thuoc vao dieu do nua.
-"%~dp0agentdc.exe" daemon
+rem Ghi stdout + stderr cua daemon ra tep.
+rem
+rem Vi sao can: daemon chay trong cua so AN cua Start.vbs, nen truoc day khi no chet thi
+rem KHONG con dau vet nao. Do duoc hai lan trong mot buoi -- daemon tu tat, va cach duy
+rem nhat de biet la thay cong 8770 khong tra loi. Log theo tung session van co, nhung log
+rem cua chinh daemon thi khong ton tai, nen khong the doc ra vi sao.
+rem
+rem >> chu khong >: moi lan khoi dong lai ghi TIEP vao cung tep. Ghi de nghia la lan chet
+rem thu hai xoa mat bang chung cua lan thu nhat, va do dung la luc can so sanh hai lan.
+rem
+rem Tep nam trong data\ vi day la thu muc ghi duoc (SQLite da o do) va nam TRONG goi --
+rem giu dung loi hua "khong dat gi ngoai thu muc nay".
+"%~dp0agentdc.exe" daemon >>"%ROOT%\data\daemon.log" 2>&1

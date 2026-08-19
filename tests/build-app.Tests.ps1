@@ -2125,6 +2125,16 @@ func duplicateWorkflowMarker() {
   if ($launcher -notmatch 'http://127\.0\.0\.1:8770/"' -or $launcher -match '8770/zalo') {
     throw 'Launcher does not open the management Portal at /'
   }
+  # Daemon output MUST land in a file.
+  #
+  # It runs inside the hidden console Start.vbs creates, so without this redirect a crash
+  # leaves no trace at all: per-session logs exist, the daemon's own output does not, and the
+  # only symptom is port 8770 going quiet. That happened twice in one session and could not be
+  # diagnosed. Append (>>) rather than truncate (>), so a second crash does not erase the
+  # evidence of the first -- which is exactly when the two need comparing.
+  if ($launcher -notmatch '>>"%ROOT%\\data\\daemon\.log" 2>&1') {
+    throw 'Launcher does not redirect daemon output to data\daemon.log; a crash would leave no trace'
+  }
 
   Write-Host 'PASS: staging copies tracked files and applies the guarded Memory, Provider, and managed-CLI seams.'
 } finally {
