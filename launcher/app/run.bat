@@ -21,6 +21,22 @@ cd /d "%ROOT%"
 rem Goc goi, cho trang cau hinh biet Restart.vbs o dau khi no tu mo lai phan mem.
 set "AGENTDC_APP_ROOT=%ROOT%"
 
+rem Xoa NO_COLOR khoi moi truong cua daemon.
+rem
+rem Vi sao: daemon truyen moi truong cua no cho MOI session agent, va Claude Code ton trong
+rem NO_COLOR -- co bien do la no ve toan bo giao dien bang mot mau. Da do duoc: cung mot ban
+rem agentdc.exe, cung mot session claude-code, chi khac moi truong luc khoi dong daemon:
+rem   co NO_COLOR=1  -> 0 ma mau trong log session
+rem   khong NO_COLOR -> 49 ma mau, 23 truecolor (38;2;215;119;87 la mau cam cua Claude)
+rem OpenCode thi bo qua NO_COLOR, nen no van co mau -- dung cai lech do da chi ra nguyen nhan.
+rem
+rem Bien nay khong bao gio duoc dat co y cho phan mem nay: no di lac vao tu shell da mo
+rem Start.vbs. Terminal cua Portal la xterm.js, no ve duoc truecolor, nen mot NO_COLOR thua
+rem huong tu noi khac chi lam mat mau ma khong ai chon.
+rem
+rem Dat rong = xoa han bien trong pham vi tien trinh nay, khong dung toi bien he thong.
+set "NO_COLOR="
+
 set "AGENTDC_HOME=%ROOT%\data"
 set "AGENTDC_PORT=8770"
 

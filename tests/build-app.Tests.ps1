@@ -2135,6 +2135,21 @@ func duplicateWorkflowMarker() {
   if ($launcher -notmatch '>>"%ROOT%\\data\\daemon\.log" 2>&1') {
     throw 'Launcher does not redirect daemon output to data\daemon.log; a crash would leave no trace'
   }
+  # NO_COLOR must be cleared before the daemon starts.
+  #
+  # The daemon hands its environment to every agent session, and Claude Code honours NO_COLOR by
+  # rendering its whole TUI in one colour. Measured on the same agentdc.exe and the same
+  # claude-code session, differing only in the environment the daemon was launched with:
+  #   with NO_COLOR=1  -> 0 colour codes in the session log
+  #   without          -> 49 colour codes, 23 truecolor
+  # OpenCode ignores NO_COLOR, and that asymmetry is what pointed at the cause.
+  #
+  # The variable is never set deliberately for this app; it leaks in from whichever shell opened
+  # Start.vbs. The Portal terminal is xterm.js and renders truecolor, so an inherited NO_COLOR
+  # only removes colour nobody asked to remove.
+  if ($launcher -notmatch 'set "NO_COLOR="') {
+    throw 'Launcher does not clear NO_COLOR; an inherited value would strip colour from every Claude session'
+  }
 
   Write-Host 'PASS: staging copies tracked files and applies the guarded Memory, Provider, and managed-CLI seams.'
 } finally {
