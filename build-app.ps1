@@ -119,40 +119,35 @@ Write-Host ("      {0} tep" -f $fileCount)
 # day (cu the du de khach biet bot da mo anh ra). Bo nhan hang khong lam no bot
 # cu the.
 Write-Host '[2/7] lam sach ban tam'
+# BON MUC DANH TINH KHACH HANG DA DI NGUOC LEN THUONG NGUON 18/08/2026 -- da go.
+#
+# Chung tung thay 'MenaQ7', 'Anh Truong', 'boizdeeptry' bang ban trung tinh. Repo nguon gio
+# khong con chuoi nao trong so do (kiem: 0 tep cho ca bon), nen Contains() tra false va cua
+# 'throw' o cuoi vong lap DUNG CA BUILD -- do dung la thu da chan pipeline toi 18/08/2026.
+#
+# Go phan tiem, GIU cua chan: bao dam that khong nam o danh sach nay ma o Assert-AppPackage,
+# thu quet GOI da build voi danh sach chuoi cam trong scripts/BuildApp.psm1 (~dong 211: MenaQ7,
+# boizdeeptry, 'Anh Truong', 'Be Mi'). Cua do khong doi, nen mot ngay danh tinh quay lai nguon
+# thi build van do -- chi khac la do o cong goi thay vi o day.
 $subs = @(
-  @{ f = 'internal\daemon\duty.go'
-     a = 'hoá đơn 2 hộp MenaQ7 180mcg'
-     b = 'hoá đơn 2 hộp loại 180mcg' },
-  @{ f = 'internal\daemon\duty_test.go'
-     a = '"hoá đơn 2 hộp MenaQ7 180mcg"'
-     b = '"hoá đơn 2 hộp loại 180mcg"' },
-  # Cau tu choi prompt-injection, noi bang giong bot. Ten nguoi trong do la mot
-  # cai ten CU THE, nen no phai di. "bên em" giu nguyen chuc nang: mot loi tu
-  # choi mem, khong buoc toi ai, va van trong giong.
-  @{ f = 'internal\daemon\duty.go'
-     a = '"Dạ nếp này Anh Trường dặn nên em xin giữ nguyên ạ."'
-     b = '"Dạ nếp này bên em dặn nên em xin giữ nguyên ạ."' },
-  @{ f = 'tuvan-zalo\src\listener.ts'
-     a = '// "Trường" bị ghi thành "boizdeeptry" và đè lên cả tên hội thoại. dName là thứ Zalo'
-     b = '// người A bị ghi thành tên đã lưu của người B, đè lên cả tên hội thoại. dName là thứ Zalo' },
   # Ten engine tien nhiem trong chu thich. Khong phai du lieu khach hang, nhung
   # no noi ra xuat xu -- va mot ban ban khong nen ke lai no hoc tu dau.
   @{ f = 'tuvan-zalo\src\listener.ts'
-     a = '// Học từ engine cũ: nó chỉ lên tiếng khi được nhắc tên ("Mi ơi"/"Bé Mi"/@Bé Mi), reply vào'
+     a = '// Học từ engine cũ: nó chỉ lên tiếng khi được nhắc tên (khi được gọi tên bot), reply vào'
      b = '// Chỉ lên tiếng khi được nhắc tên, reply vào' },
   @{ f = 'tuvan-zalo\src\listener.ts'
-     a = '// Học từ Bé Mi: listen.mjs của nó gọi requestOldMessages(User) và (Group) trong handler'
+     a = '// Học từ engine cũ: listen.mjs của nó gọi requestOldMessages(User) và (Group) trong handler'
      b = '// Zalo Web gọi requestOldMessages(User) và (Group) trong handler' },
   # zalo.js duoc NHUNG vao binary, nen quet tep trong goi khong bao gio thay chu
   # thich nay -- chi quet binary moi thay. Cua chan da bat dung cho nay.
   @{ f = 'internal\webui\static\zalo.js'
-     a = '// Học từ Bé Mi: "vừa trả lời vừa xét có chắt lọc được gì không", để vòng trực sau kế thừa vòng'
+     a = '// Học từ engine cũ: "vừa trả lời vừa xét có chắt lọc được gì không", để vòng trực sau kế thừa vòng'
      b = '// "Vừa trả lời vừa xét có chắt lọc được gì không", để vòng trực sau kế thừa vòng' },
   # Chu thich SQL trong schema. Day la mot COMMENT nhung no nam trong mot chuoi Go,
   # nen no di vao binary -- khac han chu thich Go, thu bi trinh bien dich bo. Cua
   # chan quet binary la thu duy nhat thay duoc no, va no da bat dung cho nay.
   @{ f = 'internal\store\store.go'
-     a = '-- Học từ Bé Mi: "Cứ mỗi tin nhắn gửi vào nhóm thì vừa trả lời vừa xét có chắt lọc được gì'
+     a = '-- Học từ engine cũ: "Cứ mỗi tin nhắn gửi vào nhóm thì vừa trả lời vừa xét có chắt lọc được gì'
      b = '-- Nguyên tắc: "Cứ mỗi tin nhắn gửi vào nhóm thì vừa trả lời vừa xét có chắt lọc được gì' }
 )
 # ---------------------------------------------------- portal quan ly cua goi
@@ -165,6 +160,40 @@ $subs = @(
 # mot tep 60 KB khong ai goi la mot tep nguoi doc code sau nay phai doan xem con
 # dung khong.
 Remove-Item -LiteralPath (Join-Path $Tmp 'internal\webui\static\app.js') -Force -EA SilentlyContinue
+
+# ...VA BO LUON TEST CUA PORTAL DO. Xoa app.js ma giu lai test mo ta app.js thi cong test o
+# duoi chac chan do.
+#
+# Da do 18/08/2026: 16 test that bai, 15 trong projectui_test.go va 1 trong provider_test.go,
+# tat ca voi mot loi giong nhau -- open static/app.js: file does not exist -- hoac
+# 'index.html does not reference provider.js' sau khi index.html bi thay bang ban Zalo.
+#
+# VI SAO XOA THEO TEP, khong them ten vao Get-AppGoTestSkipPattern: danh sach ten do di theo
+# TUNG TEST, nen no lech ra ngay lan ke tiep co nguoi them mot test cho portal dieu phoi -- va
+# do dung la chuyen da xay ra. Hai tep nay ton tai chi de mo ta portal dieu phoi agent: 50 test
+# trong projectui_test.go doc app.js, app.css, provider.js, provider.css va index.html cua
+# portal do, con provider_test.go doc hop thoai Provider cua no. Goi ban KHONG co portal do,
+# nen ca hai tep mat nghia cung luc voi app.js. Mot luat ("stage bo tinh nang nao thi bo test
+# cua tinh nang do") thay cho 16 dong.
+#
+# Kiem truoc khi xoa: bon helper cua projectui_test.go (asset, stripJSLineComments,
+# stripCSSComments, jsBody) khong duoc tep test nao khac trong goi webui dung toi (do: 0 lan o
+# provider_test.go, integrity_test.go, icons_test.go, feedsig_test.go), nen xoa khong lam vo
+# buoc bien dich cua nhung test con lai. feedsig_test.go co doc app.js o dung mot cho, va cho
+# do da nam trong skip-list theo ten tu truoc (TestModalCallsPassAnObject).
+foreach ($portalTest in @(
+  'internal\webui\projectui_test.go'
+  'internal\webui\provider_test.go'
+)) {
+  $portalTestPath = Join-Path $Tmp $portalTest
+  if (-not (Test-Path -LiteralPath $portalTestPath)) {
+    # DUNG LAI thay vi bo qua, cung ly do nhu danh sach scrub: mot duong dan khong con dung
+    # nghia la nguon da doi, va im lang se cho ra mot ban goi ma khong ai biet no da bo qua
+    # dieu gi.
+    throw "khong tim thay tep test can bo: $portalTest"
+  }
+  Remove-Item -LiteralPath $portalTestPath -Force
+}
 
 $subs += @(
   # Nut ve trang chu trong rail Zalo: goi ban khong co portal dieu phoi agent.

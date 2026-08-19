@@ -278,7 +278,7 @@ func TestAppRunZaloLeavesStatelessRunnerUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("appRunZalo() error = %v", err)
 	}
-	if got != run.out || run.calls != 1 || !strings.Contains(run.gotPrompt, "You answer a customer's question") {
+	if got != run.out || run.calls != 1 || !strings.Contains(run.gotPrompt, "Your operator's knowledge base is in these directories") {
 		t.Fatalf("stateless runner = output %q, calls %d, prompt %q", got, run.calls, run.gotPrompt)
 	}
 	if _, err := a.st.ZaloCLISession("stateless"); !errors.Is(err, store.ErrNotFound) {
@@ -695,7 +695,7 @@ func TestAppZaloVirginSessionStaysFreshAfterStatelessSuccess(t *testing.T) {
 		if in.Resume {
 			t.Errorf("turn %d Resume = true; virgin Claude session must stay fresh", i+1)
 		}
-		if in.Prompt != in.StatelessPrompt || !strings.Contains(in.StatelessPrompt, "You answer a customer's question") {
+		if in.Prompt != in.StatelessPrompt || !strings.Contains(in.StatelessPrompt, "Your operator's knowledge base is in these directories") {
 			t.Errorf("turn %d prompts = delta %q / stateless %q; want full bootstrap prompt", i+1, in.Prompt, in.StatelessPrompt)
 		}
 	}
@@ -2114,7 +2114,7 @@ func TestAppZaloStagedSeamCreatesResumesAndIsolatesThreadsAcrossAPIRecreation(t 
 		t.Errorf("second argv = %q; want --resume %s", command.calls[1].argv, first.ClaudeSessionID)
 	}
 	if !strings.Contains(command.calls[1].prompt, "operator correction") ||
-		strings.Contains(command.calls[1].prompt, "You answer a customer's question") {
+		strings.Contains(command.calls[1].prompt, "Your operator's knowledge base is in these directories") {
 		t.Errorf("resume prompt did not contain only delta material: %q", command.calls[1].prompt)
 	}
 	if got := strings.Count(command.calls[1].prompt, threadASecond); got != 1 {
