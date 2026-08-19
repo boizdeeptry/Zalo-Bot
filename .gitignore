@@ -28,3 +28,18 @@ app/data/
 *.key
 *.pfx
 *.p12
+
+# Thu muc lam viec tam cua cac lan build/kiem tra. KHONG duoc vao source control.
+#
+# Vi sao co muc nay: mot lan `git add -A` da quet ca .cleanup-trash va gocache ben trong no
+# thanh mot commit 17.903 tep. Chung khong phai ma nguon -- chung la ban sao cu cua ca cay
+# repo cong voi cache cua Go, va chung sinh ra lai duoc bat cu luc nao.
+#
+# .planning KHONG co trong danh sach nay: no dang co 45 tep tracked va la tai lieu thuc.
+.cleanup-trash/
+.task15-*/
+.tmp/
+.verification/
+
+# Cache cua Go, o bat ky do sau nao: mot lan build trong thu muc tam de lai ca ngan tep.
+gocache/
